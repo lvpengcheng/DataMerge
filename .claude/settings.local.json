@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find \"e:/project/DataMerge\" -type d -name \"__pycache__\" -exec rm -rf {} +)",
+      "Bash(find \"e:/project/DataMerge\" -name \"*.pyc\" -delete)",
+      "Bash(python -c \"\nimport sys\nsys.path.insert\\(0, ''e:/project/DataMerge''\\)\nfrom backend.ai_engine.prompt_generator import PromptGenerator\npg = PromptGenerator\\(\\)\n# 测试生成prompt是否报错\ntry:\n    prompt = pg.generate_batch_modular_prompt\\(\n        source_structure={''files'': {}}, \n        expected_structure={''files'': {}}, \n        rules_content=''test'', \n        modules=[], \n        output_filename=''test.xlsx''\n    \\)\n    print\\(''Prompt generated successfully, length:'', len\\(prompt\\)\\)\n    # 检查是否包含依赖列\n    if ''依赖列'' in prompt:\n        print\\(''WARNING: 依赖列 found in prompt!''\\)\n    else:\n        print\\(''No 依赖列 in prompt''\\)\nexcept Exception as e:\n    import traceback\n    traceback.print_exc\\(\\)\n    print\\(''Error:'', e\\)\n\")",
+      "Bash(python -c \"\nwith open\\(''e:/project/DataMerge/backend/ai_engine/prompt_generator.py'', ''r'', encoding=''utf-8''\\) as f:\n    lines = f.readlines\\(\\)\n\n# 找到方法起始行\nstart_line = None\nfor i, line in enumerate\\(lines\\):\n    if ''def generate_batch_modular_prompt\\('' in line:\n        start_line = i\n        break\n\nprint\\(f''Start line: {start_line + 1}''\\)\nprint\\(f''Total lines: {len\\(lines\\)}''\\)\n\")",
+      "Bash(python replace_prompt.py)",
+      "Bash(python -m py_compile \"e:/project/DataMerge/backend/ai_engine/prompt_generator.py\")",
+      "Bash(del \"e:\\\\project\\\\DataMerge\\\\backend\\\\sandbox\\\\sandbox_helpers.py\")",
+      "Bash(python -c \"\nimport openpyxl\n\n# 检查最新的输出文件\nfile_path = r''e:\\\\project\\\\DataMerge\\\\tenants\\\\rex\\\\calculations\\\\batch_1769938251_7690\\\\output\\\\薪资汇总表.xlsx''\n\n# 读取公式\nwb = openpyxl.load_workbook\\(file_path\\)\nws = wb.active\n\nprint\\(''=== 表头备注检查 ===''\\)\nfor col in range\\(1, ws.max_column + 1\\):\n    cell = ws.cell\\(row=1, column=col\\)\n    print\\(f''{cell.value}: 备注={cell.comment}''\\)\n\nprint\\(\\)\nprint\\(''=== 第2行公式检查 ===''\\)\nfor col in range\\(1, ws.max_column + 1\\):\n    cell = ws.cell\\(row=2, column=col\\)\n    value = cell.value\n    is_formula = str\\(value\\).startswith\\(''=''\\) if value else False\n    print\\(f''{ws.cell\\(row=1, column=col\\).value}: 值={value}, 是公式={is_formula}''\\)\n\nwb.close\\(\\)\n\")",
+      "Bash(ls -lt \"e:/project/DataMerge/tenants/达美乐/scripts/\"*.py)",
+      "Bash(findstr \"20260201_213054\")",
+      "Bash(python -c \"from utils.excel_comparator import compare_excel_files; from ai_engine.training_engine import TrainingEngine; print\\(''Imports OK''\\)\")",
+      "Bash(python -m py_compile utils/excel_comparator.py)",
+      "Bash(python -m py_compile ai_engine/training_engine.py)",
+      "Bash(python -m py_compile app/main.py)",
+      "Bash(python -c \"with open\\(r''e:\\\\project\\\\DataMerge\\\\backend\\\\ai_engine\\\\formula_code_generator.py'', ''r'', encoding=''utf-8''\\) as f: lines = f.readlines\\(\\); print\\(''''.join\\(lines[488:516]\\)\\)\")",
+      "Bash(chcp 65001)",
+      "Bash(python -c:*)",
+      "Bash(find:*)",
+      "Bash(grep:*)",
+      "Bash(ls:*)",
+      "Bash(pip install:*)",
+      "Bash(python run.py:*)",
+      "Bash(venv/Scripts/pip.exe install fastapi uvicorn[standard] pydantic pandas openpyxl python-multipart python-dotenv openai anthropic requests)",
+      "Bash(venv/Scripts/pip install pywin32)"
+    ]
+  }
+}
