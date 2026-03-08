@@ -1,0 +1,310 @@
+
+# ==================== 邮件处理API ====================
+
+@app.post("/api/email/add-account")
+async def add_email_account(
+    email_address: str = Form(...),
+    pop3_server: str = Form(...),
+    pop3_port: int = Form(...),
+    pop3_ssl: bool = Form(True),
+    pop3_password: str = Form(...),
+    smtp_server: str = Form(...),
+    smtp_port: int = Form(...),
+    smtp_ssl: bool = Form(True),
+    smtp_password: str = Form(...),
+    recipients: str = Form("")
+):
+    """添加邮件账户"""
+    try:
+    recipient_list = [r.strip() for r in recipients.split(",") if r.strip()]
+
+        result = email_handler.add_email_account(
+     email_address=email_address,
+            pop3_server=pop3_server,
+            pop3_port=pop3_port,
+        pop3_ssl=pop3_ssl,
+         pop3_password=pop3_password,
+            smtp_server=smtp_server,
+            smtp_port=smtp_port,
+            smtp_ssl=smtp_ssl,
+          smtp_password=smtp_password,
+            recipients=recipient_list
+        )
+
+        return result
+
+    except Exception as e:
+        logger.error(f"添加邮件账户失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"添加邮件账户失败: {str(e)}")
+
+
+@app.post("/api/email/check")
+async def check_emails():
+    """检查所有配置的邮箱，处理新邮件"""
+    try:
+        logger.info("开始检查邮件...")
+
+    accounts = email_handler.config.get("email_accounts", [])
+        if not accounts:
+            return {
+                "success": False,
+         "message": "没有配置邮箱账户"
+            }
+
+        results = []
+        ai_provider = AIProviderFactory.create_provider()
+
+        for account in accounts:
+         try:
+                logger.info(f"检查邮箱: {account['email_address']}")
+
+                # 获取新邮件
+                new_emails = email_handler.fetch_new_emails(account)
+
+                for msg in new_emails:
+               # 处理邮件
+                 result = email_handler.process_email(
+          msg,
+                 storage_manager,
+                excel_parser,
+          ai_provider
+          )
+
+             results.append(result)
+
+              # 如果文件准备好了，调用计算接口
+                  if result.get("success") and result.get("message") == "文件已准备好，可以开始计算":
+                  tenant_name = result["tenant_name"]
+              salary_year = result["salary_year"]
+                   salary_month = result["salary_month"]
+                        monthly_standard_hours = result["monthly_standard_hours"]
+
+                 # 调用计算
+                        calc_result = await _execute_calculation(
+                 tenant_name,
+             salary_year,
+              salary_month,
+          monthly_standard_hours
+                   )
+
+              result["calculation_result"] = calc_result
+
+                # 发送结果邮件（检查是否已发送过）
+              if calc_result.get("success"):
+                 email_sent = await _send_result_email(
+                  account,
+                           tenant_name,
+                    salary_year,
+                     salary_month,
+           calc_result
+            )
+                          result["email_sent"] = email_sent
+
+             # 更新上次检查时间
+            email_handler.update_last_check_time(account["email_address"])
+
+        except Exception as e:
+                logger.error(f"处理邮箱 {account['email_address']} 失败: {e}", exc_info=True)
+             results.append({
+                 "success": False,
+                 "email": account["email_address"],
+                  "error": str(e)
+                })
+
+        return {
+          "success": True,
+         "message": f"检查完成，处理了 {len(results)} 封邮件",
+          "results": results
+        }
+
+    except Exception as e:
+        logger.error(f"检查邮件失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"检查邮件失败: {str(e)}")
+
+
+async def _execute_calculation(
+    tenant_id: str,
+    salary_year: int,
+    salary_month: int,
+    monthly_standard_hours: float
+) -> Dict[str, Any]:
+    """执行计算
+
+    Args:
+        tenant_id: 租户ID
+        salary_year: 薪资年份
+        salary_month: 薪资月份
+        monthly_standard_hours: 月标准工时
+    Returns:
+        计算结果
+    """
+    try:
+        logger.info(f"开始计算 - 租户: {tenant_id}, 年月: {salary_year}-{salary_month}")
+
+      # 获取活跃脚本
+        active_script = storage_manager.get_active_script(tenant_id)
+        if not active_script:
+          return {"success": False, "error": "未找到活跃脚本"}
+
+        script_id = active_script["script_id"]
+        script_content = storage_manager.get_script_content(tenant_id, script_id)
+        if not script_content:
+            return {"success": False, "error": "脚本文件不存在"}
+
+        # 获取数据文件
+        tenant_dir = storage_manager.get_tenant_dir(tenant_id)
+        calc_dir = tenant_dir / "calculations" / f"{salary_year}{salary_month:02d}"
+        data_files = list(calc_dir.glob("*.xlsx")) + list(calc_dir.glob("*.xls"))
+
+    if not data_files:
+            return {"success": False, "error": "没有找到数据文件"}
+
+        # 创建临时目录
+        temp_dir = tempfile.mkdtemp()
+        temp_dir = str(Path(temp_dir).resolve())
+        input_dir = Path(temp_dir) / "input"
+     output_dir = Path(temp_dir) / "output"
+        input_dir.mkdir(exist_ok=True)
+        output_dir.mkdir(exist_ok=True)
+
+     # 复制数据文件
+        for f in data_files:
+    shutil.copy(f, input_dir / f.name)
+
+      # 执行脚本
+        execution_env = {
+            "input_folder": str(input_dir),
+            "output_folder": str(output_dir),
+            "manual_headers": active_script.get("script_info", {}).get("manual_headers") or {},
+            "source_files": [f.name for f in data_files],
+            "salary_year": salary_year,
+            "salary_month": salary_month,
+            "monthly_standard_hours": monthly_standard_hours
+        }
+
+        sandbox = CodeSandbox()
+        result = sandbox.execute_script(script_content, execution_env)
+
+        # 保存结果
+        if result["success"]:
+            # 查找输出目录中的文件
+            output_files = list(output_dir.glob("*.xlsx")) + list(output_dir.glob("*.xls"))
+
+            if output_files:
+         # 使用第一个输出文件
+                output_file = output_files[0]
+
+          # 保存到计算目录
+                saved_file = calc_dir / "output" / output_file.name
+              saved_file.parent.mkdir(exist_ok=True)
+                shutil.copy(output_file, saved_file)
+
+                result["saved_output_file"] = str(saved_file)
+                result["download_url"] = f"/api/download/{output_file.name}?tenant_id={tenant_id}&batch_id={salary_year}{salary_month:02d}"
+
+              logger.info(f"结果文件已保存: {saved_file}")
+            else:
+                logger.warning("输出目录中没有找到Excel文件")
+
+        # 清理临时目录
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return result
+
+    except Exception as e:
+        logger.error(f"执行计算失败: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+async def _send_result_email(
+    account: Dict[str, Any],
+    tenant_name: str,
+    salary_year: int,
+    salary_month: int,
+    calc_result: Dict[str, Any]
+) -> bool:
+    """发送结果邮件
+
+    Args:
+      account: 邮箱账户配置
+        tenant_name: 租户名称
+        salary_year: 薪资年份
+        salary_month: 薪资月份
+        calc_result: 计算结果
+
+    Returns:
+        是否发送成功
+    """
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.application import MIMEApplication
+
+        recipients = account.get("recipients", [])
+        if not recipients:
+       logger.warning("没有配置收件人，跳过发送邮件")
+            return False
+
+        # 检查是否已发送过（根据结果文件路径）
+        saved_output_file = calc_result.get("saved_output_file")
+        if saved_output_file:
+            sent_record_file = Path(saved_output_file).parent / ".email_sent"
+         if sent_record_file.exists():
+         logger.info(f"该计算结果已发送过邮件，跳过发送: {saved_output_file}")
+     return False
+
+        # 创建邮件
+        msg = MIMEMultipart()
+        msg['From'] = account["email_address"]
+        msg['To'] = ', '.join(recipients)
+     msg['Subject'] = f"{tenant_name}_{salary_year}_{salary_month}_计算结果"
+
+        # 邮件正文
+        body = f"""
+{tenant_name} {salary_year}年{salary_month}月薪资计算已完成
+
+计算状态: {'成功' if calc_result.get('success') else '失败'}
+处理时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+"""
+    if calc_result.get("success"):
+        body += f"\n下载链接: {calc_result.get('download_url', '无')}\n"
+     else:
+            body += f"\n错误信息: {calc_result.get('error', '未知错误')}\n"
+
+        msg.attach(MIMEText(body, 'plain', 'utf-8'))
+
+        # 附加结果文件
+        if saved_output_file:
+            output_file = Path(saved_output_file)
+         if output_file.exists():
+                with open(output_file, 'rb') as f:
+                    attachment = MIMEApplication(f.read(), _subtype="xlsx")
+              attachment.add_header('Content-Disposition', 'attachment', filename=output_file.name)
+                    msg.attach(attachment)
+
+        # 发送邮件
+        if account["smtp_ssl"]:
+            server = smtplib.SMTP_SSL(account["smtp_server"], account["smtp_port"])
+        else:
+        server = smtplib.SMTP(account["smtp_server"], account["smtp_port"])
+
+        server.login(account["email_address"], account["smtp_password"])
+        server.send_message(msg)
+        server.quit()
+
+        logger.info(f"结果邮件已发送给: {', '.join(recipients)}")
+
+        # 记录已发送
+        if saved_output_file:
+            sent_record_file = Path(saved_output_file).parent / ".email_sent"
+        with open(sent_record_file, 'w', encoding='utf-8') as f:
+                f.write(f"{datetime.now().isoformat()}\n")
+              f.write(f"Recipients: {', '.join(recipients)}\n")
+
+        return True
+
+    except Exception as e:
+        logger.error(f"发送结果邮件失败: {e}", exc_info=True)
+        return False
+

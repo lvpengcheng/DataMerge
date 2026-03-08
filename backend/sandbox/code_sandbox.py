@@ -139,6 +139,16 @@ class CodeSandbox:
                     exec(code_obj, exec_globals)
                     output_buffer.write(f"代码编译和执行完成\n")
 
+                    # 【性能优化】如果有预加载的源数据，替换 load_source_data 避免重复解析
+                    _pre_loaded = exec_globals.get('_pre_loaded_source_data')
+                    if _pre_loaded and 'load_source_data' in exec_globals:
+                        _original_load = exec_globals['load_source_data']
+                        def _cached_load_source_data(input_folder, manual_headers, _data=_pre_loaded):
+                            output_buffer.write(f"[性能优化] 使用预加载源数据（{len(_data)}个sheet，跳过Excel解析）\n")
+                            return _data
+                        exec_globals['load_source_data'] = _cached_load_source_data
+                        output_buffer.write(f"[性能优化] 已注入预加载源数据缓存\n")
+
                     # 尝试调用主函数
                     if 'main' in exec_globals and callable(exec_globals['main']):
                         main_func = exec_globals['main']
@@ -260,8 +270,15 @@ class CodeSandbox:
                     error_buffer.write(error_msg)
 
             # 收集输出
-            result["output"] = output_buffer.getvalue()
+            full_output = output_buffer.getvalue()
             error_output = error_buffer.getvalue()
+
+            # 限制 output 长度为前 500 字符
+            if len(full_output) > 500:
+                result["output"] = full_output[:500] + "\n...(输出过长，已截断)"
+            else:
+                result["output"] = full_output
+
             if error_output:
                 result["error"] = error_output
 

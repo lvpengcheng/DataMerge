@@ -15,6 +15,7 @@ Excel智能解析器 - Python实现
 
 import re
 import logging
+import zipfile
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Callable
 from enum import Enum
@@ -22,7 +23,67 @@ from pathlib import Path
 import openpyxl
 from openpyxl.worksheet.worksheet import Worksheet
 from openpyxl.cell.cell import Cell
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.cell_range import CellRange
 from datetime import datetime
+
+
+# ==================== 缓存优化类（read_only模式支持） ====================
+
+class _CachedCell:
+    """轻量级缓存单元格，替代openpyxl的Cell对象"""
+    __slots__ = ['value', 'row', 'column', 'font', 'fill', 'alignment', '_coord']
+
+    def __init__(self, value, row, column, font=None, fill=None, alignment=None):
+        self.value = value
+        self.row = row
+        self.column = column
+        self.font = font
+        self.fill = fill
+        self.alignment = alignment
+        self._coord = None
+
+    @property
+    def coordinate(self):
+        if self._coord is None:
+            self._coord = f"{get_column_letter(self.column)}{self.row}"
+        return self._coord
+
+
+class _CachedMergedCells:
+    """缓存合并单元格信息"""
+    __slots__ = ['ranges']
+    def __init__(self, ranges=None):
+        self.ranges = ranges if ranges is not None else []
+
+
+class _CachedWorksheet:
+    """缓存工作表 - 通过read_only模式快速加载后提供随机访问接口"""
+
+    def __init__(self, title, max_row, max_column):
+        self.title = title
+        self.max_row = max_row
+        self.max_column = max_column
+        self._styled_cells = {}  # {(row, col): _CachedCell} - 表头区域带样式的单元格
+        self._rows = None        # list: index=row, value=tuple of cell values（数据区域）
+        self._rows_offset = 0   # _rows[0] 对应的实际行号
+        self.merged_cells = _CachedMergedCells()
+
+    def cell(self, row=None, column=None):
+        # 优先返回带样式的缓存单元格（表头区域）
+        key = (row, column)
+        styled = self._styled_cells.get(key)
+        if styled is not None:
+            return styled
+        # 从行数据数组中快速读取值
+        value = None
+        if self._rows is not None:
+            idx = row - self._rows_offset
+            if 0 <= idx < len(self._rows):
+                row_data = self._rows[idx]
+                if row_data is not None and column >= 1 and column <= len(row_data):
+                    value = row_data[column - 1]
+        return _CachedCell(value, row, column)
 
 
 # ==================== 数据类定义 ====================
@@ -132,6 +193,7 @@ class HeaderRuleEngine:
     
     def __init__(self):
         self.rules: List[HeaderRule] = []
+        self._merged_cell_index = None  # 【性能优化】外部注入的合并单元格索引
         self._initialize_default_rules()
     
     def _initialize_default_rules(self):
@@ -246,9 +308,10 @@ class HeaderRuleEngine:
         """判断是否为数值类型"""
         return isinstance(value, (int, float, complex))
     
-    @staticmethod
-    def _is_merged_cell(worksheet: Worksheet, row: int, col: int) -> bool:
-        """检查是否为合并单元格"""
+    def _is_merged_cell(self, worksheet: Worksheet, row: int, col: int) -> bool:
+        """检查是否为合并单元格（使用索引优化）"""
+        if self._merged_cell_index is not None:
+            return (row, col) in self._merged_cell_index
         cell = worksheet.cell(row, col)
         for merged_range in worksheet.merged_cells.ranges:
             if cell.coordinate in merged_range:
@@ -680,6 +743,7 @@ class EnhancedRowAnalyzer:
 
     def __init__(self):
         self.logger = logging.getLogger(__name__)
+        self._merged_cell_index = None  # 【性能优化】外部注入的合并单元格索引
 
     def analyze_row_features(self, worksheet: Worksheet, row: int, max_col: int) -> RowFeatures:
         """分析行的详细特征"""
@@ -925,8 +989,10 @@ class EnhancedRowAnalyzer:
         text_lower = text.lower()
         return any(keyword.lower() in text_lower for keyword in self.HEADER_KEYWORDS)
 
-    @staticmethod
-    def _is_merged_cell(worksheet: Worksheet, row: int, col: int) -> bool:
+    def _is_merged_cell(self, worksheet: Worksheet, row: int, col: int) -> bool:
+        """【性能优化】优先使用索引查找"""
+        if self._merged_cell_index is not None:
+            return (row, col) in self._merged_cell_index
         cell = worksheet.cell(row, col)
         for merged_range in worksheet.merged_cells.ranges:
             if cell.coordinate in merged_range:
@@ -1001,11 +1067,16 @@ class IntelligentExcelParser:
         "合计", "总计", "小计", "汇总", "共计", "累计", "总和", "总额",
         "total", "subtotal", "summary", "sum", "grand total"
     }
-    
+
     def __init__(self):
         self.header_rule_engine = HeaderRuleEngine()
         self.row_analyzer = EnhancedRowAnalyzer()  # 添加增强型行分析器
         self.logger = logging.getLogger(__name__)
+
+        # 从环境变量读取配置
+        import os
+        self.max_columns = int(os.environ.get('EXCEL_MAX_COLUMNS', '150'))
+        self.logger.info(f"Excel解析器配置: 最大列数={self.max_columns}")
 
         # 添加新的优化组件
         self.consistency_validator = ColumnConsistencyValidator()
@@ -1013,13 +1084,185 @@ class IntelligentExcelParser:
         self.relation_analyzer = ColumnRelationAnalyzer()
         self.boundary_evaluator = BoundaryCandidateEvaluator(self.row_analyzer, self.relation_analyzer)
 
+        # 【性能优化】合并单元格索引缓存（按worksheet缓存）
+        self._merged_cell_index = {}  # {worksheet_id: {(row, col): merged_range}}
+        self._merged_cell_rows = {}   # {worksheet_id: {row: [merged_range, ...]}}
+        self._current_ws_id = None
+
+        # 【性能优化】预编译汇总行英文关键字正则
+        self._summary_en_patterns = {}
+        for keyword in self.SUMMARY_KEYWORDS:
+            keyword_lower = keyword.lower()
+            if not any(ord(c) > 127 for c in keyword):
+                self._summary_en_patterns[keyword_lower] = re.compile(
+                    r'\b' + re.escape(keyword_lower) + r'\b'
+                )
+
         # 添加自定义日期格式规则
+        _date_pattern = re.compile(r'(年|月|日|日期|time|date)', re.IGNORECASE)
         def custom_date_format_rule(value: Any, context: RowContext) -> float:
             if isinstance(value, str):
-                return 1.0 if re.search(r'(年|月|日|日期|time|date)', value, re.IGNORECASE) else 0.0
+                return 1.0 if _date_pattern.search(value) else 0.0
             return 0.0
 
         self.header_rule_engine.add_rule("CustomDateFormatRule", custom_date_format_rule, 0.6)
+
+    # ==================== read_only 快速加载 ====================
+
+    def _create_cached_worksheet(self, ws, merge_refs):
+        """从read_only工作表创建缓存工作表，支持随机访问
+
+        Args:
+            ws: openpyxl的ReadOnlyWorksheet对象
+            merge_refs: 合并单元格ref字符串列表，如["A1:B2", "C3:D4"]
+
+        Returns:
+            _CachedWorksheet实例
+        """
+        HEADER_SCAN_ROWS = 100  # 前100行缓存完整样式信息
+
+        max_row = ws.max_row or 0
+        max_col = ws.max_column or 0
+
+        cached = _CachedWorksheet(ws.title, max_row, max_col)
+
+        actual_max_row = 0
+        actual_max_col = 0
+
+        # 1. 读取表头区域（带font/fill/alignment样式，用于表头识别）
+        header_limit = min(HEADER_SCAN_ROWS, max_row) if max_row > 0 else HEADER_SCAN_ROWS
+        try:
+            for row_cells in ws.iter_rows(min_row=1, max_row=header_limit):
+                for cell in row_cells:
+                    if cell.value is not None:
+                        r, c = cell.row, cell.column
+                        try:
+                            cached._styled_cells[(r, c)] = _CachedCell(
+                                cell.value, r, c,
+                                font=cell.font, fill=cell.fill, alignment=cell.alignment
+                            )
+                        except Exception:
+                            cached._styled_cells[(r, c)] = _CachedCell(cell.value, r, c)
+                        actual_max_row = max(actual_max_row, r)
+                        actual_max_col = max(actual_max_col, c)
+        except Exception:
+            pass
+
+        # 2. 读取数据区域（使用list存储整行tuple，比dict快得多）
+        data_start = header_limit + 1
+        cached._rows_offset = data_start
+        rows_list = []
+        if max_row == 0 or max_row >= data_start:
+            try:
+                for row_values in ws.iter_rows(min_row=data_start, values_only=True):
+                    rows_list.append(row_values)
+            except Exception:
+                pass
+        cached._rows = rows_list
+        if rows_list:
+            actual_max_row = data_start + len(rows_list) - 1
+
+        # 修正max_row/max_col（read_only模式下可能为None）
+        if cached.max_row == 0:
+            cached.max_row = actual_max_row
+        if cached.max_column == 0:
+            cached.max_column = actual_max_col
+
+        # 3. 设置合并单元格
+        if merge_refs:
+            cached.merged_cells = _CachedMergedCells(
+                [CellRange(ref) for ref in merge_refs]
+            )
+
+        return cached
+
+    def _parse_merged_cells_from_zip(self, file_path):
+        """从xlsx ZIP文件直接解析合并单元格信息（不需要完整加载workbook）
+
+        Returns:
+            {sheet_name: [ref_string, ...]}  如 {"Sheet1": ["A1:B2", "C3:D4"]}
+        """
+        result = {}
+        if not str(file_path).lower().endswith('.xlsx'):
+            return result
+
+        try:
+            ns = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+            ns_r = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
+            ns_rel = '{http://schemas.openxmlformats.org/package/2006/relationships}'
+
+            import xml.etree.ElementTree as ET
+
+            with zipfile.ZipFile(file_path, 'r') as z:
+                # 1. 读取workbook.xml获取sheet名称和rId映射
+                wb_root = ET.fromstring(z.read('xl/workbook.xml'))
+                sheets = {}  # rId -> name
+                for s in wb_root.findall(f'.//{ns}sheet'):
+                    rid = s.get(f'{ns_r}id')
+                    name = s.get('name')
+                    if rid and name:
+                        sheets[rid] = name
+
+                # 2. 读取relationships获取rId到文件路径映射
+                rels_root = ET.fromstring(z.read('xl/_rels/workbook.xml.rels'))
+                rid_to_file = {}
+                for rel in rels_root:
+                    rid = rel.get('Id')
+                    target = rel.get('Target')
+                    if rid and target:
+                        # 处理路径：可能是相对路径
+                        if not target.startswith('/'):
+                            target = 'xl/' + target
+                        else:
+                            target = target.lstrip('/')
+                        rid_to_file[rid] = target
+
+                # 3. 对每个sheet，用正则快速提取合并单元格ref
+                for rid, sheet_name in sheets.items():
+                    sheet_file = rid_to_file.get(rid, '')
+                    if sheet_file not in z.namelist():
+                        result[sheet_name] = []
+                        continue
+
+                    data = z.read(sheet_file)
+                    # 快速字节搜索，避免解析整个XML
+                    if b'<mergeCell' not in data:
+                        result[sheet_name] = []
+                        continue
+
+                    # 用正则提取ref（比解析整个XML快得多）
+                    merge_refs = re.findall(rb'<mergeCell ref="([^"]+)"', data)
+                    result[sheet_name] = [ref.decode() for ref in merge_refs]
+
+        except Exception as e:
+            self.logger.warning(f"从ZIP解析合并单元格失败: {e}")
+
+        return result
+
+    def _build_merged_cell_index(self, worksheet):
+        """【性能优化】为worksheet构建合并单元格索引，避免每次查找都遍历所有合并区域"""
+        ws_id = id(worksheet)
+        if ws_id == self._current_ws_id:
+            return  # 已经构建过了
+
+        self._current_ws_id = ws_id
+        cell_index = {}   # (row, col) -> merged_range
+        row_index = {}    # row -> [merged_range, ...]
+
+        for merged_range in worksheet.merged_cells.ranges:
+            for r in range(merged_range.min_row, merged_range.max_row + 1):
+                if r not in row_index:
+                    row_index[r] = []
+                row_index[r].append(merged_range)
+                for c in range(merged_range.min_col, merged_range.max_col + 1):
+                    cell_index[(r, c)] = merged_range
+
+        self._merged_cell_index[ws_id] = cell_index
+        self._merged_cell_rows[ws_id] = row_index
+
+        # 注入索引到子组件，避免它们各自遍历
+        self.row_analyzer._merged_cell_index = cell_index
+        self.header_rule_engine._merged_cell_index = cell_index
 
     def _extract_file_manual_headers(self, file_path: str, manual_headers: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -1059,7 +1302,8 @@ class IntelligentExcelParser:
         return manual_headers
     
     def parse_excel_file(self, file_path: str, max_data_rows: int = None, skip_rows: int = 0,
-                        manual_headers: Dict[str, Any] = None) -> List[SheetData]:
+                        manual_headers: Dict[str, Any] = None, headers_only: bool = False,
+                        active_sheet_only: bool = False) -> List[SheetData]:
         """读取并解析Excel文件
 
         Args:
@@ -1069,23 +1313,40 @@ class IntelligentExcelParser:
             manual_headers: 手动指定的表头范围，支持多种格式：
                           1. 旧格式: {"Sheet名称": [start_row, end_row]}
                           2. 新格式: {"文件名.xlsx": {"Sheet1": [1, 1], "Sheet2": [3, 3]}}
+            headers_only: 是否只读取表头，不读取数据行（用于快速匹配）
+            active_sheet_only: 是否只加载当前激活的Sheet，默认False（加载所有Sheet）
 
         Returns:
             解析后的Sheet数据列表
         """
         result = []
-        
+
         try:
-            workbook = openpyxl.load_workbook(file_path, data_only=True)
-            
+            # 【性能优化】使用read_only模式快速加载（比标准模式快50倍）
+            workbook = openpyxl.load_workbook(file_path, data_only=True, read_only=True)
+
+            # 从ZIP直接解析合并单元格信息（read_only模式不支持merged_cells属性）
+            merged_cells_info = self._parse_merged_cells_from_zip(file_path)
+
             # 提取当前文件的manual_headers配置
             file_manual_headers = self._extract_file_manual_headers(file_path, manual_headers)
 
-            for worksheet in workbook.worksheets:
+            # 确定要处理的sheet列表
+            if active_sheet_only:
+                worksheets_to_parse = [workbook.active]
+            else:
+                worksheets_to_parse = workbook.worksheets
+
+            for ws in worksheets_to_parse:
+                # 将read_only工作表转换为缓存工作表（支持随机访问）
+                cached_ws = self._create_cached_worksheet(
+                    ws, merged_cells_info.get(ws.title, [])
+                )
+
                 # 检查是否有手动指定的表头范围
                 manual_header_range = None
                 if file_manual_headers:
-                    sheet_ranges = file_manual_headers.get(worksheet.title)
+                    sheet_ranges = file_manual_headers.get(cached_ws.title)
                     if isinstance(sheet_ranges, list) and len(sheet_ranges) == 2:
                         manual_header_range = sheet_ranges
                     elif isinstance(sheet_ranges, dict):
@@ -1095,39 +1356,50 @@ class IntelligentExcelParser:
                                 manual_header_range = value
                                 break
 
-                sheet_data = self._parse_sheet(worksheet, max_data_rows, skip_rows, manual_header_range)
+                sheet_data = self._parse_sheet(cached_ws, max_data_rows, skip_rows, manual_header_range, headers_only)
                 if sheet_data and sheet_data.regions:
                     result.append(sheet_data)
-            
+
             workbook.close()
         except Exception as e:
             print(f"解析Excel文件时出错: {e}")
             import traceback
             traceback.print_exc()
-        
+
         return result
     
     def _parse_sheet(self, worksheet: Worksheet, max_data_rows: int = None, skip_rows: int = 0,
-                    manual_header_range: List[int] = None) -> Optional[SheetData]:
+                    manual_header_range: List[int] = None, headers_only: bool = False) -> Optional[SheetData]:
         """解析单个Sheet
-        
+
         Args:
             worksheet: 工作表对象
             max_data_rows: 每个区域最多读取的数据行数，None表示读取全部
             skip_rows: 从文件开头跳过的行数
             manual_header_range: 手动指定的表头范围 [start_row, end_row]
-        
+            headers_only: 是否只读取表头，不读取数据行
+
         Returns:
             解析后的Sheet数据
         """
         sheet_data = SheetData(sheet_name=worksheet.title, regions=[])
-        
+
+        # 【性能优化】预建合并单元格索引
+        self._build_merged_cell_index(worksheet)
+
         max_row = worksheet.max_row
         max_col = worksheet.max_column
 
+        # 如果只读取表头，限制扫描行数
+        if headers_only:
+            max_data_rows = 0
+            # 表头通常在前30行内，限制扫描范围以加速
+            if max_row and max_row > 50:
+                max_row = 50
+
         # 修正 max_col：openpyxl 可能因空格式单元格导致 max_column 虚高
         # 通过扫描前几行实际数据来确定真实的最大列数
-        if max_col and max_col > 500:
+        if max_col and max_col > self.max_columns:
             real_max_col = 1
             sample_rows = min(max_row or 0, 20)
             for r in range(1, sample_rows + 1):
@@ -1680,19 +1952,17 @@ class IntelligentExcelParser:
         return False
 
     def _has_horizontal_merge(self, worksheet: Worksheet, row: int, max_col: int) -> bool:
-        """检查行中是否有水平合并单元格（跨多列）
-
-        Args:
-            row: 行号
-            max_col: 最大列数
-
-        Returns:
-            True 表示有水平合并
-        """
+        """检查行中是否有水平合并单元格（跨多列）（使用索引优化）"""
+        ws_id = id(worksheet)
+        row_ranges = self._merged_cell_rows.get(ws_id, {}).get(row)
+        if row_ranges is not None:
+            for merged_range in row_ranges:
+                if merged_range.max_col > merged_range.min_col:
+                    return True
+            return False
+        # 回退
         for merged_range in worksheet.merged_cells.ranges:
-            # 检查合并区域是否包含当前行
             if merged_range.min_row <= row <= merged_range.max_row:
-                # 检查是否是水平合并（跨多列）
                 if merged_range.max_col > merged_range.min_col:
                     return True
         return False
@@ -1946,9 +2216,18 @@ class IntelligentExcelParser:
             if max_data_rows is not None and collected_rows >= max_data_rows:
                 break
 
-            if self._is_empty_row(worksheet, row, max_col) or \
-               self._is_title_row(worksheet, row, max_col) or \
-               self._is_summary_row(worksheet, row, max_col):
+            # 【性能优化】快速预检：先检查第1列是否有值，大部分数据行第1列非空
+            first_cell_val = worksheet.cell(row, 1).value
+            if first_cell_val is not None and str(first_cell_val).strip():
+                # 第1列有值，大概率不是空行，直接快速检查汇总行（只查前几列）
+                if self._is_summary_row(worksheet, row, max_col):
+                    continue
+            else:
+                # 第1列为空，进行完整检查
+                if self._is_empty_row(worksheet, row, max_col):
+                    continue
+
+            if self._is_title_row(worksheet, row, max_col):
                 continue
 
             data_row = self._collect_row_data(worksheet, row, max_col, region.head_data, region.formula)
@@ -2008,14 +2287,21 @@ class IntelligentExcelParser:
             # 如果设置了最大行数限制且已达到限制，则停止收集
             if max_data_rows is not None and collected_rows >= max_data_rows:
                 break
-            
-            if self._is_empty_row(worksheet, row, max_col) or \
-               self._is_title_row(worksheet, row, max_col) or \
-               self._is_summary_row(worksheet, row, max_col):
+
+            # 【性能优化】快速预检
+            first_cell_val = worksheet.cell(row, 1).value
+            if first_cell_val is not None and str(first_cell_val).strip():
+                if self._is_summary_row(worksheet, row, max_col):
+                    continue
+            else:
+                if self._is_empty_row(worksheet, row, max_col):
+                    continue
+
+            if self._is_title_row(worksheet, row, max_col):
                 continue
-            
+
             data_row = self._collect_row_data(worksheet, row, max_col, region.head_data, region.formula)
-            
+
             if data_row and self._has_valid_data(data_row):
                 region.data.append(data_row)
                 collected_rows += 1
@@ -2023,10 +2309,13 @@ class IntelligentExcelParser:
         return region
     
     def _find_data_end_row(self, worksheet: Worksheet, start_row: int, max_row: int, max_col: int) -> int:
-        """查找数据结束行"""
+        """查找数据结束行（性能优化版）"""
         consecutive_empty_rows = 0
         consecutive_header_like_rows = 0
         last_valid_data_row = start_row - 1
+        # 【性能优化】连续确认为数据行后，降低检查频率
+        confirmed_data_rows = 0
+        check_interval = 1  # 初始每行检查
 
         for row in range(start_row, max_row + 1):
             if self._is_empty_row(worksheet, row, max_col):
@@ -2050,7 +2339,14 @@ class IntelligentExcelParser:
             # 遇到标题行（且不是第一行数据），数据结束
             if self._is_title_row(worksheet, row, max_col) and row > start_row:
                 return last_valid_data_row
-            
+
+            # 【性能优化】已确认大量数据行后，降低header_score检查频率
+            # 前20行每行检查，之后每50行抽样检查一次
+            if confirmed_data_rows >= 20 and (row - start_row) % 50 != 0:
+                last_valid_data_row = row
+                confirmed_data_rows += 1
+                continue
+
             # 检查是否像表头（提高阈值，避免误判）
             header_score = self.header_rule_engine.calculate_header_score(worksheet, row, max_col)
 
@@ -2068,13 +2364,15 @@ class IntelligentExcelParser:
                             # 结构与数据行相似，仍视为数据行
                             consecutive_header_like_rows = 0
                             last_valid_data_row = row
+                            confirmed_data_rows += 1
                             continue
                     # 至少要有5行数据后，才考虑可能是新表头
                     return last_valid_data_row
             else:
                 consecutive_header_like_rows = 0
                 last_valid_data_row = row
-        
+                confirmed_data_rows += 1
+
         return last_valid_data_row
     
     def _build_header_mapping(self, worksheet: Worksheet, start_row: int, end_row: int, max_col: int) -> Dict[str, str]:
@@ -2255,13 +2553,7 @@ class IntelligentExcelParser:
         return True
     
     def _is_title_row(self, worksheet: Worksheet, row: int, max_col: int) -> bool:
-        """判断是否为标题行或说明行（增强版）
-
-        识别以下类型的行：
-        1. 只有1-2个非空单元格，且包含标题关键字
-        2. 第一个单元格包含说明区域关键字
-        3. 第一个单元格以数字+、开头（如"1、xxx"）表示填写说明
-        """
+        """判断是否为标题行或说明行（增强版 + 性能优化）"""
         non_empty_cells = 0
         first_value = None
         second_value = None
@@ -2284,6 +2576,11 @@ class IntelligentExcelParser:
                 elif second_value is None:
                     second_value = value
 
+                # 【性能优化】标题行最多1-2个非空单元格
+                # 超过3个非空且无必填标记时，不可能是标题行，提前退出
+                if non_empty_cells > 3 and not has_required_marker:
+                    return False
+
         # 如果行中有多个非空单元格且包含必填标记，很可能是表头，不是标题行
         if has_required_marker and non_empty_cells >= 3:
             return False
@@ -2293,9 +2590,14 @@ class IntelligentExcelParser:
 
         first_value_str = str(first_value).strip()
 
-        # 情况1: 只有1个非空单元格，包含标题关键字
+        # 情况1: 只有1个非空单元格，包含标题关键字或示例关键字
         if non_empty_cells == 1:
+            # 添加示例、样例等垃圾数据关键字
+            garbage_keywords = ["示例", "样例", "例子", "example", "sample", "demo"]
             if any(keyword.lower() in first_value_str.lower() for keyword in self.TITLE_KEYWORDS):
+                return True
+            # 如果只有一个单元格且内容是示例类关键字，也视为标题行（垃圾数据）
+            if any(keyword in first_value_str for keyword in garbage_keywords):
                 return True
 
         # 情况2: 第一个单元格包含说明区域关键字（但不是只有必填标记开头）
@@ -2377,12 +2679,28 @@ class IntelligentExcelParser:
         return False
     
     def _is_summary_row(self, worksheet: Worksheet, row: int, max_col: int) -> bool:
-        """判断是否为汇总行"""
+        """判断是否为汇总行（性能优化版 - 使用预编译正则）"""
         for col in range(1, min(5, max_col + 1)):
             value = self._get_cell_value(worksheet.cell(row, col))
             if value and isinstance(value, str):
-                if any(keyword.lower() in value.lower() for keyword in self.SUMMARY_KEYWORDS):
-                    return True
+                value_lower = value.lower().strip()
+
+                # 排除邮箱地址（包含@符号）
+                if '@' in value_lower:
+                    continue
+
+                for keyword in self.SUMMARY_KEYWORDS:
+                    keyword_lower = keyword.lower()
+
+                    # 中文关键字直接匹配
+                    if any(ord(c) > 127 for c in keyword):
+                        if keyword_lower in value_lower:
+                            return True
+                    else:
+                        # 【性能优化】使用预编译正则
+                        pattern = self._summary_en_patterns.get(keyword_lower)
+                        if pattern and pattern.search(value_lower):
+                            return True
         return False
     
     def _contains_header_keyword(self, text: str) -> bool:
@@ -2418,18 +2736,27 @@ class IntelligentExcelParser:
     def _is_numeric(self, value: Any) -> bool:
         """判断是否为数值类型"""
         return isinstance(value, (int, float, complex))
-    
+
     def _is_merged_cell(self, worksheet: Worksheet, row: int, col: int) -> bool:
-        """检查是否为合并单元格"""
+        """检查是否为合并单元格（使用索引优化）"""
+        ws_id = id(worksheet)
+        cell_index = self._merged_cell_index.get(ws_id)
+        if cell_index is not None:
+            return (row, col) in cell_index
+        # 回退到遍历方式
         cell = worksheet.cell(row, col)
         for merged_range in worksheet.merged_cells.ranges:
             if cell.coordinate in merged_range:
                 return True
         return False
-    
+
     def _get_physical_merged_cell_range(self, worksheet: Worksheet, row: int, col: int):
-        """获取物理合并单元格范围"""
+        """获取物理合并单元格范围（使用索引优化）"""
         try:
+            ws_id = id(worksheet)
+            cell_index = self._merged_cell_index.get(ws_id)
+            if cell_index is not None:
+                return cell_index.get((row, col))
             for merged_range in worksheet.merged_cells.ranges:
                 if (row >= merged_range.min_row and row <= merged_range.max_row and
                     col >= merged_range.min_col and col <= merged_range.max_col):

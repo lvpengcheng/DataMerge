@@ -728,7 +728,11 @@ def load_expected_structure(expected_file_path: str) -> Dict[str, Any]:
         预期文件的结构信息
     """
     parser = IntelligentExcelParser()
-    results = parser.parse_excel_file(expected_file_path, manual_headers=manual_headers)
+    results = parser.parse_excel_file(
+        expected_file_path,
+        manual_headers=manual_headers,
+        active_sheet_only=True  # 只加载激活的sheet
+    )
 
     structure = {{
         "file_name": os.path.basename(expected_file_path),

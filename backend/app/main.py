@@ -6,7 +6,10 @@ import os
 import json
 import logging
 import asyncio
+import shutil
+import tempfile
 from datetime import datetime
+from pathlib import Path
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
@@ -19,6 +22,7 @@ from ..storage.storage_manager import StorageManager
 from ..document_validator import DocumentValidator
 from excel_parser import IntelligentExcelParser
 from ..sandbox.code_sandbox import CodeSandbox
+from ..email_processor.email_handler import EmailHandler
 
 # 配置日志
 logging.basicConfig(
@@ -48,6 +52,7 @@ storage_manager = StorageManager()
 document_validator = DocumentValidator()
 excel_parser = IntelligentExcelParser()
 code_sandbox = CodeSandbox()
+email_handler = EmailHandler()
 
 
 @app.post("/api/train")
@@ -114,7 +119,8 @@ async def train_model(
             # 解析预期文件以提取模版
             parsed_data = excel_parser.parse_excel_file(
                 saved_files["expected"],
-                manual_headers=manual_headers_dict
+                manual_headers=manual_headers_dict,
+                active_sheet_only=True  # 只加载激活的sheet
             )
             template_schema = document_validator.extract_document_schema(parsed_data)
 
@@ -131,6 +137,48 @@ async def train_model(
             script_id = script_info.get("script_id")
             if script_id:
                 training_result["script_download_url"] = f"/api/script/download/{tenant_id}/{script_id}"
+
+        # 移除大数据结构以减少返回体积
+        if "source_structure" in training_result:
+            del training_result["source_structure"]
+        if "expected_structure" in training_result:
+            del training_result["expected_structure"]
+
+        # 截断 training_result 本身的 rules_content
+        if "rules_content" in training_result and training_result["rules_content"]:
+            rules = training_result["rules_content"]
+            if len(rules) > 100:
+                training_result["rules_content"] = rules[:100] + "...(已截断)"
+
+        if "script_info" in training_result:
+            # 删除 script_info 中的大字段
+            if "template_schema" in training_result["script_info"]:
+                del training_result["script_info"]["template_schema"]
+            if "source_structure" in training_result["script_info"]:
+                del training_result["script_info"]["source_structure"]
+            if "expected_structure" in training_result["script_info"]:
+                del training_result["script_info"]["expected_structure"]
+            # 截断 rules_content
+            if "rules_content" in training_result["script_info"]:
+                rules = training_result["script_info"]["rules_content"]
+                if rules and len(rules) > 100:
+                    training_result["script_info"]["rules_content"] = rules[:100] + "...(已截断)"
+
+        # 截断代码字段（只保留前100字符）
+        if "best_code" in training_result and training_result["best_code"]:
+            code = training_result["best_code"]
+            training_result["best_code"] = code[:100] + "...(已截断)" if len(code) > 100 else code
+
+        # 截断迭代结果中的代码和 rules_content
+        if "iteration_results" in training_result:
+            for iteration in training_result["iteration_results"]:
+                if "code" in iteration and iteration["code"]:
+                    code = iteration["code"]
+                    iteration["code"] = code[:100] + "...(已截断)" if len(code) > 100 else code
+                if "rules_content" in iteration and iteration["rules_content"]:
+                    rules = iteration["rules_content"]
+                    if len(rules) > 100:
+                        iteration["rules_content"] = rules[:100] + "...(已截断)"
 
         # 返回训练结果
         return {
@@ -304,6 +352,48 @@ async def train_model_stream(
                         if script_id:
                             training_result["script_download_url"] = f"/api/script/download/{tenant_id}/{script_id}"
 
+                    # 移除大数据结构以减少返回体积
+                    if "source_structure" in training_result:
+                        del training_result["source_structure"]
+                    if "expected_structure" in training_result:
+                        del training_result["expected_structure"]
+
+                    # 截断 training_result 本身的 rules_content
+                    if "rules_content" in training_result and training_result["rules_content"]:
+                        rules = training_result["rules_content"]
+                        if len(rules) > 100:
+                            training_result["rules_content"] = rules[:100] + "...(已截断)"
+
+                    if "script_info" in training_result:
+                        # 删除 script_info 中的大字段
+                        if "template_schema" in training_result["script_info"]:
+                            del training_result["script_info"]["template_schema"]
+                        if "source_structure" in training_result["script_info"]:
+                            del training_result["script_info"]["source_structure"]
+                        if "expected_structure" in training_result["script_info"]:
+                            del training_result["script_info"]["expected_structure"]
+                        # 截断 rules_content
+                        if "rules_content" in training_result["script_info"]:
+                            rules = training_result["script_info"]["rules_content"]
+                            if rules and len(rules) > 100:
+                                training_result["script_info"]["rules_content"] = rules[:100] + "...(已截断)"
+
+                    # 截断代码字段（只保留前100字符）
+                    if "best_code" in training_result and training_result["best_code"]:
+                        code = training_result["best_code"]
+                        training_result["best_code"] = code[:100] + "...(已截断)" if len(code) > 100 else code
+
+                    # 截断迭代结果中的代码和 rules_content
+                    if "iteration_results" in training_result:
+                        for iteration in training_result["iteration_results"]:
+                            if "code" in iteration and iteration["code"]:
+                                code = iteration["code"]
+                                iteration["code"] = code[:100] + "...(已截断)" if len(code) > 100 else code
+                            if "rules_content" in iteration and iteration["rules_content"]:
+                                rules = iteration["rules_content"]
+                                if len(rules) > 100:
+                                    iteration["rules_content"] = rules[:100] + "...(已截断)"
+
                     # 发送最终结果
                     final_result = {
                         "type": "result",
@@ -466,32 +556,23 @@ async def calculate_data(
 
         source_structure = script_info["source_structure"]
 
-        # 使用SmartMatcherV2进行智能匹配（基于数据样例）
-        from backend.utils.smart_matcher_v2 import SmartMatcherV2
-        from backend.ai_engine.ai_provider import AIProviderFactory
+        # ========== 快速表头匹配 ==========
+        from backend.utils.fast_header_matcher import FastHeaderMatcher
 
-        # 创建AI提供者用于智能匹配
-        ai_provider = AIProviderFactory.create_provider()
-        logger.info(f"[调试] 智能匹配使用的AI提供者: {ai_provider.__class__.__name__}")
-        logger.info(f"[调试] 上传文件列表: {[os.path.basename(f) for f in saved_files['input_files']]}")
-        smart_matcher = SmartMatcherV2(ai_provider=ai_provider)
+        logger.info(f"使用FastHeaderMatcher进行快速表头匹配")
+        logger.info(f"上传文件列表: {[os.path.basename(f) for f in saved_files['input_files']]}")
 
-        # 获取训练文件夹路径
-        from pathlib import Path
-        tenant_dir = Path("tenants") / tenant_id
-        training_folder = tenant_dir / "training"
+        fast_matcher = FastHeaderMatcher()
 
-        # 执行智能匹配（传递训练文件夹路径、手动表头配置和脚本内容）
-        match_success, match_error, smart_mapping = smart_matcher.match_files_and_headers(
-            training_folder=str(training_folder),
+        # 完整读取上传文件 → 提取表头 → 和source_structure对比
+        match_success, match_error, smart_mapping = fast_matcher.match_and_prepare(
+            source_structure=source_structure,
             input_files=saved_files["input_files"],
-            manual_headers=manual_headers,
-            script_content=script_content
+            manual_headers=manual_headers
         )
 
         if not match_success:
-            # 匹配失败，返回详细错误信息
-            logger.error(f"[调试] SmartMatcherV2匹配失败: {match_error}")
+            logger.error(f"FastHeaderMatcher匹配失败: {match_error}")
             return {
                 "tenant_id": tenant_id,
                 "status": "match_failed",
@@ -500,275 +581,82 @@ async def calculate_data(
                 "message": "文件或表头匹配失败，请检查上传的文件是否与训练时的文件结构一致"
             }
 
-        logger.info(f"[调试] 文件匹配成功，映射关系: {json.dumps(smart_mapping, ensure_ascii=False, indent=2)}")
+        logger.info(f"文件匹配成功")
 
-        # 如果有映射关系，需要重命名文件和调整数据
-        smart_mapping_applied = False  # 标记smart mapping是否已应用文件映射
-        smart_mapping_warnings = []  # 记录映射信息用于前端展示
-        mapped_file_paths = {}  # 原始路径 -> 映射后路径
-        if smart_mapping and smart_mapping.get("file_mapping"):
-            smart_mapping_applied = True
-            input_dir = os.path.dirname(saved_files["input_files"][0])
-
-            # 应用文件和表头映射
-            for file_path, mapping_info in smart_mapping["file_mapping"].items():
-                expected_file = mapping_info.get("expected_file")
-                sheet_mapping = mapping_info.get("sheet_mapping", {})
-                header_mapping = mapping_info.get("header_mapping", {})
-
-                # 记录映射信息供前端展示
-                orig_name = os.path.basename(file_path)
-                if orig_name != expected_file:
-                    smart_mapping_warnings.append(f"智能匹配: 文件 {orig_name} -> {expected_file}")
-                # 过滤掉恒等映射的sheet
-                real_sheet_maps = {k: v for k, v in sheet_mapping.items() if k != v}
-                if real_sheet_maps:
-                    for src_s, tgt_s in real_sheet_maps.items():
-                        smart_mapping_warnings.append(f"智能匹配: Sheet {src_s} -> {tgt_s}")
-                # 过滤掉恒等映射的表头
-                real_header_maps = {k: v for k, v in header_mapping.items() if k != v}
-                if real_header_maps:
-                    for src_h, tgt_h in real_header_maps.items():
-                        smart_mapping_warnings.append(f"智能匹配: 列 {src_h} -> {tgt_h}")
-
-                # 1. 重命名文件
-                if orig_name != expected_file:
-                    new_file_path = os.path.join(input_dir, expected_file)
-                    if os.path.exists(new_file_path):
-                        os.remove(new_file_path)
-                    import shutil
-                    shutil.copy2(file_path, new_file_path)
-                    # 删除原始文件，防止DataValidator扫描到重复文件
-                    try:
-                        os.remove(file_path)
-                        logger.info(f"文件重命名: {orig_name} -> {expected_file}（已删除原文件）")
-                    except Exception as del_err:
-                        logger.warning(f"删除原文件失败: {del_err}")
-                        logger.info(f"文件重命名: {orig_name} -> {expected_file}")
-                    mapped_file_paths[file_path] = new_file_path
-                else:
-                    new_file_path = file_path
-
-                # 2. 如果有sheet或表头映射，需要调整Excel内容
-                if real_sheet_maps or real_header_maps:
-                    from openpyxl import load_workbook
-                    from excel_parser import IntelligentExcelParser
-
-                    # 使用IntelligentExcelParser读取文件结构（表头位置等）
-                    mapping_parser = IntelligentExcelParser()
-                    parsed_sheets = mapping_parser.parse_excel_file(new_file_path)
-
-                    # 用openpyxl加载工作簿进行就地修改（保留格式）
-                    wb = load_workbook(new_file_path)
-
-                    # 应用表头映射：根据parser识别的表头位置精确修改
-                    if real_header_maps:
-                        for sheet_data in parsed_sheets:
-                            ws_name = sheet_data.sheet_name
-                            if ws_name in wb.sheetnames:
-                                ws = wb[ws_name]
-                                for region in sheet_data.regions:
-                                    for hdr_name, col_letter in region.head_data.items():
-                                        if hdr_name in header_mapping:
-                                            for row in range(region.head_row_start, region.head_row_end + 1):
-                                                cell = ws[f"{col_letter}{row}"]
-                                                if str(cell.value).strip() == str(hdr_name).strip():
-                                                    cell.value = header_mapping[hdr_name]
-                                        logger.info(f"表头映射应用: {ws_name}, {len(real_header_maps)} 列")
-
-                    # 应用sheet名映射
-                    for old_name, new_name in real_sheet_maps.items():
-                        if old_name in wb.sheetnames:
-                            wb[old_name].title = new_name
-                            logger.info(f"Sheet重命名: {old_name} -> {new_name}")
-
-                    # 3. 重新排列列顺序，使其与训练时一致
-                    # 从source_structure中获取训练时的列顺序
-                    training_file_name = expected_file
-                    if training_file_name in source_structure.get("files", {}):
-                        training_file_info = source_structure["files"][training_file_name]
-                        for sheet_name, sheet_info in training_file_info.get("sheets", {}).items():
-                            training_headers = sheet_info.get("headers", {})
-                            if training_headers and sheet_name in wb.sheetnames:
-                                # 重新排列列顺序
-                                _reorder_columns(wb[sheet_name], training_headers, parsed_sheets, sheet_name)
-                                logger.info(f"列顺序调整: {sheet_name}, 按训练时顺序重排")
-
-                    wb.save(new_file_path)
-                    wb.close()
-
-                    if file_path not in mapped_file_paths:
-                        mapped_file_paths[file_path] = new_file_path
-
-            # 更新 saved_files["input_files"]，使后续验证使用映射后的文件
-            if mapped_file_paths:
-                updated_input_files = []
-                for f in saved_files["input_files"]:
-                    updated_input_files.append(mapped_file_paths.get(f, f))
-                saved_files["input_files"] = updated_input_files
-                logger.info(f"已更新input_files列表，共映射 {len(mapped_file_paths)} 个文件")
-
-            if smart_mapping_warnings:
-                for w in smart_mapping_warnings:
-                    logger.info(f"[智能匹配] {w}")
-
-        # 使用DataValidator进行校验和自动映射
-        logger.info(f"[调试] 开始DataValidator校验，smart_mapping_applied={smart_mapping_applied}")
-        logger.info(f"[调试] 当前input_files: {[os.path.basename(f) for f in saved_files['input_files']]}")
-        from backend.utils.data_validator import DataValidator, parse_validation_rules_from_content
-
-        validator = DataValidator(training_structure=source_structure)
-
-        # 优先使用AI生成的校验规则，如果没有则尝试正则解析
-        validation_rules = script_info.get("validation_rules", {})
-        if not validation_rules or not validation_rules.get("value_constraints"):
-            # 回退到正则解析
-            rules_content = script_info.get("rules_content", "")
-            if rules_content:
-                validation_rules = parse_validation_rules_from_content(rules_content)
-                logger.info("使用正则解析的校验规则")
-            else:
-                validation_rules = None
-        else:
-            logger.info(f"使用AI生成的校验规则: {len(validation_rules.get('value_constraints', []))} 条约束")
-
-        # 获取上传文件的目录
+        # ========== 根据匹配结果处理文件 ==========
+        import shutil
         input_dir = os.path.dirname(saved_files["input_files"][0])
 
-        # 执行校验和映射
-        is_valid, error_msg, file_mapping = validator.validate_and_map(
-            input_folder=input_dir,
-            validation_rules=validation_rules
-        )
-        logger.info(f"[调试] DataValidator结果: is_valid={is_valid}, error_msg={error_msg}, file_mapping={file_mapping}")
+        if smart_mapping and smart_mapping.get("file_mapping"):
+            for input_file_name, mapping_info in smart_mapping["file_mapping"].items():
+                needs_rewrite = mapping_info.get("needs_rewrite", False)
+                expected_file = mapping_info.get("expected_file")
 
-        validation_errors = []
-        validation_warnings = list(smart_mapping_warnings)  # 包含智能匹配信息
+                if needs_rewrite:
+                    # 不一致：用内存中的数据按映射关系生成新Excel
+                    logger.info(f"[映射] 生成映射文件: {input_file_name} → {expected_file}")
 
-        if not is_valid:
-            # 校验失败，返回失败状态但不抛出异常
-            logger.error(f"[调试] DataValidator校验失败: {error_msg}")
-            return {
-                "tenant_id": tenant_id,
-                "status": "validation_failed",
-                "batch_id": saved_files.get("batch_id", ""),
-                "error": error_msg,
-                "warnings": validation_warnings,
-                "message": "数据校验失败，请检查上传的文件"
-            }
+                    # 删除原文件
+                    old_path = os.path.join(input_dir, input_file_name)
+                    if os.path.exists(old_path):
+                        os.remove(old_path)
 
-        # 如果有文件映射，需要重命名文件（仅在smart mapping未处理时执行）
-        if file_mapping and not smart_mapping_applied:
-            import shutil
-            for source_path, target_name in file_mapping.items():
-                if os.path.basename(source_path) != target_name:
-                    target_path = os.path.join(input_dir, target_name)
-                    # 如果目标文件已存在，先删除
-                    if os.path.exists(target_path):
-                        os.remove(target_path)
-                    # 复制文件（保留原文件以防万一）
-                    shutil.copy2(source_path, target_path)
-                    logger.info(f"文件映射: {os.path.basename(source_path)} -> {target_name}")
-                    validation_warnings.append(f"文件自动映射: {os.path.basename(source_path)} -> {target_name}")
+                    # 用已解析的内存数据生成新文件
+                    FastHeaderMatcher.rewrite_excel(mapping_info, input_dir)
+                else:
+                    # 完全一致：只需要重命名文件（如果文件名不同）
+                    if input_file_name != expected_file:
+                        old_path = os.path.join(input_dir, input_file_name)
+                        new_path = os.path.join(input_dir, expected_file)
+                        if os.path.exists(new_path):
+                            os.remove(new_path)
+                        shutil.move(old_path, new_path)
+                        logger.info(f"[映射] 文件重命名: {input_file_name} → {expected_file}")
+                    else:
+                        logger.info(f"[映射] {input_file_name} 完全一致，直接使用")
 
-        # 获取预期的所有文件结构（用于后续验证）
-        expected_files = source_structure.get("files", {})
+            # 更新 input_files 列表
+            saved_files["input_files"] = [
+                os.path.join(input_dir, f) for f in os.listdir(input_dir)
+                if f.endswith(('.xlsx', '.xls')) and not f.startswith('~')
+            ]
 
-        for file_path in saved_files["input_files"]:
-            filename = os.path.basename(file_path)
-
-            # 尝试精确匹配文件名
-            file_schema = expected_files.get(filename)
-
-            # 如果精确匹配失败，尝试模糊匹配（忽略前缀数字和下划线）
-            if file_schema is None:
-                import re
-                # 移除文件名开头的数字和下划线（如 "01_"）
-                normalized_filename = re.sub(r'^[\d_]+', '', filename)
-                for expected_name, schema in expected_files.items():
-                    normalized_expected = re.sub(r'^[\d_]+', '', expected_name)
-                    if normalized_filename == normalized_expected:
-                        file_schema = schema
-                        validation_warnings.append(
-                            f"文件 {filename} 模糊匹配到 {expected_name}"
-                        )
-                        break
-
-            # 如果还是找不到匹配，跳过文件名验证，直接使用第一个可用的schema
-            if file_schema is None and expected_files:
-                # 按文件数量匹配：如果上传文件数量与预期一致，按顺序匹配
-                file_list = list(expected_files.keys())
-                file_index = saved_files["input_files"].index(file_path)
-                if file_index < len(file_list):
-                    matched_name = file_list[file_index]
-                    file_schema = expected_files[matched_name]
-                    validation_warnings.append(
-                        f"文件 {filename} 按顺序匹配到 {matched_name}"
-                    )
-
-            if file_schema is None:
-                # 完全找不到匹配，记录警告但不中断（让后续执行尝试处理）
-                validation_warnings.append(
-                    f"文件 {filename} 未找到对应的预期结构，将跳过验证"
+        # ========== 【性能优化】构建预加载源数据（消除脚本内的重复解析） ==========
+        pre_loaded_source_data = None
+        if smart_mapping and smart_mapping.get("file_mapping"):
+            try:
+                pre_loaded_source_data = _build_pre_loaded_source_data(
+                    smart_mapping["file_mapping"]
                 )
-                continue
+                if pre_loaded_source_data:
+                    logger.info(f"[性能优化] 预加载源数据: {len(pre_loaded_source_data)}个sheet")
 
-            # 创建临时的template_schema用于验证
-            temp_sheets = {}
-            for sheet_name, sheet_info in file_schema.get("sheets", {}).items():
-                # 为每个sheet创建完整的sheet schema
-                temp_sheets[sheet_name] = {
-                    "sheet_name": sheet_name,
-                    "header_ranges": [
-                        {
-                            "start_row": 1,  # 默认表头在第1行
-                            "end_row": 1,    # 表头只有1行
-                            "data_start_row": 2  # 数据从第2行开始
-                        }
-                    ],
-                    "column_count": len(sheet_info.get("headers", {})),
-                    "headers": sheet_info.get("headers", {}),
-                    "data_sample_count": len(sheet_info.get("data_sample", []))
-                }
+                    # 验证预加载数据是否包含训练时的所有 sheet
+                    expected_keys = set()
+                    for train_file, file_data in source_structure.get("files", {}).items():
+                        if "error" in file_data:
+                            continue
+                        file_base = train_file.replace('.xlsx', '').replace('.xls', '')
+                        for sheet_name in file_data.get("sheets", {}).keys():
+                            key = f"{file_base}_{sheet_name}"
+                            if len(key) > 31:
+                                key = key[:31]
+                            expected_keys.add(key)
 
-            temp_template_schema = {
-                "sheets": temp_sheets,
-                "total_sheets": file_schema.get("total_regions", 0),
-                "validation_rules": {
-                    "sheet_names": list(file_schema.get("sheets", {}).keys()),
-                    "required_headers": {
-                        sheet_name: list(sheet_info.get("headers", {}).keys())
-                        for sheet_name, sheet_info in file_schema.get("sheets", {}).items()
-                    },
-                    "column_counts": {
-                        sheet_name: len(sheet_info.get("headers", {}))
-                        for sheet_name, sheet_info in file_schema.get("sheets", {}).items()
-                    }
-                }
-            }
+                    missing_keys = expected_keys - set(pre_loaded_source_data.keys())
+                    if missing_keys:
+                        logger.warning(f"[性能优化] 预加载数据缺少训练时的 sheet（可能是空文件）: {missing_keys}")
+                        logger.warning(f"[性能优化] 将禁用预加载，脚本自行解析（可能导致相同的 KeyError）")
+                        pre_loaded_source_data = None
 
-            logger.info(f"[调试] DocumentValidator验证文件: {os.path.basename(file_path)}, 期望sheets: {list(temp_template_schema['sheets'].keys())}")
-            is_valid, errors = document_validator.validate_file(
-                file_path, temp_template_schema, manual_headers
-            )
-            logger.info(f"[调试] DocumentValidator结果: is_valid={is_valid}, errors={errors}")
-            if not is_valid:
-                validation_errors.extend(errors)
+                # 释放 parsed_data 内存（已转换为 source_data）
+                for mapping_info in smart_mapping["file_mapping"].values():
+                    mapping_info.pop("parsed_data", None)
+            except Exception as e:
+                logger.warning(f"[性能优化] 构建预加载数据失败，脚本将自行解析: {e}")
+                pre_loaded_source_data = None
 
-        # 记录警告信息（但不中断执行）
-        for warning in validation_warnings:
-            logger.warning(f"文件验证警告: {warning}")
-
-        if validation_errors:
-            return {
-                "tenant_id": tenant_id,
-                "status": "validation_failed",
-                "errors": validation_errors,
-                "warnings": validation_warnings,
-                "message": "源文档格式验证失败"
-            }
-
-        # 准备执行环境
+        # ========== 准备执行环境并执行计算 ==========
         # 使用批次的output文件夹作为输出目录
         batch_output_dir = os.path.join(
             os.path.dirname(os.path.dirname(saved_files["input_files"][0])), "output"
@@ -782,7 +670,11 @@ async def calculate_data(
             "tenant_id": tenant_id
         }
 
-        # 添加可选的薪资参数（如果提供）- 直接使用传入的值，不自动计算
+        # 注入预加载源数据（脚本执行时 load_source_data 将跳过 Excel 解析）
+        if pre_loaded_source_data:
+            execution_env["_pre_loaded_source_data"] = pre_loaded_source_data
+
+        # 添加薪资参数
         if salary_year is not None:
             execution_env["salary_year"] = salary_year
         if salary_month is not None:
@@ -1386,6 +1278,67 @@ def _reorder_columns(ws, training_headers: Dict[str, str], parsed_sheets, sheet_
 
     except Exception as e:
         logger.error(f"列重排失败: {e}", exc_info=True)
+
+
+def _build_pre_loaded_source_data(file_mapping: dict) -> dict:
+    """从匹配结果中构建预加载的 source_data（与脚本 load_source_data 返回格式一致）
+
+    返回格式: {"文件名_Sheet名": {"df": DataFrame, "columns": [列名]}}
+    """
+    from backend.utils.data_helpers import convert_region_to_dataframe
+
+    source_data = {}
+
+    for input_file_name, mapping_info in file_mapping.items():
+        expected_file = mapping_info.get("expected_file", input_file_name)
+        file_base = expected_file.replace('.xlsx', '').replace('.xls', '')
+        parsed_data = mapping_info.get("parsed_data", [])
+        if not parsed_data:
+            continue
+
+        needs_rewrite = mapping_info.get("needs_rewrite", False)
+        sheet_mapping = mapping_info.get("sheet_mapping", {})
+        header_mapping = mapping_info.get("header_mapping", {})
+
+        for sheet_data in parsed_data:
+            # 确定最终的 sheet 名
+            if needs_rewrite:
+                target_sheet = sheet_mapping.get(sheet_data.sheet_name, sheet_data.sheet_name)
+            else:
+                target_sheet = sheet_data.sheet_name
+
+            for region in sheet_data.regions:
+                # needs_rewrite 时需要映射表头名
+                if needs_rewrite and header_mapping:
+                    from excel_parser import ExcelRegion
+                    mapped_head = {}
+                    for col_name, col_letter in region.head_data.items():
+                        mapped_name = header_mapping.get(col_name, col_name)
+                        mapped_head[mapped_name] = col_letter
+                    # 构建映射后的 region 用于转 DataFrame
+                    mapped_region = ExcelRegion(
+                        head_data=mapped_head,
+                        data=region.data,
+                        formula=region.formula
+                    )
+                    df = convert_region_to_dataframe(mapped_region)
+                else:
+                    df = convert_region_to_dataframe(region)
+
+                if df.empty:
+                    continue
+
+                sheet_name = f"{file_base}_{target_sheet}"
+                if len(sheet_name) > 31:
+                    sheet_name = sheet_name[:31]
+
+                source_data[sheet_name] = {
+                    "df": df,
+                    "columns": list(df.columns)
+                }
+                logger.info(f"[性能优化] 预加载: {sheet_name} ({len(df)}行, {len(df.columns)}列)")
+
+    return source_data
 
 
 async def _save_temp_file(upload_file: UploadFile) -> str:
@@ -2019,6 +1972,252 @@ async def revalidate_script(
     except Exception as e:
         logger.error(f"重新验证失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"重新验证失败: {str(e)}")
+
+
+@app.post("/api/email/add-account")
+async def add_email_account(
+    email_address: str = Form(...),
+    pop3_server: str = Form(...),
+    pop3_port: int = Form(...),
+    pop3_ssl: bool = Form(True),
+    pop3_password: str = Form(...),
+    smtp_server: str = Form(...),
+    smtp_port: int = Form(...),
+    smtp_ssl: bool = Form(True),
+    smtp_password: str = Form(...),
+    recipients: Optional[str] = Form(None)
+):
+    """添加邮件账户
+
+    Args:
+        email_address: 邮箱地址
+        pop3_server: POP3服务器地址
+        pop3_port: POP3端口号
+        pop3_ssl: POP3是否使用SSL
+        pop3_password: POP3密码或授权码
+        smtp_server: SMTP服务器地址
+        smtp_port: SMTP端口号
+        smtp_ssl: SMTP是否使用SSL
+        smtp_password: SMTP密码或授权码
+        recipients: 收件人列表，多个邮箱用逗号分隔
+    """
+    try:
+        # 解析收件人列表
+        recipients_list = []
+        if recipients:
+            recipients_list = [r.strip() for r in recipients.split(',') if r.strip()]
+
+        result = email_handler.add_email_account(
+            email_address=email_address,
+            pop3_server=pop3_server,
+            pop3_port=pop3_port,
+            pop3_ssl=pop3_ssl,
+            pop3_password=pop3_password,
+            smtp_server=smtp_server,
+            smtp_port=smtp_port,
+            smtp_ssl=smtp_ssl,
+            smtp_password=smtp_password,
+            recipients=recipients_list
+        )
+        return result
+
+    except Exception as e:
+        logger.error(f"添加邮箱账户失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"添加邮箱账户失败: {str(e)}")
+
+
+@app.post("/api/email/check")
+async def check_emails():
+    """检查所有配置的邮箱账户，处理新邮件"""
+    try:
+        config = email_handler.config
+        accounts = config.get("email_accounts", [])
+
+        if not accounts:
+            return {"success": True, "message": "没有配置邮箱账户", "results": []}
+
+        ai_provider = AIProviderFactory.create_provider()
+        results = []
+        processed_count = 0
+
+        for account in accounts:
+            try:
+                # 获取新邮件
+                emails = email_handler.fetch_new_emails(account)
+                logger.info(f"账户 {account['email_address']} 获取到 {len(emails)} 封新邮件")
+
+                for msg in emails:
+                    try:
+                        # 获取Message-ID用于去重标记
+                        message_id = msg.get('Message-ID', '').strip()
+
+                        # 处理邮件（解析主题、保存附件、匹配文件）
+                        process_result = email_handler.process_email(
+                            msg, storage_manager, excel_parser, ai_provider
+                        )
+
+                        if not process_result.get("success"):
+                            # 即使处理失败（如主题不匹配），也标记为已处理，避免重复
+                            email_handler.mark_email_processed(message_id)
+                            results.append(process_result)
+                            continue
+
+                        tenant_name = process_result["tenant_name"]
+                        salary_year = process_result["salary_year"]
+                        salary_month = process_result["salary_month"]
+                        monthly_standard_hours = process_result.get("monthly_standard_hours", 174.0)
+
+                        # 调用计算逻辑
+                        calc_result = await _execute_email_calculation(
+                            tenant_name, salary_year, salary_month, monthly_standard_hours
+                        )
+                        process_result["calculation_result"] = calc_result
+
+                        # 发送结果邮件
+                        recipients = account.get("recipients", [])
+                        if recipients and calc_result.get("success"):
+                            result_file = calc_result.get("result_file_path", "")
+                            send_result = email_handler.send_result_email(
+                                account=account,
+                                recipients=recipients,
+                                tenant_name=tenant_name,
+                                salary_year=salary_year,
+                                salary_month=salary_month,
+                                result_file_path=result_file,
+                                success=True
+                            )
+                            process_result["email_sent"] = send_result
+                        elif recipients and not calc_result.get("success"):
+                            send_result = email_handler.send_result_email(
+                                account=account,
+                                recipients=recipients,
+                                tenant_name=tenant_name,
+                                salary_year=salary_year,
+                                salary_month=salary_month,
+                                result_file_path="",
+                                success=False,
+                                error_message=calc_result.get("error", "计算失败")
+                            )
+                            process_result["email_sent"] = send_result
+
+                        # 标记邮件为已处理
+                        email_handler.mark_email_processed(message_id)
+
+                        results.append(process_result)
+                        processed_count += 1
+
+                    except Exception as e:
+                        logger.error(f"处理邮件失败: {e}", exc_info=True)
+                        results.append({"success": False, "message": f"处理邮件失败: {str(e)}"})
+
+                # 更新上次检查时间
+                email_handler.update_last_check_time(account["email_address"])
+
+            except Exception as e:
+                logger.error(f"检查账户 {account.get('email_address', '未知')} 失败: {e}", exc_info=True)
+                results.append({
+                    "success": False,
+                    "message": f"检查账户失败: {str(e)}",
+                    "email_address": account.get("email_address", "")
+                })
+
+        return {
+            "success": True,
+            "message": f"检查完成，处理了 {processed_count} 封邮件",
+            "results": results
+        }
+
+    except Exception as e:
+        logger.error(f"检查邮件失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"检查邮件失败: {str(e)}")
+
+
+async def _execute_email_calculation(
+    tenant_name: str,
+    salary_year: int,
+    salary_month: int,
+    monthly_standard_hours: float
+) -> Dict[str, Any]:
+    """执行邮件触发的计算
+
+    Args:
+        tenant_name: 租户名称
+        salary_year: 薪资年份
+        salary_month: 薪资月份
+        monthly_standard_hours: 当月标准工时
+
+    Returns:
+        计算结果
+    """
+    try:
+        # 获取活跃脚本
+        active_script = storage_manager.get_active_script(tenant_name)
+        if not active_script:
+            return {"success": False, "error": f"租户 {tenant_name} 未找到活跃脚本"}
+
+        script_content = storage_manager.get_script_content(
+            tenant_name, active_script["script_id"]
+        )
+        if not script_content:
+            return {"success": False, "error": "脚本内容不存在"}
+
+        script_info = active_script.get("script_info", {})
+
+        # 准备计算目录
+        tenant_dir = storage_manager.get_tenant_dir(tenant_name)
+        calc_dir = tenant_dir / "calculations" / f"{salary_year}{salary_month:02d}"
+        output_dir = calc_dir / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 获取已匹配的输入文件
+        input_files = list(calc_dir.glob("*.xlsx")) + list(calc_dir.glob("*.xls"))
+        # 排除output目录下的文件
+        input_files = [f for f in input_files if "output" not in str(f)]
+
+        if not input_files:
+            return {"success": False, "error": "没有找到输入文件"}
+
+        # 构建执行环境
+        execution_env = {
+            "input_folder": str(calc_dir),
+            "output_folder": str(output_dir),
+            "manual_headers": script_info.get("manual_headers") or {},
+            "source_files": [f.name for f in input_files],
+            "salary_year": salary_year,
+            "salary_month": salary_month,
+            "monthly_standard_hours": monthly_standard_hours
+        }
+
+        # 执行脚本
+        exec_result = code_sandbox.execute_script(script_content, execution_env)
+
+        if not exec_result["success"]:
+            return {"success": False, "error": exec_result.get("error", "脚本执行失败")}
+
+        # 查找输出文件
+        output_files = list(output_dir.glob("*.xlsx"))
+        if not output_files:
+            return {"success": False, "error": "脚本执行成功但未生成输出文件"}
+
+        result_file = output_files[0]
+
+        # 尝试COM公式计算
+        try:
+            from ..utils.excel_comparator import calculate_excel_formulas
+            calculate_excel_formulas(str(result_file))
+        except Exception as calc_err:
+            logger.warning(f"公式计算失败（非致命）: {calc_err}")
+
+        batch_id = f"{salary_year}{salary_month:02d}"
+        return {
+            "success": True,
+            "result_file_path": str(result_file),
+            "download_url": f"/api/download/result.xlsx?tenant_id={tenant_name}&batch_id={batch_id}"
+        }
+
+    except Exception as e:
+        logger.error(f"邮件触发计算失败: {e}", exc_info=True)
+        return {"success": False, "error": f"计算失败: {str(e)}"}
 
 
 @app.post("/api/adjust-code")

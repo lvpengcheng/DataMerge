@@ -14,14 +14,38 @@ class PromptGenerator:
     # ============ 通用组件说明（只定义一次）============
     EXCEL_PARSER_INTERFACE = """## IntelligentExcelParser 接口
 使用 `from excel_parser import IntelligentExcelParser` 解析Excel。
-返回 `List[SheetData]`，每个SheetData包含:
-- sheet_name: str
-- regions: List[ExcelRegion]
 
-ExcelRegion结构:
-- head_data: Dict[str, str] - 表头名到列字母映射，如 {"姓名": "A", "工资": "B"}
-- data: List[Dict[str, Any]] - 数据行，格式 {列字母: 值}
-- formula: Dict[str, str] - 公式映射"""
+**方法签名**:
+```python
+parse_excel_file(file_path, max_data_rows=None, skip_rows=0, manual_headers=None, headers_only=False, active_sheet_only=False) -> List[SheetData]
+```
+
+**参数说明**:
+- `file_path`: Excel文件路径
+- `max_data_rows`: 每个区域最多读取的数据行数，None表示读取全部
+- `skip_rows`: 从文件开头跳过的行数
+- `manual_headers`: 手动指定的表头范围（通常从全局变量获取）
+- `headers_only`: 是否只读取表头，不读取数据行（用于快速匹配）
+- `active_sheet_only`: 是否只加载当前激活的Sheet，默认False
+
+**返回值**: `List[SheetData]`，每个SheetData包含:
+- `sheet_name`: str - Sheet名称
+- `regions`: List[ExcelRegion] - 数据区域列表
+
+**ExcelRegion结构**:
+- `head_data`: Dict[str, str] - 表头名到列字母映射，如 {"姓名": "A", "工资": "B"}
+- `data`: List[Dict[str, Any]] - 数据行，格式 {列字母: 值}
+- `formula`: Dict[str, str] - 公式映射
+
+**使用示例**:
+```python
+parser = IntelligentExcelParser()
+results = parser.parse_excel_file(file_path, manual_headers=manual_headers)
+for sheet_data in results:
+    for region in sheet_data.regions:
+        # 转换为DataFrame
+        df = convert_region_to_dataframe(region)
+```"""
 
     GLOBAL_VARS_DESC = """## 可用全局变量（直接使用，勿用os.environ）
 - input_folder, output_folder: 路径字符串
@@ -744,6 +768,11 @@ input_folder, output_folder, manual_headers: {manual_headers_json}
 2. ✅ 源数据已写入Excel（供公式引用）
 3. ✅ 参数sheet已创建（参数!$B$2=年份, $B$3=月份, $B$4=月标准工时）
 4. 🎯 你的任务：创建结果sheet，填充数据和Excel公式
+5. ✅ 生成代码时要注意引用列的位置，不能假设列位置，必须用get_vlookup_col_num()函数计算列号
+6. ✅ 结果sheet的表头必须完全匹配预期结构，列顺
+7. ✅ 注意生成代码的完整性，一次性生成完整的代码
+8. ✅ 参与计算的日期必须用DATEVALUE()转换
+9. ✅ 规则中指定的特殊规则必须严格遵守，禁止任何形式的简化处理
 
 ## 已有变量
 - wb: openpyxl Workbook
@@ -798,35 +827,45 @@ f"=IFERROR(VLOOKUP(K{r},\'{sn_attend}\'!$F:$BG,{col_attend_work},FALSE),0)"
 - ⚠️ **已定义常量和辅助函数，必须使用：**
   - `EMPTY` = Excel空字符串""，用法：`f"=IFERROR(...,{EMPTY})"`
   - `excel_text('门店全职')` = Excel文本值"门店全职"，用法：`f"=IF(P{r}={excel_text('门店全职')},1,0)"`
-- ⚠️ f-string统一写法：
-  - 所有公式f-string一律用双引号 f"..."
-  - Excel sheet名的单引号一律转义为 \'
-  - **Excel空字符串用{EMPTY}代替，禁止写\"\"或""**
-  - **Excel文本比较用{excel_text('xxx')}代替，禁止写\"xxx\"**
+- ⚠️ **f-string引号选择规则（最关键！）**：
+  - **如果Excel公式中包含双引号（如TEXT函数、DATEDIF的"Y"参数等），必须使用单引号f-string：f'...'**
+  - **如果Excel公式中只包含单引号（如sheet名），使用双引号f-string：f"..."**
+  - **示例**：
+    - ✅ `f'=TEXT(A{r},"YYYY-MM-DD")'` ← 公式中有双引号，外层用单引号
+    - ✅ `f'=DATEDIF(N{r},DATE(参数!$B$2,参数!$B$3+1,0),"Y")'` ← 公式中有双引号，外层用单引号
+    - ✅ `f"=VLOOKUP(K{r},\'{sn_bank}\'!$A:$J,{col_num},FALSE)"` ← 公式中只有单引号，外层用双引号
+    - ❌ `f"=TEXT(A{r},\"YYYY-MM-DD\")"` ← 错误！双引号冲突
+    - ❌ `f"=DATEDIF(N{r},DATE(参数!$B$2,参数!$B$3+1,0),""Y"")"` ← 错误！双引号冲突
+- ⚠️ 特殊情况处理：
+  - Excel空字符串：用{EMPTY}代替，不要写""
+  - Excel文本比较：用{excel_text('xxx')}代替，不要写"xxx"
 - ✅ 正确示例：
   - `f"=IFERROR(VLOOKUP(K{r},\'{sn_bank}\'!$A:$J,{col_num},FALSE),{EMPTY})"`
   - `f"=IF(P{r}={excel_text('门店全职')},1,0)"`
+  - `f'=TEXT(参数!$B$2&"-"&TEXT(参数!$B$3,"00"),"YYYY-MM")'`
 - ❌ 绝对禁止：
   - `f"=IFERROR(...,\"\")"` ← 用{EMPTY}代替
   - `f"=IF(P{r}=\"门店全职\",1,0)"` ← 用{excel_text('门店全职')}代替
+  - `f"=TEXT(A{r},\"YYYY-MM-DD\")"` ← 改用单引号f-string
   - 跨行写赋值语句
 
-## 【规则5】模块导入规则
+## 【规则5】模块导入规则（严格执行，违反=立即失败）
 - ❌ 禁止在函数内部导入已在顶层导入的模块
 - 已导入模块：os, pandas(pd), openpyxl(Workbook, Comment, PatternFill, Font, get_column_letter, column_index_from_string)
 
-## 【规则5.1】历史数据查询工具（可选使用）
-- 沙箱中提供了 `history_provider` 全局变量（HistoricalDataProvider实例）
-- 当规则中涉及"累计"、"本年前几个月汇总"、"历史数据"等需求时可使用
-- 可用方法：
-  - `history_provider.get_sum(field, year, months=[1,2,3])` → 获取指定字段的汇总值
-  - `history_provider.get_avg(field, year, months=[1,2,3])` → 获取平均值
-  - `history_provider.get_count(field, year, months=[1,2,3])` → 获取计数
-  - `history_provider.get_employee_history(emp_code, year, months, fields)` → 获取指定员工的历史数据DataFrame
-  - `history_provider.get_available_months(year)` → 获取有历史数据的月份列表
-  - `history_provider.load_history(year, month)` → 加载指定月份的完整DataFrame
-- condition参数支持筛选：`{{"field": "部门", "op": "==", "value": "销售部"}}`
-- ⚠️ 如果规则中没有涉及历史数据需求，不要使用此工具
+## 【规则5.1】历史数据引用（可选使用）
+- 系统会自动创建一个"历史数据"sheet，包含当前薪资年从第1月到当前月前一个月的所有历史计算结果
+- 历史数据sheet结构：
+  - 第1列：薪资月份（数字，如1、2、3...）
+  - 其余列：与结果sheet的列名一致（如工号、姓名、基本工资、应发工资等）
+- 当规则中涉及"累计"、"本年前几个月汇总"、"历史数据"等需求时，使用Excel公式引用此sheet
+- 常用公式示例：
+  - 累计某字段：`=SUMIFS(历史数据!$E:$E, 历史数据!$A:$A, "<"&salary_month, 历史数据!$B:$B, B{{r}})`
+    （解释：汇总历史数据E列，条件是薪资月份<当前月 且 工号=当前行工号）
+  - 获取某员工某月数据：`=VLOOKUP(B{{r}}&"-"&某月份, 历史数据!$B:$Z, 列号, 0)`
+  - 按部门汇总历史：`=SUMIFS(历史数据!$F:$F, 历史数据!$C:$C, C{{r}}, 历史数据!$A:$A, "<"&salary_month)`
+- ⚠️ 如果当前是薪资年的第1个月，历史数据sheet为空或不存在，公式需要处理错误（用IFERROR包裹）
+- ⚠️ 如果规则中没有涉及历史数据需求，不要引用此sheet
 
 ## 【规则6】工号类型
 - 一般情况下，工号都是数字格式，不需要TEXT转换
@@ -982,6 +1021,11 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
 2. ✅ 源数据已写入Excel（供公式引用）
 3. ✅ 参数sheet已创建（参数!$B$2=年份, $B$3=月份, $B$4=月标准工时）
 4. 🎯 你的任务：创建结果sheet，填充数据和Excel公式
+5. ✅ 生成代码时要注意引用列的位置，不能假设列位置，必须用get_vlookup_col_num()函数计算列号
+6. ✅ 结果sheet的表头必须完全匹配预期结构，列顺
+7. ✅ 注意生成代码的完整性，一次性生成完整的代码
+8. ✅ 参与计算的日期必须用DATEVALUE()转换
+9. ✅ 规则中指定的特殊规则必须严格遵守，禁止任何形式的简化处理
 
 ## 已有变量
 - wb: openpyxl Workbook
@@ -1212,6 +1256,11 @@ def fill_columns_batch_{batch_index + 1}(ws, r, source_sheets):
 2. ✅ 源数据已写入Excel（供公式引用）
 3. ✅ 参数sheet已创建（参数!$B$2=年份, $B$3=月份, $B$4=月标准工时）
 4. 🎯 你的任务：创建结果sheet，填充数据和Excel公式
+5. ✅ 生成代码时要注意引用列的位置，不能假设列位置，必须用get_vlookup_col_num()函数计算列号
+6. ✅ 结果sheet的表头必须完全匹配预期结构，列顺
+7. ✅ 注意生成代码的完整性，一次性生成完整的代码
+8. ✅ 参与计算的日期必须用DATEVALUE()转换
+9. ✅ 规则中指定的特殊规则必须严格遵守，禁止任何形式的简化处理
 
 ## 已有变量
 - wb: openpyxl Workbook
@@ -1281,19 +1330,28 @@ TXT_NO = '"否"'
 f"=IF(P{{r}}={{TXT_FULLTIME}},1,0)"
 f"=IF(Q{{r}}={{TXT_YES}},100,0)"
 ```
-- ⚠️ f-string统一写法：
-  - 所有公式f-string一律用双引号 f"..."
-  - Excel sheet名的单引号一律转义为 \\'
-  - **Excel空字符串用{{EMPTY}}代替**
-  - **Excel文本比较用预定义的TXT_变量代替**
-  - **禁止在f-string内部调用任何函数（如excel_text()等）**
+- ⚠️ **f-string引号选择规则（最关键！）**：
+  - **如果Excel公式中包含双引号（如TEXT函数、DATEDIF的"Y"参数等），必须使用单引号f-string：f'...'**
+  - **如果Excel公式中只包含单引号（如sheet名），使用双引号f-string：f"..."**
+  - **示例**：
+    - ✅ `f'=TEXT(A{{r}},"YYYY-MM-DD")'` ← 公式中有双引号，外层用单引号
+    - ✅ `f'=DATEDIF(N{{r}},DATE(参数!$B$2,参数!$B$3+1,0),"Y")'` ← 公式中有双引号，外层用单引号
+    - ✅ `f"=VLOOKUP(K{{r}},\\'{{sn_bank}}\\'!$A:$J,{{col_num}},FALSE)"` ← 公式中只有单引号，外层用双引号
+    - ❌ `f"=TEXT(A{{r}},\\"YYYY-MM-DD\\")"` ← 错误！双引号冲突
+    - ❌ `f"=DATEDIF(N{{r}},DATE(参数!$B$2,参数!$B$3+1,0),""Y"")"` ← 错误！双引号冲突
+- ⚠️ 特殊情况处理：
+  - Excel空字符串：用{{EMPTY}}代替
+  - Excel文本比较：用预定义的TXT_变量代替
+  - 禁止在f-string内部调用任何函数（如excel_text()等）
 - ✅ 正确示例：
   - `f"=IFERROR(VLOOKUP(K{{r}},\\'{{sn_bank}}\\'!$A:$J,{{col_num}},FALSE),{{EMPTY}})"`
   - `f"=IF(P{{r}}={{TXT_FULLTIME}},1,0)"`
   - `f"=IFERROR(VLOOKUP(K{{r}},\\'{{sn_bank}}\\'!$A:$J,{{col_num}},FALSE),0)"`
+  - `f'=TEXT(参数!$B$2&"-"&TEXT(参数!$B$3,"00"),"YYYY-MM")'`
 - ❌ 绝对禁止：
   - `f"=IFERROR(...,\\"\\")"` ← 用{{EMPTY}}代替
   - `f"=IFERROR(...,"")"` ← 双引号冲突
+  - `f"=TEXT(A{{r}},\\"YYYY-MM-DD\\")"` ← 改用单引号f-string
   - `f"=IF(P{{r}}=\\"门店全职\\",1,0)"` ← 用TXT_变量代替
   - `f"=IF(P{{r}}={{excel_text('门店全职')}},1,0)"` ← 禁止在f-string内调用函数
   - 跨行写赋值语句（如 .value = ( 换行 f"..." 换行 )）
@@ -1302,18 +1360,19 @@ f"=IF(Q{{r}}={{TXT_YES}},100,0)"
 - ❌ 禁止在函数内部导入已在顶层导入的模块
 - 已导入模块：os, pandas(pd), openpyxl(Workbook, Comment, PatternFill, Font, get_column_letter, column_index_from_string)
 
-## 【规则5.1】历史数据查询工具（可选使用）
-- 沙箱中提供了 `history_provider` 全局变量（HistoricalDataProvider实例）
-- 当规则中涉及"累计"、"本年前几个月汇总"、"历史数据"等需求时可使用
-- 可用方法：
-  - `history_provider.get_sum(field, year, months=[1,2,3])` → 获取指定字段的汇总值
-  - `history_provider.get_avg(field, year, months=[1,2,3])` → 获取平均值
-  - `history_provider.get_count(field, year, months=[1,2,3])` → 获取计数
-  - `history_provider.get_employee_history(emp_code, year, months, fields)` → 获取指定员工的历史数据DataFrame
-  - `history_provider.get_available_months(year)` → 获取有历史数据的月份列表
-  - `history_provider.load_history(year, month)` → 加载指定月份的完整DataFrame
-- condition参数支持筛选：`{{"field": "部门", "op": "==", "value": "销售部"}}`
-- ⚠️ 如果规则中没有涉及历史数据需求，不要使用此工具
+## 【规则5.1】历史数据引用（可选使用）
+- 系统会自动创建一个"历史数据"sheet，包含当前薪资年从第1月到当前月前一个月的所有历史计算结果
+- 历史数据sheet结构：
+  - 第1列：薪资月份（数字，如1、2、3...）
+  - 其余列：与结果sheet的列名一致（如工号、姓名、基本工资、应发工资等）
+- 当规则中涉及"累计"、"本年前几个月汇总"、"历史数据"等需求时，使用Excel公式引用此sheet
+- 常用公式示例：
+  - 累计某字段：`=SUMIFS(历史数据!$E:$E, 历史数据!$A:$A, "<"&salary_month, 历史数据!$B:$B, B{{r}})`
+    （解释：汇总历史数据E列，条件是薪资月份<当前月 且 工号=当前行工号）
+  - 获取某员工某月数据：`=VLOOKUP(B{{r}}&"-"&某月份, 历史数据!$B:$Z, 列号, 0)`
+  - 按部门汇总历史：`=SUMIFS(历史数据!$F:$F, 历史数据!$C:$C, C{{r}}, 历史数据!$A:$A, "<"&salary_month)`
+- ⚠️ 如果当前是薪资年的第1个月，历史数据sheet为空或不存在，公式需要处理错误（用IFERROR包裹）
+- ⚠️ 如果规则中没有涉及历史数据需求，不要引用此sheet
 
 ## 【规则6】工号类型
 - 一般情况下，工号都是数字格式，不需要TEXT转换

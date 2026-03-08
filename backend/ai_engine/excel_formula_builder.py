@@ -81,7 +81,11 @@ class ExcelFormulaBuilder:
             file_base = Path(filename).stem  # 去掉扩展名
 
             try:
-                results = parser.parse_excel_file(file_path, manual_headers=manual_headers)
+                results = parser.parse_excel_file(
+                    file_path,
+                    manual_headers=manual_headers,
+                    active_sheet_only=True  # 只加载激活的sheet
+                )
 
                 for sheet_data in results:
                     for region in sheet_data.regions:

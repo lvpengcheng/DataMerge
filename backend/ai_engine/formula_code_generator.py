@@ -1630,6 +1630,12 @@ def load_source_data(input_folder, manual_headers):
     Returns:
         source_data: {"文件名_sheet名": {"df": DataFrame, "columns": [列名]}}
     """
+    # 【性能优化】如果执行环境注入了预加载数据，直接使用（跳过Excel解析）
+    _cached = globals().get('_pre_loaded_source_data')
+    if _cached is not None:
+        print(f"[性能优化] 使用预加载源数据（{len(_cached)}个sheet，跳过Excel解析）")
+        return _cached
+
     source_data = {}
     parser = IntelligentExcelParser()
 
@@ -1639,7 +1645,11 @@ def load_source_data(input_folder, manual_headers):
         file_path = os.path.join(input_folder, filename)
         file_base = filename.replace('.xlsx','').replace('.xls','')
 
-        results = parser.parse_excel_file(file_path, manual_headers=manual_headers)
+        results = parser.parse_excel_file(
+            file_path,
+            manual_headers=manual_headers,
+            active_sheet_only=True  # 只加载激活的sheet
+        )
 
         for sheet_data in results:
             for region in sheet_data.regions:
@@ -1735,6 +1745,99 @@ def write_params_sheet(wb, salary_year, salary_month, monthly_standard_hours):
     return params_sheet_name
 
 
+def write_history_sheet(wb, history_prov, salary_year, salary_month):
+    """创建历史数据实体sheet，供公式引用
+
+    加载当前薪资年从第1月到当前月前一个月的所有历史计算结果，
+    合并为一个"历史数据"sheet写入workbook。
+    如果没有历史数据，创建一个只有表头的空sheet。
+
+    Args:
+        wb: openpyxl Workbook对象
+        history_prov: HistoricalDataProvider实例（沙箱注入的history_provider）
+        salary_year: 薪资年份
+        salary_month: 薪资月份
+
+    Returns:
+        history_sheet_name: 历史数据sheet名称
+    """
+    history_sheet_name = "历史数据"
+
+    if not salary_year or not salary_month:
+        print("缺少薪资年月参数，创建空的历史数据sheet")
+        ws = wb.create_sheet(title=history_sheet_name)
+        header_fill = PatternFill(start_color="87CEEB", end_color="87CEEB", fill_type="solid")
+        cell = ws.cell(row=1, column=1, value="薪资月份")
+        cell.fill = header_fill
+        cell.font = Font(bold=True)
+        return history_sheet_name
+
+    salary_year = int(salary_year)
+    salary_month = int(salary_month)
+
+    # 收集当前薪资年内、当前月之前的所有历史数据
+    all_dfs = []
+    if history_prov:
+        for month in range(1, salary_month):
+            df = history_prov.load_history(salary_year, month)
+            if df is not None:
+                df = df.copy()
+                df.insert(0, "薪资月份", month)
+                all_dfs.append(df)
+                print(f"加载历史数据: {salary_year}年{month}月, {len(df)}行")
+
+    # 写入sheet
+    ws = wb.create_sheet(title=history_sheet_name)
+    header_fill = PatternFill(start_color="87CEEB", end_color="87CEEB", fill_type="solid")
+
+    if not all_dfs:
+        # 没有历史数据，从预期文件读取结构创建空表头
+        print("没有找到历史数据，尝试从预期文件读取结构创建空sheet")
+        expected_columns = ["薪资月份"]  # 默认至少有薪资月份列
+
+        try:
+            output_folder = globals().get('output_folder', '')
+            if output_folder and os.path.exists(output_folder):
+                # 查找预期文件（expected目录中的xlsx文件）
+                expected_files = [f for f in os.listdir(output_folder)
+                                if f.endswith(('.xlsx', '.xls')) and not f.startswith('~')]
+                if expected_files:
+                    expected_file = os.path.join(output_folder, expected_files[0])
+                    # 读取第一个sheet的列名
+                    expected_df = pd.read_excel(expected_file, nrows=0)
+                    if len(expected_df.columns) > 0:
+                        expected_columns = ["薪资月份"] + list(expected_df.columns)
+                        print(f"从预期文件 {expected_files[0]} 读取到 {len(expected_df.columns)} 列")
+        except Exception as e:
+            print(f"读取预期文件结构失败，使用默认列: {e}")
+
+        # 写入表头
+        for col_idx, col_name in enumerate(expected_columns, 1):
+            cell = ws.cell(row=1, column=col_idx, value=col_name)
+            cell.fill = header_fill
+            cell.font = Font(bold=True)
+
+        print(f"创建空的历史数据sheet，包含 {len(expected_columns)} 列表头")
+        return history_sheet_name
+
+    # 合并所有月份数据
+    combined = pd.concat(all_dfs, ignore_index=True)
+
+    # 写入表头（蓝色背景）
+    for col_idx, col_name in enumerate(combined.columns, 1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.fill = header_fill
+        cell.font = Font(bold=True)
+
+    # 写入数据
+    for row_idx, row in enumerate(combined.itertuples(index=False), 2):
+        for col_idx, value in enumerate(row, 1):
+            ws.cell(row=row_idx, column=col_idx, value=value if pd.notna(value) else "")
+
+    print(f"历史数据sheet创建完成: {len(combined)}行, {len(combined.columns)}列")
+    return history_sheet_name
+
+
 # ============================================================
 # AI生成的fill_result_sheets函数（下方）
 # 注意：函数名是fill_result_sheets（复数），可以创建多个结果sheet
@@ -1779,6 +1882,11 @@ def main():
     monthly_hours_val = globals().get('monthly_standard_hours', 174)
     params_sheet = write_params_sheet(wb, salary_year_val, salary_month_val, monthly_hours_val)
 
+    # 步骤2.6: 创建历史数据sheet（供公式引用）
+    print("步骤2.6: 创建历史数据sheet...")
+    history_prov = globals().get('history_provider', None)
+    history_sheet_name = write_history_sheet(wb, history_prov, salary_year_val, salary_month_val)
+
     # 步骤3: 调用AI生成的函数填充结果sheet（可能有多个）
     print("步骤3: 填充结果sheet...")
     # 传递薪资参数给fill_result_sheets，以便在公式中使用
@@ -1789,10 +1897,10 @@ def main():
         wb.remove(default_sheet)
 
     # 把第一个结果sheet移到最前面（如果需要）
-    # 找到非源数据的sheet（排除源数据sheet和"参数"sheet）
+    # 找到非源数据的sheet（排除源数据sheet、"参数"sheet和"历史数据"sheet）
     source_sheet_names = set(source_sheets.keys())
     for ws in wb.worksheets:
-        if ws.title not in source_sheet_names and ws.title != "参数":
+        if ws.title not in source_sheet_names and ws.title != "参数" and ws.title != "历史数据":
             wb.move_sheet(ws, offset=-len(wb.worksheets)+1)
             break
 
@@ -1937,6 +2045,16 @@ def main():
                 # 将 \" 替换为 "" （在Excel公式中两个双引号表示一个双引号）
                 line = line.replace('\\"', '"')
 
+            # 修复两行代码粘在一起的问题（如 "+ 1EMPTY = ''"）
+            # 检测模式：数字后面紧跟大写字母开头的标识符和等号
+            if re.search(r'\d+[A-Z_][A-Z_0-9]*\s*=', line):
+                # 在数字和大写字母之间插入换行
+                line = re.sub(r'(\d+)([A-Z_][A-Z_0-9]*\s*=)', r'\1\n\2', line)
+                # 如果修复后包含换行，需要拆分成多行
+                if '\n' in line:
+                    cleaned_lines.extend(line.split('\n'))
+                    continue
+
             cleaned_lines.append(line)
 
         return '\n'.join(cleaned_lines)
@@ -2018,13 +2136,20 @@ def main():
 - 所有日期参与计算前必须用 `DATEVALUE()`
 - 检查清单：日期比较、日期相减、日期筛选
 
-## 【规则4】代码完整性
+## 【规则4】代码完整性和f-string引号规则
 - 每行代码必须完整闭合，不允许截断
-- f-string规则：公式含双引号时，外层用单引号
-  - ✅ `f'=TEXT(A1,"YYYY-MM-DD")'`
-  - ❌ `f"=TEXT(A1,"YYYY-MM-DD")"`
+- ⚠️ **f-string引号选择规则（最关键！）**：
+  - **如果Excel公式中包含双引号（如TEXT函数、DATEDIF的"Y"参数等），必须使用单引号f-string：f'...'**
+  - **如果Excel公式中只包含单引号（如sheet名），使用双引号f-string：f"..."**
+  - ✅ 正确示例：
+    - `f'=TEXT(A1,"YYYY-MM-DD")'` ← 公式中有双引号，外层用单引号
+    - `f'=DATEDIF(N{r},DATE(参数!$B$2,参数!$B$3+1,0),"Y")'` ← 公式中有双引号，外层用单引号
+    - `f"=VLOOKUP(K{r},'{sn_bank}'!$A:$J,{col_num},FALSE)"` ← 公式中只有单引号，外层用双引号
+  - ❌ 错误示例：
+    - `f"=TEXT(A1,\"YYYY-MM-DD\")"` ← 错误！双引号冲突
+    - `f"=DATEDIF(N{r},DATE(参数!$B$2,参数!$B$3+1,0),""Y"")"` ← 错误！双引号冲突
 
-## 【规则5】模块导入规则
+## 【规则5】模块导入规则（严格执行，违反=立即失败）
 - ❌ 禁止在函数内部导入已在顶层导入的模块（会导致UnboundLocalError）
 - ❌ 禁止：在fill_result_sheets函数内写 `import pandas as pd`
 - ✅ 正确：直接使用顶层已导入的 `pd`（pandas已在文件开头导入）

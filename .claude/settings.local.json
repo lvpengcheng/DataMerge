@@ -24,7 +24,17 @@
       "Bash(pip install:*)",
       "Bash(python run.py:*)",
       "Bash(venv/Scripts/pip.exe install fastapi uvicorn[standard] pydantic pandas openpyxl python-multipart python-dotenv openai anthropic requests)",
-      "Bash(venv/Scripts/pip install pywin32)"
+      "Bash(venv/Scripts/pip install pywin32)",
+      "Bash(python test_pop3.py:*)",
+      "Bash(curl:*)",
+      "Bash(python test_attachments.py:*)",
+      "Bash(python test_file_matching.py:*)",
+      "Bash(python:*)",
+      "Bash(git checkout:*)",
+      "Bash(python3:*)",
+      "Bash(pip show:*)",
+      "Bash(pip search:*)",
+      "Bash(xargs cat:*)"
     ]
   }
 }

@@ -1268,7 +1268,11 @@ class TrainingEngine:
                     raise FileNotFoundError(f"源文件不存在: {file_path}")
 
                 file_name = Path(file_path).name
-                parsed_data = self.excel_parser.parse_excel_file(file_path, manual_headers=manual_headers)
+                parsed_data = self.excel_parser.parse_excel_file(
+                    file_path,
+                    manual_headers=manual_headers,
+                    active_sheet_only=True  # 只加载激活的sheet
+                )
 
                 file_structure = {
                     "file_name": file_name,
@@ -1317,7 +1321,11 @@ class TrainingEngine:
             if not Path(expected_file).exists():
                 raise FileNotFoundError(f"预期结果文件不存在: {expected_file}")
 
-            parsed_data = self.excel_parser.parse_excel_file(expected_file, manual_headers=manual_headers)
+            parsed_data = self.excel_parser.parse_excel_file(
+                expected_file,
+                manual_headers=manual_headers,
+                active_sheet_only=True  # 只加载激活的sheet
+            )
 
             structure = {
                 "file_name": Path(expected_file).name,
@@ -1499,8 +1507,16 @@ class TrainingEngine:
         """比较两个Excel文件"""
         try:
             # 解析实际输出文件
-            actual_data = self.excel_parser.parse_excel_file(actual_file, manual_headers=manual_headers)
-            expected_data = self.excel_parser.parse_excel_file(expected_file, manual_headers=manual_headers)
+            actual_data = self.excel_parser.parse_excel_file(
+                actual_file,
+                manual_headers=manual_headers,
+                active_sheet_only=True  # 只加载激活的sheet
+            )
+            expected_data = self.excel_parser.parse_excel_file(
+                expected_file,
+                manual_headers=manual_headers,
+                active_sheet_only=True  # 只加载激活的sheet
+            )
 
             # 转换为结构化的字典
             actual_structure = self._convert_to_structure(actual_data)

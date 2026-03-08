@@ -1,0 +1,29 @@
+{
+  "last_check_time": "2026-03-03T23:38:18.418549",
+  "email_accounts": [
+    {
+      "email_address": "lupech@163.com",
+      "pop3_server": "pop.163.com",
+      "pop3_port": 995,
+      "pop3_ssl": true,
+      "pop3_password": "YRbEUpDrNDTpCtHw",
+      "smtp_server": "smtp.163.com",
+      "smtp_port": 465,
+      "smtp_ssl": true,
+      "smtp_password": "YRbEUpDrNDTpCtHw",
+      "recipients": [
+        "lupech@163.com"
+      ],
+      "last_check_time": "2026-03-05T10:11:38.131821"
+    }
+  ],
+  "processed_message_ids": [
+    "<1813eec6.2ea9.19cb6d01c84.Coremail.lupech@163.com>",
+    "<7b488a8e.310c.19cb6d7e1c7.Coremail.lupech@163.com>",
+    "<67a3c772.3df5.19cb7074f4f.Coremail.lupech@163.com>",
+    "<1266658515.89510691.1772661417056@insideapple.apple.com>",
+    "<701ba0a3.5a6.19cbb70706e.Coremail.lupech@163.com>",
+    "<665372d6.abe.19cbb88276f.Coremail.lupech@163.com>",
+    "<52c50bee.1a8f.19cbbbcfd4e.Coremail.lupech@163.com>"
+  ]
+}
