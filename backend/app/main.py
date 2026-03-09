@@ -64,7 +64,8 @@ async def train_model(
     manual_headers: Optional[str] = Form(None),
     salary_year: Optional[int] = Form(None),  # 可选的薪资年份
     salary_month: Optional[int] = Form(None),  # 可选的薪资月份
-    monthly_standard_hours: Optional[float] = Form(None)  # 可选的当月标准工时
+    monthly_standard_hours: Optional[float] = Form(None),  # 可选的当月标准工时
+    force_retrain: bool = Form(False)  # 是否强制重新训练
 ):
     """训练AI生成数据处理脚本
 
@@ -77,6 +78,9 @@ async def train_model(
         salary_year: 薪资年份（可选）
         salary_month: 薪资月份（可选）
         monthly_standard_hours: 当月标准工时（可选，由调用方计算并传入）
+        force_retrain: 是否强制重新训练（默认False）
+            - False: 如果历史最佳分数=100%，直接使用历史最佳代码；如果<100%，重新训练
+            - True: 清除所有历史训练数据和最佳代码，从头开始全新训练
     """
     try:
         logger.info(f"开始训练，租户: {tenant_id}")
@@ -111,7 +115,8 @@ async def train_model(
             tenant_id=tenant_id,
             salary_year=salary_year,
             salary_month=salary_month,
-            monthly_standard_hours=monthly_standard_hours
+            monthly_standard_hours=monthly_standard_hours,
+            force_retrain=force_retrain
         )
 
         # 提取文档格式模版
@@ -208,7 +213,8 @@ async def train_model_stream(
     manual_headers: Optional[str] = Form(None),
     salary_year: Optional[int] = Form(None),  # 可选的薪资年份
     salary_month: Optional[int] = Form(None),  # 可选的薪资月份
-    monthly_standard_hours: Optional[float] = Form(None)  # 可选的当月标准工时
+    monthly_standard_hours: Optional[float] = Form(None),  # 可选的当月标准工时
+    force_retrain: bool = Form(False)  # 是否强制重新训练
 ):
     """流式训练AI生成数据处理脚本（支持实时日志输出）
 
@@ -221,6 +227,9 @@ async def train_model_stream(
         salary_year: 薪资年份（可选）
         salary_month: 薪资月份（可选）
         monthly_standard_hours: 当月标准工时（可选，由调用方计算并传入）
+        force_retrain: 是否强制重新训练（默认False）
+            - False: 如果历史最佳分数=100%，直接使用历史最佳代码；如果<100%，重新训练
+            - True: 清除所有历史训练数据和最佳代码，从头开始全新训练
     """
     try:
         logger.info(f"开始流式训练，租户: {tenant_id}")
@@ -327,7 +336,8 @@ async def train_model_stream(
                                 tenant_id=tenant_id,
                                 salary_year=salary_year,
                                 salary_month=salary_month,
-                                monthly_standard_hours=monthly_standard_hours
+                                monthly_standard_hours=monthly_standard_hours,
+                                force_retrain=force_retrain
                             )
                         )
 
@@ -335,7 +345,8 @@ async def train_model_stream(
                     if training_result["success"]:
                         parsed_data = excel_parser.parse_excel_file(
                             saved_files["expected"],
-                            manual_headers=manual_headers_dict
+                            manual_headers=manual_headers_dict,
+                            active_sheet_only=True  # 只加载激活的sheet
                         )
                         template_schema = document_validator.extract_document_schema(parsed_data)
 
@@ -2488,7 +2499,8 @@ async def adjust_code(
             excel_parser = IntelligentExcelParser()
             parsed_data = excel_parser.parse_excel_file(
                 str(expected_file),
-                manual_headers=script_info.get("manual_headers")
+                manual_headers=script_info.get("manual_headers"),
+                active_sheet_only=True  # 只加载激活的sheet
             )
             document_validator = DocumentValidator()
             template_schema = document_validator.extract_document_schema(parsed_data)

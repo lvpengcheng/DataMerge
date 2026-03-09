@@ -119,7 +119,8 @@ async def train_model(
             # 解析预期文件以提取模版
             parsed_data = excel_parser.parse_excel_file(
                 saved_files["expected"],
-                manual_headers=manual_headers_dict
+                manual_headers=manual_headers_dict,
+                active_sheet_only=True  # 只加载激活的sheet
             )
             template_schema = document_validator.extract_document_schema(parsed_data)
 
@@ -292,7 +293,8 @@ async def train_model_stream(
                     if training_result["success"]:
                         parsed_data = excel_parser.parse_excel_file(
                             saved_files["expected"],
-                            manual_headers=manual_headers_dict
+                            manual_headers=manual_headers_dict,
+                            active_sheet_only=True  # 只加载激活的sheet
                         )
                         template_schema = document_validator.extract_document_schema(parsed_data)
 
@@ -561,7 +563,7 @@ async def calculate_data(
 
                     # 使用IntelligentExcelParser读取文件结构（表头位置等）
                     mapping_parser = IntelligentExcelParser()
-                    parsed_sheets = mapping_parser.parse_excel_file(new_file_path)
+                    parsed_sheets = mapping_parser.parse_excel_file(new_file_path, active_sheet_only=True)
 
                     # 用openpyxl加载工作簿进行就地修改（保留格式）
                     wb = load_workbook(new_file_path)
@@ -2294,7 +2296,8 @@ async def adjust_code(
             excel_parser = IntelligentExcelParser()
             parsed_data = excel_parser.parse_excel_file(
                 str(expected_file),
-                manual_headers=script_info.get("manual_headers")
+                manual_headers=script_info.get("manual_headers"),
+                active_sheet_only=True  # 只加载激活的sheet
             )
             document_validator = DocumentValidator()
             template_schema = document_validator.extract_document_schema(parsed_data)

@@ -452,7 +452,7 @@ class EmailHandler:
         for attachment in attachments:
             try:
                 # 解析附件结构
-                parsed_sheets = excel_parser.parse_excel_file(str(attachment))
+                parsed_sheets = excel_parser.parse_excel_file(str(attachment), active_sheet_only=True)
 
                 # 尝试匹配
                 best_match_file = None

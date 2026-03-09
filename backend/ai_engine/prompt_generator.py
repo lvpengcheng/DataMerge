@@ -6,6 +6,7 @@ import json
 import logging
 from typing import Dict, List, Any, Optional
 from pathlib import Path
+from .rule_extractor import RuleExtractor
 
 
 class PromptGenerator:
@@ -65,6 +66,7 @@ for sheet_data in results:
         self.templates = self._load_templates()
         self.max_structure_length = 20000000
         self.logger = logging.getLogger(__name__)
+        self.rule_extractor = RuleExtractor()
 
     def _load_templates(self) -> Dict[str, str]:
         """加载提示词模板"""
@@ -91,6 +93,10 @@ for sheet_data in results:
 ## 数据处理规则
 {rules_content}
 
+{data_cleaning_rules}
+
+{warning_rules}
+
 ## 手动表头规则
 {manual_headers}
 
@@ -113,6 +119,8 @@ for sheet_data in results:
 - 验证员工编号唯一性
 - 输出格式必须与预期结构一致
 - 禁止简化任何计算逻辑
+- **数据清洗**: 在复制基础数据时，必须应用数据清洗规则过滤不符合条件的数据
+- **警告收集**: 创建warnings列表收集所有警告信息，在main()函数最后返回 {"success": True, "warnings": warnings}
 
 请生成完整Python代码。""",
 
@@ -142,6 +150,10 @@ for sheet_data in results:
 ## 数据处理规则
 {rules_content}
 
+{data_cleaning_rules}
+
+{warning_rules}
+
 ## 手动表头规则
 {manual_headers}
 
@@ -155,7 +167,9 @@ for sheet_data in results:
 3. 实现列名映射处理不一致问题
 4. 确保输出与预期完全一致
 5. **严禁简化处理**：禁止用 `= 0 # 简化` 跳过任何计算
-6.主键字段是不是和其他表内的类型不一致，导致需要转换
+6. 主键字段是不是和其他表内的类型不一致，导致需要转换
+7. **数据清洗**: 在复制基础数据时，必须应用数据清洗规则过滤不符合条件的数据
+8. **警告收集**: 创建warnings列表收集所有警告信息，在main()函数最后返回 {"success": True, "warnings": warnings}
 
 请提供修正后的完整代码。""",
 
@@ -363,6 +377,22 @@ for sheet_data in results:
         if len(manual_headers_str) > 1000:
             manual_headers_str = self._compress_structure(manual_headers, max_length=30000)
 
+        # 提取数据清洗规则和警告规则
+        extracted_rules = self.rule_extractor.extract_rules(rules_content)
+        data_cleaning_rules_text = ""
+        warning_rules_text = ""
+
+        if extracted_rules["data_cleaning_rules"] or extracted_rules["warning_rules"]:
+            formatted_rules = self.rule_extractor.format_rules_for_prompt(extracted_rules)
+            # 分离数据清洗规则和警告规则
+            if "## 数据清洗规则" in formatted_rules:
+                parts = formatted_rules.split("## 警告信息规则")
+                data_cleaning_rules_text = parts[0]
+                if len(parts) > 1:
+                    warning_rules_text = "## 警告信息规则" + parts[1]
+            else:
+                warning_rules_text = formatted_rules
+
         template = self.templates["training"]
         replacements = {
             "{excel_parser_interface}": self.EXCEL_PARSER_INTERFACE,
@@ -371,6 +401,8 @@ for sheet_data in results:
             "{source_structure}": compressed_source,
             "{expected_structure}": compressed_expected,
             "{rules_content}": rules_content,
+            "{data_cleaning_rules}": data_cleaning_rules_text,
+            "{warning_rules}": warning_rules_text,
             "{manual_headers}": manual_headers_str
         }
 
@@ -400,6 +432,22 @@ for sheet_data in results:
         if len(manual_headers_str) > 800:
             manual_headers_str = self._compress_structure(manual_headers, max_length=30000)
 
+        # 提取数据清洗规则和警告规则
+        extracted_rules = self.rule_extractor.extract_rules(rules_content)
+        data_cleaning_rules_text = ""
+        warning_rules_text = ""
+
+        if extracted_rules["data_cleaning_rules"] or extracted_rules["warning_rules"]:
+            formatted_rules = self.rule_extractor.format_rules_for_prompt(extracted_rules)
+            # 分离数据清洗规则和警告规则
+            if "## 数据清洗规则" in formatted_rules:
+                parts = formatted_rules.split("## 警告信息规则")
+                data_cleaning_rules_text = parts[0]
+                if len(parts) > 1:
+                    warning_rules_text = "## 警告信息规则" + parts[1]
+            else:
+                warning_rules_text = formatted_rules
+
         template = self.templates["correction"]
         replacements = {
             "{excel_parser_interface}": self.EXCEL_PARSER_INTERFACE,
@@ -411,6 +459,8 @@ for sheet_data in results:
             "{source_structure}": compressed_source,
             "{expected_structure}": compressed_expected,
             "{rules_content}": rules_content,
+            "{data_cleaning_rules}": data_cleaning_rules_text,
+            "{warning_rules}": warning_rules_text,
             "{manual_headers}": manual_headers_str
         }
 
@@ -746,6 +796,18 @@ input_folder, output_folder, manual_headers: {manual_headers_json}
         rules = self._remove_empty_lines(rules_content[:20000])
         _ = manual_headers
 
+        # 提取数据清洗规则和警告规则
+        extracted_rules = self.rule_extractor.extract_rules(rules_content)
+        data_cleaning_rules_text = ""
+
+        if extracted_rules["data_cleaning_rules"]:
+            data_cleaning_rules_text = "\n## 数据清洗规则（在write_source_sheets中应用）\n"
+            data_cleaning_rules_text += "⚠️ 在将源数据写入Excel之前，必须先应用以下清洗规则过滤数据：\n\n"
+            for i, rule in enumerate(extracted_rules["data_cleaning_rules"], 1):
+                if rule['original_text'] and not rule['original_text'].startswith('--'):
+                    data_cleaning_rules_text += f"{i}. {rule['original_text']}\n"
+            data_cleaning_rules_text += "\n**实现方式**：在write_source_sheets函数中，对每个DataFrame应用清洗逻辑后再写入Excel。\n"
+
         # 统计总列数
         total_columns = 0
         expected_sheets_info = ""
@@ -759,30 +821,37 @@ input_folder, output_folder, manual_headers: {manual_headers_json}
                     total_columns += col_count
                     expected_sheets_info += f"- **{sheet_name}** ({col_count}列): {list(headers.keys())}\n"
 
-        template = """你是专业Python程序员，擅长人力资源行业的薪资计算、税务处理、考勤管理，同时你也是一个EXCEL公式大师，熟悉每个公式的使用方法和使用场景，需生成fill_result_sheets函数来创建结果sheet。
+        template = """你是专业Python程序员，擅长人力资源行业的薪资计算、税务处理、考勤管理，同时你也是一个EXCEL公式大师，熟悉每个公式的使用方法和使用场景。
 
 ⚠️⚠️⚠️ 本次任务共有 __TOTAL_COLUMNS__ 列，你必须为每一列都生成处理逻辑，在全部 __TOTAL_COLUMNS__ 列完成之前绝对不能停止生成！⚠️⚠️⚠️
 
+## 你的任务
+1. 🎯 生成 clean_source_data 函数：应用数据清洗规则过滤源数据
+2. 🎯 生成 fill_result_sheets 函数：创建结果sheet，填充数据和Excel公式
+
 ## 执行流程（固定代码已处理）
-1. ✅ 源数据已加载到 source_sheets 字典
-2. ✅ 源数据已写入Excel（供公式引用）
-3. ✅ 参数sheet已创建（参数!$B$2=年份, $B$3=月份, $B$4=月标准工时）
-4. 🎯 你的任务：创建结果sheet，填充数据和Excel公式
-5. ✅ 生成代码时要注意引用列的位置，不能假设列位置，必须用get_vlookup_col_num()函数计算列号
-6. ✅ 结果sheet的表头必须完全匹配预期结构，列顺
-7. ✅ 注意生成代码的完整性，一次性生成完整的代码
+1. ✅ 源数据已加载到 source_data 字典（DataFrame格式）
+2. 🎯 你的任务1：生成clean_source_data函数，应用清洗规则过滤数据
+3. ✅ 清洗后的数据会写入Excel（供公式引用）
+4. ✅ 参数sheet已创建（参数!$B$2=年份, $B$3=月份, $B$4=月标准工时）
+5. 🎯 你的任务2：生成fill_result_sheets函数，创建结果sheet并填充公式
+6. ✅ 生成代码时要注意引用列的位置，不能假设列位置，必须用get_vlookup_col_num()函数计算列号
+7. ✅ 结果sheet的表头必须完全匹配预期结构
 8. ✅ 参与计算的日期必须用DATEVALUE()转换
 9. ✅ 规则中指定的特殊规则必须严格遵守，禁止任何形式的简化处理
 
 ## 已有变量
 - wb: openpyxl Workbook
-- source_sheets: {"文件名_sheet名": {"df": DataFrame, "ws": worksheet}}
+- source_data: {"文件名_sheet名": {"df": DataFrame, "columns": [列名]}} （清洗前）
+- source_sheets: {"文件名_sheet名": {"df": DataFrame, "ws": worksheet}} （清洗后，写入Excel）
 
 __SOURCE_STRUCTURE__
 __EXPECTED_SHEETS_INFO__
 
 ## 预期输出结构
 __COMPRESSED_EXPECTED__
+
+__DATA_CLEANING_RULES__
 
 ## 计算规则
 __RULES__
@@ -795,7 +864,9 @@ __RULES__
 
 ## 【规则2】VLOOKUP是唯一跨表取数方式
 - 主表数据：直接复制,不能用VLOOKUP（会导致性能问题）
+- ⚠️ **重要**：主表数据复制时使用的是source_sheets中的数据，这些数据已经过clean_source_data函数清洗，符合所有数据清洗规则
 - 非主表数据：**必须且只能**用VLOOKUP，禁止任何其他方式
+- ⚠️ **重要**：VLOOKUP引用的源数据sheet也是清洗后的数据，已过滤掉不符合规则的记录
 
 ### VLOOKUP列号规则（最关键！必须使用get_vlookup_col_num函数）
 - ⚠️ **禁止硬编码VLOOKUP列号数字！必须使用get_vlookup_col_num()函数计算**
@@ -949,20 +1020,49 @@ f"=IFERROR(VLOOKUP(K{r},\'{sn_attend}\'!$F:$BG,{col_attend_work},FALSE),0)"
 ⚠️ 在代码最后添加注释：# 共处理了 X 列（预期 __TOTAL_COLUMNS__ 列），用于自我验证。
 
 # ==================== 函数签名 ====================
+
+## 1. 数据清洗函数（如果有清洗规则）
+def clean_source_data(source_data):
+    \"\"\"应用数据清洗规则过滤源数据
+
+    Args:
+        source_data: {"文件名_sheet名": {"df": DataFrame, "columns": [列名]}}
+
+    Returns:
+        清洗后的source_data（相同格式）
+    \"\"\"
+    # 根据数据清洗规则，过滤每个DataFrame中不符合条件的记录
+    # 例如：去除重复工号、过滤空值、过滤离职员工等
+    # 返回清洗后的source_data
+    pass
+
+## 2. 结果填充函数
 def fill_result_sheets(wb, source_sheets, salary_year=None,
                        salary_month=None, monthly_standard_hours=174):
+    \"\"\"创建结果sheet并填充数据和公式
 
-    主表策略：选员工数最全的表
-    其他表：全部VLOOKUP
-    计算列：完整实现所有逻辑
+    Args:
+        wb: openpyxl Workbook
+        source_sheets: {"文件名_sheet名": {"df": DataFrame, "ws": worksheet}}
+        salary_year: 薪资年份
+        salary_month: 薪资月份
+        monthly_standard_hours: 月标准工时
+    \"\"\"
+    # 主表策略：选员工数最全的表
+    # 其他表：全部VLOOKUP
+    # 计算列：完整实现所有逻辑
+    pass
 
-请生成完整的fill_result_sheets函数代码。必须覆盖预期输出结构中的所有列，不允许遗漏任何一列，全部列的逻辑都生成完毕后才能结束。"""
+请生成完整的代码：
+1. 如果有数据清洗规则，先生成clean_source_data函数
+2. 然后生成fill_result_sheets函数，必须覆盖预期输出结构中的所有列，不允许遗漏任何一列"""
 
         return (template
                 .replace('__TOTAL_COLUMNS__', str(total_columns))
                 .replace('__SOURCE_STRUCTURE__', source_structure)
                 .replace('__EXPECTED_SHEETS_INFO__', expected_sheets_info)
                 .replace('__COMPRESSED_EXPECTED__', compressed_expected)
+                .replace('__DATA_CLEANING_RULES__', data_cleaning_rules_text)
                 .replace('__RULES__', rules))
 
     def generate_formula_batch_prompt(
@@ -1227,6 +1327,18 @@ def fill_columns_batch_{batch_index + 1}(ws, r, source_sheets):
         compressed_expected = self._compress_structure(expected_structure, max_length=30000)
         rules = self._remove_empty_lines(rules_content[:20000])
 
+        # 提取数据清洗规则和警告规则
+        extracted_rules = self.rule_extractor.extract_rules(rules_content)
+        data_cleaning_rules_text = ""
+
+        if extracted_rules["data_cleaning_rules"]:
+            data_cleaning_rules_text = "\n## 数据清洗规则（在clean_source_data中应用）\n"
+            data_cleaning_rules_text += "⚠️ 在将源数据写入Excel之前，必须先应用以下清洗规则过滤数据：\n\n"
+            for i, rule in enumerate(extracted_rules["data_cleaning_rules"], 1):
+                if rule['original_text'] and not rule['original_text'].startswith('--'):
+                    data_cleaning_rules_text += f"{i}. {rule['original_text']}\n"
+            data_cleaning_rules_text += "\n**实现方式**：生成clean_source_data函数，对每个DataFrame应用清洗逻辑后返回清洗后的数据。\n"
+
         # 统计总列数和sheet信息
         total_columns = 0
         expected_sheets_info = ""
@@ -1247,30 +1359,36 @@ def fill_columns_batch_{batch_index + 1}(ws, r, source_sheets):
         )
 
         # Step 3: 生成代码（包含完整上下文，不再依赖前置分析步骤）
-        step3 = f"""你是专业Python程序员，擅长人力资源行业的薪资计算、税务处理、考勤管理，同时你也是一个EXCEL公式大师，熟悉每个公式的使用方法和使用场景，需生成fill_result_sheets函数来创建结果sheet。
+        step3 = f"""你是专业Python程序员，擅长人力资源行业的薪资计算、税务处理、考勤管理，同时你也是一个EXCEL公式大师，熟悉每个公式的使用方法和使用场景。
 
 ⚠️⚠️⚠️ 本次任务共有 {total_columns} 列，你必须为每一列都生成处理逻辑，在全部 {total_columns} 列完成之前绝对不能停止生成！⚠️⚠️⚠️
 
+## 你的任务
+1. 🎯 生成 clean_source_data 函数：应用数据清洗规则过滤源数据
+2. 🎯 生成 fill_result_sheets 函数：创建结果sheet，填充数据和Excel公式
+
 ## 执行流程（固定代码已处理）
-1. ✅ 源数据已加载到 source_sheets 字典
-2. ✅ 源数据已写入Excel（供公式引用）
-3. ✅ 参数sheet已创建（参数!$B$2=年份, $B$3=月份, $B$4=月标准工时）
-4. 🎯 你的任务：创建结果sheet，填充数据和Excel公式
-5. ✅ 生成代码时要注意引用列的位置，不能假设列位置，必须用get_vlookup_col_num()函数计算列号
-6. ✅ 结果sheet的表头必须完全匹配预期结构，列顺
-7. ✅ 注意生成代码的完整性，一次性生成完整的代码
+1. ✅ 源数据已加载到 source_data 字典（DataFrame格式）
+2. 🎯 你的任务1：生成clean_source_data函数，应用清洗规则过滤数据
+3. ✅ 清洗后的数据会写入Excel（供公式引用）
+4. ✅ 参数sheet已创建（参数!$B$2=年份, $B$3=月份, $B$4=月标准工时）
+5. 🎯 你的任务2：生成fill_result_sheets函数，创建结果sheet并填充公式
+6. ✅ 生成代码时要注意引用列的位置，不能假设列位置，必须用get_vlookup_col_num()函数计算列号
+7. ✅ 结果sheet的表头必须完全匹配预期结构
 8. ✅ 参与计算的日期必须用DATEVALUE()转换
 9. ✅ 规则中指定的特殊规则必须严格遵守，禁止任何形式的简化处理
 
 ## 已有变量
 - wb: openpyxl Workbook
-- source_sheets: {{"文件名_sheet名": {{"df": DataFrame, "ws": worksheet}}}}
+- source_data: {{"文件名_sheet名": {{"df": DataFrame, "columns": [列名]}}}} （清洗前）
+- source_sheets: {{"文件名_sheet名": {{"df": DataFrame, "ws": worksheet}}}} （清洗后，写入Excel）
 
 {source_structure}
 {expected_sheets_info}
 
 ## 预期输出结构
 {compressed_expected}
+{data_cleaning_rules_text}
 
 ## 计算规则
 {rules}
@@ -1283,7 +1401,9 @@ def fill_columns_batch_{batch_index + 1}(ws, r, source_sheets):
 
 ## 【规则2】VLOOKUP是唯一跨表取数方式
 - 主表数据：直接复制,不能用VLOOKUP（会导致性能问题）
+- ⚠️ **重要**：主表数据复制时使用的是source_sheets中的数据，这些数据已经过clean_source_data函数清洗，符合所有数据清洗规则
 - 非主表数据：**必须且只能**用VLOOKUP，禁止任何其他方式
+- ⚠️ **重要**：VLOOKUP引用的源数据sheet也是清洗后的数据，已过滤掉不符合规则的记录
 
 ### VLOOKUP列号规则（最关键！必须使用get_vlookup_col_num函数）
 - ⚠️ **禁止硬编码VLOOKUP列号数字！必须使用get_vlookup_col_num()函数计算**

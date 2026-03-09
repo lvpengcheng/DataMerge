@@ -136,7 +136,7 @@ class SmartMatcherV2:
                     file_manual_headers = manual_headers.get(file_name)
 
                 parser = IntelligentExcelParser()
-                sheet_list = parser.parse_excel_file(file_path, manual_headers=file_manual_headers, headers_only=True)
+                sheet_list = parser.parse_excel_file(file_path, manual_headers=file_manual_headers, headers_only=True, active_sheet_only=True)
 
                 sheets_data = {}
                 for sheet_data in sheet_list:
@@ -175,7 +175,7 @@ class SmartMatcherV2:
                     file_manual_headers = manual_headers.get(file_name)
 
                 parser = IntelligentExcelParser()
-                sheet_list = parser.parse_excel_file(file_path, manual_headers=file_manual_headers, headers_only=True)
+                sheet_list = parser.parse_excel_file(file_path, manual_headers=file_manual_headers, headers_only=True, active_sheet_only=True)
 
                 sheets_data = {}
                 for sheet_data in sheet_list:

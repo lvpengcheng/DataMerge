@@ -263,7 +263,8 @@ class TrainingEngine:
         tenant_id: str = "default",
         salary_year: Optional[int] = None,
         salary_month: Optional[int] = None,
-        monthly_standard_hours: Optional[float] = None
+        monthly_standard_hours: Optional[float] = None,
+        force_retrain: bool = False
     ) -> Dict[str, Any]:
         """训练AI生成数据处理脚本
 
@@ -276,6 +277,9 @@ class TrainingEngine:
             salary_year: 薪资年份（可选）
             salary_month: 薪资月份（可选）
             monthly_standard_hours: 当月标准工时（可选，由调用方计算并传入）
+            force_retrain: 是否强制重新训练（默认False）
+                - False: 如果历史最佳分数=100%，直接使用历史最佳代码；如果<100%，重新训练
+                - True: 清除所有历史训练数据和最佳代码，从头开始全新训练
         """
         # 保存薪资参数供后续使用
         self.salary_year = salary_year
@@ -294,6 +298,32 @@ class TrainingEngine:
         self.training_logger = TrainingLogger(tenant_id, keyword=keyword)
         if self.stream_callback:
             self.training_logger.set_stream_callback(self.stream_callback)
+
+        # 处理强制重新训练
+        if force_retrain:
+            self.training_logger.log_info("=" * 60)
+            self.training_logger.log_info("强制重新训练模式：清除所有历史数据")
+            self.training_logger.log_info("=" * 60)
+
+            # 清除历史最佳分数和代码
+            historical_best_file = self._get_historical_best_file(tenant_id)
+            if historical_best_file.exists():
+                historical_best_file.unlink()
+                self.training_logger.log_info(f"已删除历史最佳分数文件: {historical_best_file}")
+
+            # 清除历史训练日志（可选，保留日志便于追溯）
+            # 注意：这里不删除training_logs目录，只清除历史最佳数据
+            # 如果需要清除所有训练日志，可以取消下面的注释
+            """
+            training_logs_dir = Path(f"tenants/{tenant_id}/training_logs")
+            if training_logs_dir.exists():
+                import shutil
+                shutil.rmtree(training_logs_dir)
+                training_logs_dir.mkdir(parents=True, exist_ok=True)
+                self.training_logger.log_info(f"已清除历史训练日志目录: {training_logs_dir}")
+            """
+
+            self.training_logger.log_info("历史数据清除完成，开始全新训练")
 
         # 开始训练记录
         self.training_logger.start_training(
@@ -351,7 +381,7 @@ class TrainingEngine:
             result = self._train_formula_mode(
                 source_files, expected_file, rules_content,
                 source_structure, expected_structure,
-                manual_headers, tenant_id
+                manual_headers, tenant_id, force_retrain
             )
             # 添加校验规则到结果
             result["validation_rules"] = validation_rules
@@ -552,7 +582,8 @@ class TrainingEngine:
         source_structure: Dict[str, Any],
         expected_structure: Dict[str, Any],
         manual_headers: Optional[Dict[str, Any]] = None,
-        tenant_id: str = "default"
+        tenant_id: str = "default",
+        force_retrain: bool = False
     ) -> Dict[str, Any]:
         """使用公式模式训练 - 生成使用Excel公式的Python代码
 
@@ -569,6 +600,7 @@ class TrainingEngine:
             expected_structure: 预期文件结构
             manual_headers: 手动表头配置
             tenant_id: 租户ID
+            force_retrain: 是否强制重新训练
 
         Returns:
             训练结果字典
@@ -586,6 +618,32 @@ class TrainingEngine:
         historical_best_code = historical_best.get("best_code")
         if historical_best_score > 0:
             self.training_logger.log_info(f"历史最佳分数: {historical_best_score:.2%}")
+
+        # 如果不是强制重新训练，且历史最佳分数已经是100%，直接返回，不需要再训练
+        if not force_retrain and historical_best_score >= 1.0 and historical_best_code:
+            self.training_logger.log_info("历史最佳分数已达到100%，跳过训练，直接使用历史最佳代码")
+            self.training_logger.log_training_complete(
+                best_score=historical_best_score,
+                total_iterations=0,
+                success=True,
+                best_code_length=len(historical_best_code) if historical_best_code else 0
+            )
+            return {
+                "success": True,
+                "best_score": historical_best_score,
+                "current_score": historical_best_score,
+                "historical_best_score": historical_best_score,
+                "total_iterations": 0,
+                "output_path": "",
+                "result_excel": "",
+                "comparison_excel": "",
+                "best_code": historical_best_code,
+                "mode": "formula",
+                "iteration_results": [],
+                "source_structure": source_structure,
+                "expected_structure": expected_structure,
+                "validation_rules": {}
+            }
 
         # 创建公式代码生成器
         formula_generator = FormulaCodeGenerator(

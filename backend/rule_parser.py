@@ -673,7 +673,7 @@ class ExcelRuleParser(RuleParser):
             raise FileNotFoundError(f"Excel文件不存在: {file_path}")
 
         # 使用现有的Excel解析器
-        sheet_data_list = self.excel_parser.parse_excel_file(file_path)
+        sheet_data_list = self.excel_parser.parse_excel_file(file_path, active_sheet_only=True)
 
         # 解析规则
         return self._parse_rules_from_excel(sheet_data_list, file_path)

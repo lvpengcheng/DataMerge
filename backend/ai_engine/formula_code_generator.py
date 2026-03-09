@@ -1866,6 +1866,12 @@ def main():
     )
     print(f"加载完成，共 {len(source_data)} 个源数据sheet")
 
+    # 步骤1.5: 应用数据清洗规则（如果定义了clean_source_data函数）
+    if 'clean_source_data' in globals():
+        print("步骤1.5: 应用数据清洗规则...")
+        source_data = clean_source_data(source_data)
+        print(f"清洗完成，共 {len(source_data)} 个源数据sheet")
+
     # 创建Workbook
     wb = Workbook()
     # 删除默认的空sheet（后面会创建结果sheet）
@@ -1934,6 +1940,8 @@ def main():
         AI生成的代码有时在def fill_result_sheets之前包含
         游离的f-string、注释或其他代码片段，这些会导致
         拼接后在模块级别执行出错（如 name 'r' is not defined）。
+
+        注意：现在代码中可能包含clean_source_data函数，需要保留完整的函数块。
         """
         lines = code.split('\n')
 
@@ -1947,23 +1955,57 @@ def main():
         if func_start <= 0:
             return code  # 没找到或已经在第一行
 
-        # 保留函数定义之前的合法代码（import、常量定义、辅助函数定义）
+        # 保留函数定义之前的合法代码（import、常量定义、完整的函数定义）
         clean_prefix = []
-        for i in range(func_start):
+        i = 0
+        while i < func_start:
             stripped = lines[i].strip()
-            # 保留：空行、import、常量赋值（大写变量）、def、class、注释
+
+            # 保留：空行、注释、import
             if (not stripped
                 or stripped.startswith('#')
                 or stripped.startswith('import ')
-                or stripped.startswith('from ')
-                or stripped.startswith('def ')
-                or stripped.startswith('class ')
-                or re.match(r'^[A-Z_][A-Z_0-9]*\s*=', stripped)  # 常量如 EMPTY = ...
+                or stripped.startswith('from ')):
+                clean_prefix.append(lines[i])
+                i += 1
+                continue
+
+            # 保留：常量赋值（大写变量）
+            if (re.match(r'^[A-Z_][A-Z_0-9]*\s*=', stripped)  # 常量如 EMPTY = ...
                 or re.match(r'^TXT_\w+\s*=', stripped)):  # TXT_常量
                 clean_prefix.append(lines[i])
-            else:
-                # 跳过游离代码（如 f-string、表达式等）
-                logger.info(f"清理函数定义前的游离代码: 行{i+1}: {stripped[:60]}")
+                i += 1
+                continue
+
+            # 保留：完整的函数或类定义（包括函数体）
+            if stripped.startswith('def ') or stripped.startswith('class '):
+                # 找到函数/类的结束位置（下一个顶级def/class或到func_start）
+                func_end = i + 1
+                base_indent = len(lines[i]) - len(lines[i].lstrip())
+
+                while func_end < func_start:
+                    line = lines[func_end]
+                    # 如果是空行，继续
+                    if not line.strip():
+                        func_end += 1
+                        continue
+                    # 如果缩进大于函数定义行，说明还在函数体内
+                    current_indent = len(line) - len(line.lstrip())
+                    if current_indent > base_indent:
+                        func_end += 1
+                        continue
+                    # 如果缩进等于或小于函数定义行，说明函数结束
+                    break
+
+                # 保留整个函数块
+                for j in range(i, func_end):
+                    clean_prefix.append(lines[j])
+                i = func_end
+                continue
+
+            # 跳过游离代码（如 f-string、表达式等）
+            logger.info(f"清理函数定义前的游离代码: 行{i+1}: {stripped[:60]}")
+            i += 1
 
         return '\n'.join(clean_prefix + lines[func_start:])
 
@@ -2250,20 +2292,36 @@ def main():
         return complete_code
 
     def _extract_fill_result_sheets_function(self, code: str) -> str:
-        """从完整代码中提取fill_result_sheets函数
+        """从完整代码中提取clean_source_data和fill_result_sheets函数
 
         Args:
             code: 完整代码
 
         Returns:
-            fill_result_sheets函数代码
+            提取的函数代码（可能包含clean_source_data和fill_result_sheets）
         """
         # 防御性检查：如果代码为空或None
         if not code:
             logger.warning("_extract_fill_result_sheets_function: 传入的代码为空")
             return ""
 
-        # 先尝试查找fill_result_sheets（复数形式）
+        extracted_functions = []
+
+        # 1. 尝试提取clean_source_data函数
+        clean_start_idx = code.find("def clean_source_data")
+        if clean_start_idx != -1:
+            # 查找clean_source_data函数结束位置
+            clean_end_idx = len(code)
+            # 查找下一个顶级函数定义
+            next_def_idx = code.find("\ndef ", clean_start_idx + 1)
+            if next_def_idx > clean_start_idx:
+                clean_end_idx = next_def_idx
+
+            clean_function = code[clean_start_idx:clean_end_idx].strip()
+            extracted_functions.append(clean_function)
+            logger.info("提取到clean_source_data函数")
+
+        # 2. 提取fill_result_sheets函数
         start_pattern = "def fill_result_sheets"
         start_idx = code.find(start_pattern)
 
@@ -2272,19 +2330,25 @@ def main():
             start_pattern = "def fill_result_sheet"
             start_idx = code.find(start_pattern)
 
-        if start_idx == -1:
+        if start_idx != -1:
+            # 查找函数结束位置（下一个顶级def或文件结束）
+            end_idx = len(code)
+            # 查找后续的顶级函数定义
+            next_def_patterns = ["\ndef main(", "\ndef load_", "\ndef convert_", "\ndef write_", "\n# ==="]
+            for pattern in next_def_patterns:
+                idx = code.find(pattern, start_idx + 1)
+                if idx > start_idx and idx < end_idx:
+                    end_idx = idx
+
+            fill_function = code[start_idx:end_idx].strip()
+            extracted_functions.append(fill_function)
+            logger.info("提取到fill_result_sheets函数")
+
+        if not extracted_functions:
             return ""
 
-        # 查找函数结束位置（下一个顶级def或文件结束）
-        end_idx = len(code)
-        # 查找后续的顶级函数定义
-        next_def_patterns = ["\ndef main(", "\ndef load_", "\ndef convert_", "\ndef write_", "\n# ==="]
-        for pattern in next_def_patterns:
-            idx = code.find(pattern, start_idx + 1)
-            if idx > start_idx and idx < end_idx:
-                end_idx = idx
-
-        return code[start_idx:end_idx].strip()
+        # 用两个空行连接多个函数
+        return "\n\n\n".join(extracted_functions)
 
     # ============ 多步分析模式 ============
 

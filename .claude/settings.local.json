@@ -34,7 +34,13 @@
       "Bash(python3:*)",
       "Bash(pip show:*)",
       "Bash(pip search:*)",
-      "Bash(xargs cat:*)"
+      "Bash(xargs cat:*)",
+      "Bash(tail:*)",
+      "Bash(done)",
+      "Read(//c/Users/Administrator/Desktop/training/rules/**)"
+    ],
+    "additionalDirectories": [
+      "E:\\project\\DataMerge20260224\\DataMerge\\backend\\test_data\\data_cleaning_test"
     ]
   }
 }
