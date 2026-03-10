@@ -715,6 +715,7 @@ def compare_excel_files(
                 key_values.append("")
 
             if merge_status == "left_only":
+                # 生成文件缺少这一行，所有单元格都算差异
                 unmatched_expected += 1
                 ws.cell(row=row_idx, column=1, value=key_values[0])
                 ws.cell(row=row_idx, column=2, value=key_values[1])
@@ -728,9 +729,11 @@ def compare_excel_files(
                         start_color="FFFF99", end_color="FFFF99", fill_type="solid"
                     )
                 row_idx += 1
-                total_differences += 1
+                # 修复：缺少一整行，应该增加该行所有数据列的单元格数
+                total_differences += len(compare_data_columns)
                 continue
             elif merge_status == "right_only":
+                # 生成文件多出这一行（不影响分数，因为total_cells基于预期文件）
                 unmatched_result += 1
                 ws.cell(row=row_idx, column=1, value=key_values[0])
                 ws.cell(row=row_idx, column=2, value=key_values[1])
@@ -1004,6 +1007,7 @@ def compare_dataframes(
                 key_values.append("")
 
             if merge_status == "left_only":
+                # 生成文件缺少这一行，所有单元格都算差异
                 unmatched_expected += 1
                 ws.cell(row=row_idx, column=1, value=key_values[0])
                 ws.cell(row=row_idx, column=2, value=key_values[1])
@@ -1017,9 +1021,11 @@ def compare_dataframes(
                         start_color="FFFF99", end_color="FFFF99", fill_type="solid"
                     )
                 row_idx += 1
-                total_differences += 1
+                # 修复：缺少一整行，应该增加该行所有数据列的单元格数
+                total_differences += len(compare_data_columns)
                 continue
             elif merge_status == "right_only":
+                # 生成文件多出这一行（不影响分数，因为total_cells基于预期文件）
                 unmatched_result += 1
                 ws.cell(row=row_idx, column=1, value=key_values[0])
                 ws.cell(row=row_idx, column=2, value=key_values[1])

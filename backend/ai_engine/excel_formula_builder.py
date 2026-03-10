@@ -420,8 +420,8 @@ class ExcelFormulaBuilder:
             lines.append("")
 
         lines.append("**【重要】VLOOKUP主键选择策略：**")
-        lines.append("1. 优先使用工号/员工编号作为查找键")
-        lines.append("2. 其次使用姓名或身份证号")
+        lines.append("1. 优先使用工号/员工编号/身份证号作为查找键")
+        lines.append("2. 其次使用姓名")
         lines.append("3. VLOOKUP范围必须从主键列开始，不能从$A列开始（除非主键就在A列）")
         lines.append("")
 
