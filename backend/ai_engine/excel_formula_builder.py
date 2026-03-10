@@ -91,7 +91,10 @@ class ExcelFormulaBuilder:
                     for region in sheet_data.regions:
                         # 转换为DataFrame
                         df = self._convert_region_to_dataframe(region)
-                        if df.empty:
+                        # 修改：即使DataFrame为空（只有表头没有数据），也要添加
+                        # 这样可以避免公式引用只有表头的sheet时出现KeyError
+                        # 只有当DataFrame连列名都没有时才跳过
+                        if df.empty and len(df.columns) == 0:
                             continue
 
                         # 生成sheet名称：文件名_sheet名（统一格式）
@@ -123,12 +126,20 @@ class ExcelFormulaBuilder:
         return source_info
 
     def _convert_region_to_dataframe(self, region) -> pd.DataFrame:
-        """将ExcelRegion转换为DataFrame"""
-        if not region.data:
-            return pd.DataFrame()
+        """将ExcelRegion转换为DataFrame
 
+        即使没有数据行，也会返回带列名的空DataFrame，
+        这样可以避免在引用只有表头的sheet时出现KeyError
+        """
+        # 获取列名映射
         col_letter_to_name = {v: k for k, v in region.head_data.items()}
+        columns = list(region.head_data.keys())
 
+        # 如果没有数据，返回带列名的空DataFrame
+        if not region.data:
+            return pd.DataFrame(columns=columns)
+
+        # 转换数据行
         converted_data = []
         for row in region.data:
             new_row = {}
@@ -137,7 +148,6 @@ class ExcelFormulaBuilder:
                 new_row[col_name] = value
             converted_data.append(new_row)
 
-        columns = list(region.head_data.keys())
         return pd.DataFrame(converted_data, columns=columns)
 
     def build_excel_with_formulas(

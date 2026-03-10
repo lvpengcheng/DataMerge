@@ -2194,6 +2194,7 @@ class IntelligentExcelParser:
         region.head_data = self._build_header_mapping(worksheet, header_info.start_row, header_info.end_row, max_col)
 
         if not region.head_data:
+            self.logger.warning(f"表头解析失败：行 {header_info.start_row}-{header_info.end_row} 没有找到有效的表头")
             return None
 
         region.data_row_start = header_info.end_row + 1
@@ -2204,7 +2205,9 @@ class IntelligentExcelParser:
         potential_data_end_row = self._find_data_end_row(worksheet, region.data_row_start, max_row, max_col)
 
         if potential_data_end_row < region.data_row_start:
+            # 只有表头没有数据的情况，这是正常的
             region.data_row_end = region.data_row_start - 1
+            self.logger.info(f"区域只有表头没有数据：表头行 {region.head_row_start}-{region.head_row_end}，表头数量 {len(region.head_data)}")
             return region
 
         region.data_row_end = potential_data_end_row
@@ -2264,19 +2267,22 @@ class IntelligentExcelParser:
         region.head_row_start = header_start_row
         region.head_row_end = header_end_row
         region.head_data = self._build_header_mapping(worksheet, header_start_row, header_end_row, max_col)
-        
+
         if not region.head_data:
+            self.logger.warning(f"手动指定的表头解析失败：行 {header_start_row}-{header_end_row} 没有找到有效的表头")
             return None
-        
+
         region.data_row_start = header_end_row + 1
         region.data = []
         region.formula = {}
-        
+
         # 查找数据结束行
         potential_data_end_row = self._find_data_end_row(worksheet, region.data_row_start, max_row, max_col)
-        
+
         if potential_data_end_row < region.data_row_start:
+            # 只有表头没有数据的情况，这是正常的
             region.data_row_end = region.data_row_start - 1
+            self.logger.info(f"手动指定的区域只有表头没有数据：表头行 {region.head_row_start}-{region.head_row_end}，表头数量 {len(region.head_data)}")
             return region
         
         region.data_row_end = potential_data_end_row

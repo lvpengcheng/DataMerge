@@ -652,12 +652,15 @@ def convert_region_to_dataframe(region) -> pd.DataFrame:
 
     Returns:
         转换后的DataFrame，列名为中文表头名称
+        即使没有数据行，也会返回带列名的空DataFrame
     """
-    if not region.data:
-        return pd.DataFrame()
-
     # 创建列字母到列名的反向映射
     col_letter_to_name = {v: k for k, v in region.head_data.items()}
+    columns = list(region.head_data.keys())
+
+    # 如果没有数据，返回带列名的空DataFrame
+    if not region.data:
+        return pd.DataFrame(columns=columns)
 
     # 转换数据
     converted_data = []
@@ -669,7 +672,6 @@ def convert_region_to_dataframe(region) -> pd.DataFrame:
         converted_data.append(new_row)
 
     # 创建DataFrame，确保列顺序与表头一致
-    columns = list(region.head_data.keys())
     return pd.DataFrame(converted_data, columns=columns)
 
 

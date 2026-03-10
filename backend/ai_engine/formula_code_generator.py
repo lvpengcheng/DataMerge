@@ -1605,10 +1605,20 @@ def add_header_comment(cell, source_desc: str):
 
 
 def convert_region_to_dataframe(region) -> pd.DataFrame:
-    """将ExcelRegion转换为DataFrame"""
-    if not region.data:
-        return pd.DataFrame()
+    """将ExcelRegion转换为DataFrame
+
+    即使没有数据行，也会返回带列名的空DataFrame，
+    这样可以避免在引用只有表头的sheet时出现KeyError
+    """
+    # 获取列名映射
     col_letter_to_name = {v: k for k, v in region.head_data.items()}
+    columns = list(region.head_data.keys())
+
+    # 如果没有数据，返回带列名的空DataFrame
+    if not region.data:
+        return pd.DataFrame(columns=columns)
+
+    # 转换数据行
     converted_data = []
     for row in region.data:
         new_row = {}
@@ -1616,7 +1626,7 @@ def convert_region_to_dataframe(region) -> pd.DataFrame:
             col_name = col_letter_to_name.get(col_letter, col_letter)
             new_row[col_name] = value
         converted_data.append(new_row)
-    columns = list(region.head_data.keys())
+
     return pd.DataFrame(converted_data, columns=columns)
 
 
@@ -1654,7 +1664,10 @@ def load_source_data(input_folder, manual_headers):
         for sheet_data in results:
             for region in sheet_data.regions:
                 df = convert_region_to_dataframe(region)
-                if df.empty:
+                # 修改：即使DataFrame为空（只有表头没有数据），也要添加到source_data
+                # 这样可以避免公式引用只有表头的sheet时出现KeyError
+                # 只有当DataFrame连列名都没有时才跳过
+                if df.empty and len(df.columns) == 0:
                     continue
 
                 # sheet名称格式：文件名_sheet名
@@ -1666,7 +1679,11 @@ def load_source_data(input_folder, manual_headers):
                     "df": df,
                     "columns": list(df.columns)
                 }
-                print(f"加载源数据: {sheet_name}, 列: {list(df.columns)}, 行数: {len(df)}")
+                if len(df) > 0:
+                    print(f"加载源数据: {sheet_name}, 列: {list(df.columns)}, 行数: {len(df)}")
+                else:
+                    print(f"加载源数据: {sheet_name}, 列: {list(df.columns)}, 行数: 0 (只有表头)")
+
 
     return source_data
 

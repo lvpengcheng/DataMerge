@@ -1344,9 +1344,23 @@ class ClaudeProvider(BaseAIProvider):
             default_headers={"anthropic-beta": "context-1m-2025-08-07"},
         )
 
-    def _claude_chat(self, system_prompt, messages, max_tokens=None, temperature=0.1, **kwargs):
-        """非流式调用 Anthropic SDK，返回 (content, stop_reason)"""
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ("extra_headers", "stream")}
+    def _claude_chat(self, system_prompt, messages, max_tokens=None, temperature=0.1, use_cache=True, **kwargs):
+        """非流式调用 Anthropic SDK，返回 (content, stop_reason)
+
+        Args:
+            system_prompt: 系统提示词
+            messages: 消息列表
+            max_tokens: 最大token数
+            temperature: 温度参数
+            use_cache: 是否启用提示词缓存（默认True）
+            **kwargs: 其他参数
+        """
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ("extra_headers", "stream", "use_cache")}
+
+        # 如果启用缓存，添加cache_control参数
+        if use_cache:
+            filtered_kwargs["cache_control"] = {"type": "ephemeral"}
+
         response = self._client.messages.create(
             model=self.model,
             max_tokens=max_tokens or max(self.max_tokens, 64000),
@@ -1359,9 +1373,23 @@ class ClaudeProvider(BaseAIProvider):
         stop_reason = response.stop_reason
         return content, stop_reason
 
-    def _claude_chat_stream(self, system_prompt, messages, max_tokens=None, temperature=0.1, **kwargs):
-        """流式调用 Anthropic SDK，yield (text_chunk, stop_reason)"""
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ("extra_headers", "stream")}
+    def _claude_chat_stream(self, system_prompt, messages, max_tokens=None, temperature=0.1, use_cache=True, **kwargs):
+        """流式调用 Anthropic SDK，yield (text_chunk, stop_reason)
+
+        Args:
+            system_prompt: 系统提示词
+            messages: 消息列表
+            max_tokens: 最大token数
+            temperature: 温度参数
+            use_cache: 是否启用提示词缓存（默认True）
+            **kwargs: 其他参数
+        """
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ("extra_headers", "stream", "use_cache")}
+
+        # 如果启用缓存，添加cache_control参数
+        if use_cache:
+            filtered_kwargs["cache_control"] = {"type": "ephemeral"}
+
         stop_reason = None
         with self._client.messages.stream(
             model=self.model,
