@@ -1327,8 +1327,9 @@ class TrainingEngine:
 
                 file_name = Path(file_path).name
                 parsed_data = self.excel_parser.parse_excel_file(
-                    file_path,
-                    manual_headers=manual_headers,
+                      file_path,
+                    max_data_rows=10,  # 训练时只读取10行数据用于分析结构
+          manual_headers=manual_headers,
                     active_sheet_only=True  # 只加载激活的sheet
                 )
 
@@ -1381,6 +1382,7 @@ class TrainingEngine:
 
             parsed_data = self.excel_parser.parse_excel_file(
                 expected_file,
+             max_data_rows=10,  # 训练时只读取10行数据用于分析结构
                 manual_headers=manual_headers,
                 active_sheet_only=True  # 只加载激活的sheet
             )

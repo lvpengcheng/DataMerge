@@ -2706,6 +2706,16 @@ class IntelligentExcelParser:
                         # 【性能优化】使用预编译正则
                         pattern = self._summary_en_patterns.get(keyword_lower)
                         if pattern and pattern.search(value_lower):
+                            # 额外验证：英文关键字匹配后，检查单元格值是否确实像汇总描述
+                            # 如果单元格值包含多个单词（如人名 "Sum YiShou Zhang"），
+                            # 且关键字只是其中一个单词，则不是汇总行
+                            words = value_lower.split()
+                            if len(words) > 2:
+                                # 超过2个单词，很可能是人名或其他描述性文本，不是汇总
+                                continue
+                            # 单元格值过长（超过20字符），关键字只占很小比例，不是汇总
+                            if len(value_lower) > 20 and len(keyword_lower) / len(value_lower) < 0.3:
+                                continue
                             return True
         return False
     
