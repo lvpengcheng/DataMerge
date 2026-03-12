@@ -54,6 +54,11 @@ excel_parser = IntelligentExcelParser()
 code_sandbox = CodeSandbox()
 email_handler = EmailHandler()
 
+# 训练锁字典：防止同一租户并发训练
+import threading
+from collections import defaultdict
+_training_locks = defaultdict(threading.Lock)
+
 
 @app.post("/api/train")
 async def train_model(
@@ -85,118 +90,138 @@ async def train_model(
     try:
         logger.info(f"开始训练，租户: {tenant_id}")
 
-        # 保存上传的文件
-        saved_files = await _save_uploaded_files(
-            tenant_id, rule_files, source_files, expected_result
-        )
+        # 获取租户的训练锁
+        lock = _training_locks[tenant_id]
 
-        # 解析手动表头规则
-        manual_headers_dict = None
-        if manual_headers:
-            try:
-                manual_headers_dict = json.loads(manual_headers)
-                # 规范化manual_headers格式
-                manual_headers_dict = _normalize_manual_headers(manual_headers_dict)
-            except json.JSONDecodeError as e:
-                raise HTTPException(status_code=400, detail=f"手动表头规则格式错误: {str(e)}")
+        # 尝试获取锁（非阻塞）
+        if not lock.acquire(blocking=False):
+            logger.warning(f"租户 {tenant_id} 正在训练中，拒绝新的训练请求")
+            raise HTTPException(
+                status_code=409,
+                detail=f"租户 {tenant_id} 正在训练中，请等待当前训练完成后再试"
+            )
 
-        # 创建训练引擎（会自动从配置创建AI提供者）
-        # 从环境变量读取最大训练迭代次数，默认为2
-        max_iterations = int(os.getenv("MAX_TRAINING_ITERATIONS", "2"))
-        training_engine = TrainingEngine(max_iterations=max_iterations)
+        try:
+            # 保存上传的文件
+            saved_files = await _save_uploaded_files(
+                tenant_id, rule_files, source_files, expected_result
+            )
 
-        # 执行训练
-        logger.info(f"开始调用训练引擎，源文件: {len(saved_files['source'])}, 规则文件: {len(saved_files['rules'])}")
-        training_result = training_engine.train(
-            source_files=saved_files["source"],
-            expected_file=saved_files["expected"],
-            rule_files=saved_files["rules"],
-            manual_headers=manual_headers_dict,
-            tenant_id=tenant_id,
-            salary_year=salary_year,
-            salary_month=salary_month,
-            monthly_standard_hours=monthly_standard_hours,
-            force_retrain=force_retrain
-        )
+            # 解析手动表头规则
+            manual_headers_dict = None
+            if manual_headers:
+                try:
+                    manual_headers_dict = json.loads(manual_headers)
+                    # 规范化manual_headers格式
+                    manual_headers_dict = _normalize_manual_headers(manual_headers_dict)
+                except json.JSONDecodeError as e:
+                    raise HTTPException(status_code=400, detail=f"手动表头规则格式错误: {str(e)}")
 
-        # 提取文档格式模版
-        if training_result["success"]:
-            # 解析预期文件以提取模版
-            parsed_data = excel_parser.parse_excel_file(
-                saved_files["expected"],
+            # 创建训练引擎（会自动从配置创建AI提供者）
+            # 从环境变量读取最大训练迭代次数，默认为2
+            max_iterations = int(os.getenv("MAX_TRAINING_ITERATIONS", "2"))
+            training_engine = TrainingEngine(max_iterations=max_iterations)
+
+            # 执行训练
+            logger.info(f"开始调用训练引擎，源文件: {len(saved_files['source'])}, 规则文件: {len(saved_files['rules'])}")
+            training_result = training_engine.train(
+                source_files=saved_files["source"],
+                expected_file=saved_files["expected"],
+                rule_files=saved_files["rules"],
                 manual_headers=manual_headers_dict,
-                active_sheet_only=True  # 只加载激活的sheet
-            )
-            template_schema = document_validator.extract_document_schema(parsed_data)
-
-            # 保存生成的脚本
-            script_info = storage_manager.save_script(
-                tenant_id,
-                training_result["best_code"],
-                training_result,
-                template_schema
+                tenant_id=tenant_id,
+                salary_year=salary_year,
+                salary_month=salary_month,
+                monthly_standard_hours=monthly_standard_hours,
+                force_retrain=force_retrain
             )
 
-            training_result["script_info"] = script_info
-            # 添加脚本下载链接
-            script_id = script_info.get("script_id")
-            if script_id:
-                training_result["script_download_url"] = f"/api/script/download/{tenant_id}/{script_id}"
+            # 提取文档格式模版
+            if training_result["success"]:
+                # 解析预期文件以提取模版
+                parsed_data = excel_parser.parse_excel_file(
+                    saved_files["expected"],
+                    manual_headers=manual_headers_dict,
+                    active_sheet_only=True  # 只加载激活的sheet
+                )
+                template_schema = document_validator.extract_document_schema(parsed_data)
 
-        # 移除大数据结构以减少返回体积
-        if "source_structure" in training_result:
-            del training_result["source_structure"]
-        if "expected_structure" in training_result:
-            del training_result["expected_structure"]
+                # 保存生成的脚本
+                script_info = storage_manager.save_script(
+                    tenant_id,
+                    training_result["best_code"],
+                    training_result,
+                    template_schema
+                )
 
-        # 截断 training_result 本身的 rules_content
-        if "rules_content" in training_result and training_result["rules_content"]:
-            rules = training_result["rules_content"]
-            if len(rules) > 100:
-                training_result["rules_content"] = rules[:100] + "...(已截断)"
+                training_result["script_info"] = script_info
+                # 添加脚本下载链接
+                script_id = script_info.get("script_id")
+                if script_id:
+                    training_result["script_download_url"] = f"/api/script/download/{tenant_id}/{script_id}"
 
-        if "script_info" in training_result:
-            # 删除 script_info 中的大字段
-            if "template_schema" in training_result["script_info"]:
-                del training_result["script_info"]["template_schema"]
-            if "source_structure" in training_result["script_info"]:
-                del training_result["script_info"]["source_structure"]
-            if "expected_structure" in training_result["script_info"]:
-                del training_result["script_info"]["expected_structure"]
-            # 截断 rules_content
-            if "rules_content" in training_result["script_info"]:
-                rules = training_result["script_info"]["rules_content"]
-                if rules and len(rules) > 100:
-                    training_result["script_info"]["rules_content"] = rules[:100] + "...(已截断)"
+            # 移除大数据结构以减少返回体积
+            if "source_structure" in training_result:
+                del training_result["source_structure"]
+            if "expected_structure" in training_result:
+                del training_result["expected_structure"]
 
-        # 截断代码字段（只保留前100字符）
-        if "best_code" in training_result and training_result["best_code"]:
-            code = training_result["best_code"]
-            training_result["best_code"] = code[:100] + "...(已截断)" if len(code) > 100 else code
+            # 截断 training_result 本身的 rules_content
+            if "rules_content" in training_result and training_result["rules_content"]:
+                rules = training_result["rules_content"]
+                if len(rules) > 100:
+                    training_result["rules_content"] = rules[:100] + "...(已截断)"
 
-        # 截断迭代结果中的代码和 rules_content
-        if "iteration_results" in training_result:
-            for iteration in training_result["iteration_results"]:
-                if "code" in iteration and iteration["code"]:
-                    code = iteration["code"]
-                    iteration["code"] = code[:100] + "...(已截断)" if len(code) > 100 else code
-                if "rules_content" in iteration and iteration["rules_content"]:
-                    rules = iteration["rules_content"]
-                    if len(rules) > 100:
-                        iteration["rules_content"] = rules[:100] + "...(已截断)"
+            if "script_info" in training_result:
+                # 删除 script_info 中的大字段
+                if "template_schema" in training_result["script_info"]:
+                    del training_result["script_info"]["template_schema"]
+                if "source_structure" in training_result["script_info"]:
+                    del training_result["script_info"]["source_structure"]
+                if "expected_structure" in training_result["script_info"]:
+                    del training_result["script_info"]["expected_structure"]
+                # 截断 rules_content
+                if "rules_content" in training_result["script_info"]:
+                    rules = training_result["script_info"]["rules_content"]
+                    if rules and len(rules) > 100:
+                        training_result["script_info"]["rules_content"] = rules[:100] + "...(已截断)"
 
-        # 返回训练结果
-        return {
-            "tenant_id": tenant_id,
-            "status": "completed",
-            "training_result": training_result,
-            "files_uploaded": {
-                "rules": len(rule_files),
-                "source_data": len(source_files),
-                "expected_result": 1
+            # 截断代码字段（只保留前100字符）
+            if "best_code" in training_result and training_result["best_code"]:
+                code = training_result["best_code"]
+                training_result["best_code"] = code[:100] + "...(已截断)" if len(code) > 100 else code
+
+            # 截断迭代结果中的代码和 rules_content
+            if "iteration_results" in training_result:
+                for iteration in training_result["iteration_results"]:
+                    if "code" in iteration and iteration["code"]:
+                        code = iteration["code"]
+                        iteration["code"] = code[:100] + "...(已截断)" if len(code) > 100 else code
+                    if "rules_content" in iteration and iteration["rules_content"]:
+                        rules = iteration["rules_content"]
+                        if len(rules) > 100:
+                            iteration["rules_content"] = rules[:100] + "...(已截断)"
+
+            # 返回训练结果
+            return {
+                "tenant_id": tenant_id,
+                "status": "completed",
+                "training_result": training_result,
+                "files_uploaded": {
+                    "rules": len(rule_files),
+                    "source_data": len(source_files),
+                    "expected_result": 1
+                }
             }
-        }
 
+        finally:
+            # 释放训练锁
+            lock.release()
+            logger.info(f"租户 {tenant_id} 训练锁已释放")
+
+    except HTTPException:
+        # HTTPException直接抛出（包括409冲突错误）
+        raise
     except Exception as e:
         logger.error(f"训练失败: {e}", exc_info=True)
         logger.error(f"错误类型: {type(e).__name__}")
@@ -233,6 +258,17 @@ async def train_model_stream(
     """
     try:
         logger.info(f"开始流式训练，租户: {tenant_id}")
+
+        # 获取租户的训练锁
+        lock = _training_locks[tenant_id]
+
+        # 尝试获取锁（非阻塞）
+        if not lock.acquire(blocking=False):
+            logger.warning(f"租户 {tenant_id} 正在训练中，拒绝新的流式训练请求")
+            raise HTTPException(
+                status_code=409,
+                detail=f"租户 {tenant_id} 正在训练中，请等待当前训练完成后再试"
+            )
 
         # 保存上传的文件
         saved_files = await _save_uploaded_files(
@@ -436,6 +472,9 @@ async def train_model_stream(
                 finally:
                     # 发送结束标记
                     await logs_queue.put(None)
+                    # 释放训练锁
+                    lock.release()
+                    logger.info(f"租户 {tenant_id} 流式训练锁已释放")
 
             # 启动训练任务
             training_task = asyncio.create_task(run_training())
@@ -470,6 +509,9 @@ async def train_model_stream(
             }
         )
 
+    except HTTPException:
+        # HTTPException直接抛出（包括409冲突错误）
+        raise
     except Exception as e:
         logger.error(f"流式训练初始化失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"流式训练初始化失败: {str(e)}")

@@ -1348,7 +1348,7 @@ class ClaudeProvider(BaseAIProvider):
         """非流式调用 Anthropic SDK，返回 (content, stop_reason)
 
         Args:
-            system_prompt: 系统提示词
+            system_prompt: 系统提示词（字符串或数组）
             messages: 消息列表
             max_tokens: 最大token数
             temperature: 温度参数
@@ -1357,9 +1357,15 @@ class ClaudeProvider(BaseAIProvider):
         """
         filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ("extra_headers", "stream", "use_cache")}
 
-        # 如果启用缓存，添加cache_control参数
-        if use_cache:
-            filtered_kwargs["cache_control"] = {"type": "ephemeral"}
+        # 如果启用缓存，将system_prompt转换为数组格式并添加cache_control
+        if use_cache and isinstance(system_prompt, str):
+            system_prompt = [
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ]
 
         response = self._client.messages.create(
             model=self.model,
@@ -1377,7 +1383,7 @@ class ClaudeProvider(BaseAIProvider):
         """流式调用 Anthropic SDK，yield (text_chunk, stop_reason)
 
         Args:
-            system_prompt: 系统提示词
+            system_prompt: 系统提示词（字符串或数组）
             messages: 消息列表
             max_tokens: 最大token数
             temperature: 温度参数
@@ -1386,9 +1392,15 @@ class ClaudeProvider(BaseAIProvider):
         """
         filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ("extra_headers", "stream", "use_cache")}
 
-        # 如果启用缓存，添加cache_control参数
-        if use_cache:
-            filtered_kwargs["cache_control"] = {"type": "ephemeral"}
+        # 如果启用缓存，将system_prompt转换为数组格式并添加cache_control
+        if use_cache and isinstance(system_prompt, str):
+            system_prompt = [
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ]
 
         stop_reason = None
         with self._client.messages.stream(
