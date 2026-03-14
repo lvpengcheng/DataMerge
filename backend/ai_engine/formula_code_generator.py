@@ -2437,6 +2437,117 @@ ws.conditional_formatting.add(f"D2:D{{n_rows+1}}", FormulaRule(formula=[f"D2>200
         # 用两个空行连接多个函数
         return "\n\n\n".join(extracted_functions)
 
+    @staticmethod
+    def extract_column_block(code: str, column_name: str) -> tuple:
+        """从 fill_result_sheets 函数中提取指定列名的代码块
+
+        列代码块格式：# X列(N): 列名 - 说明\\n        ws.cell(...)\\n...
+        块的范围：从该列注释开始，到下一个列注释/段落分隔符(# ===)/循环结束为止
+
+        Args:
+            code: fill_result_sheets 函数的完整代码
+            column_name: 要提取的列名，如 "绩效等级"
+
+        Returns:
+            (block_text, start_pos, end_pos) 或 (None, -1, -1) 如果未找到
+        """
+        # 匹配 # X列(N): 列名 格式的注释
+        # 列名可能包含在注释的冒号后面
+        pattern = re.compile(
+            r'^([ \t]*# [A-Z]{1,3}列\(\d+\):\s*' + re.escape(column_name) + r'.*?)$',
+            re.MULTILINE
+        )
+        match = pattern.search(code)
+        if not match:
+            return (None, -1, -1)
+
+        start_pos = match.start()
+
+        # 找到块的结束位置：下一个列注释 或 段落分隔符
+        end_pattern = re.compile(
+            r'^[ \t]*(?:# [A-Z]{1,3}列\(\d+\):|# ===)',
+            re.MULTILINE
+        )
+        end_match = end_pattern.search(code, match.end() + 1)
+        if end_match:
+            end_pos = end_match.start()
+        else:
+            # 没有后续列注释，取到函数结尾
+            end_pos = len(code)
+
+        block_text = code[start_pos:end_pos]
+        return (block_text, start_pos, end_pos)
+
+    @staticmethod
+    def replace_column_blocks(code: str, replacements: dict) -> str:
+        """批量替换多个列的代码块
+
+        Args:
+            code: fill_result_sheets 函数的完整代码
+            replacements: {"列名": "新代码块"} 字典
+
+        Returns:
+            替换后的完整代码
+        """
+        # 先收集所有要替换的位置，按位置倒序排列（从后往前替换，避免偏移）
+        replace_ops = []
+        for col_name, new_block in replacements.items():
+            old_block, start, end = FormulaCodeGenerator.extract_column_block(code, col_name)
+            if old_block is None:
+                logger.warning(f"replace_column_blocks: 未找到列 '{col_name}' 的代码块，跳过")
+                continue
+            # 确保新代码块末尾有换行
+            if not new_block.endswith('\n'):
+                new_block += '\n'
+            # 保留原始代码块后面的空行
+            trailing = code[end - 1:end] if end <= len(code) else ''
+            if not new_block.endswith('\n\n') and trailing != '\n':
+                new_block += '\n'
+            replace_ops.append((start, end, new_block))
+
+        # 按位置倒序替换
+        replace_ops.sort(key=lambda x: x[0], reverse=True)
+        for start, end, new_block in replace_ops:
+            code = code[:start] + new_block + code[end:]
+
+        return code
+
+    @staticmethod
+    def inject_pre_loop_code(code: str, new_pre_loop_code: str) -> str:
+        """在 for 循环之前注入新的初始化代码（如新的变量定义）
+
+        在 '# === N. 逐行填充 ===' 或 'for i in range' 之前插入
+
+        Args:
+            code: fill_result_sheets 函数代码
+            new_pre_loop_code: 要注入的代码行
+
+        Returns:
+            注入后的代码
+        """
+        if not new_pre_loop_code or not new_pre_loop_code.strip():
+            return code
+
+        # 查找逐行填充注释或for循环
+        insert_patterns = [
+            r'^([ \t]*# ===.*逐行填充.*===)',
+            r'^([ \t]*for\s+\w+\s+in\s+range)',
+        ]
+        for pat in insert_patterns:
+            match = re.search(pat, code, re.MULTILINE)
+            if match:
+                insert_pos = match.start()
+                # 确保新代码正确缩进和换行
+                if not new_pre_loop_code.endswith('\n'):
+                    new_pre_loop_code += '\n'
+                new_pre_loop_code += '\n'
+                code = code[:insert_pos] + new_pre_loop_code + code[insert_pos:]
+                return code
+
+        # 未找到插入点，追加到函数开头区域
+        logger.warning("inject_pre_loop_code: 未找到逐行填充标记，无法注入")
+        return code
+
     # ============ 多步分析模式 ============
 
     def _generate_with_multi_step_analysis(

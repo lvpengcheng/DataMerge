@@ -1358,7 +1358,7 @@ class ClaudeProvider(BaseAIProvider):
         filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ("extra_headers", "stream", "use_cache")}
 
         # 如果启用缓存，将system_prompt转换为数组格式并添加cache_control
-        if use_cache and isinstance(system_prompt, str):
+        if use_cache and isinstance(system_prompt, str) and system_prompt.strip():
             system_prompt = [
                 {
                     "type": "text",
@@ -1393,7 +1393,7 @@ class ClaudeProvider(BaseAIProvider):
         filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ("extra_headers", "stream", "use_cache")}
 
         # 如果启用缓存，将system_prompt转换为数组格式并添加cache_control
-        if use_cache and isinstance(system_prompt, str):
+        if use_cache and isinstance(system_prompt, str) and system_prompt.strip():
             system_prompt = [
                 {
                     "type": "text",

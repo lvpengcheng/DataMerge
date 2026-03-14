@@ -4,6 +4,7 @@
 
 import json
 import logging
+import re
 from typing import Dict, List, Any, Optional
 from pathlib import Path
 from .rule_extractor import RuleExtractor
@@ -568,6 +569,212 @@ for sheet_data in results:
 
         result = self._optimize_prompt(result, target_max_length=25000)
         self.logger.info(f"生成的提示词长度: {len(result)} 字符")
+        return result
+
+    def generate_column_adjustment_prompt(
+        self,
+        fill_function: str,
+        target_columns: list,
+        adjustment_request: str,
+        source_structure: dict,
+        expected_structure: dict,
+        rules_content: str,
+        manual_headers: dict = None
+    ) -> str:
+        """生成单列修正提示词 - AI只返回需要修改的列代码片段
+
+        Args:
+            fill_function: 当前 fill_result_sheets 函数代码（可能包含clean_source_data）
+            target_columns: 用户指定要修改的列名列表
+            adjustment_request: 用户修改说明
+            source_structure: 源数据结构
+            expected_structure: 预期输出结构
+            rules_content: 原始计算规则
+            manual_headers: 手动表头映射
+        """
+        compressed_source = self._compress_structure(source_structure, max_length=20000)
+        compressed_expected = self._compress_structure(expected_structure, max_length=15000)
+        manual_headers_str = json.dumps(manual_headers, ensure_ascii=False, indent=2) if manual_headers else "无"
+
+        columns_str = "、".join(target_columns)
+
+        # 分离 clean_source_data 和 fill_result_sheets
+        only_fill_function = fill_function
+        if "def clean_source_data" in fill_function:
+            fill_start = fill_function.find("def fill_result_sheets")
+            if fill_start == -1:
+                fill_start = fill_function.find("def fill_result_sheet")
+            if fill_start > 0:
+                only_fill_function = fill_function[fill_start:].strip()
+
+        # 提取目标列当前的代码，帮助 AI 理解上下文
+        from .formula_code_generator import FormulaCodeGenerator
+        current_columns_code = ""
+        for col_name in target_columns:
+            block, _, _ = FormulaCodeGenerator.extract_column_block(only_fill_function, col_name)
+            if block:
+                current_columns_code += f"\n### 当前 {col_name} 的代码：\n```python\n{block.strip()}\n```\n"
+            else:
+                current_columns_code += f"\n### {col_name}：未找到现有代码块（可能是新列）\n"
+
+        prompt = f"""你是专业Python程序员，擅长人力资源行业的薪资计算、税务处理、考勤管理，同时你也是一个EXCEL公式大师。
+
+# 任务：单列精准修正
+
+用户要求修改以下列：**{columns_str}**
+修改要求：{adjustment_request}
+
+## 当前完整 fill_result_sheets 函数（只读参考，不要全部返回）
+```python
+{only_fill_function}
+```
+
+## 目标列当前代码
+{current_columns_code}
+
+## 输入文件结构（跨表取数参考）
+{compressed_source}
+
+## 预期输出结构
+{compressed_expected}
+
+## 计算规则
+{rules_content[:10000]}
+
+## 手动表头映射
+{manual_headers_str}
+
+{self.CORE_RULES}
+
+# 输出格式要求（严格遵守！）
+
+请分析用户的修改要求，判断实际需要修改哪些列（可能比用户指定的多，比如修改了基本工资的取数方式，依赖它的应发工资等也需要联动修改）。
+
+按以下固定格式返回，**不要返回完整函数**，只返回需要修改的列代码片段：
+
+```
+### MODIFIED_COLUMNS: 列名1, 列名2, ...
+
+### COLUMN: X列(N): 列名
+        # X列(N): 列名 - 说明
+        ws.cell(row=r, column=N).value = ...
+### END_COLUMN
+
+### COLUMN: Y列(M): 列名
+        # Y列(M): 列名 - 说明
+        ws.cell(row=r, column=M).value = ...
+### END_COLUMN
+
+### PRE_LOOP_CODE
+    col_new_var = get_vlookup_col_num("X", "A")
+### END_PRE_LOOP_CODE
+```
+
+## 格式说明
+1. `### MODIFIED_COLUMNS:` 列出所有实际修改的列名（逗号分隔）
+2. 每个 `### COLUMN:` 到 `### END_COLUMN` 之间是一列的完整代码块
+3. 代码块必须保持原始缩进（8个空格，即for循环内的缩进）
+4. 列注释格式必须是：`# X列(N): 列名 - 说明`，与原代码保持一致
+5. `### PRE_LOOP_CODE` 到 `### END_PRE_LOOP_CODE` 之间放需要新增的循环外变量定义（如新的VLOOKUP列号变量），如果不需要新增则省略此段
+6. **不要**返回未修改的列
+7. **不要**返回完整的 fill_result_sheets 函数
+8. **不要**修改 clean_source_data 或警告规则逻辑"""
+
+        self.logger.info(f"生成单列修正提示词（结构化输出模式），目标列: {columns_str}，长度: {len(prompt)} 字符")
+        return prompt
+
+    @staticmethod
+    def parse_column_adjustment_response(ai_response: str) -> dict:
+        """解析 AI 返回的结构化列修正响应
+
+        支持多种AI输出风格：
+        - 标准格式（### COLUMN: ... ### END_COLUMN）
+        - 包裹在markdown代码块中（```...```）
+        - AI可能使用不同的空白或大小写
+
+        Returns:
+            {
+                "modified_columns": ["列名1", "列名2"],
+                "column_blocks": {"列名1": "代码块", "列名2": "代码块"},
+                "pre_loop_code": "新增的循环外代码" 或 None
+            }
+        """
+        result = {
+            "modified_columns": [],
+            "column_blocks": {},
+            "pre_loop_code": None
+        }
+
+        # 预处理：去掉markdown代码块标记
+        cleaned = ai_response
+        # 去掉 ```python ... ``` 和 ``` ... ``` 包裹
+        cleaned = re.sub(r'```(?:python|py)?\s*\n', '', cleaned)
+        cleaned = re.sub(r'\n```\s*', '\n', cleaned)
+
+        # 提取修改列列表
+        mod_match = re.search(r'###\s*MODIFIED_COLUMNS[：:]\s*(.+)', cleaned)
+        if mod_match:
+            result["modified_columns"] = [c.strip() for c in mod_match.group(1).split(",") if c.strip()]
+
+        # 提取每列代码块 - 标准格式
+        column_pattern = re.compile(
+            r'###\s*COLUMN[：:]\s*([A-Z]{1,3})列[（\(](\d+)[）\)][：:]\s*(.+?)\s*\n(.*?)###\s*END_COLUMN',
+            re.DOTALL
+        )
+        for match in column_pattern.finditer(cleaned):
+            col_letter = match.group(1)
+            col_num = match.group(2)
+            col_name = match.group(3).strip()
+            code_block = match.group(4)
+
+            # 清理代码块：去掉首尾空行，但保留缩进
+            lines = code_block.split('\n')
+            while lines and not lines[0].strip():
+                lines.pop(0)
+            while lines and not lines[-1].strip():
+                lines.pop()
+            code_block = '\n'.join(lines)
+
+            if code_block.strip():
+                result["column_blocks"][col_name] = code_block
+
+        # 如果标准格式没匹配到，尝试备用格式：
+        # AI可能直接返回列注释+代码，没有 ### COLUMN 包裹
+        if not result["column_blocks"]:
+            # 查找所有列注释块: # X列(N): 列名 - 说明
+            fallback_pattern = re.compile(
+                r'([ \t]*# ([A-Z]{1,3})列[（\(](\d+)[）\)][：:]\s*(.+?)(?:\s*-\s*.+?)?\n'
+                r'(?:[ \t]+.*\n)*)',
+                re.MULTILINE
+            )
+            for match in fallback_pattern.finditer(cleaned):
+                full_block = match.group(0)
+                col_name = match.group(4).strip()
+
+                # 清理
+                lines = full_block.split('\n')
+                while lines and not lines[-1].strip():
+                    lines.pop()
+                full_block = '\n'.join(lines)
+
+                if full_block.strip():
+                    result["column_blocks"][col_name] = full_block
+
+        # 提取循环外新增代码
+        pre_loop_match = re.search(
+            r'###\s*PRE_LOOP_CODE\s*\n(.*?)###\s*END_PRE_LOOP_CODE',
+            cleaned,
+            re.DOTALL
+        )
+        if pre_loop_match:
+            pre_code = pre_loop_match.group(1).strip()
+            if pre_code:
+                result["pre_loop_code"] = pre_code
+
+        # 如果 MODIFIED_COLUMNS 为空但有 column_blocks，从 blocks 补全
+        if not result["modified_columns"] and result["column_blocks"]:
+            result["modified_columns"] = list(result["column_blocks"].keys())
+
         return result
 
     def generate_correction_prompt_with_ai_rules(

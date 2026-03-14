@@ -1917,7 +1917,11 @@ async def revalidate_script(
             raise HTTPException(status_code=404, detail="训练源文件目录下没有Excel文件")
 
         # 查找预期文件
-        expected_file = _find_expected_file(expected_dir)
+        expected_file = None
+        if expected_dir.exists():
+            expected_files = list(expected_dir.glob("*.xlsx")) + list(expected_dir.glob("*.xls"))
+            if expected_files:
+                expected_file = expected_files[0]
         if not expected_file:
             raise HTTPException(status_code=404, detail="训练预期文件目录下没有Excel文件")
 
@@ -2277,6 +2281,7 @@ async def _execute_email_calculation(
 async def adjust_code(
     tenant_id: str = Form(...),
     adjustment_request: str = Form(...),
+    target_columns: Optional[str] = Form(None),
     salary_year: Optional[int] = Form(None),
     salary_month: Optional[int] = Form(None),
     monthly_standard_hours: Optional[float] = Form(None)
@@ -2286,6 +2291,7 @@ async def adjust_code(
     参数:
         tenant_id: 租户ID
         adjustment_request: 用户的修改要求
+        target_columns: 要修改的目标列名（逗号分隔，可选。传入时走单列修正模式）
         salary_year: 薪资年份（可选）
         salary_month: 薪资月份（可选）
         monthly_standard_hours: 当月标准工时（可选）
@@ -2352,6 +2358,11 @@ async def adjust_code(
         is_formula_mode = "def fill_result_sheets" in script_content or "def fill_result_sheet" in script_content
         ai_provider = AIProviderFactory.create_with_fallback()
 
+        # 预先定义时间戳和日志目录（供后续日志保存使用）
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        logs_dir = tenant_dir / "training_logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+
         if is_formula_mode:
             from ..ai_engine.formula_code_generator import FormulaCodeGenerator
             formula_generator = FormulaCodeGenerator(ai_provider=ai_provider)
@@ -2359,7 +2370,27 @@ async def adjust_code(
             fill_function = formula_generator._extract_fill_result_sheets_function(script_content)
             rules_content = script_info.get("rules_content", "")
 
-            adjustment_prompt = f"""你是专业Python程序员，擅长人力资源行业的薪资计算、税务处理、考勤管理，同时你也是一个EXCEL公式大师。
+            # 解析目标列
+            target_columns_list = None
+            if target_columns:
+                target_columns_list = [c.strip() for c in target_columns.split(",") if c.strip()]
+
+            if target_columns_list:
+                # 单列修正模式：使用精准的单列修正提示词
+                prompt_generator = PromptGenerator()
+                adjustment_prompt = prompt_generator.generate_column_adjustment_prompt(
+                    fill_function=fill_function,
+                    target_columns=target_columns_list,
+                    adjustment_request=adjustment_request,
+                    source_structure=script_info.get("source_structure", {}),
+                    expected_structure=script_info.get("expected_structure", {}),
+                    rules_content=rules_content,
+                    manual_headers=script_info.get("manual_headers")
+                )
+                logger.info(f"单列修正模式：目标列={target_columns_list}，prompt长度={len(adjustment_prompt)}")
+            else:
+                # 通用调整模式：保持原有逻辑
+                adjustment_prompt = f"""你是专业Python程序员，擅长人力资源行业的薪资计算、税务处理、考勤管理，同时你也是一个EXCEL公式大师。
 请根据用户要求修改fill_result_sheets函数。
 
 【任务说明】
@@ -2380,13 +2411,116 @@ async def adjust_code(
 只输出修改后的完整fill_result_sheets函数代码，不需要其他代码。确保函数签名不变。"""
 
             logger.info("公式模式：调用AI修改fill_result_sheets函数")
-            ai_response = ai_provider.generate_code(adjustment_prompt)
 
-            corrected_fill = formula_generator._extract_python_code(ai_response)
-            if corrected_fill:
-                adjusted_code = formula_generator._build_complete_code(corrected_fill)
+            # 保存调整提示词到日志
+            adjust_prompt_file = logs_dir / f"adjust_prompt_{timestamp}.txt"
+            try:
+                with open(adjust_prompt_file, 'w', encoding='utf-8') as f:
+                    f.write(f"# 调整类型: {'单列修正' if target_columns_list else '通用调整'}\n")
+                    f.write(f"# 目标列: {target_columns or '无'}\n")
+                    f.write(f"# 修改要求: {adjustment_request}\n")
+                    f.write(f"# 时间: {timestamp}\n")
+                    f.write("=" * 80 + "\n")
+                    f.write(adjustment_prompt)
+                logger.info(f"调整提示词已保存: {adjust_prompt_file.name}")
+            except Exception as e:
+                logger.warning(f"保存调整提示词失败: {e}")
+
+            if target_columns_list:
+                # 单列修正模式：直接调用chat获取原始响应，不走generate_code的AST校验
+                # 因为返回的是代码片段（缩进的循环体），AST会报unexpected indent
+                try:
+                    logger.info("单列修正：使用chat()直接获取AI原始响应")
+                    ai_response = ai_provider.chat(
+                        [{"role": "user", "content": adjustment_prompt}]
+                    )
+                    logger.info(f"单列修正：chat()返回长度={len(ai_response) if ai_response else 0}")
+                    if ai_response and len(ai_response) > 200:
+                        logger.info(f"单列修正：响应前200字符: {ai_response[:200]}")
+                except Exception as e:
+                    logger.warning(f"单列修正chat调用失败: {e}，回退到generate_completion")
+                    # 回退用generate_completion而非generate_code，避免AST校验
+                    try:
+                        ai_response = ai_provider.generate_completion(adjustment_prompt)
+                    except Exception as e2:
+                        logger.error(f"单列修正generate_completion也失败: {e2}")
+                        ai_response = None
             else:
-                adjusted_code = None
+                ai_response = ai_provider.generate_code(adjustment_prompt)
+
+            # 始终保存AI原始响应（便于调试）
+            try:
+                adjust_response_file = logs_dir / f"adjust_response_{timestamp}.txt"
+                with open(adjust_response_file, 'w', encoding='utf-8') as f:
+                    f.write(ai_response or "（AI未返回有效响应）")
+                logger.info(f"AI响应已保存: {adjust_response_file.name}")
+            except Exception as save_err:
+                logger.warning(f"保存AI响应失败: {save_err}")
+
+            if target_columns_list:
+                # 单列修正模式：解析结构化响应，用正则替换列代码块
+                parsed = PromptGenerator.parse_column_adjustment_response(ai_response)
+                logger.info(f"单列修正：AI返回修改列={parsed['modified_columns']}，"
+                           f"代码块数={len(parsed['column_blocks'])}，"
+                           f"有PRE_LOOP={parsed['pre_loop_code'] is not None}")
+
+                if parsed["column_blocks"]:
+                    # 在原始代码上做精准替换
+                    modified_code = fill_function
+
+                    # 1. 注入循环外新增变量（如有）
+                    if parsed["pre_loop_code"]:
+                        modified_code = FormulaCodeGenerator.inject_pre_loop_code(
+                            modified_code, parsed["pre_loop_code"]
+                        )
+                        logger.info(f"单列修正：已注入PRE_LOOP_CODE")
+
+                    # 2. 逐列替换
+                    replaced_cols = []
+                    for col_name, new_block in parsed["column_blocks"].items():
+                        old_block, start, end = FormulaCodeGenerator.extract_column_block(modified_code, col_name)
+                        if old_block is not None:
+                            modified_code = FormulaCodeGenerator.replace_column_blocks(
+                                modified_code, {col_name: new_block}
+                            )
+                            replaced_cols.append(col_name)
+                            logger.info(f"单列修正：已替换列 '{col_name}'")
+                        else:
+                            logger.warning(f"单列修正：未找到列 '{col_name}' 的代码块，跳过替换")
+
+                    if replaced_cols:
+                        adjusted_code = formula_generator._build_complete_code(modified_code)
+                        logger.info(f"单列修正成功：替换了 {len(replaced_cols)} 列 {replaced_cols}")
+                    else:
+                        logger.warning("单列修正：没有成功替换任何列，回退到全函数模式")
+                        adjusted_code = None
+                else:
+                    logger.warning("单列修正：AI未返回有效的列代码块，回退到全函数模式")
+                    adjusted_code = None
+
+                # 如果结构化替换失败，回退到全函数替换
+                if adjusted_code is None:
+                    logger.info("单列修正回退：尝试从AI响应中提取完整函数")
+                    corrected_fill = formula_generator._extract_python_code(ai_response)
+                    if corrected_fill:
+                        adjusted_code = formula_generator._build_complete_code(corrected_fill)
+            else:
+                # 通用调整模式：提取完整函数
+                corrected_fill = formula_generator._extract_python_code(ai_response)
+                if corrected_fill:
+                    adjusted_code = formula_generator._build_complete_code(corrected_fill)
+                else:
+                    adjusted_code = None
+
+            # 保存调整后的代码
+            if adjusted_code:
+                try:
+                    adjust_code_file = logs_dir / f"adjust_code_{timestamp}.py"
+                    with open(adjust_code_file, 'w', encoding='utf-8') as f:
+                        f.write(adjusted_code)
+                    logger.info(f"调整代码已保存: {adjust_code_file.name}")
+                except Exception as e:
+                    logger.warning(f"保存调整代码失败: {e}")
         else:
             adjustment_prompt = f"""你是专业Python程序员。以下是一段已经训练好的数据处理代码，用户希望对其进行调整。
 
@@ -2429,7 +2563,11 @@ async def adjust_code(
         if not source_files:
             raise HTTPException(status_code=404, detail="训练源文件目录下没有Excel文件")
 
-        expected_file = _find_expected_file(expected_dir)
+        expected_file = None
+        if expected_dir.exists():
+            expected_files = list(expected_dir.glob("*.xlsx")) + list(expected_dir.glob("*.xls"))
+            if expected_files:
+                expected_file = expected_files[0]
         if not expected_file:
             raise HTTPException(status_code=404, detail="训练预期文件目录下没有Excel文件")
 
@@ -2507,10 +2645,7 @@ async def adjust_code(
 
         logger.info(f"调整后分数: {new_score:.4f}, 原始分数: {original_score:.4f}")
 
-        # 保存输出和对比文件到training_logs
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        logs_dir = tenant_dir / "training_logs"
-        logs_dir.mkdir(parents=True, exist_ok=True)
+        # 保存输出和对比文件到training_logs（复用前面的timestamp和logs_dir）
 
         saved_output = logs_dir / f"adjust_output_{timestamp}_{output_file.name}"
         shutil.copy(output_file, saved_output)
