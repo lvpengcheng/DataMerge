@@ -1557,6 +1557,7 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.comments import Comment
 from openpyxl.styles import PatternFill, Font
+from openpyxl.formatting.rule import CellIsRule, FormulaRule
 from openpyxl.utils import get_column_letter, column_index_from_string
 from excel_parser import IntelligentExcelParser
 
@@ -2184,12 +2185,44 @@ def main():
 - ❌ 禁止：中文全角 （）【】""''
 - 🔍 每次输出前检查：括号、引号是否全部半角
 
-## 【规则2】VLOOKUP是最优的跨表取数方式，如果不行可以使用INDEX+MATCH，但禁止直接引用DataFrame或其他方式
+## 【规则2】跨表取数方式（按优先级排序，禁止直接引用DataFrame）
 - 主表数据：直接复制，特别是工号等主键列，直接复制值，不要用公式
-- 非主表数据：**必须优先使用**用VLOOKUP，如果VLOOKUP无法满足需求（如需要双向查找），可以使用INDEX+MATCH，但禁止直接引用DataFrame或其他方式
+- 非主表数据：必须使用Excel公式跨表取数，根据场景选择最合适的方式：
+
+### 方式A：VLOOKUP（默认首选，适用于单条件精确匹配）
 - 列号的计算非常重要，必须正确计算：列号 = 目标列位置 - 范围起始列位置 + 1
 - 格式：`=IFERROR(VLOOKUP(主键,'xxx'!$A:$Z,列号,FALSE),0)`
 - 文本主键加TEXT：`=IFERROR(VLOOKUP(TEXT(A2,"@"),'xxx'!$A:$Z,列号,FALSE),0)`
+
+### 方式B：XLOOKUP（适用于需要反向查找、自定义默认值、近似匹配）
+- 格式：`=XLOOKUP(查找值,'xxx'!查找列,'xxx'!返回列,默认值,0)`
+- 优势：无需计算列号，支持从右向左查找，默认值更灵活
+- 示例：`=XLOOKUP(A2,'xxx'!$C:$C,'xxx'!$A:$A,"未找到",0)`
+
+### 方式C：INDEX+MATCH（适用于双向查找、多条件匹配）
+- 格式：`=IFERROR(INDEX('xxx'!返回列,MATCH(查找值,'xxx'!查找列,0)),0)`
+- 多条件：`=IFERROR(INDEX('xxx'!返回列,MATCH(1,(条件1)*(条件2),0)),0)` （需Ctrl+Shift+Enter数组公式）
+- 适用场景：需要左向查找、多列联合匹配
+
+### 方式D：FILTER（适用于一对多匹配、条件筛选取值）
+- 格式：`=IFERROR(FILTER('xxx'!返回列,'xxx'!条件列=查找值),0)`
+- 适用场景：一个员工可能有多条记录需要汇总
+- 常与SUM/AVERAGE等聚合函数配合：`=SUM(FILTER('xxx'!金额列,'xxx'!工号列=A2))`
+
+### 方式E：SUMPRODUCT（适用于多条件汇总计算，兼容性最好）
+- 格式：`=SUMPRODUCT(('xxx'!条件列1=查找值1)*('xxx'!条件列2=查找值2)*('xxx'!数值列))`
+- 适用场景：多条件求和、条件计数、加权计算等
+- 条件求和：`=SUMPRODUCT(('xxx'!$A:$A=A2)*('xxx'!$B:$B="正常")*('xxx'!$D:$D))`
+- 条件计数：`=SUMPRODUCT(('xxx'!$A:$A=A2)*('xxx'!$B:$B="出勤")*1)`
+- 优势：无需Ctrl+Shift+Enter，兼容所有Excel版本，天然支持多条件
+
+### 选择原则
+- 单条件精确匹配 → 优先VLOOKUP
+- 需要反向查找或自定义未找到返回值 → XLOOKUP
+- 多条件匹配或左向查找 → INDEX+MATCH
+- 一对多匹配需要聚合 → FILTER+聚合函数
+- 多条件求和/计数/加权计算 → SUMPRODUCT
+- 所有跨表公式必须用IFERROR包裹
 
 ## 【规则3】日期必转换
 - 所有日期参与计算前必须用 `DATEVALUE()`
@@ -2217,13 +2250,46 @@ def main():
 - 一般情况下，工号都是数字格式，不需要TEXT转换
 - 只有当工号包含字母或特殊字符时，才需要用TEXT转换
 
+## 【规则7】条件格式规则（标红、高亮、颜色标记等样式）
+- 如果规则文档中要求对某些单元格进行颜色标记、标红、高亮等，必须用openpyxl的条件格式实现，不能跳过或只留注释
+- 需要额外导入：`from openpyxl.formatting.rule import CellIsRule, FormulaRule`
+- 条件格式代码放在**所有公式填充完成之后**
+
+### 数值条件格式（CellIsRule）
+- 适用于：大于/小于/等于某个数值
+- 格式：
+```python
+from openpyxl.formatting.rule import CellIsRule
+red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+# 出勤天数>20标红（E列）
+ws.conditional_formatting.add(f"E2:E{{n_rows+1}}", CellIsRule(operator="greaterThan", formula=["20"], fill=red_fill))
+```
+- 支持的operator：greaterThan, lessThan, equal, notEqual, greaterThanOrEqual, lessThanOrEqual, between
+
+### 公式条件格式（FormulaRule）
+- 适用于：复杂条件、跨列判断、文本匹配
+- 格式：
+```python
+from openpyxl.formatting.rule import FormulaRule
+yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+# 基本工资>20000标黄警告（D列）
+ws.conditional_formatting.add(f"D2:D{{n_rows+1}}", FormulaRule(formula=[f"D2>20000"], fill=yellow_fill))
+```
+
+### 常用颜色
+- 红色：FF0000（标红/警告）
+- 黄色：FFFF00（标黄/提醒）
+- 绿色：00FF00（标绿/正常）
+- 橙色：FFA500（标橙/注意）
+
 # ==================== 执行检查清单 ====================
 每生成一列公式前，按顺序检查：
-1. [ ] 是否跨表取数？→ 是 → 必须用VLOOKUP
+1. [ ] 是否跨表取数？→ 是 → 根据场景选择VLOOKUP/XLOOKUP/INDEX+MATCH/FILTER/SUMPRODUCT
 2. [ ] 是否涉及日期？→ 是 → 加DATEVALUE
 3. [ ] 是否有文本比较？→ 是 → 值加双引号（如"是"）
 4. [ ] 是否有中文标点？→ 是 → 全部改为英文
 5. [ ] f-string内有双引号？→ 是 → 外层用单引号
+6. [ ] 规则是否要求条件格式（标红/高亮等）？→ 是 → 在公式填充后用CellIsRule/FormulaRule实现
 
 # ==================== 快速参考 ====================
 ## VLOOKUP列号计算
@@ -2233,14 +2299,18 @@ def main():
 ## 常用模板
 | 场景 | 公式模板 |
 |------|---------|
-| 跨表取数 | `=IFERROR(VLOOKUP(A2,'表名'!$A:$Z,列号,FALSE),0)` |
+| 跨表取数(VLOOKUP) | `=IFERROR(VLOOKUP(A2,'表名'!$A:$Z,列号,FALSE),0)` |
+| 跨表取数(XLOOKUP) | `=XLOOKUP(A2,'表名'!$A:$A,'表名'!$E:$E,"",0)` |
+| 跨表取数(INDEX+MATCH) | `=IFERROR(INDEX('表名'!$E:$E,MATCH(A2,'表名'!$A:$A,0)),0)` |
+| 跨表一对多汇总(FILTER) | `=SUM(FILTER('表名'!$D:$D,'表名'!$A:$A=A2))` |
+| 跨表多条件汇总(SUMPRODUCT) | `=SUMPRODUCT(('表名'!$A:$A=A2)*('表名'!$B:$B="正常")*('表名'!$D:$D))` |
 | 日期比较 | `=IF(DATEVALUE(A2)>参数!$B$5,"是","否")` |
 | 表内汇总 | `=SUMIF('表名'!$A:$A,A2,'表名'!$C:$C)` |
 | 参数引用 | `参数!$B$4` (绝对引用) |
 
 ## 禁止行为（立即停止）
 - ❌ "暂时跳过" / "简化为0" → 必须完整实现
-- ❌ 直接引用DataFrame值 → 必须改用VLOOKUP
+- ❌ 直接引用DataFrame值 → 必须改用Excel跨表公式（VLOOKUP/XLOOKUP/INDEX+MATCH/FILTER/SUMPRODUCT）
 - ❌ 跨行不闭合引号 → 每行必须独立完整
 - ❌ 禁止在结果报表内使用sumif等汇总函数 → 汇总必须在源数据sheet完成
 

@@ -25,7 +25,9 @@ class RuleExtractor:
         result = {
             "data_cleaning_rules": [],
             "warning_rules": [],
-            "import_validation_rules": {}
+            "import_validation_rules": {},
+            "conditional_format_rules": [],
+            "precision_rules": []
         }
 
         # 提取数据清洗规则
@@ -39,6 +41,14 @@ class RuleExtractor:
         # 提取导入校验规则
         import_rules = self._extract_import_validation_rules(rules_content)
         result["import_validation_rules"] = import_rules
+
+        # 提取条件格式规则（标红、高亮、颜色标记等）
+        cf_rules = self._extract_conditional_format_rules(rules_content)
+        result["conditional_format_rules"] = cf_rules
+
+        # 提取数值精度规则（小数位数、四舍五入等）
+        precision_rules = self._extract_precision_rules(rules_content)
+        result["precision_rules"] = precision_rules
 
         return result
 
@@ -126,10 +136,10 @@ class RuleExtractor:
         """提取警告规则"""
         rules = []
 
-        # 查找"警告信息"章节
-        # 支持多种格式：## 六、警告信息  ## 四、警告信息  ## 警告信息
+        # 查找"警告信息/警告规则"章节
+        # 支持多种格式：## 六、警告信息  ## 四、警告规则  ## 警告信息
         warning_section_match = re.search(
-            r'#+\s*(?:[一二三四五六七八九十\d]+[、.．]\s*)?警告信息\s*\n(.*?)(?=\n#+\s*|\Z)',
+            r'#+\s*(?:[一二三四五六七八九十\d]+[、.．]\s*)?警告(?:信息|规则)\s*\n(.*?)(?=\n#+\s*|\Z)',
             content,
             re.DOTALL | re.IGNORECASE
         )
@@ -140,11 +150,13 @@ class RuleExtractor:
         warning_content = warning_section_match.group(1)
 
         # 提取每条警告规则
-        # 匹配段落（非空行）
-        paragraphs = [p.strip() for p in warning_content.split('\n') if p.strip() and not p.strip().startswith('---')]
+        rule_lines = re.findall(r'^[\s]*[-•]\s*(.+?)$', warning_content, re.MULTILINE)
 
-        for para in paragraphs:
-            parsed_rule = self._parse_warning_rule(para)
+        for line in rule_lines:
+            line = line.strip()
+            if not line or line.startswith('---'):
+                continue
+            parsed_rule = self._parse_warning_rule(line)
             if parsed_rule:
                 rules.append(parsed_rule)
 
@@ -208,6 +220,156 @@ class RuleExtractor:
             rules[table_name] = [r.strip() for r in rule_lines if r.strip()]
 
         return rules
+
+    def _extract_precision_rules(self, content: str) -> List[Dict[str, Any]]:
+        """提取数值精度规则（小数位数、四舍五入等）"""
+        rules = []
+
+        # 查找"数值精度"或"精度规则"章节
+        for section_keyword in [r'数值精度', r'精度规则', r'小数精度', r'数据精度']:
+            section_match = re.search(
+                r'#+\s*(?:[一二三四五六七八九十\d]+[、.．]\s*)?' + section_keyword + r'\s*\n(.*?)(?=\n#+\s*|\Z)',
+                content,
+                re.DOTALL | re.IGNORECASE
+            )
+            if section_match:
+                section_content = section_match.group(1)
+                rule_lines = re.findall(r'^[\s]*[-•\d.]\s*(.+?)$', section_content, re.MULTILINE)
+                for line in rule_lines:
+                    line = line.strip()
+                    if line and not line.startswith('---'):
+                        rules.append({"original_text": line})
+
+        # 全文扫描精度相关描述
+        precision_patterns = re.findall(
+            r'(.{0,30}(?:保留\d+位小数|四舍五入|取整|精度).{0,50})',
+            content
+        )
+        for match in precision_patterns:
+            match = re.sub(r'^[\s\-•]+', '', match).strip()
+            if not match:
+                continue
+            if any(match in r['original_text'] or r['original_text'] in match for r in rules):
+                continue
+            if match.startswith('#') or match.startswith('//'):
+                continue
+            rules.append({"original_text": match})
+
+        return rules
+
+    def _extract_conditional_format_rules(self, content: str) -> List[Dict[str, Any]]:
+        """提取条件格式规则（标红、高亮、颜色标记、加粗等样式规则）"""
+        rules = []
+
+        # 方式1：查找专门的"条件格式"或"特殊规则"章节
+        for section_keyword in [r'条件格式[规则]*', r'特殊规则', r'显示规则', r'样式规则']:
+            cf_section_match = re.search(
+                r'#+\s*(?:[一二三四五六七八九十\d]+[、.．]\s*)?' + section_keyword + r'\s*\n(.*?)(?=\n#+\s*|\Z)',
+                content,
+                re.DOTALL | re.IGNORECASE
+            )
+            if cf_section_match:
+                cf_content = cf_section_match.group(1)
+                rule_lines = re.findall(r'^[\s]*[-•\d.]\s*(.+?)$', cf_content, re.MULTILINE)
+                for line in rule_lines:
+                    line = line.strip()
+                    if line and not line.startswith('---'):
+                        # 只提取包含样式相关关键词的行
+                        if self._is_conditional_format_line(line):
+                            parsed = self._parse_conditional_format_rule(line)
+                            if parsed:
+                                rules.append(parsed)
+
+        # 方式2：全文扫描含有条件格式关键词的规则行
+        cf_patterns = [
+            r'(.{0,50}(?:标红|标黄|标绿|标蓝|变红|变黄|高亮|底色|背景色|字体颜色|加粗显示|颜色标记|条件格式|标注[红黄绿蓝橙]色|[红黄绿蓝橙]色(?:标[注记]|显示|提[醒示])|填充[红黄绿蓝橙]色).{0,80})',
+        ]
+        for pattern in cf_patterns:
+            matches = re.findall(pattern, content)
+            for match in matches:
+                match = re.sub(r'^[\s\-•]+', '', match).strip()
+                if not match:
+                    continue
+                # 避免重复（已在章节中提取的）
+                if any(match in r['original_text'] or r['original_text'] in match for r in rules):
+                    continue
+                # 排除非规则性内容（如代码注释、日志等）
+                if match.startswith('#') or match.startswith('//') or 'import' in match:
+                    continue
+                parsed = self._parse_conditional_format_rule(match)
+                if parsed:
+                    rules.append(parsed)
+
+        return rules
+
+    def _is_conditional_format_line(self, text: str) -> bool:
+        """判断一行文本是否包含条件格式相关关键词"""
+        keywords = [
+            '标红', '标黄', '标绿', '标蓝', '变红', '变黄',
+            '高亮', '底色', '背景色', '字体颜色', '加粗显示', '加粗',
+            '颜色标记', '条件格式', '红色', '黄色', '绿色', '蓝色', '橙色',
+            '标注', '着色', '变色',
+        ]
+        return any(kw in text for kw in keywords)
+
+    def _parse_conditional_format_rule(self, rule_text: str) -> Dict[str, Any]:
+        """解析单条条件格式规则"""
+        rule = {
+            "original_text": rule_text,
+            "field": None,
+            "condition": None,
+            "style": None
+        }
+
+        # 提取样式类型
+        style_map = {
+            "标红": {"type": "fill", "color": "FF0000"},
+            "变红": {"type": "fill", "color": "FF0000"},
+            "红色": {"type": "fill", "color": "FF0000"},
+            "标黄": {"type": "fill", "color": "FFFF00"},
+            "变黄": {"type": "fill", "color": "FFFF00"},
+            "黄色": {"type": "fill", "color": "FFFF00"},
+            "标绿": {"type": "fill", "color": "00FF00"},
+            "绿色": {"type": "fill", "color": "00FF00"},
+            "标蓝": {"type": "fill", "color": "0000FF"},
+            "蓝色": {"type": "fill", "color": "0000FF"},
+            "橙色": {"type": "fill", "color": "FFA500"},
+            "高亮": {"type": "fill", "color": "FFFF00"},
+            "加粗显示": {"type": "font", "bold": True},
+            "加粗": {"type": "font", "bold": True},
+        }
+        for keyword, style in style_map.items():
+            if keyword in rule_text:
+                rule["style"] = style
+                break
+
+        # 提取条件（大于、小于、等于、不等于等）
+        condition_match = re.search(
+            r'(大于|小于|等于|不等于|超过|低于|>=|<=|>|<|=)\s*(\d+\.?\d*)',
+            rule_text
+        )
+        if condition_match:
+            op_text = condition_match.group(1)
+            value = condition_match.group(2)
+            op_map = {
+                "大于": "greaterThan", "超过": "greaterThan", ">": "greaterThan",
+                "小于": "lessThan", "低于": "lessThan", "<": "lessThan",
+                "等于": "equal", "=": "equal",
+                "不等于": "notEqual",
+                ">=": "greaterThanOrEqual",
+                "<=": "lessThanOrEqual",
+            }
+            rule["condition"] = {
+                "operator": op_map.get(op_text, "greaterThan"),
+                "value": value
+            }
+
+        # 提取字段名
+        field_match = re.search(r'[【""]?([^】"""\s]{2,8})[】""]?\s*(?:大于|小于|等于|不等于|超过|低于|>=|<=|>|<)', rule_text)
+        if field_match:
+            rule["field"] = field_match.group(1)
+
+        return rule
 
     def _extract_field_name(self, text: str) -> str:
         """从文本中提取字段名"""
@@ -281,6 +443,22 @@ class RuleExtractor:
                 sections.append(f"\n### {table_name}\n")
                 for rule in table_rules:
                     sections.append(f"- {rule}\n")
+            sections.append("\n")
+
+        # 格式化条件格式规则
+        if rules.get("conditional_format_rules"):
+            sections.append("## 条件格式规则\n")
+            sections.append("在填充公式后，需要对以下情况应用条件格式（使用openpyxl的conditional_formatting）：\n")
+            for i, rule in enumerate(rules["conditional_format_rules"], 1):
+                sections.append(f"{i}. {rule['original_text']}\n")
+            sections.append("\n**重要**: 使用`from openpyxl.formatting.rule import CellIsRule`实现条件格式，放在公式填充之后。\n\n")
+
+        # 格式化数值精度规则
+        if rules.get("precision_rules"):
+            sections.append("## 数值精度规则\n")
+            sections.append("在生成公式时，必须按以下精度要求使用ROUND函数：\n")
+            for i, rule in enumerate(rules["precision_rules"], 1):
+                sections.append(f"{i}. {rule['original_text']}\n")
             sections.append("\n")
 
         return "".join(sections)

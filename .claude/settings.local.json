@@ -37,7 +37,10 @@
       "Bash(xargs cat:*)",
       "Bash(tail:*)",
       "Bash(done)",
-      "Read(//c/Users/Administrator/Desktop/training/rules/**)"
+      "Read(//c/Users/Administrator/Desktop/training/rules/**)",
+      "Read(//c/Users/Administrator/Downloads/**)",
+      "Read(//e/project/DataMerge20260224/**)",
+      "Bash(wc -l /e/project/DataMerge20260224/DataMerge/backend/ai_engine/*.py)"
     ],
     "additionalDirectories": [
       "E:\\project\\DataMerge20260224\\DataMerge\\backend\\test_data\\data_cleaning_test"
