@@ -23,6 +23,42 @@ document.addEventListener('DOMContentLoaded', function() {
                 }
             }, 200);
         });
+
+        // 添加focus和input事件
+        input.addEventListener('focus', showTenantDropdown);
+        input.addEventListener('input', filterTenantDropdown);
+    }
+
+    // 监听文件选择
+    const sourceFiles = document.getElementById('source-files');
+    const targetFile = document.getElementById('target-file');
+    const ruleFiles = document.getElementById('rule-files');
+
+    console.log('File inputs found:', {
+        sourceFiles: !!sourceFiles,
+        targetFile: !!targetFile,
+        ruleFiles: !!ruleFiles
+    });
+
+    if (sourceFiles) {
+        sourceFiles.addEventListener('change', () => {
+            console.log('source-files changed');
+            updateFileList('source-files', 'source-file-list');
+        });
+    }
+
+    if (targetFile) {
+        targetFile.addEventListener('change', () => {
+            console.log('target-file changed');
+            updateFileList('target-file', 'target-file-list');
+        });
+    }
+
+    if (ruleFiles) {
+        ruleFiles.addEventListener('change', () => {
+            console.log('rule-files changed');
+            updateFileList('rule-files', 'rule-file-list');
+        });
     }
 });
 
@@ -136,7 +172,7 @@ function onTenantSelected(tenantId) {
 
     // 重置右侧
     resetProgress();
-    document.getElementById('result-section').style.display = 'none';
+    clearResultSection();
 
     // 如果有训练历史，显示结果
     const tenantHistory = trainingHistoryData[tenantId];
@@ -319,7 +355,6 @@ function showHistoryResult(tenantId, tenantHistory) {
     downloadHtml += '</div>';
 
     resultDownloads.innerHTML = downloadHtml;
-    resultSection.style.display = 'block';
 }
 
 // ==================== 训练流程 ====================
@@ -344,7 +379,7 @@ async function startTraining() {
     document.getElementById('start-training-btn').disabled = true;
     document.getElementById('start-training-btn').textContent = '训练中...';
 
-    document.getElementById('result-section').style.display = 'none';
+    clearResultSection();
     resetProgress();
 
     const formData = new FormData();
@@ -356,6 +391,27 @@ async function startTraining() {
     Array.from(sourceFiles).forEach(file => formData.append('source_files', file));
     formData.append('target_file', targetFile);
     Array.from(ruleFiles).forEach(file => formData.append('rule_files', file));
+
+    // 添加可选参数
+    const salaryMonth = document.getElementById('salary-month').value.trim();
+    const standardHours = document.getElementById('standard-hours').value.trim();
+    const manualHeaders = document.getElementById('manual-headers').value.trim();
+
+    // 解析薪资年月（格式：2026-03）
+    if (salaryMonth) {
+        const parts = salaryMonth.split('-');
+        if (parts.length === 2) {
+            const year = parseInt(parts[0]);
+            const month = parseInt(parts[1]);
+            if (!isNaN(year) && !isNaN(month)) {
+                formData.append('salary_year', year);
+                formData.append('salary_month', month);
+            }
+        }
+    }
+
+    if (standardHours) formData.append('monthly_standard_hours', standardHours);
+    if (manualHeaders) formData.append('manual_headers', manualHeaders);
 
     trainingStartTime = Date.now();
     startTimer();
@@ -559,8 +615,6 @@ function showResult(data) {
             <button class="btn btn-secondary" onclick="resetTraining()">重新训练</button>
         </div>
     `;
-
-    resultSection.style.display = 'block';
 }
 
 function showError(message) {
@@ -580,12 +634,6 @@ function showError(message) {
             </div>
         </div>
     `;
-
-    resultSection.style.display = 'block';
-    stopTimer();
-
-    document.getElementById('start-training-btn').disabled = false;
-    document.getElementById('start-training-btn').textContent = '开始训练';
 }
 
 // ==================== 进度条和日志 ====================
@@ -635,8 +683,15 @@ function resetProgress() {
     updateProgressBar(0);
 }
 
+function clearResultSection() {
+    const resultCard = document.getElementById('result-card');
+    const resultDownloads = document.getElementById('result-downloads');
+    resultCard.innerHTML = '<p style="color: #999; text-align: center; padding: 20px;">等待训练完成...</p>';
+    resultDownloads.innerHTML = '';
+}
+
 function resetTraining() {
-    document.getElementById('result-section').style.display = 'none';
+    clearResultSection();
     document.getElementById('start-training-btn').disabled = false;
     document.getElementById('start-training-btn').textContent = '开始训练';
     resetProgress();
@@ -898,4 +953,31 @@ async function submitAdjustment() {
         submitBtn.disabled = false;
         submitBtn.textContent = '开始修正';
     }
+}
+
+// ==================== 文件列表显示 ====================
+
+function updateFileList(inputId, listId) {
+    const input = document.getElementById(inputId);
+    const list = document.getElementById(listId);
+
+    console.log('updateFileList called:', inputId, 'files:', input?.files?.length);
+
+    if (!input || !list) {
+        console.error('Element not found:', inputId, listId);
+        return;
+    }
+
+    if (!input.files || input.files.length === 0) {
+        list.innerHTML = '';
+        return;
+    }
+
+    let html = '<div style="margin-top: 8px; font-size: 13px; color: #666;">';
+    Array.from(input.files).forEach(file => {
+        html += `<div style="padding: 4px 0;">📄 ${file.name}</div>`;
+    });
+    html += '</div>';
+    list.innerHTML = html;
+    console.log('File list updated:', list.innerHTML);
 }

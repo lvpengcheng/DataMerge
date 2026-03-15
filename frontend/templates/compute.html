@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>智算页面 - DataMerge</title>
+    <link rel="stylesheet" href="/static/css/compute.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🧮 智算页面</h1>
+            <nav class="nav-links">
+                <a href="/training">训练页面</a>
+                <a href="/compute" class="active">智算页面</a>
+            </nav>
+        </header>
+
+        <div class="main-content">
+            <!-- 左侧配置 -->
+            <section class="config-section">
+                <h2>计算配置</h2>
+
+                <div class="form-group">
+                    <label for="tenant-input">租户ID:</label>
+                    <div class="combo-container" id="tenant-combo">
+                        <input type="text"
+                               id="tenant-input"
+                               placeholder="输入或选择租户ID"
+                               autocomplete="off">
+                        <div class="combo-dropdown" id="tenant-dropdown"></div>
+                    </div>
+                </div>
+
+                <div class="form-group" id="script-selector-group" style="display: none;">
+                    <label for="script-selector">计算版本:</label>
+                    <select id="script-selector">
+                        <option value="">加载中...</option>
+                    </select>
+                    <div class="script-info" id="script-info"></div>
+                </div>
+
+                <div class="form-group">
+                    <label for="source-files">源文件:</label>
+                    <input type="file" id="source-files" multiple accept=".xlsx,.xls" required>
+                    <div class="file-list" id="source-file-list"></div>
+                </div>
+
+                <div class="form-group">
+                    <label for="salary-month">薪资年月 (可选):</label>
+                    <input type="text" id="salary-month" placeholder="例如: 2026-03">
+                </div>
+
+                <div class="form-group">
+                    <label for="standard-hours">标准工时 (可选):</label>
+                    <input type="number" id="standard-hours" placeholder="例如: 174" step="0.1">
+                </div>
+
+                <button class="btn btn-primary" id="compute-btn" disabled>
+                    开始计算
+                </button>
+            </section>
+
+            <!-- 右侧结果 -->
+            <div class="right-panel">
+                <section class="result-section">
+                    <h2>计算进度</h2>
+
+                    <div class="status-card">
+                        <div class="status-header">
+                            <span class="status-label">当前状态:</span>
+                            <span class="status-value" id="current-status">等待计算</span>
+                        </div>
+                        <div class="progress-bar-container">
+                            <div class="progress-bar" id="progress-bar"></div>
+                            <span class="progress-text" id="progress-text">0%</span>
+                        </div>
+                    </div>
+
+                    <div class="log-container">
+                        <h3>执行日志</h3>
+                        <div class="log-content" id="log-content">
+                            <div class="log-entry info"><span class="log-timestamp">[--:--:--]</span>等待开始计算...</div>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="download-section">
+                    <h2>计算结果</h2>
+                    <div class="result-card" id="result-card">
+                        <p style="color: #999; text-align: center; padding: 20px;">等待计算完成...</p>
+                    </div>
+                    <div class="result-downloads" id="result-downloads"></div>
+                </section>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/compute.js"></script>
+</body>
+</html>

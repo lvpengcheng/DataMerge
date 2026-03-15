@@ -41,7 +41,8 @@
       "Read(//c/Users/Administrator/Downloads/**)",
       "Read(//e/project/DataMerge20260224/**)",
       "Bash(wc -l /e/project/DataMerge20260224/DataMerge/backend/ai_engine/*.py)",
-      "Bash(netstat -ano)"
+      "Bash(netstat -ano)",
+      "Bash(node -c training.js)"
     ],
     "additionalDirectories": [
       "E:\\project\\DataMerge20260224\\DataMerge\\backend\\test_data\\data_cleaning_test"

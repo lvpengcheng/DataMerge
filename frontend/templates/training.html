@@ -10,6 +10,10 @@
     <div class="container">
         <header>
             <h1>智训</h1>
+            <nav class="nav-links">
+                <a href="/training" class="active">训练页面</a>
+                <a href="/compute">智算页面</a>
+            </nav>
             <div class="tenant-info">
                 <span>租户ID: <strong id="tenant-id">-</strong></span>
             </div>
@@ -25,9 +29,7 @@
                         <div class="combo-box" id="tenant-combo">
                             <input type="text" id="tenant-input"
                                    placeholder="输入或选择租户ID"
-                                   autocomplete="off"
-                                   onfocus="showTenantDropdown()"
-                                   oninput="filterTenantDropdown()">
+                                   autocomplete="off">
                             <div class="combo-dropdown" id="tenant-dropdown"></div>
                         </div>
                     </div>
@@ -81,26 +83,41 @@
                     </div>
 
                     <div class="form-group">
+                        <label for="salary-month">薪资年月 (可选):</label>
+                        <input type="text" id="salary-month" placeholder="例如: 2026-03">
+                    </div>
+
+                    <div class="form-group">
+                        <label for="standard-hours">标准工时 (可选):</label>
+                        <input type="number" id="standard-hours" placeholder="例如: 174" step="0.1">
+                    </div>
+
+                    <div class="form-group">
+                        <label for="manual-headers">手动表头 (可选):</label>
+                        <textarea id="manual-headers" rows="3" placeholder="每行一个表头名称，例如:&#10;姓名&#10;部门&#10;基本工资"></textarea>
+                    </div>
+
+                    <div class="form-group">
                         <label for="ai-provider">AI 模型:</label>
                         <select id="ai-provider">
+                            <option value="deepseek">DeepSeek</option>
                             <option value="claude">Claude (推荐)</option>
                             <option value="openai">OpenAI GPT-4</option>
-                            <option value="deepseek">DeepSeek</option>
                         </select>
                     </div>
 
                     <div class="form-group">
                         <label for="mode">生成模式:</label>
                         <select id="mode">
+                            <option value="formula">公式模式</option>
                             <option value="auto">自动选择</option>
                             <option value="modular">模块化模式</option>
-                            <option value="formula">公式模式</option>
                         </select>
                     </div>
 
                     <div class="form-group">
                         <label for="max-iterations">最大迭代次数:</label>
-                        <input type="number" id="max-iterations" value="5" min="1" max="10">
+                        <input type="number" id="max-iterations" value="1" min="1" max="10">
                     </div>
 
                     <div class="form-group">
@@ -160,9 +177,11 @@
                 </section>
 
                 <!-- 训练结果区 -->
-                <section class="result-section" id="result-section" style="display: none;">
+                <section class="result-section" id="result-section">
                     <h2>训练结果</h2>
-                    <div class="result-card" id="result-card"></div>
+                    <div class="result-card" id="result-card">
+                        <p style="color: #999; text-align: center; padding: 20px;">等待训练完成...</p>
+                    </div>
                     <div class="result-downloads" id="result-downloads"></div>
                 </section>
             </div>

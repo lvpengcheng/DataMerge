@@ -61,7 +61,17 @@ for sheet_data in results:
 3. **DataFrame初始化**: 用 base_df = 源表.copy()，禁止空DataFrame后赋值
 4. **apply用法**: df["列"].apply(lambda x: ...)，x是单值，非Series
 5. **列名匹配**: 源文件列名可能与规则不一致，需建立语义映射
-6. **ROUND操作**: 仅规则明确要求时才添加"""
+6. **ROUND操作**: 仅规则明确要求时才添加
+7. **动态查找源数据**: 使用 find_source_sheet(source_sheets, target_columns=[...], sheet_name_hint="...") 查找源数据sheet，不要硬编码文件名。例如：
+   ```python
+   # 错误示例（硬编码文件名）：
+   df_main = source_sheets['1薪资备份表_Sheet1']["df"]
+
+   # 正确示例（动态查找）：
+   key_salary = find_source_sheet(source_sheets, target_columns=["姓名", "部门", "基本工资"], sheet_name_hint="薪资")
+   df_main = source_sheets[key_salary]["df"]
+   ```
+   这样可以避免计算时因文件名不同导致KeyError。"""
 
     def __init__(self):
         self.templates = self._load_templates()

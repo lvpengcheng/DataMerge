@@ -163,6 +163,10 @@ class TrainingEngine:
         """获取历史最佳分数文件路径"""
         return Path("tenants") / tenant_id / "best_history.json"
 
+    def _get_historical_best_file(self, tenant_id: str) -> Path:
+        """获取历史最佳分数文件路径（别名方法）"""
+        return self._get_best_history_path(tenant_id)
+
     def _load_historical_best(self, tenant_id: str) -> Dict[str, Any]:
         """加载租户的历史最佳分数和代码
 

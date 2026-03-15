@@ -1724,6 +1724,48 @@ def write_source_sheets(wb, source_data):
     return source_sheets
 
 
+def find_source_sheet(source_sheets, target_columns=None, sheet_name_hint=None):
+    """辅助函数：根据列名或sheet名称提示查找源数据sheet
+
+    这个函数用于在计算时动态查找源数据sheet，避免硬编码文件名导致的KeyError。
+
+    Args:
+        source_sheets: 源数据字典 {"文件名_sheet名": {"df": DataFrame, "ws": worksheet}}
+        target_columns: 目标列名列表（用于匹配），例如 ["姓名", "部门", "基本工资"]
+        sheet_name_hint: sheet名称提示（比如"薪资"、"考勤"等关键词）
+
+    Returns:
+        匹配的sheet key，如果找不到返回None
+    """
+    # 策略1: 如果只有一个sheet，直接返回
+    if len(source_sheets) == 1:
+        return list(source_sheets.keys())[0]
+
+    # 策略2: 根据列名匹配（如果提供了target_columns）
+    if target_columns:
+        best_match = None
+        best_score = 0
+        for sheet_key, sheet_data in source_sheets.items():
+            sheet_columns = set(sheet_data["df"].columns)
+            target_set = set(target_columns)
+            # 计算列名匹配度
+            match_count = len(sheet_columns & target_set)
+            if match_count > best_score:
+                best_score = match_count
+                best_match = sheet_key
+        if best_match and best_score > 0:
+            return best_match
+
+    # 策略3: 根据sheet名称提示匹配
+    if sheet_name_hint:
+        for sheet_key in source_sheets.keys():
+            if sheet_name_hint in sheet_key:
+                return sheet_key
+
+    # 策略4: 返回第一个sheet
+    return list(source_sheets.keys())[0] if source_sheets else None
+
+
 def write_params_sheet(wb, salary_year, salary_month, monthly_standard_hours):
     """创建参数sheet，存储薪资参数供公式引用
 
@@ -2235,11 +2277,11 @@ def main():
   - **如果Excel公式中只包含单引号（如sheet名），使用双引号f-string：f"..."**
   - ✅ 正确示例：
     - `f'=TEXT(A1,"YYYY-MM-DD")'` ← 公式中有双引号，外层用单引号
-    - `f'=DATEDIF(N{r},DATE(参数!$B$2,参数!$B$3+1,0),"Y")'` ← 公式中有双引号，外层用单引号
-    - `f"=VLOOKUP(K{r},'{sn_bank}'!$A:$J,{col_num},FALSE)"` ← 公式中只有单引号，外层用双引号
+    - `f'=DATEDIF(N{{r}},DATE(参数!$B$2,参数!$B$3+1,0),"Y")'` ← 公式中有双引号，外层用单引号
+    - `f"=VLOOKUP(K{{r}},'{sn_bank}'!$A:$J,{col_num},FALSE)"` ← 公式中只有单引号，外层用双引号
   - ❌ 错误示例：
     - `f"=TEXT(A1,\"YYYY-MM-DD\")"` ← 错误！双引号冲突
-    - `f"=DATEDIF(N{r},DATE(参数!$B$2,参数!$B$3+1,0),""Y"")"` ← 错误！双引号冲突
+    - `f"=DATEDIF(N{{r}},DATE(参数!$B$2,参数!$B$3+1,0),""Y"")"` ← 错误！双引号冲突
 
 ## 【规则5】模块导入规则（严格执行，违反=立即失败）
 - ❌ 禁止在函数内部导入已在顶层导入的模块（会导致UnboundLocalError）

@@ -2802,6 +2802,437 @@ def _extract_code_from_response(response: str):
     return response.strip() if response and response.strip() else None
 
 
+@app.post("/api/compute/stream")
+async def compute_with_script_stream(
+    tenant_id: str = Form(...),
+    script_id: str = Form(...),
+    source_files: List[UploadFile] = File(...),
+    salary_year: Optional[int] = Form(None),
+    salary_month: Optional[int] = Form(None),
+    standard_hours: Optional[float] = Form(None)
+):
+    """使用已训练的脚本进行计算（流式输出日志）
+
+    Args:
+        tenant_id: 租户ID
+        script_id: 脚本ID
+        source_files: 源文件列表
+        salary_year: 薪资年份（可选）
+        salary_month: 薪资月份（可选）
+        standard_hours: 标准工时（可选）
+    """
+    import tempfile
+    import shutil
+    import io
+    import sys
+    from datetime import datetime
+
+    try:
+        logger.info(f"开始流式计算，租户: {tenant_id}, 脚本: {script_id}")
+
+        # 获取脚本内容
+        script_content = storage_manager.get_script_content(tenant_id, script_id)
+        if not script_content:
+            raise HTTPException(status_code=404, detail=f"脚本不存在: {script_id}")
+
+        # 创建异步生成器来流式输出日志
+        async def stream_compute_logs():
+            """流式输出计算日志"""
+            logs_queue = asyncio.Queue(maxsize=10000)
+
+            async def run_compute():
+                temp_dir = None
+                try:
+                    # 发送开始消息
+                    start_msg = {
+                        "type": "status",
+                        "message": "计算开始",
+                        "tenant_id": tenant_id,
+                        "script_id": script_id,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    await logs_queue.put(json.dumps(start_msg, ensure_ascii=False))
+
+                    # 创建临时目录
+                    temp_dir = Path(tempfile.mkdtemp(prefix="compute_"))
+
+                    # 保存源文件
+                    source_dir = temp_dir / "source"
+                    source_dir.mkdir(parents=True, exist_ok=True)
+
+                    log_msg = {
+                        "type": "log",
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "level": "info",
+                        "message": f"保存源文件到临时目录: {source_dir}"
+                    }
+                    await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+
+                    for file in source_files:
+                        file_path = source_dir / file.filename
+                        with open(file_path, 'wb') as f:
+                            shutil.copyfileobj(file.file, f)
+                        log_msg = {
+                            "type": "log",
+                            "timestamp": datetime.now().strftime("%H:%M:%S"),
+                            "level": "info",
+                            "message": f"已保存源文件: {file.filename}"
+                        }
+                        await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+
+                    # 保存脚本
+                    script_path = temp_dir / f"{script_id}.py"
+                    script_path.write_text(script_content, encoding='utf-8')
+
+                    # 执行脚本
+                    output_dir = temp_dir / "output"
+                    output_dir.mkdir(parents=True, exist_ok=True)
+
+                    log_msg = {
+                        "type": "log",
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "level": "info",
+                        "message": "开始执行计算脚本..."
+                    }
+                    await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+
+                    # 在线程池中执行脚本（避免阻塞事件循环）
+                    import concurrent.futures
+                    loop = asyncio.get_event_loop()
+
+                    def execute_script():
+                        # 捕获标准输出
+                        output_buffer = io.StringIO()
+                        old_stdout = sys.stdout
+                        sys.stdout = output_buffer
+
+                        try:
+                            # 动态导入并执行
+                            import importlib.util
+                            sys.path.insert(0, str(temp_dir))
+                            spec = importlib.util.spec_from_file_location("compute_script", script_path)
+                            module = importlib.util.module_from_spec(spec)
+
+                            # 设置全局变量
+                            module.input_folder = str(source_dir)
+                            module.output_folder = str(output_dir)
+                            if salary_year is not None:
+                                module.salary_year = salary_year
+                            if salary_month is not None:
+                                module.salary_month = salary_month
+                            if standard_hours is not None:
+                                module.monthly_standard_hours = standard_hours
+
+                            spec.loader.exec_module(module)
+
+                            # 调用main函数
+                            if hasattr(module, 'main'):
+                                import inspect
+                                sig = inspect.signature(module.main)
+                                params = list(sig.parameters.keys())
+
+                                kwargs = {}
+                                if len(params) >= 2:
+                                    args = [str(source_dir), str(output_dir)]
+                                    if 'salary_year' in params and salary_year is not None:
+                                        kwargs['salary_year'] = salary_year
+                                    if 'salary_month' in params and salary_month is not None:
+                                        kwargs['salary_month'] = salary_month
+                                    if 'monthly_standard_hours' in params and standard_hours is not None:
+                                        kwargs['monthly_standard_hours'] = standard_hours
+                                    result = module.main(*args, **kwargs)
+                                elif len(params) == 0:
+                                    result = module.main()
+                                else:
+                                    result = module.main(str(source_dir))
+                            else:
+                                raise Exception("脚本缺少main函数")
+
+                            return {"success": True, "output": output_buffer.getvalue()}
+                        finally:
+                            sys.stdout = old_stdout
+
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        exec_result = await loop.run_in_executor(executor, execute_script)
+
+                    # 发送脚本输出日志
+                    if exec_result.get("output"):
+                        for line in exec_result["output"].split('\n'):
+                            if line.strip():
+                                log_msg = {
+                                    "type": "log",
+                                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                    "level": "info",
+                                    "message": line
+                                }
+                                await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+
+                    # 查找输出文件
+                    output_files = list(output_dir.glob("*.xlsx"))
+                    if not output_files:
+                        raise Exception("未生成输出文件")
+
+                    output_file = output_files[0]
+
+                    log_msg = {
+                        "type": "log",
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "level": "success",
+                        "message": f"生成输出文件: {output_file.name}"
+                    }
+                    await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+
+                    # 保存到租户目录
+                    tenant_dir = storage_manager.get_tenant_dir(tenant_id)
+                    compute_dir = tenant_dir / "compute_results"
+                    compute_dir.mkdir(parents=True, exist_ok=True)
+
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    saved_file = compute_dir / f"result_{timestamp}_{output_file.name}"
+                    shutil.copy(output_file, saved_file)
+
+                    # 统计行数
+                    import openpyxl
+                    wb = openpyxl.load_workbook(saved_file)
+                    rows_processed = sum(ws.max_row for ws in wb.worksheets)
+
+                    log_msg = {
+                        "type": "log",
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "level": "success",
+                        "message": f"结果已保存，共处理 {rows_processed} 行数据"
+                    }
+                    await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+
+                    # 发送完成消息
+                    final_result = {
+                        "type": "complete",
+                        "success": True,
+                        "data": {
+                            "output_file": saved_file.name,
+                            "rows_processed": rows_processed,
+                            "tenant_id": tenant_id,
+                            "script_id": script_id
+                        }
+                    }
+                    await logs_queue.put(json.dumps(final_result, ensure_ascii=False))
+
+                except Exception as e:
+                    logger.error(f"计算执行失败: {e}", exc_info=True)
+                    error_result = {
+                        "type": "error",
+                        "message": str(e),
+                        "tenant_id": tenant_id,
+                        "script_id": script_id,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    await logs_queue.put(json.dumps(error_result, ensure_ascii=False))
+                finally:
+                    # 清理临时目录
+                    if temp_dir and temp_dir.exists():
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                    # 发送结束标记
+                    await logs_queue.put(None)
+
+            # 启动计算任务
+            compute_task = asyncio.create_task(run_compute())
+
+            try:
+                # 流式输出日志
+                while True:
+                    log_message = await logs_queue.get()
+                    if log_message is None:
+                        break  # 结束标记
+                    # 发送日志消息
+                    yield f"data: {log_message}\n\n"
+            finally:
+                # 确保计算任务完成
+                if not compute_task.done():
+                    compute_task.cancel()
+                    try:
+                        await compute_task
+                    except asyncio.CancelledError:
+                        pass
+
+        # 返回流式响应
+        return StreamingResponse(
+            stream_compute_logs(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"流式计算初始化失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/compute")
+async def compute_with_script(
+    tenant_id: str = Form(...),
+    script_id: str = Form(...),
+    source_files: List[UploadFile] = File(...),
+    salary_year: Optional[int] = Form(None),
+    salary_month: Optional[int] = Form(None),
+    standard_hours: Optional[float] = Form(None)
+):
+    """使用已训练的脚本进行计算
+
+    Args:
+        tenant_id: 租户ID
+        script_id: 脚本ID
+        source_files: 源文件列表
+        salary_year: 薪资年份（可选）
+        salary_month: 薪资月份（可选）
+        standard_hours: 标准工时（可选）
+    """
+    import tempfile
+    import shutil
+    from datetime import datetime
+
+    try:
+        # 获取脚本内容
+        script_content = storage_manager.get_script_content(tenant_id, script_id)
+        if not script_content:
+            raise HTTPException(status_code=404, detail=f"脚本不存在: {script_id}")
+
+        # 创建临时目录
+        temp_dir = Path(tempfile.mkdtemp(prefix="compute_"))
+
+        try:
+            # 保存源文件
+            source_dir = temp_dir / "source"
+            source_dir.mkdir(parents=True, exist_ok=True)
+
+            for file in source_files:
+                file_path = source_dir / file.filename
+                with open(file_path, 'wb') as f:
+                    shutil.copyfileobj(file.file, f)
+
+            # 保存脚本
+            script_path = temp_dir / f"{script_id}.py"
+            script_path.write_text(script_content, encoding='utf-8')
+
+            # 执行脚本
+            output_dir = temp_dir / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            # 动态导入并执行
+            import sys
+            import importlib.util
+
+            sys.path.insert(0, str(temp_dir))
+            spec = importlib.util.spec_from_file_location("compute_script", script_path)
+            module = importlib.util.module_from_spec(spec)
+
+            # 设置全局变量（供不带参数的main()函数使用）
+            module.input_folder = str(source_dir)
+            module.output_folder = str(output_dir)
+            if salary_year is not None:
+                module.salary_year = salary_year
+            if salary_month is not None:
+                module.salary_month = salary_month
+            if standard_hours is not None:
+                module.monthly_standard_hours = standard_hours
+
+            spec.loader.exec_module(module)
+
+            # 调用main函数（智能传递参数）
+            if hasattr(module, 'main'):
+                # 检查main函数的签名，只传递它接受的参数
+                import inspect
+                sig = inspect.signature(module.main)
+                params = list(sig.parameters.keys())
+
+                # 构建参数字典
+                kwargs = {}
+
+                # 基本参数（位置参数）
+                if len(params) >= 2:
+                    # 如果有至少2个参数，按位置传递 source_dir 和 output_dir
+                    args = [str(source_dir), str(output_dir)]
+
+                    # 可选参数（关键字参数）
+                    if 'salary_year' in params and salary_year is not None:
+                        kwargs['salary_year'] = salary_year
+                    if 'salary_month' in params and salary_month is not None:
+                        kwargs['salary_month'] = salary_month
+                    if 'monthly_standard_hours' in params and standard_hours is not None:
+                        kwargs['monthly_standard_hours'] = standard_hours
+
+                    result = module.main(*args, **kwargs)
+                elif len(params) == 0:
+                    # main() 不带参数，使用全局变量方式（已在上面设置）
+                    result = module.main()
+                else:
+                    # 只有1个参数，尝试传递 source_dir
+                    result = module.main(str(source_dir))
+            else:
+                raise HTTPException(status_code=500, detail="脚本缺少main函数")
+
+            # 查找输出文件
+            output_files = list(output_dir.glob("*.xlsx"))
+            if not output_files:
+                raise HTTPException(status_code=500, detail="未生成输出文件")
+
+            output_file = output_files[0]
+
+            # 保存到租户目录
+            tenant_dir = storage_manager.get_tenant_dir(tenant_id)
+            compute_dir = tenant_dir / "compute_results"
+            compute_dir.mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            saved_file = compute_dir / f"result_{timestamp}_{output_file.name}"
+            shutil.copy(output_file, saved_file)
+
+            # 统计行数
+            import openpyxl
+            wb = openpyxl.load_workbook(saved_file)
+            rows_processed = sum(ws.max_row for ws in wb.worksheets)
+
+            return {
+                "success": True,
+                "output_file": saved_file.name,
+                "rows_processed": rows_processed,
+                "tenant_id": tenant_id,
+                "script_id": script_id
+            }
+
+        finally:
+            # 清理临时目录
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    except Exception as e:
+        logger.error(f"计算失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/download-compute-result/{tenant_id}/{filename}")
+async def download_compute_result(tenant_id: str, filename: str):
+    """下载计算结果文件"""
+    try:
+        tenant_dir = storage_manager.get_tenant_dir(tenant_id)
+        file_path = tenant_dir / "compute_results" / filename
+
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail="文件不存在")
+
+        return FileResponse(
+            path=str(file_path),
+            filename=filename,
+            media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+    except Exception as e:
+        logger.error(f"下载计算结果失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ==================== 前端页面路由 ====================
 
 @app.get("/training", response_class=HTMLResponse)
@@ -2816,17 +3247,22 @@ async def training_page():
 
 @app.get("/", response_class=HTMLResponse)
 async def index_page():
-    """首页 - 重定向到训练页面"""
+    """首页 - 返回训练页面"""
     _frontend_dir = Path(__file__).resolve().parent.parent.parent / "frontend"
-    # 优先返回 index.html
-    index_file = _frontend_dir / "index.html"
-    if index_file.exists():
-        return HTMLResponse(content=index_file.read_text(encoding="utf-8"))
-    # 回退到训练页面
     template_file = _frontend_dir / "templates" / "training.html"
     if template_file.exists():
         return HTMLResponse(content=template_file.read_text(encoding="utf-8"))
     return HTMLResponse(content="<h1>DataMerge - 请访问 <a href='/training'>训练页面</a></h1>")
+
+
+@app.get("/compute", response_class=HTMLResponse)
+async def compute_page():
+    """智算页面"""
+    _frontend_dir = Path(__file__).resolve().parent.parent.parent / "frontend"
+    template_file = _frontend_dir / "templates" / "compute.html"
+    if template_file.exists():
+        return HTMLResponse(content=template_file.read_text(encoding="utf-8"))
+    return HTMLResponse(content="<h1>智算页面未找到</h1>")
 
 
 # ==================== 前端兼容API端点 ====================
