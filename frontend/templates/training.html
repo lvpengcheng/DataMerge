@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DataMerge - 训练可视化</title>
+    <link rel="stylesheet" href="/static/css/training.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>智训</h1>
+            <div class="tenant-info">
+                <span>租户ID: <strong id="tenant-id">-</strong></span>
+            </div>
+        </header>
+
+        <div class="main-content">
+            <!-- 训练配置区 -->
+            <section class="config-section">
+                <h2>训练配置</h2>
+                <form id="training-form">
+                    <div class="form-group">
+                        <label for="tenant-input">租户ID:</label>
+                        <div class="combo-box" id="tenant-combo">
+                            <input type="text" id="tenant-input"
+                                   placeholder="输入或选择租户ID"
+                                   autocomplete="off"
+                                   onfocus="showTenantDropdown()"
+                                   oninput="filterTenantDropdown()">
+                            <div class="combo-dropdown" id="tenant-dropdown"></div>
+                        </div>
+                    </div>
+
+                    <!-- 训练ID下拉（仅已训练租户显示） -->
+                    <div class="form-group" id="script-selector-group" style="display: none;">
+                        <label for="script-select">训练ID:</label>
+                        <select id="script-select">
+                        </select>
+                    </div>
+
+                    <!-- 租户训练状态面板 -->
+                    <div class="tenant-status-card" id="tenant-status-card" style="display: none;">
+                        <h3>训练状态</h3>
+                        <div class="status-grid">
+                            <div class="status-item">
+                                <span class="label">最佳分数:</span>
+                                <span class="value" id="tenant-best-score">-</span>
+                            </div>
+                            <div class="status-item">
+                                <span class="label">脚本ID:</span>
+                                <span class="value" id="tenant-script-id">-</span>
+                            </div>
+                            <div class="status-item">
+                                <span class="label">上次训练:</span>
+                                <span class="value" id="tenant-last-training">-</span>
+                            </div>
+                            <div class="status-item">
+                                <span class="label">训练状态:</span>
+                                <span class="value" id="tenant-training-status">-</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="source-files">源文件:</label>
+                        <input type="file" id="source-files" multiple accept=".xlsx,.xls" required>
+                        <div class="file-list" id="source-file-list"></div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="target-file">目标文件:</label>
+                        <input type="file" id="target-file" accept=".xlsx,.xls" required>
+                        <div class="file-list" id="target-file-list"></div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="rule-files">规则文件 (可选):</label>
+                        <input type="file" id="rule-files" multiple accept=".md,.txt,.pdf,.docx">
+                        <div class="file-list" id="rule-file-list"></div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="ai-provider">AI 模型:</label>
+                        <select id="ai-provider">
+                            <option value="claude">Claude (推荐)</option>
+                            <option value="openai">OpenAI GPT-4</option>
+                            <option value="deepseek">DeepSeek</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="mode">生成模式:</label>
+                        <select id="mode">
+                            <option value="auto">自动选择</option>
+                            <option value="modular">模块化模式</option>
+                            <option value="formula">公式模式</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="max-iterations">最大迭代次数:</label>
+                        <input type="number" id="max-iterations" value="5" min="1" max="10">
+                    </div>
+
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="force-retrain">
+                            强制重新训练（清除历史数据）
+                        </label>
+                    </div>
+
+                    <button type="submit" id="start-training-btn" class="btn btn-primary">
+                        开始训练
+                    </button>
+                </form>
+            </section>
+
+            <!-- 右侧区域 -->
+            <div class="right-panel">
+                <!-- 训练进度区（始终显示） -->
+                <section class="progress-section" id="progress-section">
+                    <h2>训练进度</h2>
+
+                    <div class="status-card">
+                        <div class="status-header">
+                            <span class="status-label">当前状态:</span>
+                            <span class="status-value" id="current-status">等待训练</span>
+                        </div>
+                        <div class="progress-bar-container">
+                            <div class="progress-bar" id="progress-bar"></div>
+                            <span class="progress-text" id="progress-text">0%</span>
+                        </div>
+                    </div>
+
+                    <div class="iteration-info">
+                        <div class="info-item">
+                            <span class="label">训练轮次:</span>
+                            <span class="value" id="current-iteration">0</span>
+                            <span class="separator">/</span>
+                            <span class="value" id="max-iteration">-</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="label">已用时间:</span>
+                            <span class="value" id="elapsed-time">--:--</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="label">准确率:</span>
+                            <span class="value" id="accuracy">-</span>
+                        </div>
+                    </div>
+
+                    <!-- 实时日志 -->
+                    <div class="log-container">
+                        <h3>实时日志</h3>
+                        <div class="log-content" id="log-content">
+                            <div class="log-entry info"><span class="log-timestamp">[--:--:--]</span>等待训练开始...</div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 训练结果区 -->
+                <section class="result-section" id="result-section" style="display: none;">
+                    <h2>训练结果</h2>
+                    <div class="result-card" id="result-card"></div>
+                    <div class="result-downloads" id="result-downloads"></div>
+                </section>
+            </div>
+        </div>
+    </div>
+
+    <!-- 调整逻辑弹窗 -->
+    <div class="modal-overlay" id="adjust-modal" style="display: none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>调整列逻辑</h2>
+                <button class="modal-close" onclick="closeAdjustModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="modal-loading" id="adjust-loading">
+                    <div class="loading">正在获取差异列信息...</div>
+                </div>
+                <div id="adjust-rules-summary"></div>
+                <div id="adjust-columns-list"></div>
+                <div class="form-group" style="margin-top: 15px;">
+                    <label>AI 模型:</label>
+                    <select id="adjust-ai-provider">
+                        <option value="claude">Claude (推荐)</option>
+                        <option value="openai">OpenAI GPT-4</option>
+                        <option value="deepseek">DeepSeek</option>
+                    </select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeAdjustModal()">取消</button>
+                <button class="btn btn-primary" id="adjust-submit-btn" onclick="submitAdjustment()">开始修正</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/training.js"></script>
+</body>
+</html>

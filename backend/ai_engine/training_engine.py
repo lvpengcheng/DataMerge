@@ -852,6 +852,7 @@ class TrainingEngine:
                     "saved_comparison_path": saved_comparison_path,
                     "comparison": comparison_text,
                     "detailed_diff": detailed_diff_text,  # 详细差异信息
+                    "field_diff_samples": field_diff_samples,  # 按字段分类的差异
                     "code": code
                 }
                 iteration_results.append(iteration_result)

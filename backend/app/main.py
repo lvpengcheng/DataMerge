@@ -12,7 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -47,6 +48,11 @@ app.add_middleware(
     allow_headers=["*"],  # 允许所有HTTP头
 )
 
+# 挂载前端静态文件
+_frontend_dir = Path(__file__).resolve().parent.parent.parent / "frontend"
+if _frontend_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(_frontend_dir / "static")), name="static")
+
 # 初始化组件
 storage_manager = StorageManager()
 document_validator = DocumentValidator()
@@ -62,13 +68,14 @@ _training_locks = defaultdict(threading.Lock)
 
 @app.post("/api/train")
 async def train_model(
-    tenant_id: str = Form(...),  # 从路径参数改为表单参数
+    tenant_id: str = Form(...),
     rule_files: List[UploadFile] = File(...),
     source_files: List[UploadFile] = File(...),
-    expected_result: UploadFile = File(...),
+    expected_result: Optional[UploadFile] = File(None),
+    target_file: Optional[UploadFile] = File(None),
     manual_headers: Optional[str] = Form(None),
-    salary_year: Optional[int] = Form(None),  # 可选的薪资年份
-    salary_month: Optional[int] = Form(None),  # 可选的薪资月份
+    salary_year: Optional[int] = Form(None),
+    salary_month: Optional[int] = Form(None),
     monthly_standard_hours: Optional[float] = Form(None),  # 可选的当月标准工时
     force_retrain: bool = Form(False)  # 是否强制重新训练
 ):
@@ -89,6 +96,12 @@ async def train_model(
     """
     try:
         logger.info(f"开始训练，租户: {tenant_id}")
+
+        # 兼容前端字段名：target_file 和 expected_result 二选一
+        if expected_result is None and target_file is not None:
+            expected_result = target_file
+        if expected_result is None:
+            raise HTTPException(status_code=400, detail="缺少预期结果文件（expected_result 或 target_file）")
 
         # 获取租户的训练锁
         lock = _training_locks[tenant_id]
@@ -231,15 +244,19 @@ async def train_model(
 
 @app.post("/api/train/stream")
 async def train_model_stream(
-    tenant_id: str = Form(...),  # 从路径参数改为表单参数
+    tenant_id: str = Form(...),
     rule_files: List[UploadFile] = File(...),
     source_files: List[UploadFile] = File(...),
-    expected_result: UploadFile = File(...),
+    expected_result: Optional[UploadFile] = File(None),
+    target_file: Optional[UploadFile] = File(None),
     manual_headers: Optional[str] = Form(None),
-    salary_year: Optional[int] = Form(None),  # 可选的薪资年份
-    salary_month: Optional[int] = Form(None),  # 可选的薪资月份
-    monthly_standard_hours: Optional[float] = Form(None),  # 可选的当月标准工时
-    force_retrain: bool = Form(False)  # 是否强制重新训练
+    salary_year: Optional[int] = Form(None),
+    salary_month: Optional[int] = Form(None),
+    monthly_standard_hours: Optional[float] = Form(None),
+    ai_provider: Optional[str] = Form(None),
+    mode: Optional[str] = Form(None),
+    max_iterations: Optional[int] = Form(None),
+    force_retrain: bool = Form(False)
 ):
     """流式训练AI生成数据处理脚本（支持实时日志输出）
 
@@ -258,6 +275,12 @@ async def train_model_stream(
     """
     try:
         logger.info(f"开始流式训练，租户: {tenant_id}")
+
+        # 兼容前端字段名：target_file 和 expected_result 二选一
+        if expected_result is None and target_file is not None:
+            expected_result = target_file
+        if expected_result is None:
+            raise HTTPException(status_code=400, detail="缺少预期结果文件（expected_result 或 target_file）")
 
         # 获取租户的训练锁
         lock = _training_locks[tenant_id]
@@ -291,44 +314,63 @@ async def train_model_stream(
             logs_queue = asyncio.Queue(maxsize=10000)  # 增加队列大小
 
             def log_callback(message: str):
-                """日志回调函数"""
+                """日志回调函数 - 解析日志消息并转换为前端事件格式"""
                 try:
-                    # 解析日志消息，提取级别和内容
-                    import re
+                    import re as _re
                     # 使用 re.DOTALL 让 . 匹配换行符
-                    match = re.match(r'^\[(\d{2}:\d{2}:\d{2})\] \[(\w+)\] (.+)$', message, re.DOTALL)
+                    match = _re.match(r'^\[(\d{2}:\d{2}:\d{2})\] \[(\w+)\] (.+)$', message, _re.DOTALL)
                     if match:
                         timestamp, level, content = match.groups()
                         level_lower = level.lower()
+
+                        # 检测迭代开始事件：匹配 "开始调用AI生成代码 (迭代: N, ...)"
+                        iter_start = _re.search(r'迭代[:\s]*(\d+)', content)
+                        if iter_start and ('开始' in content or '生成代码' in content):
+                            iteration = int(iter_start.group(1))
+                            iter_event = {
+                                "type": "iteration_start",
+                                "iteration": iteration,
+                                "total": effective_max_iterations,
+                                "message": content
+                            }
+                            logs_queue.put_nowait(json.dumps(iter_event, ensure_ascii=False))
+
+                        # 检测迭代完成事件：匹配 "第 N 次迭代完成 - 分数: XX.XX%"
+                        iter_complete = _re.search(r'第\s*(\d+)\s*次迭代完成.*?分数[:\s]*(\d+\.?\d*)%', content)
+                        if iter_complete:
+                            iteration = int(iter_complete.group(1))
+                            accuracy = float(iter_complete.group(2)) / 100.0
+                            iter_event = {
+                                "type": "iteration_complete",
+                                "iteration": iteration,
+                                "success": accuracy >= 0.95,
+                                "accuracy": accuracy,
+                                "message": content
+                            }
+                            logs_queue.put_nowait(json.dumps(iter_event, ensure_ascii=False))
 
                         # 判断是否是AI代码流式输出
                         if level_lower == "code":
                             log_data = {
                                 "type": "code_stream",
-                                "data": {
-                                    "timestamp": timestamp,
-                                    "chunk": content
-                                }
+                                "timestamp": timestamp,
+                                "chunk": content
                             }
                         else:
                             log_data = {
                                 "type": "log",
-                                "data": {
-                                    "timestamp": timestamp,
-                                    "level": level_lower,
-                                    "message": content
-                                }
+                                "timestamp": timestamp,
+                                "level": level_lower,
+                                "message": content
                             }
                         logs_queue.put_nowait(json.dumps(log_data, ensure_ascii=False))
                     else:
                         # 直接发送原始消息
                         log_data = {
                             "type": "log",
-                            "data": {
-                                "timestamp": datetime.now().strftime("%H:%M:%S"),
-                                "level": "info",
-                                "message": message
-                            }
+                            "timestamp": datetime.now().strftime("%H:%M:%S"),
+                            "level": "info",
+                            "message": message
                         }
                         logs_queue.put_nowait(json.dumps(log_data, ensure_ascii=False))
                 except asyncio.QueueFull:
@@ -338,23 +380,28 @@ async def train_model_stream(
                     print(f"[ERROR] log_callback异常: {e}")
 
             # 创建训练引擎并设置流式回调
-            max_iterations = int(os.getenv("MAX_TRAINING_ITERATIONS", "2"))
+            effective_max_iterations = max_iterations or int(os.getenv("MAX_TRAINING_ITERATIONS", "2"))
             training_engine = TrainingEngine(
-                max_iterations=max_iterations,
+                max_iterations=effective_max_iterations,
                 stream_callback=log_callback
             )
+
+            # 如果前端指定了AI提供者，临时设置环境变量
+            original_ai_provider = None
+            if ai_provider:
+                original_ai_provider = os.environ.get("AI_PROVIDER")
+                os.environ["AI_PROVIDER"] = ai_provider
+                logger.info(f"使用前端指定的AI提供者: {ai_provider}")
 
             # 在后台执行训练
             async def run_training():
                 try:
-                    # 发送开始消息
+                    # 发送开始消息（兼容前端 status 事件格式）
                     start_msg = {
-                        "type": "start",
-                        "data": {
-                            "tenant_id": tenant_id,
-                            "message": "训练开始",
-                            "timestamp": datetime.now().isoformat()
-                        }
+                        "type": "status",
+                        "message": "训练开始",
+                        "tenant_id": tenant_id,
+                        "timestamp": datetime.now().isoformat()
                     }
                     await logs_queue.put(json.dumps(start_msg, ensure_ascii=False))
 
@@ -441,18 +488,21 @@ async def train_model_stream(
                                 if len(rules) > 100:
                                     iteration["rules_content"] = rules[:100] + "...(已截断)"
 
-                    # 发送最终结果
+                    # 发送最终结果（兼容前端 complete 事件格式）
+                    script_id = training_result.get("script_info", {}).get("script_id")
+                    best_score = training_result.get("best_score", 0)
+                    total_iterations = training_result.get("total_iterations", 0)
+
                     final_result = {
-                        "type": "result",
+                        "type": "complete",
+                        "success": training_result.get("success", False),
                         "data": {
+                            "script_id": script_id,
+                            "iterations": total_iterations,
+                            "final_accuracy": best_score,
                             "tenant_id": tenant_id,
                             "status": "completed",
-                            "training_result": training_result,
-                            "files_uploaded": {
-                                "rules": len(rule_files),
-                                "source_data": len(source_files),
-                                "expected_result": 1
-                            }
+                            "training_result": training_result
                         }
                     }
                     await logs_queue.put(json.dumps(final_result, ensure_ascii=False))
@@ -461,15 +511,18 @@ async def train_model_stream(
                     logger.error(f"训练执行失败: {e}", exc_info=True)
                     error_result = {
                         "type": "error",
-                        "data": {
-                            "tenant_id": tenant_id,
-                            "status": "failed",
-                            "error": str(e),
-                            "timestamp": datetime.now().isoformat()
-                        }
+                        "message": str(e),
+                        "tenant_id": tenant_id,
+                        "timestamp": datetime.now().isoformat()
                     }
                     await logs_queue.put(json.dumps(error_result, ensure_ascii=False))
                 finally:
+                    # 恢复原始AI提供者环境变量
+                    if ai_provider:
+                        if original_ai_provider is not None:
+                            os.environ["AI_PROVIDER"] = original_ai_provider
+                        elif "AI_PROVIDER" in os.environ:
+                            del os.environ["AI_PROVIDER"]
                     # 发送结束标记
                     await logs_queue.put(None)
                     # 释放训练锁
@@ -2747,6 +2800,584 @@ def _extract_code_from_response(response: str):
         if matches:
             return max(matches, key=len).strip()
     return response.strip() if response and response.strip() else None
+
+
+# ==================== 前端页面路由 ====================
+
+@app.get("/training", response_class=HTMLResponse)
+async def training_page():
+    """训练可视化页面"""
+    _frontend_dir = Path(__file__).resolve().parent.parent.parent / "frontend"
+    template_file = _frontend_dir / "templates" / "training.html"
+    if template_file.exists():
+        return HTMLResponse(content=template_file.read_text(encoding="utf-8"))
+    raise HTTPException(status_code=404, detail="训练页面未找到")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index_page():
+    """首页 - 重定向到训练页面"""
+    _frontend_dir = Path(__file__).resolve().parent.parent.parent / "frontend"
+    # 优先返回 index.html
+    index_file = _frontend_dir / "index.html"
+    if index_file.exists():
+        return HTMLResponse(content=index_file.read_text(encoding="utf-8"))
+    # 回退到训练页面
+    template_file = _frontend_dir / "templates" / "training.html"
+    if template_file.exists():
+        return HTMLResponse(content=template_file.read_text(encoding="utf-8"))
+    return HTMLResponse(content="<h1>DataMerge - 请访问 <a href='/training'>训练页面</a></h1>")
+
+
+# ==================== 前端兼容API端点 ====================
+
+@app.get("/api/download-script/{tenant_id}")
+async def download_script_by_tenant(tenant_id: str):
+    """下载脚本（前端兼容版 - 自动获取活跃脚本）"""
+    try:
+        active_script = storage_manager.get_active_script(tenant_id)
+        if not active_script:
+            raise HTTPException(status_code=404, detail=f"租户 {tenant_id} 未找到活跃脚本")
+
+        script_id = active_script["script_id"]
+        tenant_dir = storage_manager.get_tenant_dir(tenant_id)
+        script_file = tenant_dir / "scripts" / f"{script_id}.py"
+
+        if not script_file.exists():
+            raise HTTPException(status_code=404, detail=f"脚本文件不存在: {script_id}")
+
+        return FileResponse(
+            str(script_file),
+            filename=f"{tenant_id}_{script_id}.py",
+            media_type="text/x-python"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/download-log/{tenant_id}/{filename}")
+async def download_training_log_file(tenant_id: str, filename: str):
+    """下载训练日志中的文件（输出Excel、对比Excel、代码、提示词等）"""
+    try:
+        # 安全检查：防止路径穿越
+        if ".." in filename or "/" in filename or "\\" in filename:
+            raise HTTPException(status_code=400, detail="非法文件名")
+
+        tenant_dir = storage_manager.get_tenant_dir(tenant_id)
+        file_path = tenant_dir / "training_logs" / filename
+
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail=f"文件不存在: {filename}")
+
+        # 根据后缀设置 media_type
+        suffix = file_path.suffix.lower()
+        media_types = {
+            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".xls": "application/vnd.ms-excel",
+            ".py": "text/x-python",
+            ".txt": "text/plain",
+            ".log": "text/plain",
+            ".json": "application/json",
+        }
+        media_type = media_types.get(suffix, "application/octet-stream")
+
+        return FileResponse(
+            str(file_path),
+            filename=filename,
+            media_type=media_type
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/training-status/{tenant_id}")
+async def get_training_status(tenant_id: str):
+    """获取租户训练状态"""
+    try:
+        lock = _training_locks[tenant_id]
+        is_training = lock.locked() if hasattr(lock, 'locked') else False
+
+        active_script = storage_manager.get_active_script(tenant_id)
+        has_trained = active_script is not None
+
+        result = {
+            "tenant_id": tenant_id,
+            "is_training": is_training,
+            "has_trained": has_trained,
+        }
+
+        if active_script:
+            script_info = active_script.get("script_info", {})
+            result["best_score"] = script_info.get("score", 0)
+            result["script_id"] = active_script.get("script_id")
+
+        # 读取 training_summary.json
+        tenant_dir = storage_manager.get_tenant_dir(tenant_id)
+        summary_file = tenant_dir / "training_logs" / "training_summary.json"
+        if summary_file.exists():
+            try:
+                summary = json.loads(summary_file.read_text(encoding="utf-8"))
+                result["last_training"] = {
+                    "completed": summary.get("training_completed"),
+                    "success": summary.get("success"),
+                    "best_score": summary.get("best_score"),
+                    "iterations": summary.get("total_iterations"),
+                    "elapsed_seconds": summary.get("elapsed_time_seconds")
+                }
+            except Exception:
+                pass
+
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/training-logs/{tenant_id}")
+async def get_training_logs(tenant_id: str, limit: int = 50):
+    """获取租户训练日志文件列表"""
+    try:
+        tenant_dir = storage_manager.get_tenant_dir(tenant_id)
+        logs_dir = tenant_dir / "training_logs"
+
+        if not logs_dir.exists():
+            return {"tenant_id": tenant_id, "logs": []}
+
+        log_files = sorted(logs_dir.iterdir(), key=lambda f: f.stat().st_mtime, reverse=True)
+        logs = []
+        for f in log_files[:limit]:
+            logs.append({
+                "filename": f.name,
+                "size": f.stat().st_size,
+                "modified": datetime.fromtimestamp(f.stat().st_mtime).isoformat()
+            })
+
+        return {"tenant_id": tenant_id, "logs": logs}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/tenant-scripts/{tenant_id}")
+async def get_tenant_scripts(tenant_id: str):
+    """获取租户的所有训练脚本列表"""
+    try:
+        tenant_dir = storage_manager.get_tenant_dir(tenant_id)
+        training_dir = tenant_dir / "training"
+        active_script = storage_manager.get_active_script(tenant_id)
+        active_script_id = active_script.get("script_id") if active_script else None
+
+        scripts = []
+        if training_dir.exists():
+            for script_dir in sorted(training_dir.iterdir(), key=lambda d: d.stat().st_mtime, reverse=True):
+                if not script_dir.is_dir():
+                    continue
+                script_id = script_dir.name
+                result_file = script_dir / "training_result.json"
+                score = None
+                created = None
+                if result_file.exists():
+                    try:
+                        data = json.loads(result_file.read_text(encoding="utf-8"))
+                        score = data.get("best_score")
+                        created = data.get("saved_time")
+                    except Exception:
+                        pass
+                scripts.append({
+                    "script_id": script_id,
+                    "score": score,
+                    "is_active": script_id == active_script_id,
+                    "created": created or datetime.fromtimestamp(script_dir.stat().st_mtime).isoformat()
+                })
+
+        return {
+            "tenant_id": tenant_id,
+            "active_script_id": active_script_id,
+            "scripts": scripts
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/training-detail/{tenant_id}")
+async def get_training_detail(tenant_id: str, script_id: str = None, live: bool = True):
+    """获取训练详情：实时重新执行脚本对比，返回每列差异数、公式、代码逻辑、规则
+
+    Args:
+        tenant_id: 租户ID
+        script_id: 指定脚本ID（可选，默认活跃脚本）
+        live: 是否实时重新执行脚本对比（默认True）
+    """
+    import shutil
+    import tempfile
+    import time as _time
+    import re
+    from ..utils.excel_comparator import compare_excel_files, calculate_excel_formulas
+
+    try:
+        active_script = storage_manager.get_active_script(tenant_id)
+        if not active_script:
+            raise HTTPException(status_code=404, detail="该租户无活跃脚本")
+
+        target_script_id = script_id or active_script.get("script_id")
+        script_info = active_script.get("script_info", {})
+
+        # 读取脚本内容
+        script_content = storage_manager.get_script_content(tenant_id, target_script_id)
+        if not script_content:
+            raise HTTPException(status_code=404, detail=f"脚本文件不存在: {target_script_id}")
+
+        tenant_dir = storage_manager.get_tenant_dir(tenant_id)
+
+        # 读取训练结果中的规则和结构信息
+        training_result_file = tenant_dir / "training" / target_script_id / "training_result.json"
+        rules_content = ""
+        source_structure = {}
+        expected_structure = {}
+        iteration_results = []
+
+        if training_result_file.exists():
+            try:
+                tr_data = json.loads(training_result_file.read_text(encoding="utf-8"))
+                rules_content = tr_data.get("rules_content", "")
+                source_structure = tr_data.get("source_structure", {})
+                expected_structure = tr_data.get("expected_structure", {})
+                iterations = tr_data.get("iteration_results", [])
+                iteration_results = [
+                    {"iteration": it.get("iteration", i+1), "score": it.get("score", 0)}
+                    for i, it in enumerate(iterations)
+                ]
+            except Exception:
+                pass
+
+        # 如果script_info中也有规则信息，优先用training_result的，兜底用script_info的
+        if not rules_content:
+            rules_content = script_info.get("rules_content", "")
+
+        # 提取预期输出的列名列表
+        # expected_structure 可能有两种格式:
+        # 格式1: {sheet_name: {headers: [...], ...}}
+        # 格式2: {file_name: "...", sheets: {sheet_name: {headers: [...]}}, total_regions: N}
+        expected_columns = []
+        sheets_data = expected_structure
+        if "sheets" in expected_structure and isinstance(expected_structure.get("sheets"), dict):
+            sheets_data = expected_structure["sheets"]
+        for sheet_name, sheet_data in sheets_data.items():
+            if not isinstance(sheet_data, dict):
+                continue
+            headers = sheet_data.get("headers", [])
+            if headers:
+                expected_columns.extend(headers)
+
+        # ===== 提取脚本中每列的代码逻辑 =====
+        column_code_map = {}
+        is_formula_mode = "def fill_result_sheets" in script_content or "def fill_result_sheet" in script_content
+        if is_formula_mode:
+            try:
+                from ..ai_engine.formula_code_generator import FormulaCodeGenerator
+                formula_gen = FormulaCodeGenerator.__new__(FormulaCodeGenerator)
+                fill_function = formula_gen._extract_fill_result_sheets_function(script_content)
+                if fill_function:
+                    # 用正则提取所有列块注释: # X列(N): 列名
+                    col_pattern = re.compile(
+                        r'# ([A-Z]{1,3})列\((\d+)\):\s*(.+?)(?:\s*-\s*.+)?$',
+                        re.MULTILINE
+                    )
+                    for m in col_pattern.finditer(fill_function):
+                        col_letter = m.group(1)
+                        col_num = m.group(2)
+                        col_name = m.group(3).strip()
+                        block, start, end = FormulaCodeGenerator.extract_column_block(fill_function, col_name)
+                        if block:
+                            # 只保留前500字符，避免返回过大
+                            column_code_map[col_name] = block[:500] + ("..." if len(block) > 500 else "")
+            except Exception as e:
+                logger.warning(f"提取列代码逻辑失败: {e}")
+
+        # ===== 实时重新执行脚本对比 =====
+        field_diff_samples = {}
+        live_score = None
+
+        if live:
+            source_dir = tenant_dir / "training" / "source"
+            expected_dir = tenant_dir / "training" / "expected"
+
+            has_files = (
+                source_dir.exists()
+                and expected_dir.exists()
+                and list(source_dir.glob("*.xlsx")) + list(source_dir.glob("*.xls"))
+            )
+
+            if has_files:
+                try:
+                    source_files = list(source_dir.glob("*.xlsx")) + list(source_dir.glob("*.xls"))
+                    expected_files = list(expected_dir.glob("*.xlsx")) + list(expected_dir.glob("*.xls"))
+                    expected_file = expected_files[0] if expected_files else None
+
+                    if expected_file:
+                        temp_dir = tempfile.mkdtemp()
+                        temp_dir_path = Path(temp_dir).resolve()
+                        input_dir = temp_dir_path / "input"
+                        output_dir = temp_dir_path / "output"
+                        input_dir.mkdir(exist_ok=True)
+                        output_dir.mkdir(exist_ok=True)
+
+                        for sf in source_files:
+                            shutil.copy(sf, input_dir / sf.name)
+
+                        execution_env = {
+                            "input_folder": str(input_dir),
+                            "output_folder": str(output_dir),
+                            "manual_headers": script_info.get("manual_headers") or {},
+                            "source_files": [sf.name for sf in source_files]
+                        }
+
+                        exec_result = code_sandbox.execute_script(script_content, execution_env)
+
+                        if exec_result["success"]:
+                            output_files = list(output_dir.glob("*.xlsx"))
+                            if output_files:
+                                output_file = output_files[0]
+                                # COM公式计算
+                                try:
+                                    calculate_excel_formulas(str(output_file))
+                                except Exception:
+                                    pass
+
+                                comparison_output = str(output_dir / "diff_temp.xlsx")
+                                comparison_result = compare_excel_files(
+                                    result_file=str(output_file),
+                                    expected_file=str(expected_file),
+                                    output_file=comparison_output
+                                )
+                                field_diff_samples = comparison_result.get("field_diff_samples", {})
+                                total_cells = comparison_result.get("total_cells", 0)
+                                matched_cells = comparison_result.get("matched_cells", 0)
+                                if total_cells > 0:
+                                    live_score = matched_cells / total_cells
+                        else:
+                            logger.warning(f"training-detail实时执行失败: {exec_result.get('error', '')[:200]}")
+
+                        shutil.rmtree(str(temp_dir_path), ignore_errors=True)
+                except Exception as e:
+                    logger.warning(f"training-detail实时对比失败: {e}")
+
+        # 如果实时对比没有结果，回退到存储的数据
+        if not field_diff_samples and training_result_file.exists():
+            try:
+                tr_data = json.loads(training_result_file.read_text(encoding="utf-8"))
+                iterations = tr_data.get("iteration_results", [])
+                if iterations:
+                    best_it = max(iterations, key=lambda x: x.get("score", 0))
+                    field_diff_samples = best_it.get("field_diff_samples", {})
+                    if not field_diff_samples:
+                        exec_result_data = best_it.get("execution_result", {})
+                        if isinstance(exec_result_data, dict):
+                            field_diff_samples = exec_result_data.get("field_diff_samples", {})
+            except Exception:
+                pass
+
+        return {
+            "tenant_id": tenant_id,
+            "script_id": target_script_id,
+            "score": live_score if live_score is not None else script_info.get("score"),
+            "field_diff_samples": field_diff_samples,
+            "column_code_map": column_code_map,
+            "rules_content": rules_content[:3000] if rules_content else "",
+            "expected_columns": expected_columns,
+            "source_structure_summary": {
+                sheet: {"headers": data.get("headers", []), "rows": data.get("total_rows", 0)}
+                for sheet, data in (source_structure.get("sheets", source_structure) if isinstance(source_structure, dict) else {}).items()
+                if isinstance(data, dict)
+            } if source_structure else {},
+            "iteration_results": iteration_results,
+            "is_formula_mode": is_formula_mode,
+            "live_validated": live and live_score is not None
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"training-detail失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/tenants")
+async def list_tenants():
+    """获取所有租户列表及其训练状态"""
+    try:
+        tenants_dir = storage_manager.base_dir
+        tenants = []
+
+        if tenants_dir.exists():
+            for tenant_dir in sorted(tenants_dir.iterdir()):
+                if not tenant_dir.is_dir():
+                    continue
+                tenant_id = tenant_dir.name
+
+                tenant_info = {
+                    "tenant_id": tenant_id,
+                    "has_training": False,
+                    "best_score": None,
+                    "script_id": None,
+                    "last_training": None
+                }
+
+                # 检查是否有活跃脚本
+                active_script = storage_manager.get_active_script(tenant_id)
+                if active_script:
+                    tenant_info["has_training"] = True
+                    tenant_info["script_id"] = active_script.get("script_id")
+                    script_info = active_script.get("script_info", {})
+                    tenant_info["best_score"] = script_info.get("score")
+
+                # 读取训练摘要
+                summary_file = tenant_dir / "training_logs" / "training_summary.json"
+                if summary_file.exists():
+                    try:
+                        summary = json.loads(summary_file.read_text(encoding="utf-8"))
+                        tenant_info["has_training"] = True
+                        tenant_info["last_training"] = summary.get("training_completed")
+                        if tenant_info["best_score"] is None:
+                            tenant_info["best_score"] = summary.get("best_score")
+                    except Exception:
+                        pass
+
+                tenants.append(tenant_info)
+
+        return {"tenants": tenants}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/training-history")
+async def get_all_training_history():
+    """获取所有租户的训练历史（含每次训练的关键文件）"""
+    try:
+        tenants_dir = storage_manager.base_dir
+        result = {}
+
+        if not tenants_dir.exists():
+            return {"history": result}
+
+        for tenant_dir in sorted(tenants_dir.iterdir()):
+            if not tenant_dir.is_dir():
+                continue
+            tenant_id = tenant_dir.name
+            logs_dir = tenant_dir / "training_logs"
+
+            if not logs_dir.exists():
+                continue
+
+            # 按时间戳分组训练记录
+            training_sessions = {}
+            for f in sorted(logs_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
+                if not f.is_file():
+                    continue
+                name = f.name
+                size = f.stat().st_size
+                mtime = datetime.fromtimestamp(f.stat().st_mtime).isoformat()
+
+                # 判断文件类型
+                file_type = "other"
+                if "_code_" in name and name.endswith(".py"):
+                    file_type = "code"
+                elif "_output_" in name and name.endswith(".xlsx"):
+                    file_type = "output"
+                elif "_comparison_" in name and name.endswith(".xlsx"):
+                    file_type = "comparison"
+                elif "_prompt_" in name and name.endswith(".txt"):
+                    file_type = "prompt"
+                elif "_response_" in name and name.endswith(".txt"):
+                    file_type = "response"
+                elif name == "training_summary.json":
+                    file_type = "summary"
+                elif name.endswith(".log"):
+                    file_type = "log"
+                elif "adjust_" in name:
+                    file_type = "adjust_" + name.split("adjust_")[1].split("_")[0]
+
+                # 提取时间戳作为 session key（格式：20260305_225513）
+                import re as _re
+                ts_match = _re.search(r'(\d{8}_\d{6})', name)
+                session_key = ts_match.group(1) if ts_match else "unknown"
+
+                if session_key not in training_sessions:
+                    training_sessions[session_key] = {
+                        "timestamp": session_key,
+                        "files": []
+                    }
+
+                training_sessions[session_key]["files"].append({
+                    "filename": name,
+                    "type": file_type,
+                    "size": size,
+                    "modified": mtime
+                })
+
+            # 读取训练摘要补充信息
+            summary_file = logs_dir / "training_summary.json"
+            summary_data = None
+            if summary_file.exists():
+                try:
+                    summary_data = json.loads(summary_file.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+
+            # 获取活跃脚本信息
+            active_script = storage_manager.get_active_script(tenant_id)
+            best_score = None
+            script_id = None
+            if active_script:
+                script_id = active_script.get("script_id")
+                script_info = active_script.get("script_info", {})
+                best_score = script_info.get("score")
+
+            result[tenant_id] = {
+                "best_score": best_score,
+                "script_id": script_id,
+                "last_training": summary_data.get("training_completed") if summary_data else None,
+                "success": summary_data.get("success") if summary_data else None,
+                "total_iterations": summary_data.get("total_iterations") if summary_data else None,
+                "elapsed_seconds": summary_data.get("elapsed_time_seconds") if summary_data else None,
+                "sessions": list(training_sessions.values()),
+                "iteration_results": [],
+                "field_diff_samples": {}
+            }
+
+            # 从 training_result.json 读取迭代详情和差异字段
+            if script_id:
+                training_result_file = tenant_dir / "training" / script_id / "training_result.json"
+                if training_result_file.exists():
+                    try:
+                        tr_data = json.loads(training_result_file.read_text(encoding="utf-8"))
+                        iterations = tr_data.get("iteration_results", [])
+                        result[tenant_id]["iteration_results"] = [
+                            {
+                                "iteration": it.get("iteration", i + 1),
+                                "score": it.get("score", 0),
+                                "error_description": it.get("error_description", ""),
+                            }
+                            for i, it in enumerate(iterations)
+                        ]
+                        # 从最佳迭代中提取 field_diff_samples
+                        # 优先查找直接存储的 field_diff_samples（formula模式）
+                        # 其次从 execution_result 中查找（modular模式）
+                        best_it = max(iterations, key=lambda x: x.get("score", 0)) if iterations else None
+                        if best_it:
+                            fds = best_it.get("field_diff_samples", {})
+                            if not fds:
+                                exec_result = best_it.get("execution_result", {})
+                                if isinstance(exec_result, dict):
+                                    fds = exec_result.get("field_diff_samples", {})
+                            result[tenant_id]["field_diff_samples"] = fds
+                    except Exception:
+                        pass
+
+        return {"history": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":

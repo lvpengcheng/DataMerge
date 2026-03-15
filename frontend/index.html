@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI训练可视化 - DataMerge</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .header {
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        .header h1 {
+            color: #333;
+            font-size: 28px;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            color: #666;
+            font-size: 14px;
+        }
+
+        .main-content {
+            display: grid;
+            grid-template-columns: 400px 1fr;
+            gap: 20px;
+        }
+
+        .form-panel {
+            background: white;
+            border-radius: 12px;
+            padding: 25px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            height: fit-content;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            color: #333;
+            font-weight: 500;
+            font-size: 14px;
+        }
+
+        .form-group input[type="text"],
+        .form-group input[type="number"],
+        .form-group select {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+
+        .form-group input:focus,
+        .form-group select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .file-upload {
+            border: 2px dashed #ddd;
+            border-radius: 6px;
+            padding: 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .file-upload:hover {
+            border-color: #667eea;
+            background: #f8f9ff;
+        }
+
+        .file-upload input {
+            display: none;
+        }
+
+        .file-list {
+            margin-top: 10px;
+            font-size: 13px;
+            color: #666;
+        }
+
+        .file-item {
+            background: #f5f5f5;
+            padding: 8px 12px;
+            border-radius: 4px;
+            margin-top: 5px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .file-item button {
+            background: none;
+            border: none;
+            color: #e74c3c;
+            cursor: pointer;
+            font-size: 16px;
+        }
+
+        .btn {
+            width: 100%;
+            padding: 12px;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn-primary:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .log-panel {
+            background: white;
+            border-radius: 12px;
+            padding: 25px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            display: flex;
+            flex-direction: column;
+        }
+
+        .status-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .status-text {
+            font-weight: 500;
+            color: #333;
+        }
+
+        .status-badge {
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .status-idle {
+            background: #e9ecef;
+            color: #6c757d;
+        }
+
+        .status-running {
+            background: #d1ecf1;
+            color: #0c5460;
+        }
+
+        .status-success {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .status-error {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        .log-container {
+            flex: 1;
+            background: #1e1e1e;
+            border-radius: 8px;
+            padding: 15px;
+            overflow-y: auto;
+            max-height: 600px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+
+        .log-entry {
+            margin-bottom: 4px;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .log-info {
+            color: #4fc3f7;
+        }
+
+        .log-success {
+            color: #81c784;
+        }
+
+        .log-warning {
+            color: #ffb74d;
+        }
+
+        .log-error {
+            color: #e57373;
+        }
+
+        .log-code {
+            color: #ce93d8;
+        }
+
+        .log-timestamp {
+            color: #78909c;
+            margin-right: 8px;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 6px;
+            background: #e9ecef;
+            border-radius: 3px;
+            overflow: hidden;
+            margin-top: 10px;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            transition: width 0.3s;
+            width: 0%;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 AI训练可视化系统</h1>
+            <p>实时监控AI模型训练过程，查看代码生成和执行日志</p>
+        </div>
+
+        <div class="main-content">
+            <!-- 左侧表单 -->
+            <div class="form-panel">
+                <h2 style="margin-bottom: 20px; color: #333; font-size: 20px;">训练配置</h2>
+
+                <form id="trainingForm">
+                    <div class="form-group">
+                        <label>租户ID</label>
+                        <input type="text" id="tenantId" value="rex220" required>
+                    </div>
+
+                    <div class="form-group">
+                        <label>AI模型</label>
+                        <select id="aiProvider" required>
+                            <option value="claude">Claude (Anthropic)</option>
+                            <option value="deepseek">DeepSeek</option>
+                            <option value="openai">OpenAI GPT-4</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label>生成模式</label>
+                        <select id="mode" required>
+                            <option value="auto">自动选择</option>
+                            <option value="formula">公式模式</option>
+                            <option value="modular">模块化模式</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label>最大迭代次数</label>
+                        <input type="number" id="maxIterations" value="3" min="1" max="10" required>
+                    </div>
+
+                    <div class="form-group">
+                        <label>源文件 (可多选)</label>
+                        <div class="file-upload" onclick="document.getElementById('sourceFiles').click()">
+                            <input type="file" id="sourceFiles" multiple accept=".xlsx,.xls" onchange="updateFileList('source')">
+                            <p>📁 点击选择Excel文件</p>
+                        </div>
+                        <div id="sourceFileList" class="file-list"></div>
+                    </div>
+
+                    <div class="form-group">
+                        <label>目标文件</label>
+                        <div class="file-upload" onclick="document.getElementById('targetFile').click()">
+                            <input type="file" id="targetFile" accept=".xlsx,.xls" onchange="updateFileList('target')">
+                            <p>🎯 点击选择目标文件</p>
+                        </div>
+                        <div id="targetFileList" class="file-list"></div>
+                    </div>
+
+                    <div class="form-group">
+                        <label>规则文件 (可多选)</label>
+                        <div class="file-upload" onclick="document.getElementById('ruleFiles').click()">
+                            <input type="file" id="ruleFiles" multiple accept=".md,.txt,.pdf,.docx" onchange="updateFileList('rule')">
+                            <p>📋 点击选择规则文件</p>
+                        </div>
+                        <div id="ruleFileList" class="file-list"></div>
+                    </div>
+
+                    <button type="submit" class="btn btn-primary" id="startBtn">
+                        🚀 开始训练
+                    </button>
+                </form>
+            </div>
+
+            <!-- 右侧日志 -->
+            <div class="log-panel">
+                <div class="status-bar">
+                    <div class="status-text">训练状态</div>
+                    <div class="status-badge status-idle" id="statusBadge">空闲</div>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill"></div>
+                </div>
+                <div class="log-container" id="logContainer">
+                    <div class="log-entry log-info">
+                        <span class="log-timestamp">[系统]</span>
+                        等待开始训练...
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let eventSource = null;
+
+        function updateFileList(type) {
+            const input = document.getElementById(type + 'Files') || document.getElementById(type + 'File');
+            const listDiv = document.getElementById(type + 'FileList');
+
+            if (!input.files.length) {
+                listDiv.innerHTML = '';
+                return;
+            }
+
+            listDiv.innerHTML = '';
+            Array.from(input.files).forEach((file, index) => {
+                const item = document.createElement('div');
+                item.className = 'file-item';
+                item.innerHTML = `
+                    <span>${file.name}</span>
+                    <button onclick="removeFile('${type}', ${index})" type="button">×</button>
+                `;
+                listDiv.appendChild(item);
+            });
+        }
+
+        function removeFile(type, index) {
+            const input = document.getElementById(type + 'Files') || document.getElementById(type + 'File');
+            const dt = new DataTransfer();
+
+            Array.from(input.files).forEach((file, i) => {
+                if (i !== index) dt.items.add(file);
+            });
+
+            input.files = dt.files;
+            updateFileList(type);
+        }
+
+        function addLog(message, type = 'info') {
+            const logContainer = document.getElementById('logContainer');
+            const entry = document.createElement('div');
+            entry.className = `log-entry log-${type}`;
+            entry.textContent = message;
+            logContainer.appendChild(entry);
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+
+        function updateStatus(status, text) {
+            const badge = document.getElementById('statusBadge');
+            badge.className = `status-badge status-${status}`;
+            badge.textContent = text;
+        }
+
+        function updateProgress(percent) {
+            document.getElementById('progressFill').style.width = percent + '%';
+        }
+
+        document.getElementById('trainingForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            // 关闭之前的连接
+            if (eventSource) {
+                eventSource.close();
+            }
+
+            // 清空日志
+            document.getElementById('logContainer').innerHTML = '';
+            updateProgress(0);
+            updateStatus('running', '训练中');
+
+            const startBtn = document.getElementById('startBtn');
+            startBtn.disabled = true;
+            startBtn.textContent = '⏳ 训练中...';
+
+            // 准备表单数据
+            const formData = new FormData();
+            formData.append('tenant_id', document.getElementById('tenantId').value);
+            formData.append('ai_provider', document.getElementById('aiProvider').value);
+            formData.append('mode', document.getElementById('mode').value);
+            formData.append('max_iterations', document.getElementById('maxIterations').value);
+
+            // 添加源文件
+            const sourceFiles = document.getElementById('sourceFiles').files;
+            for (let file of sourceFiles) {
+                formData.append('source_files', file);
+            }
+
+            // 添加目标文件
+            const targetFile = document.getElementById('targetFile').files[0];
+            if (targetFile) {
+                formData.append('target_file', targetFile);
+            }
+
+            // 添加规则文件
+            const ruleFiles = document.getElementById('ruleFiles').files;
+            for (let file of ruleFiles) {
+                formData.append('rule_files', file);
+            }
+
+            try {
+                // 发送请求
+                const response = await fetch('/api/train/stream', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    const chunk = decoder.decode(value);
+                    const lines = chunk.split('\n');
+
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            try {
+                                const data = JSON.parse(line.slice(6));
+                                handleSSEMessage(data);
+                            } catch (e) {
+                                console.error('解析SSE消息失败:', e, line);
+                            }
+                        }
+                    }
+                }
+
+            } catch (error) {
+                addLog(`错误: ${error.message}`, 'error');
+                updateStatus('error', '训练失败');
+            } finally {
+                startBtn.disabled = false;
+                startBtn.textContent = '🚀 开始训练';
+            }
+        });
+
+        function handleSSEMessage(data) {
+            switch (data.type) {
+                case 'status':
+                    addLog(`[状态] ${data.message}`, 'info');
+                    break;
+                case 'log':
+                    addLog(data.message, data.level || 'info');
+                    break;
+                case 'iteration_start':
+                    addLog(`\n=== 第 ${data.iteration}/${data.total} 轮迭代开始 ===`, 'info');
+                    updateProgress((data.iteration - 1) / data.total * 100);
+                    break;
+                case 'iteration_progress':
+                    addLog(`[迭代 ${data.iteration}] ${data.message}`, 'info');
+                    break;
+                case 'iteration_complete':
+                    const status = data.success ? 'success' : 'warning';
+                    const accuracy = data.accuracy ? ` (准确率: ${(data.accuracy * 100).toFixed(2)}%)` : '';
+                    addLog(`[迭代 ${data.iteration}] ${data.message}${accuracy}`, status);
+                    updateProgress(data.iteration / data.total * 100);
+                    break;
+                case 'complete':
+                    addLog('\n✅ 训练完成！', 'success');
+                    if (data.result) {
+                        addLog(`脚本ID: ${data.result.script_id}`, 'success');
+                        addLog(`总迭代次数: ${data.result.iterations}`, 'success');
+                        addLog(`最终准确率: ${(data.result.final_accuracy * 100).toFixed(2)}%`, 'success');
+                    }
+                    updateStatus('success', '训练成功');
+                    updateProgress(100);
+                    break;
+                case 'error':
+                    addLog(`❌ 错误: ${data.message}`, 'error');
+                    updateStatus('error', '训练失败');
+                    break;
+            }
+        }
+    </script>
+</body>
+</html>
