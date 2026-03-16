@@ -575,7 +575,8 @@ class CodeSandbox:
         """
         import re
 
-        # 1. 中文全角字符转换为英文半角字符
+        # 1. 中文全角字符转换为英文半角字符（仅替换字符串字面量之外的部分）
+        # 注意：不能全局替换，因为字符串字面量中的全角字符可能是文件名/sheet名的一部分
         fullwidth_to_halfwidth = {
             '（': '(',
             '）': ')',
@@ -583,10 +584,6 @@ class CodeSandbox:
             '】': ']',
             '｛': '{',
             '｝': '}',
-            '"': '"',
-            '"': '"',
-            ''': "'",
-            ''': "'",
             '，': ',',
             '；': ';',
             '：': ':',
@@ -601,8 +598,46 @@ class CodeSandbox:
             '＞': '>',
         }
 
-        for fullwidth, halfwidth in fullwidth_to_halfwidth.items():
-            code = code.replace(fullwidth, halfwidth)
+        # 逐行处理，只替换字符串字面量之外的全角字符
+        def _replace_outside_strings(line, replacements):
+            """替换字符串字面量之外的全角字符"""
+            result = []
+            i = 0
+            n = len(line)
+            while i < n:
+                ch = line[i]
+                # 检测字符串开始
+                if ch in ('"', "'"):
+                    quote = ch
+                    # 检查三引号
+                    if line[i:i+3] in ('"""', "'''"):
+                        quote = line[i:i+3]
+                    # 找到字符串结尾，原样保留
+                    end = i + len(quote)
+                    while end < n:
+                        if line[end] == '\\':
+                            end += 2  # 跳过转义
+                            continue
+                        if line[end:end+len(quote)] == quote:
+                            end += len(quote)
+                            break
+                        end += 1
+                    result.append(line[i:end])
+                    i = end
+                elif ch == '#':
+                    # 注释部分也不替换
+                    result.append(line[i:])
+                    break
+                else:
+                    # 非字符串部分：替换全角
+                    result.append(replacements.get(ch, ch))
+                    i += 1
+            return ''.join(result)
+
+        code = '\n'.join(
+            _replace_outside_strings(line, fullwidth_to_halfwidth)
+            for line in code.split('\n')
+        )
 
         # 2. 修复f-string中的引号嵌套问题
         # 问题：f"...TEXT(...,"YYYY-MM-DD")..." 或 f"=IF(A1="",..." 中内部双引号会导致语法错误

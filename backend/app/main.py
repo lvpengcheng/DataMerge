@@ -1431,7 +1431,9 @@ def _build_pre_loaded_source_data(file_mapping: dict) -> dict:
                 else:
                     df = convert_region_to_dataframe(region)
 
-                if df.empty:
+                # 与 load_source_data 保持一致：只有表头没有数据的sheet也要保留
+                # 只有当DataFrame连列名都没有时才跳过
+                if df.empty and len(df.columns) == 0:
                     continue
 
                 sheet_name = f"{file_base}_{target_sheet}"
@@ -1692,6 +1694,87 @@ async def calculate_data_split(
             os.path.dirname(os.path.dirname(saved_files["input_files"][0])), "output"
         )
 
+        # ========== 【关键修复】使用FastHeaderMatcher映射sheet名和列名 ==========
+        pre_loaded_source_data = None
+        try:
+            from backend.utils.fast_header_matcher import FastHeaderMatcher
+
+            fast_matcher = FastHeaderMatcher()
+            current_input_files = [
+                os.path.join(input_dir, f) for f in os.listdir(input_dir)
+                if f.endswith(('.xlsx', '.xls')) and not f.startswith('~')
+            ]
+
+            if current_input_files and source_structure:
+                match_success, match_error, smart_mapping = fast_matcher.match_and_prepare(
+                    source_structure=source_structure,
+                    input_files=current_input_files,
+                    manual_headers=manual_headers
+                )
+
+                if match_success and smart_mapping and smart_mapping.get("file_mapping"):
+                    fm = smart_mapping["file_mapping"]
+
+                    # 根据映射结果重写/重命名文件
+                    for input_file_name, mapping_info in fm.items():
+                        needs_rewrite = mapping_info.get("needs_rewrite", False)
+                        expected_file = mapping_info.get("expected_file")
+
+                        if needs_rewrite:
+                            old_path = os.path.join(input_dir, input_file_name)
+                            if os.path.exists(old_path):
+                                os.remove(old_path)
+                            FastHeaderMatcher.rewrite_excel(mapping_info, input_dir)
+                            logger.info(f"[calculate/split] 生成映射文件: {input_file_name} → {expected_file}")
+                        else:
+                            if input_file_name != expected_file:
+                                old_path = os.path.join(input_dir, input_file_name)
+                                new_path = os.path.join(input_dir, expected_file)
+                                if os.path.exists(new_path):
+                                    os.remove(new_path)
+                                shutil.move(old_path, new_path)
+                                logger.info(f"[calculate/split] 文件重命名: {input_file_name} → {expected_file}")
+
+                    # 更新 input_files 列表
+                    saved_files["input_files"] = [
+                        os.path.join(input_dir, f) for f in os.listdir(input_dir)
+                        if f.endswith(('.xlsx', '.xls')) and not f.startswith('~')
+                    ]
+
+                    # 构建预加载源数据
+                    try:
+                        pre_loaded_source_data = _build_pre_loaded_source_data(fm)
+                        if pre_loaded_source_data:
+                            logger.info(f"[calculate/split] 预加载源数据: {len(pre_loaded_source_data)}个sheet")
+
+                            # 验证预加载数据
+                            expected_keys = set()
+                            for train_file, file_data in source_structure.get("files", {}).items():
+                                if "error" in file_data:
+                                    continue
+                                file_base = train_file.replace('.xlsx', '').replace('.xls', '')
+                                for sn in file_data.get("sheets", {}).keys():
+                                    key = f"{file_base}_{sn}"
+                                    if len(key) > 31:
+                                        key = key[:31]
+                                    expected_keys.add(key)
+
+                            missing_keys = expected_keys - set(pre_loaded_source_data.keys())
+                            if missing_keys:
+                                logger.warning(f"[calculate/split] 预加载数据缺少: {missing_keys}")
+                                pre_loaded_source_data = None
+                    except Exception as e:
+                        logger.warning(f"[calculate/split] 构建预加载数据失败: {e}")
+                        pre_loaded_source_data = None
+
+                    # 释放 parsed_data 内存
+                    for mapping_info in fm.values():
+                        mapping_info.pop("parsed_data", None)
+                elif not match_success:
+                    logger.warning(f"[calculate/split] FastHeaderMatcher匹配失败: {match_error}")
+        except Exception as e:
+            logger.warning(f"[calculate/split] 表头映射过程出错: {e}，将使用原始文件名", exc_info=True)
+
         execution_env = {
             "input_folder": os.path.dirname(saved_files["input_files"][0]),
             "output_folder": batch_output_dir,
@@ -1699,6 +1782,10 @@ async def calculate_data_split(
             "source_files": [os.path.basename(f) for f in saved_files["input_files"]],
             "tenant_id": tenant_id
         }
+
+        # 注入预加载源数据
+        if pre_loaded_source_data:
+            execution_env["_pre_loaded_source_data"] = pre_loaded_source_data
 
         # 添加可选的薪资参数（如果提供）- 直接使用传入的值，不自动计算
         if salary_year is not None:
@@ -2640,10 +2727,11 @@ async def adjust_code(
             "manual_headers": script_info.get("manual_headers") or {},
             "source_files": [sf.name for sf in source_files]
         }
-        if salary_year is not None:
-            execution_env["salary_year"] = salary_year
-        if salary_month is not None:
-            execution_env["salary_month"] = salary_month
+        # 薪资参数：前端传入优先，否则使用当前年月作为默认值（避免脚本因None报错）
+        from datetime import datetime as _dt
+        _now = _dt.now()
+        execution_env["salary_year"] = salary_year if salary_year is not None else _now.year
+        execution_env["salary_month"] = salary_month if salary_month is not None else _now.month
         if monthly_standard_hours is not None:
             execution_env["monthly_standard_hours"] = monthly_standard_hours
 
@@ -2708,40 +2796,36 @@ async def adjust_code(
             saved_comparison = logs_dir / f"adjust_comparison_{timestamp}.xlsx"
             shutil.copy(comparison_output, saved_comparison)
 
-        adopted = False
+        adopted = True
         new_script_id = None
 
-        if new_score >= original_score:
-            adopted = True
-            # 构建training_result用于save_script
-            training_result_for_save = {
-                "best_score": new_score,
-                "total_iterations": 1,
-                "success": new_score >= 0.95,
-                "manual_headers": script_info.get("manual_headers"),
-                "source_structure": script_info.get("source_structure", {}),
-                "expected_structure": script_info.get("expected_structure", {}),
-                "rules_content": script_info.get("rules_content", ""),
-                "validation_rules": script_info.get("validation_rules", {}),
-            }
+        # 手动调整模式：无论分数是否提升都采纳修改
+        training_result_for_save = {
+            "best_score": new_score,
+            "total_iterations": 1,
+            "success": new_score >= 0.95,
+            "manual_headers": script_info.get("manual_headers"),
+            "source_structure": script_info.get("source_structure", {}),
+            "expected_structure": script_info.get("expected_structure", {}),
+            "rules_content": script_info.get("rules_content", ""),
+            "validation_rules": script_info.get("validation_rules", {}),
+        }
 
-            # 提取template_schema
-            excel_parser = IntelligentExcelParser()
-            parsed_data = excel_parser.parse_excel_file(
-                str(expected_file),
-                manual_headers=script_info.get("manual_headers"),
-                active_sheet_only=True  # 只加载激活的sheet
-            )
-            document_validator = DocumentValidator()
-            template_schema = document_validator.extract_document_schema(parsed_data)
+        # 提取template_schema
+        excel_parser = IntelligentExcelParser()
+        parsed_data = excel_parser.parse_excel_file(
+            str(expected_file),
+            manual_headers=script_info.get("manual_headers"),
+            active_sheet_only=True  # 只加载激活的sheet
+        )
+        document_validator = DocumentValidator()
+        template_schema = document_validator.extract_document_schema(parsed_data)
 
-            new_script_info = storage_manager.save_script(
-                tenant_id, adjusted_code, training_result_for_save, template_schema
-            )
-            new_script_id = new_script_info["script_id"]
-            logger.info(f"调整代码已采纳，新脚本ID: {new_script_id}")
-        else:
-            logger.info(f"调整代码未采纳，分数不足: {new_score:.4f} < {original_score:.4f}")
+        new_script_info = storage_manager.save_script(
+            tenant_id, adjusted_code, training_result_for_save, template_schema
+        )
+        new_script_id = new_script_info["script_id"]
+        logger.info(f"调整代码已采纳，新脚本ID: {new_script_id}，新分数: {new_score:.4f}，原始分数: {original_score:.4f}")
 
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -2880,6 +2964,113 @@ async def compute_with_script_stream(
                         }
                         await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
 
+                    # ========== 【关键修复】根据列头映射表名/sheet名/列名 ==========
+                    pre_loaded_source_data = None
+                    try:
+                        active_script = storage_manager.get_active_script(tenant_id)
+                        if active_script and "script_info" in active_script:
+                            script_info = active_script["script_info"]
+                            source_structure = script_info.get("source_structure")
+                            manual_headers = script_info.get("manual_headers")
+
+                            if source_structure:
+                                from backend.utils.fast_header_matcher import FastHeaderMatcher
+
+                                fast_matcher = FastHeaderMatcher()
+                                input_files = [
+                                    str(f) for f in source_dir.glob("*.xlsx")
+                                    if not f.name.startswith("~")
+                                ] + [
+                                    str(f) for f in source_dir.glob("*.xls")
+                                    if not f.name.startswith("~")
+                                ]
+
+                                if input_files:
+                                    log_msg = {
+                                        "type": "log",
+                                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                        "level": "info",
+                                        "message": f"开始表头匹配映射（{len(input_files)}个文件）..."
+                                    }
+                                    await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+
+                                    match_success, match_error, smart_mapping = fast_matcher.match_and_prepare(
+                                        source_structure=source_structure,
+                                        input_files=input_files,
+                                        manual_headers=manual_headers
+                                    )
+
+                                    if match_success and smart_mapping and smart_mapping.get("file_mapping"):
+                                        file_mapping = smart_mapping["file_mapping"]
+
+                                        # 根据映射结果重写/重命名文件
+                                        for input_file_name, mapping_info in file_mapping.items():
+                                            needs_rewrite = mapping_info.get("needs_rewrite", False)
+                                            expected_file = mapping_info.get("expected_file")
+
+                                            if needs_rewrite:
+                                                old_path = os.path.join(str(source_dir), input_file_name)
+                                                if os.path.exists(old_path):
+                                                    os.remove(old_path)
+                                                FastHeaderMatcher.rewrite_excel(mapping_info, str(source_dir))
+                                                logger.info(f"[compute/stream] 生成映射文件: {input_file_name} → {expected_file}")
+                                            else:
+                                                if input_file_name != expected_file:
+                                                    old_path = os.path.join(str(source_dir), input_file_name)
+                                                    new_path = os.path.join(str(source_dir), expected_file)
+                                                    if os.path.exists(new_path):
+                                                        os.remove(new_path)
+                                                    shutil.move(old_path, new_path)
+                                                    logger.info(f"[compute/stream] 文件重命名: {input_file_name} → {expected_file}")
+
+                                        # 构建预加载源数据
+                                        try:
+                                            pre_loaded_source_data = _build_pre_loaded_source_data(file_mapping)
+                                            if pre_loaded_source_data:
+                                                logger.info(f"[compute/stream] 预加载源数据: {len(pre_loaded_source_data)}个sheet")
+
+                                                # 验证预加载数据是否包含训练时的所有 sheet
+                                                expected_keys = set()
+                                                for train_file, file_data in source_structure.get("files", {}).items():
+                                                    if "error" in file_data:
+                                                        continue
+                                                    file_base = train_file.replace('.xlsx', '').replace('.xls', '')
+                                                    for sn in file_data.get("sheets", {}).keys():
+                                                        key = f"{file_base}_{sn}"
+                                                        if len(key) > 31:
+                                                            key = key[:31]
+                                                        expected_keys.add(key)
+
+                                                missing_keys = expected_keys - set(pre_loaded_source_data.keys())
+                                                if missing_keys:
+                                                    logger.warning(f"[compute/stream] 预加载数据缺少: {missing_keys}，将由脚本自行解析")
+                                                    pre_loaded_source_data = None
+                                        except Exception as e:
+                                            logger.warning(f"[compute/stream] 构建预加载数据失败: {e}")
+                                            pre_loaded_source_data = None
+
+                                        # 释放 parsed_data 内存
+                                        for mapping_info in file_mapping.values():
+                                            mapping_info.pop("parsed_data", None)
+
+                                        log_msg = {
+                                            "type": "log",
+                                            "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                            "level": "info",
+                                            "message": f"表头匹配映射完成"
+                                        }
+                                        await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+                                    elif not match_success:
+                                        log_msg = {
+                                            "type": "log",
+                                            "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                            "level": "warning",
+                                            "message": f"表头匹配失败: {match_error}，将使用原始文件名"
+                                        }
+                                        await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+                    except Exception as e:
+                        logger.warning(f"[compute/stream] 表头映射过程出错: {e}，将使用原始文件名", exc_info=True)
+
                     # 保存脚本
                     script_path = temp_dir / f"{script_id}.py"
                     script_path.write_text(script_content, encoding='utf-8')
@@ -2923,7 +3114,19 @@ async def compute_with_script_stream(
                             if standard_hours is not None:
                                 module.monthly_standard_hours = standard_hours
 
+                            # 【关键】注入预加载源数据，避免因文件名/sheet名不同导致KeyError
+                            if pre_loaded_source_data:
+                                module._pre_loaded_source_data = pre_loaded_source_data
+
                             spec.loader.exec_module(module)
+
+                            # 【关键】替换 load_source_data，使用预加载数据
+                            if pre_loaded_source_data and hasattr(module, 'load_source_data'):
+                                _original_load = module.load_source_data
+                                def _cached_load(input_folder, manual_headers, _data=pre_loaded_source_data):
+                                    print(f"[性能优化] 使用预加载源数据（{len(_data)}个sheet，跳过Excel解析）")
+                                    return _data
+                                module.load_source_data = _cached_load
 
                             # 调用main函数
                             if hasattr(module, 'main'):
@@ -3438,7 +3641,14 @@ async def get_tenant_scripts(tenant_id: str):
 
 
 @app.get("/api/training-detail/{tenant_id}")
-async def get_training_detail(tenant_id: str, script_id: str = None, live: bool = True):
+async def get_training_detail(
+    tenant_id: str,
+    script_id: str = None,
+    live: bool = True,
+    salary_year: Optional[int] = None,
+    salary_month: Optional[int] = None,
+    monthly_standard_hours: Optional[float] = None
+):
     """获取训练详情：实时重新执行脚本对比，返回每列差异数、公式、代码逻辑、规则
 
     Args:
@@ -3569,6 +3779,15 @@ async def get_training_detail(tenant_id: str, script_id: str = None, live: bool 
                             "manual_headers": script_info.get("manual_headers") or {},
                             "source_files": [sf.name for sf in source_files]
                         }
+
+                        # 添加薪资参数（避免脚本因salary_month为None导致NoneType+int错误）
+                        # 前端传入优先，否则使用当前年月作为默认值
+                        from datetime import datetime as _dt
+                        _now = _dt.now()
+                        execution_env["salary_year"] = salary_year if salary_year is not None else _now.year
+                        execution_env["salary_month"] = salary_month if salary_month is not None else _now.month
+                        if monthly_standard_hours is not None:
+                            execution_env["monthly_standard_hours"] = monthly_standard_hours
 
                         exec_result = code_sandbox.execute_script(script_content, execution_env)
 

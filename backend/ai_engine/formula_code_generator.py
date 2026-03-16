@@ -1929,8 +1929,12 @@ def main():
     # 步骤1.5: 应用数据清洗规则（如果定义了clean_source_data函数）
     if 'clean_source_data' in globals():
         print("步骤1.5: 应用数据清洗规则...")
-        source_data = clean_source_data(source_data)
-        print(f"清洗完成，共 {len(source_data)} 个源数据sheet")
+        cleaned = clean_source_data(source_data)
+        if cleaned is not None:
+            source_data = cleaned
+            print(f"清洗完成，共 {len(source_data)} 个源数据sheet")
+        else:
+            print("警告: clean_source_data返回None，使用原始数据继续")
 
     # 创建Workbook
     wb = Workbook()

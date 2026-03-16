@@ -42,7 +42,9 @@
       "Read(//e/project/DataMerge20260224/**)",
       "Bash(wc -l /e/project/DataMerge20260224/DataMerge/backend/ai_engine/*.py)",
       "Bash(netstat -ano)",
-      "Bash(node -c training.js)"
+      "Bash(node -c training.js)",
+      "Bash(findstr \"2026\")",
+      "Bash(powershell -Command \"Get-ChildItem -Path ''tenants'' -Filter ''*.py'' -Recurse | Where-Object { $_FullName -match ''2026'' } | Select-Object -ExpandProperty FullName\")"
     ],
     "additionalDirectories": [
       "E:\\project\\DataMerge20260224\\DataMerge\\backend\\test_data\\data_cleaning_test"

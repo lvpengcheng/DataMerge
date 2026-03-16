@@ -1064,6 +1064,7 @@ input_folder, output_folder, manual_headers: {manual_headers_json}
                 if rule['original_text'] and not rule['original_text'].startswith('--'):
                     data_cleaning_rules_text += f"{i}. {rule['original_text']}\n"
             data_cleaning_rules_text += "\n**实现方式**：在write_source_sheets函数中，对每个DataFrame应用清洗逻辑后再写入Excel。\n"
+            data_cleaning_rules_text += '**汇总规则**：如果某个表存在单人多行数据需要汇总，groupby的key只能是清洗规则中指定的汇总主键，除主键外的其他字段都不能作为groupby key。数值型列（包括用文本表示的数值，但不包括日期）用sum聚合，文本列和日期列用first取值。禁止使用pivot_table，不允许改变原表的列结构（表头必须和清洗前完全一致）。\n'
 
         conditional_format_text = ""
         if extracted_rules["conditional_format_rules"]:
@@ -1226,15 +1227,36 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
 
 ## 1. 数据清洗函数（如果有清洗规则）
 def clean_source_data(source_data):
-    \"\"\"应用数据清洗规则过滤源数据
+    \"\"\"应用数据清洗规则：过滤无效数据 + 按主键汇总多行为单行
 
     Args:
         source_data: {"文件名_sheet名": {"df": DataFrame, "columns": [列名]}}
 
     Returns:
         清洗后的source_data（相同格式）
+
+    代码结构要求（必须严格遵守）：
+    - 必须用 for key, val in source_data.items(): 遍历所有表
+    - 在循环内用 if/elif 判断不同的 key 做对应清洗
+    - 不需要清洗的表也必须原样拷贝到 cleaned 中
+    - return cleaned 必须在函数最外层（与for同级），禁止嵌套在if内部
+
+    重要汇总规则（单人多行→单人单行）：
+    - groupby的key只能是清洗规则中指定的汇总主键（如工号），除主键外的其他字段都不能作为groupby key
+    - 数值型列（包括用文本表示的数值，但不包括日期）用sum聚合
+    - 文本列、日期列用first取值
+    - **禁止使用pivot_table**，不允许改变原表的列结构（表头必须和清洗前完全一致）
+    - 汇总后必须更新columns：cleaned[key]["columns"] = list(df.columns)
     \"\"\"
-    pass
+    cleaned = {{}}
+    for key, val in source_data.items():
+        df = val["df"].copy()
+        columns = val["columns"]
+        # 根据key判断做对应清洗...
+        # if key == "xxx": ...
+        # elif key == "yyy": ...
+        cleaned[key] = {{"df": df, "columns": list(df.columns)}}
+    return cleaned  # 必须在for循环之后、函数最外层返回
 
 ## 2. 结果填充函数
 def fill_result_sheets(wb, source_sheets, salary_year=None,
@@ -1544,6 +1566,7 @@ def fill_columns_batch_{batch_index + 1}(ws, r, source_sheets):
                 if rule['original_text'] and not rule['original_text'].startswith('--'):
                     data_cleaning_rules_text += f"{i}. {rule['original_text']}\n"
             data_cleaning_rules_text += "\n**实现方式**：生成clean_source_data函数，对每个DataFrame应用清洗逻辑后返回清洗后的数据。\n"
+            data_cleaning_rules_text += '**汇总规则**：如果某个表存在单人多行数据需要汇总，groupby的key只能是清洗规则中指定的汇总主键，除主键外的其他字段都不能作为groupby key。数值型列（包括用文本表示的数值，但不包括日期）用sum聚合，文本列和日期列用first取值。禁止使用pivot_table，不允许改变原表的列结构（表头必须和清洗前完全一致）。\n'
 
         conditional_format_text = ""
         if extracted_rules["conditional_format_rules"]:
@@ -1707,8 +1730,28 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
 
 ## 1. 数据清洗函数（如果有清洗规则）
 def clean_source_data(source_data):
-    \"\"\"应用数据清洗规则过滤源数据\"\"\"
-    pass
+    \"\"\"应用数据清洗规则：过滤无效数据 + 按主键汇总多行为单行
+
+    代码结构要求（必须严格遵守）：
+    - 必须用 for key, val in source_data.items(): 遍历所有表
+    - 在循环内用 if/elif 判断不同的 key 做对应清洗
+    - 不需要清洗的表也必须原样拷贝到 cleaned 中
+    - return cleaned 必须在函数最外层（与for同级），禁止嵌套在if内部
+
+    重要汇总规则（单人多行→单人单行）：
+    - groupby的key只能是清洗规则中指定的汇总主键（如工号），除主键外的其他字段都不能作为groupby key
+    - 数值型列（包括用文本表示的数值，但不包括日期）用sum聚合
+    - 文本列、日期列用first取值
+    - **禁止使用pivot_table**，不允许改变原表的列结构（表头必须和清洗前完全一致）
+    - 汇总后必须更新columns：cleaned[key]["columns"] = list(df.columns)
+    \"\"\"
+    cleaned = {{}}
+    for key, val in source_data.items():
+        df = val["df"].copy()
+        columns = val["columns"]
+        # 根据key判断做对应清洗...
+        cleaned[key] = {{"df": df, "columns": list(df.columns)}}
+    return cleaned  # 必须在for循环之后、函数最外层返回
 
 ## 2. 结果填充函数
 def fill_result_sheets(wb, source_sheets, salary_year=None,

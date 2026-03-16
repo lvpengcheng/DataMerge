@@ -754,7 +754,24 @@ async function openAdjustModal(tenantId) {
     // 调用增强版 training-detail（live=true，实时执行脚本对比）
     let detail = null;
     try {
-        const response = await fetch(`/api/training-detail/${tenantId}?live=true`);
+        // 构建URL，附带薪资参数（避免脚本因参数为空报错）
+        let detailUrl = `/api/training-detail/${tenantId}?live=true`;
+        const salaryMonthEl = document.getElementById('salary-month');
+        const standardHoursEl = document.getElementById('standard-hours');
+        if (salaryMonthEl && salaryMonthEl.value.trim()) {
+            const parts = salaryMonthEl.value.trim().split('-');
+            if (parts.length === 2) {
+                const year = parseInt(parts[0]);
+                const month = parseInt(parts[1]);
+                if (!isNaN(year) && !isNaN(month)) {
+                    detailUrl += `&salary_year=${year}&salary_month=${month}`;
+                }
+            }
+        }
+        if (standardHoursEl && standardHoursEl.value.trim()) {
+            detailUrl += `&monthly_standard_hours=${standardHoursEl.value.trim()}`;
+        }
+        const response = await fetch(detailUrl);
         if (response.ok) {
             detail = await response.json();
         }
@@ -913,6 +930,24 @@ async function submitAdjustment() {
         formData.append('adjustment_request', adjustmentRequest);
         formData.append('target_columns', targetColumns.join(','));
 
+        // 附带薪资参数（避免脚本因参数为空报错）
+        const salaryMonthEl = document.getElementById('salary-month');
+        const standardHoursEl = document.getElementById('standard-hours');
+        if (salaryMonthEl && salaryMonthEl.value.trim()) {
+            const parts = salaryMonthEl.value.trim().split('-');
+            if (parts.length === 2) {
+                const year = parseInt(parts[0]);
+                const month = parseInt(parts[1]);
+                if (!isNaN(year) && !isNaN(month)) {
+                    formData.append('salary_year', year);
+                    formData.append('salary_month', month);
+                }
+            }
+        }
+        if (standardHoursEl && standardHoursEl.value.trim()) {
+            formData.append('monthly_standard_hours', standardHoursEl.value.trim());
+        }
+
         const response = await fetch('/api/adjust-code', {
             method: 'POST',
             body: formData
@@ -925,23 +960,37 @@ async function submitAdjustment() {
         }
 
         const columnsList = document.getElementById('adjust-columns-list');
-        const adopted = result.adopted;
-        const origScore = result.original_score;
-        const newScore = result.new_score;
 
-        columnsList.innerHTML += `
-            <div class="adjust-result ${adopted ? 'adopted' : 'rejected'}">
-                <strong>${adopted ? '已采纳' : '未采纳'}</strong> —
-                原始分数: ${origScore}% → 新分数: ${newScore}%
-                ${adopted ? '(新脚本ID: ' + result.new_script_id + ')' : '(分数未提升，未替换)'}
-                <br>匹配: ${result.matched_cells}/${result.total_cells} 个单元格，差异 ${result.total_differences} 处
-            </div>
-        `;
+        // 处理执行失败的情况（脚本出错才显示失败）
+        if (result.status === 'execution_failed' || result.status === 'ai_generation_failed' || result.status === 'no_output') {
+            columnsList.innerHTML += `
+                <div class="adjust-result rejected">
+                    <strong>脚本执行失败</strong> — ${escapeHtml(result.error || result.message || '未知错误')}
+                    <br>执行耗时: ${result.execution_time || '-'}秒
+                </div>
+            `;
+            addLog('error', `调整失败: ${result.error || result.message || '未知错误'}`);
+        } else {
+            // 正常完成：显示对比结果
+            const adopted = result.adopted;
+            const origScore = result.original_score != null ? result.original_score : '-';
+            const newScore = result.new_score != null ? result.new_score : '-';
+            const matchedCells = result.matched_cells != null ? result.matched_cells : '-';
+            const totalCells = result.total_cells != null ? result.total_cells : '-';
+            const totalDiff = result.total_differences != null ? result.total_differences : '-';
 
-        addLog(adopted ? 'success' : 'warning',
-            `调整完成: ${adopted ? '已采纳' : '未采纳'} 原始=${origScore}% 新=${newScore}%`);
+            columnsList.innerHTML += `
+                <div class="adjust-result adopted">
+                    <strong>已采纳</strong> — 新脚本ID: ${result.new_script_id || '-'}
+                    <br>原始分数: ${origScore}% → 新分数: ${newScore}%
+                    <br>匹配: ${matchedCells}/${totalCells} 个单元格，差异 ${totalDiff} 处
+                    <br>执行耗时: ${result.execution_time || '-'}秒
+                </div>
+            `;
 
-        if (adopted) {
+            addLog('success', `调整完成: 已采纳 原始=${origScore}% 新=${newScore}%`);
+
+            // 刷新列表显示新脚本
             await Promise.all([loadTenantList(), loadTrainingHistory()]);
             loadTenantStatus();
             loadTenantScripts(tenantId);
