@@ -340,10 +340,12 @@ async def train_model_stream(
                         if iter_complete:
                             iteration = int(iter_complete.group(1))
                             accuracy = float(iter_complete.group(2)) / 100.0
+                            # 从环境变量读取训练成功阈值
+                            training_success_threshold = float(os.getenv("TRAINING_SUCCESS_THRESHOLD", "0.95"))
                             iter_event = {
                                 "type": "iteration_complete",
                                 "iteration": iteration,
-                                "success": accuracy >= 0.95,
+                                "success": accuracy >= training_success_threshold,
                                 "accuracy": accuracy,
                                 "message": content
                             }
@@ -2800,10 +2802,12 @@ async def adjust_code(
         new_script_id = None
 
         # 手动调整模式：无论分数是否提升都采纳修改
+        # 从环境变量读取训练成功阈值
+        training_success_threshold = float(os.getenv("TRAINING_SUCCESS_THRESHOLD", "0.95"))
         training_result_for_save = {
             "best_score": new_score,
             "total_iterations": 1,
-            "success": new_score >= 0.95,
+            "success": new_score >= training_success_threshold,
             "manual_headers": script_info.get("manual_headers"),
             "source_structure": script_info.get("source_structure", {}),
             "expected_structure": script_info.get("expected_structure", {}),

@@ -74,6 +74,10 @@ class TrainingEngine:
         self.stream_callback = stream_callback
         self.training_logger = None
 
+        # 训练成功阈值配置
+        self.training_success_threshold = float(os.getenv("TRAINING_SUCCESS_THRESHOLD", "0.95"))
+        self.training_perfect_threshold = float(os.getenv("TRAINING_PERFECT_THRESHOLD", "1.0"))
+
     def _is_natural_language_document(self, text: str) -> bool:
         """检查文本是否是自然语言文档（而非结构化规则）"""
         if not text:
@@ -542,9 +546,9 @@ class TrainingEngine:
                 # 记录迭代完成
                 self.training_logger.log_iteration_complete(iteration_num, score, is_best)
 
-                # 如果达到100%匹配，提前结束
-                if score >= 1.0:
-                    self.training_logger.log_info("达到100%匹配，提前结束训练")
+                # 如果达到完美匹配阈值，提前结束
+                if score >= self.training_perfect_threshold:
+                    self.training_logger.log_info(f"达到{self.training_perfect_threshold*100:.0f}%匹配，提前结束训练")
                     break
 
             except Exception as e:
@@ -566,7 +570,7 @@ class TrainingEngine:
             "validation_rules": validation_rules,
             "iteration_results": iteration_results,
             "total_iterations": len(iteration_results),
-            "success": best_score > 0.7,  # 70%以上认为成功
+            "success": best_score >= self.training_success_threshold,
             "log_file": self.training_logger.get_log_file_path(),
             "training_summary": self.training_logger.get_training_summary_path()
         }
@@ -623,9 +627,9 @@ class TrainingEngine:
         if historical_best_score > 0:
             self.training_logger.log_info(f"历史最佳分数: {historical_best_score:.2%}")
 
-        # 如果不是强制重新训练，且历史最佳分数已经是100%，直接返回，不需要再训练
-        if not force_retrain and historical_best_score >= 1.0 and historical_best_code:
-            self.training_logger.log_info("历史最佳分数已达到100%，跳过训练，直接使用历史最佳代码")
+        # 如果不是强制重新训练，且历史最佳分数已经达到完美匹配阈值，直接返回，不需要再训练
+        if not force_retrain and historical_best_score >= self.training_perfect_threshold and historical_best_code:
+            self.training_logger.log_info(f"历史最佳分数已达到{self.training_perfect_threshold*100:.0f}%，跳过训练，直接使用历史最佳代码")
             self.training_logger.log_training_complete(
                 best_score=historical_best_score,
                 total_iterations=0,
@@ -872,9 +876,9 @@ class TrainingEngine:
                 else:
                     self.training_logger.log_iteration_complete(iteration_num, score, is_best=False)
 
-                # 如果分数达到100%，提前结束
-                if score >= 1.0:
-                    self.training_logger.log_info("达到100%匹配，提前结束训练")
+                # 如果分数达到完美匹配阈值，提前结束
+                if score >= self.training_perfect_threshold:
+                    self.training_logger.log_info(f"达到{self.training_perfect_threshold*100:.0f}%匹配，提前结束训练")
                     break
 
             except Exception as e:
@@ -899,7 +903,7 @@ class TrainingEngine:
 
         # 构建返回结果
         result = {
-            "success": final_score >= 0.95,
+            "success": final_score >= self.training_success_threshold,
             "best_score": final_score,
             "current_score": best_score,
             "historical_best_score": historical_best_score,
@@ -1062,9 +1066,9 @@ class TrainingEngine:
                 # 记录迭代完成
                 self.training_logger.log_iteration_complete(iteration_num, score, is_best)
 
-                # 如果达到100%匹配，提前结束
-                if score >= 1.0:
-                    self.training_logger.log_info("达到100%匹配，提前结束训练")
+                # 如果达到完美匹配阈值，提前结束
+                if score >= self.training_perfect_threshold:
+                    self.training_logger.log_info(f"达到{self.training_perfect_threshold*100:.0f}%匹配，提前结束训练")
                     break
 
             except Exception as e:
@@ -1103,7 +1107,7 @@ class TrainingEngine:
             "rules_content": rules_content,
             "iteration_results": iteration_results,
             "total_iterations": len(iteration_results),
-            "success": best_score > 0.7,
+            "success": best_score >= self.training_success_threshold,
             "generation_mode": "modular",
             "log_file": self.training_logger.get_log_file_path(),
             "training_summary": self.training_logger.get_training_summary_path()

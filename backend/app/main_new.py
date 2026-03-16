@@ -2281,10 +2281,12 @@ async def adjust_code(
         if new_score >= original_score:
             adopted = True
             # 构建training_result用于save_script
+            # 从环境变量读取训练成功阈值
+            training_success_threshold = float(os.getenv("TRAINING_SUCCESS_THRESHOLD", "0.95"))
             training_result_for_save = {
                 "best_score": new_score,
                 "total_iterations": 1,
-                "success": new_score >= 0.95,
+                "success": new_score >= training_success_threshold,
                 "manual_headers": script_info.get("manual_headers"),
                 "source_structure": script_info.get("source_structure", {}),
                 "expected_structure": script_info.get("expected_structure", {}),
