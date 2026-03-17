@@ -218,6 +218,7 @@ async function startCompute() {
     btn.disabled = true;
     btn.textContent = '计算中...';
     clearResult();
+    addLog('info', '准备开始计算...');
     updateStatus('计算中');
     updateProgress(10);
 
@@ -250,6 +251,7 @@ async function startCompute() {
 
     try {
         updateProgress(20);
+        addLog('info', '正在连接服务器...');
 
         const resp = await fetch('/api/compute/stream', {
             method: 'POST',
@@ -260,6 +262,7 @@ async function startCompute() {
             throw new Error(`HTTP error! status: ${resp.status}`);
         }
 
+        addLog('info', '连接成功，开始接收数据...');
         const reader = resp.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
@@ -304,23 +307,43 @@ function handleComputeEvent(event) {
     switch (event.type) {
         case 'status':
             addLog('info', event.message);
+            // 根据状态更新进度
+            if (event.message.includes('计算开始')) {
+                updateProgress(15);
+            }
             break;
 
         case 'log':
             addLog(event.level, event.message);
+            // 根据日志内容递进式更新进度
+            if (event.message.includes('保存源文件')) {
+                updateProgress(25);
+            } else if (event.message.includes('表头匹配')) {
+                updateProgress(35);
+            } else if (event.message.includes('匹配完成')) {
+                updateProgress(45);
+            } else if (event.message.includes('开始执行')) {
+                updateProgress(55);
+            } else if (event.message.includes('预加载源数据') || event.message.includes('性能优化')) {
+                updateProgress(65);
+            } else if (event.message.includes('生成输出文件')) {
+                updateProgress(85);
+            } else if (event.message.includes('结果已保存')) {
+                updateProgress(95);
+            }
             break;
 
         case 'complete':
             updateProgress(100);
             updateStatus('计算完成');
-            addLog('success', '计算成功完成!');
+            addLog('success', '✓ 计算成功完成!');
             if (event.data) {
                 showResult(event.data);
             }
             break;
 
         case 'error':
-            addLog('error', `错误: ${event.message}`);
+            addLog('error', `✗ 错误: ${event.message}`);
             updateStatus('计算失败');
             showError(event.message);
             break;

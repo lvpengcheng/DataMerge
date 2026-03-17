@@ -6,7 +6,7 @@
 
 body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%);
     height: 100vh;
     padding: 20px;
 }
@@ -21,9 +21,9 @@ body {
 
 header {
     background: white;
-    padding: 30px;
+    padding: 20px 30px;
     border-radius: 12px;
-    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
     margin-bottom: 30px;
     display: flex;
     justify-content: space-between;
@@ -32,18 +32,51 @@ header {
 }
 
 header h1 {
-    color: #333;
-    font-size: 28px;
+    color: #1976d2;
+    font-size: 24px;
     font-weight: 600;
+    margin: 0;
+}
+
+.header-left {
+    display: flex;
+    align-items: center;
+}
+
+.nav-links {
+    display: flex;
+    gap: 10px;
+    margin-right: 30px;
+}
+
+.nav-links a {
+    padding: 10px 20px;
+    border-radius: 8px;
+    text-decoration: none;
+    color: #666;
+    font-size: 15px;
+    font-weight: 500;
+    transition: all 0.3s;
+    border: 2px solid transparent;
+}
+
+.nav-links a:hover {
+    background: #e3f2fd;
+    color: #1976d2;
+}
+
+.nav-links a.active {
+    background: #1976d2;
+    color: white;
+    border-color: #1976d2;
 }
 
 .tenant-info {
-    color: #666;
-    font-size: 14px;
+    display: none;
 }
 
 .tenant-info strong {
-    color: #667eea;
+    color: #1976d2;
     font-size: 16px;
 }
 
@@ -108,7 +141,7 @@ section h3 {
 .form-group textarea:focus,
 .form-group select:focus {
     outline: none;
-    border-color: #667eea;
+    border-color: #1976d2;
 }
 
 .form-group input[type="file"] {
@@ -149,14 +182,14 @@ section h3 {
     font-size: 13px;
     border: none;
     border-radius: 6px;
-    background: #667eea;
+    background: #1976d2;
     color: white;
     cursor: pointer;
     white-space: nowrap;
 }
 
 .btn-small:hover {
-    background: #5a6fd6;
+    background: #1565c0;
 }
 
 /* 自定义 combobox 下拉 */
@@ -174,7 +207,7 @@ section h3 {
 
 .combo-box input:focus {
     outline: none;
-    border-color: #667eea;
+    border-color: #1976d2;
 }
 
 .combo-container {
@@ -212,7 +245,7 @@ section h3 {
 }
 
 .combo-item:hover {
-    background: #f0f4ff;
+    background: #e3f2fd;
 }
 
 .combo-item.disabled {
@@ -249,8 +282,8 @@ section h3 {
 
 /* 租户训练状态卡片 */
 .tenant-status-card {
-    background: #f0f4ff;
-    border: 1px solid #d0d9f0;
+    background: #e3f2fd;
+    border: 1px solid #90caf9;
     border-radius: 8px;
     padding: 15px;
     margin-bottom: 20px;
@@ -261,7 +294,7 @@ section h3 {
     color: #555;
     margin: 0 0 12px 0;
     padding-bottom: 8px;
-    border-bottom: 1px solid #d0d9f0;
+    border-bottom: 1px solid #90caf9;
 }
 
 .status-grid {
@@ -285,14 +318,14 @@ section h3 {
 }
 
 .btn-primary {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    background: linear-gradient(135deg, #42a5f5 0%, #1976d2 100%);
     color: white;
     width: 100%;
 }
 
 .btn-primary:hover {
     transform: translateY(-2px);
-    box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+    box-shadow: 0 4px 12px rgba(25, 118, 210, 0.4);
 }
 
 .btn-primary:disabled {
@@ -333,7 +366,7 @@ section h3 {
 }
 
 .status-card {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    background: linear-gradient(135deg, #42a5f5 0%, #1976d2 100%);
     padding: 25px;
     border-radius: 10px;
     color: white;
@@ -432,7 +465,7 @@ section h3 {
     background: #f8f9fa;
     padding: 15px;
     border-radius: 8px;
-    border-left: 4px solid #667eea;
+    border-left: 4px solid #1976d2;
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -483,18 +516,18 @@ section h3 {
 
 .iteration-actions .history-link {
     font-size: 12px;
-    color: #667eea;
+    color: #1976d2;
     text-decoration: none;
     padding: 2px 8px;
-    border: 1px solid #d0d9f0;
+    border: 1px solid #90caf9;
     border-radius: 4px;
     transition: all 0.2s;
 }
 
 .iteration-actions .history-link:hover {
-    background: #667eea;
+    background: #1976d2;
     color: white;
-    border-color: #667eea;
+    border-color: #1976d2;
 }
 
 /* 日志区域 */
@@ -581,7 +614,7 @@ section h3 {
     background: #f8f9fa;
     border-radius: 8px;
     padding: 12px 15px;
-    border-left: 3px solid #667eea;
+    border-left: 3px solid #1976d2;
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -611,18 +644,18 @@ section h3 {
 
 .history-link {
     font-size: 12px;
-    color: #667eea;
+    color: #1976d2;
     text-decoration: none;
     padding: 3px 8px;
-    border: 1px solid #d0d9f0;
+    border: 1px solid #90caf9;
     border-radius: 4px;
     transition: all 0.2s;
 }
 
 .history-link:hover {
-    background: #667eea;
+    background: #1976d2;
     color: white;
-    border-color: #667eea;
+    border-color: #1976d2;
 }
 
 /* 结果区域 */
@@ -691,18 +724,18 @@ section h3 {
 
 .btn-download {
     padding: 10px 18px;
-    border: 1px solid #667eea;
+    border: 1px solid #1976d2;
     border-radius: 6px;
     font-size: 13px;
     font-weight: 500;
     cursor: pointer;
     background: white;
-    color: #667eea;
+    color: #1976d2;
     transition: all 0.2s;
 }
 
 .btn-download:hover {
-    background: #667eea;
+    background: #1976d2;
     color: white;
 }
 
@@ -905,7 +938,7 @@ section h3 {
 
 .adjust-column-textarea:focus {
     outline: none;
-    border-color: #667eea;
+    border-color: #1976d2;
 }
 
 .adjust-column-textarea::placeholder {
@@ -934,18 +967,18 @@ section h3 {
 
 .btn-adjust {
     padding: 8px 16px;
-    border: 1px solid #667eea;
+    border: 1px solid #1976d2;
     border-radius: 6px;
     font-size: 13px;
     font-weight: 500;
     cursor: pointer;
     background: white;
-    color: #667eea;
+    color: #1976d2;
     transition: all 0.2s;
 }
 
 .btn-adjust:hover {
-    background: #667eea;
+    background: #1976d2;
     color: white;
 }
 
@@ -1010,8 +1043,8 @@ section h3 {
 
 /* 列代码逻辑折叠框（复用规则框样式） */
 .adjust-code-box {
-    background: #f0f4ff;
-    border: 1px solid #d0d9f0;
+    background: #e3f2fd;
+    border: 1px solid #90caf9;
     border-radius: 6px;
     margin-bottom: 10px;
     overflow: hidden;
@@ -1021,7 +1054,7 @@ section h3 {
     padding: 8px 12px;
     font-size: 13px;
     font-weight: 500;
-    color: #667eea;
+    color: #1976d2;
     cursor: pointer;
     display: flex;
     justify-content: space-between;
@@ -1031,7 +1064,7 @@ section h3 {
 }
 
 .adjust-code-header:hover {
-    background: #e0e8ff;
+    background: #bbdefb;
 }
 
 .adjust-code-content {
@@ -1057,7 +1090,7 @@ section h3 {
     color: #333;
     white-space: pre-wrap;
     word-break: break-all;
-    border-top: 1px solid #d0d9f0;
-    background: #f8faff;
+    border-top: 1px solid #90caf9;
+    background: #f5f9fc;
     font-family: 'Consolas', 'Monaco', monospace;
 }

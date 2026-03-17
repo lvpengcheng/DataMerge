@@ -3018,6 +3018,13 @@ async def compute_with_script_stream(
                                                     os.remove(old_path)
                                                 FastHeaderMatcher.rewrite_excel(mapping_info, str(source_dir))
                                                 logger.info(f"[compute/stream] 生成映射文件: {input_file_name} → {expected_file}")
+                                                log_msg = {
+                                                    "type": "log",
+                                                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                                    "level": "info",
+                                                    "message": f"生成映射文件: {input_file_name} → {expected_file}"
+                                                }
+                                                await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
                                             else:
                                                 if input_file_name != expected_file:
                                                     old_path = os.path.join(str(source_dir), input_file_name)
@@ -3026,12 +3033,38 @@ async def compute_with_script_stream(
                                                         os.remove(new_path)
                                                     shutil.move(old_path, new_path)
                                                     logger.info(f"[compute/stream] 文件重命名: {input_file_name} → {expected_file}")
+                                                    log_msg = {
+                                                        "type": "log",
+                                                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                                        "level": "info",
+                                                        "message": f"文件重命名: {input_file_name} → {expected_file}"
+                                                    }
+                                                    await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
 
                                         # 构建预加载源数据
                                         try:
                                             pre_loaded_source_data = _build_pre_loaded_source_data(file_mapping)
                                             if pre_loaded_source_data:
                                                 logger.info(f"[compute/stream] 预加载源数据: {len(pre_loaded_source_data)}个sheet")
+                                                log_msg = {
+                                                    "type": "log",
+                                                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                                    "level": "info",
+                                                    "message": f"预加载源数据: {len(pre_loaded_source_data)}个sheet"
+                                                }
+                                                await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+
+                                                # 发送每个sheet的详细信息
+                                                for sheet_name, sheet_info in pre_loaded_source_data.items():
+                                                    df = sheet_info.get("df")
+                                                    if df is not None:
+                                                        log_msg = {
+                                                            "type": "log",
+                                                            "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                                            "level": "info",
+                                                            "message": f"  └─ {sheet_name}: {len(df)}行 × {len(df.columns)}列"
+                                                        }
+                                                        await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
 
                                                 # 验证预加载数据是否包含训练时的所有 sheet
                                                 expected_keys = set()

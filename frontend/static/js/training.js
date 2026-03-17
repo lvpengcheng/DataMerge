@@ -166,7 +166,7 @@ document.addEventListener('click', function(e) {
 // 选中租户后
 function onTenantSelected(tenantId) {
     if (!tenantId) return;
-    document.getElementById('tenant-id').textContent = tenantId;
+    // 租户ID已选择，加载状态和脚本
     loadTenantStatus();
     loadTenantScripts(tenantId);
 
@@ -374,8 +374,12 @@ async function startTraining() {
         return;
     }
 
-    document.getElementById('tenant-id').textContent = tenantId;
-    document.getElementById('max-iteration').textContent = maxIterations;
+    // 更新训练参数显示（如果元素存在）
+    const maxIterationEl = document.getElementById('max-iteration');
+    if (maxIterationEl) {
+        maxIterationEl.textContent = maxIterations;
+    }
+
     document.getElementById('start-training-btn').disabled = true;
     document.getElementById('start-training-btn').textContent = '训练中...';
 
@@ -700,8 +704,7 @@ function resetTraining() {
 // ==================== 下载 ====================
 
 function downloadScript() {
-    const tenantId = document.getElementById('tenant-input').value.trim()
-        || document.getElementById('tenant-id').textContent;
+    const tenantId = document.getElementById('tenant-input').value.trim();
     if (tenantId && tenantId !== '-') {
         window.location.href = `/api/download-script/${tenantId}`;
     } else {
