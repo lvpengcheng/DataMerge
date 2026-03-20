@@ -6,6 +6,8 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
+    default-libmysqlclient-dev \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 # 复制依赖文件
@@ -27,5 +29,5 @@ ENV PYTHONUNBUFFERED=1
 # 暴露端口
 EXPOSE 8000
 
-# 启动命令
-CMD ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# 启动命令（先初始化数据库，再启动服务）
+CMD ["sh", "-c", "python -m backend.database.init_db && uvicorn backend.app.main:app --host 0.0.0.0 --port 8000"]

@@ -8,7 +8,6 @@ services:
     env_file:
       - .env
     environment:
-      - DATABASE_URL=sqlite:///./data.db
       - REDIS_URL=redis://redis:6379/0
     volumes:
       - ./tenants:/app/tenants
@@ -31,7 +30,6 @@ services:
     env_file:
       - .env
     environment:
-      - DATABASE_URL=sqlite:///./data.db
       - REDIS_URL=redis://redis:6379/0
     volumes:
       - ./tenants:/app/tenants
@@ -47,7 +45,6 @@ services:
     env_file:
       - .env
     environment:
-      - DATABASE_URL=sqlite:///./data.db
       - REDIS_URL=redis://redis:6379/0
     volumes:
       - ./tenants:/app/tenants

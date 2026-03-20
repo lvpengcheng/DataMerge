@@ -8,6 +8,14 @@ let codeStreamBuffer = '';
 
 // 页面加载完成后初始化
 document.addEventListener('DOMContentLoaded', function() {
+    // 认证检查
+    if (!AUTH.requireAuth()) return;
+    AUTH.renderUserInfo(document.querySelector('header'));
+    if (AUTH.isAdmin()) {
+        const adminNav = document.getElementById('nav-admin');
+        if (adminNav) adminNav.style.display = '';
+    }
+
     initializeForm();
     loadTenantList();
     loadTrainingHistory();
@@ -107,7 +115,7 @@ function formatFileSize(bytes) {
 
 async function loadTenantList() {
     try {
-        const response = await fetch('/api/tenants');
+        const response = await AUTH.authFetch('/api/tenants');
         if (!response.ok) return;
         const data = await response.json();
         tenantListData = data.tenants || [];
@@ -188,7 +196,7 @@ async function loadTenantScripts(tenantId) {
     const select = document.getElementById('script-select');
 
     try {
-        const response = await fetch(`/api/tenant-scripts/${tenantId}`);
+        const response = await AUTH.authFetch(`/api/tenant-scripts/${tenantId}`);
         if (!response.ok) { group.style.display = 'none'; return; }
         const data = await response.json();
         const scripts = data.scripts || [];
@@ -225,7 +233,7 @@ async function loadTenantStatus() {
     if (!tenantId) { card.style.display = 'none'; return; }
 
     try {
-        const response = await fetch(`/api/training-status/${tenantId}`);
+        const response = await AUTH.authFetch(`/api/training-status/${tenantId}`);
         if (!response.ok) {
             card.style.display = 'block';
             document.getElementById('tenant-training-status').textContent = '未找到';
@@ -276,7 +284,7 @@ async function loadTenantStatus() {
 
 async function loadTrainingHistory() {
     try {
-        const response = await fetch('/api/training-history');
+        const response = await AUTH.authFetch('/api/training-history');
         if (!response.ok) return;
         const data = await response.json();
         trainingHistoryData = data.history || {};
@@ -424,7 +432,7 @@ async function startTraining() {
     addLog('info', `租户: ${tenantId}  模型: ${aiProvider}  模式: ${mode}  最大迭代: ${maxIterations}`);
 
     try {
-        const response = await fetch('/api/train/stream', {
+        const response = await AUTH.authFetch('/api/train/stream', {
             method: 'POST',
             body: formData
         });
@@ -714,7 +722,7 @@ function downloadScript() {
 
 async function downloadTrainingFiles(tenantId, fileType) {
     try {
-        const response = await fetch(`/api/training-logs/${tenantId}`);
+        const response = await AUTH.authFetch(`/api/training-logs/${tenantId}`);
         if (!response.ok) { alert('获取训练日志失败'); return; }
         const data = await response.json();
         const logs = data.logs || [];
@@ -774,7 +782,7 @@ async function openAdjustModal(tenantId) {
         if (standardHoursEl && standardHoursEl.value.trim()) {
             detailUrl += `&monthly_standard_hours=${standardHoursEl.value.trim()}`;
         }
-        const response = await fetch(detailUrl);
+        const response = await AUTH.authFetch(detailUrl);
         if (response.ok) {
             detail = await response.json();
         }
@@ -951,7 +959,7 @@ async function submitAdjustment() {
             formData.append('monthly_standard_hours', standardHoursEl.value.trim());
         }
 
-        const response = await fetch('/api/adjust-code', {
+        const response = await AUTH.authFetch('/api/adjust-code', {
             method: 'POST',
             body: formData
         });

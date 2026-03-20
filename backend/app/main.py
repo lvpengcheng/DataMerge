@@ -24,6 +24,11 @@ from ..document_validator import DocumentValidator
 from excel_parser import IntelligentExcelParser
 from ..sandbox.code_sandbox import CodeSandbox
 from ..email_processor.email_handler import EmailHandler
+from ..auth.router import router as auth_router
+from ..admin.router import router as admin_router
+from ..database.connection import engine, get_db
+from ..database import models as db_models
+from ..auth.dependencies import get_current_user, get_accessible_tenants
 
 # 配置日志
 logging.basicConfig(
@@ -47,6 +52,16 @@ app.add_middleware(
     allow_methods=["*"],  # 允许所有HTTP方法
     allow_headers=["*"],  # 允许所有HTTP头
 )
+
+# 注册认证和管理路由
+app.include_router(auth_router)
+app.include_router(admin_router)
+
+
+@app.on_event("startup")
+async def startup_event():
+    db_models.Base.metadata.create_all(bind=engine)
+
 
 # 挂载前端静态文件
 _frontend_dir = Path(__file__).resolve().parent.parent.parent / "frontend"
@@ -3503,6 +3518,26 @@ async def compute_page():
     if template_file.exists():
         return HTMLResponse(content=template_file.read_text(encoding="utf-8"))
     return HTMLResponse(content="<h1>智算页面未找到</h1>")
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    """登录页面"""
+    _frontend_dir = Path(__file__).resolve().parent.parent.parent / "frontend"
+    template_file = _frontend_dir / "templates" / "login.html"
+    if template_file.exists():
+        return HTMLResponse(content=template_file.read_text(encoding="utf-8"))
+    raise HTTPException(status_code=404, detail="登录页面未找到")
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page():
+    """管理后台页面"""
+    _frontend_dir = Path(__file__).resolve().parent.parent.parent / "frontend"
+    template_file = _frontend_dir / "templates" / "admin.html"
+    if template_file.exists():
+        return HTMLResponse(content=template_file.read_text(encoding="utf-8"))
+    raise HTTPException(status_code=404, detail="管理页面未找到")
 
 
 # ==================== 前端兼容API端点 ====================

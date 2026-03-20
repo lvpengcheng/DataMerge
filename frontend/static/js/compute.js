@@ -5,6 +5,14 @@ let currentScriptId = '';
 
 // 页面加载完成后初始化
 document.addEventListener('DOMContentLoaded', function() {
+    // 认证检查
+    if (!AUTH.requireAuth()) return;
+    AUTH.renderUserInfo(document.querySelector('header'));
+    if (AUTH.isAdmin()) {
+        const adminNav = document.getElementById('nav-admin');
+        if (adminNav) adminNav.style.display = '';
+    }
+
     loadTenantList();
 
     // 租户输入框事件
@@ -48,7 +56,7 @@ document.addEventListener('click', function(e) {
 
 async function loadTenantList() {
     try {
-        const resp = await fetch('/api/training-history');
+        const resp = await AUTH.authFetch('/api/training-history');
         const data = await resp.json();
         console.log('Training history data:', data);
 
@@ -113,7 +121,7 @@ async function loadTenantScripts(tenantId) {
     const info = document.getElementById('script-info');
 
     try {
-        const resp = await fetch(`/api/tenant-scripts/${encodeURIComponent(tenantId)}`);
+        const resp = await AUTH.authFetch(`/api/tenant-scripts/${encodeURIComponent(tenantId)}`);
         if (!resp.ok) {
             group.style.display = 'none';
             return;
@@ -253,7 +261,7 @@ async function startCompute() {
         updateProgress(20);
         addLog('info', '正在连接服务器...');
 
-        const resp = await fetch('/api/compute/stream', {
+        const resp = await AUTH.authFetch('/api/compute/stream', {
             method: 'POST',
             body: formData
         });

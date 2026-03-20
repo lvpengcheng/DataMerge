@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>系统管理 - 数据整合平台</title>
+    <link rel="stylesheet" href="/static/css/admin.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="header-left">
+                <nav class="nav-links">
+                    <a href="/training">智训</a>
+                    <a href="/compute">智算</a>
+                    <a href="/admin" class="active">管理</a>
+                </nav>
+            </div>
+            <div class="user-info" id="user-info"></div>
+        </header>
+
+        <!-- Tab 导航 -->
+        <div class="tab-nav">
+            <button class="tab-btn active" data-tab="users">用户管理</button>
+            <button class="tab-btn" data-tab="roles">角色管理</button>
+            <button class="tab-btn" data-tab="orgs">组织管理</button>
+            <button class="tab-btn" data-tab="tenant-auth">租户授权</button>
+        </div>
+
+        <!-- 用户管理 Tab -->
+        <div class="tab-content active" id="tab-users">
+            <div class="toolbar">
+                <button class="btn btn-primary" onclick="Admin.showCreateUser()">新建用户</button>
+            </div>
+            <table class="data-table" id="users-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>用户名</th>
+                        <th>显示名</th>
+                        <th>组织</th>
+                        <th>角色</th>
+                        <th>状态</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <!-- 角色管理 Tab -->
+        <div class="tab-content" id="tab-roles">
+            <div class="toolbar">
+                <button class="btn btn-primary" onclick="Admin.showCreateRole()">新建角色</button>
+            </div>
+            <table class="data-table" id="roles-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>角色名</th>
+                        <th>描述</th>
+                        <th>权限</th>
+                        <th>系统角色</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <!-- 组织管理 Tab -->
+        <div class="tab-content" id="tab-orgs">
+            <div class="toolbar">
+                <button class="btn btn-primary" onclick="Admin.showCreateOrg()">新建组织</button>
+            </div>
+            <table class="data-table" id="orgs-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>组织名称</th>
+                        <th>上级组织</th>
+                        <th>描述</th>
+                        <th>状态</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <!-- 租户授权 Tab -->
+        <div class="tab-content" id="tab-tenant-auth">
+            <div class="toolbar">
+                <button class="btn btn-primary" onclick="Admin.showGrantAuth()">新增授权</button>
+            </div>
+            <table class="data-table" id="auth-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>租户ID</th>
+                        <th>组织</th>
+                        <th>授权类型</th>
+                        <th>授权时间</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- 通用弹窗 -->
+    <div class="modal-overlay" id="modal-overlay" style="display:none;">
+        <div class="modal" id="modal">
+            <div class="modal-header">
+                <h3 id="modal-title">弹窗</h3>
+                <button class="modal-close" onclick="Admin.closeModal()">&times;</button>
+            </div>
+            <div class="modal-body" id="modal-body"></div>
+            <div class="modal-footer">
+                <button class="btn" onclick="Admin.closeModal()">取消</button>
+                <button class="btn btn-primary" id="modal-confirm" onclick="Admin.confirmModal()">确定</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/auth.js"></script>
+    <script src="/static/js/admin.js"></script>
+</body>
+</html>
