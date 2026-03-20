@@ -1845,6 +1845,16 @@ if __name__ == "__main__":
         """对话接口（模拟）"""
         return "这是本地AI的回复，请配置实际的本地AI服务。"
 
+    def _openai_chat(self, messages, temperature=0.1, max_tokens=None, **kwargs):
+        """兼容 OpenAI 接口的非流式调用，返回 (content, finish_reason)"""
+        content = self.chat(messages, **kwargs)
+        return content, "stop"
+
+    def _openai_chat_stream(self, messages, temperature=0.1, max_tokens=None, **kwargs):
+        """兼容 OpenAI 接口的流式调用，yield (content_chunk, finish_reason)"""
+        content = self.chat(messages, **kwargs)
+        yield content, "stop"
+
     def generate_completion(self, prompt: str, **kwargs) -> str:
         """生成完成文本（单轮对话）"""
         messages = [

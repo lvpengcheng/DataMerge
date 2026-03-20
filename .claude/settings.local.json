@@ -50,10 +50,14 @@
       "Bash(./build_iis.bat)",
       "Bash(powershell -command \"Compress-Archive -Path ''*'' -DestinationPath ''../releases/DataMerge-IIS-v1.0.0.zip'' -Force\")",
       "Bash(mkdir -p releases)",
-      "Bash(powershell -command \"Compress-Archive -Path ''build_iis\\\\*'' -DestinationPath ''releases\\\\DataMerge-IIS-v1.0.0.zip'' -Force\")"
+      "Bash(powershell -command \"Compress-Archive -Path ''build_iis\\\\*'' -DestinationPath ''releases\\\\DataMerge-IIS-v1.0.0.zip'' -Force\")",
+      "Read(//e/soft/soft/Aspose.Cells/python使用示例/**)",
+      "Read(//e/soft/soft/Aspose.Cells/**)",
+      "Bash(dotnet --list-runtimes)"
     ],
     "additionalDirectories": [
-      "E:\\project\\DataMerge20260224\\DataMerge\\backend\\test_data\\data_cleaning_test"
+      "E:\\project\\DataMerge20260224\\DataMerge\\backend\\test_data\\data_cleaning_test",
+      "e:\\soft\\soft\\Aspose.Cells\\python使用示例\\libs"
     ]
   }
 }
