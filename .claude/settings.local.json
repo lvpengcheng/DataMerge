@@ -44,7 +44,13 @@
       "Bash(netstat -ano)",
       "Bash(node -c training.js)",
       "Bash(findstr \"2026\")",
-      "Bash(powershell -Command \"Get-ChildItem -Path ''tenants'' -Filter ''*.py'' -Recurse | Where-Object { $_FullName -match ''2026'' } | Select-Object -ExpandProperty FullName\")"
+      "Bash(powershell -Command \"Get-ChildItem -Path ''tenants'' -Filter ''*.py'' -Recurse | Where-Object { $_FullName -match ''2026'' } | Select-Object -ExpandProperty FullName\")",
+      "Bash(tar -tzf datamerge-1.0.0.tar.gz)",
+      "Bash(tar -tzf dist/datamerge-1.0.0.tar.gz)",
+      "Bash(./build_iis.bat)",
+      "Bash(powershell -command \"Compress-Archive -Path ''*'' -DestinationPath ''../releases/DataMerge-IIS-v1.0.0.zip'' -Force\")",
+      "Bash(mkdir -p releases)",
+      "Bash(powershell -command \"Compress-Archive -Path ''build_iis\\\\*'' -DestinationPath ''releases\\\\DataMerge-IIS-v1.0.0.zip'' -Force\")"
     ],
     "additionalDirectories": [
       "E:\\project\\DataMerge20260224\\DataMerge\\backend\\test_data\\data_cleaning_test"

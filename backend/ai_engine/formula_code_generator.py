@@ -1690,25 +1690,14 @@ def load_source_data(input_folder, manual_headers):
 
 
 def write_source_sheets(wb, source_data):
-    """步骤3: 把源数据写入Excel的后续sheet
-
-    Args:
-        wb: openpyxl Workbook对象
-        source_data: 源数据字典
-
-    Returns:
-        source_sheets: {"文件名_sheet名": {"df": DataFrame, "ws": worksheet}}
-    """
     source_sheets = {}
     header_fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
 
     for sheet_name, data_info in source_data.items():
         df = data_info["df"]
-
-        # 创建worksheet
         ws = wb.create_sheet(title=sheet_name)
 
-        # 写入表头（绿色背景）
+        # 写入表头
         for col_idx, col_name in enumerate(df.columns, 1):
             cell = ws.cell(row=1, column=col_idx, value=col_name)
             cell.fill = header_fill
@@ -1717,7 +1706,17 @@ def write_source_sheets(wb, source_data):
         # 写入数据
         for row_idx, row in enumerate(df.itertuples(index=False), 2):
             for col_idx, value in enumerate(row, 1):
-                ws.cell(row=row_idx, column=col_idx, value=value if pd.notna(value) else "")
+                col_name = df.columns[col_idx - 1]
+                # 如果列名包含“日期”，尝试将文本转换为日期对象
+                if '日期' in col_name and pd.notna(value):
+                    try:
+                        # 强制转换为 datetime（可处理多种格式，如 2006-01-12、2006/01/12 等）
+                        value = pd.to_datetime(value).to_pydatetime()
+                    except:
+                        pass  # 转换失败则保留原值（可能是无效日期）
+                cell = ws.cell(row=row_idx, column=col_idx, value=value if pd.notna(value) else "")
+                if '日期' in col_name:
+                    cell.number_format = 'yyyy/mm/dd'  # 设置显示格式
 
         source_sheets[sheet_name] = {"df": df, "ws": ws}
 

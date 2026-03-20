@@ -1,4 +1,9 @@
 /tenants
 /compare_results
 /logs
+/dist
+/build_iis
+/venv
+/releases
+/compare_results
 nul

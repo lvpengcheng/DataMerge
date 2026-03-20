@@ -1,0 +1,19 @@
+include README.md
+include requirements.txt
+include LICENSE
+include .env.example
+include run.py
+include excel_parser.py
+recursive-include frontend/static *
+recursive-include frontend/templates *
+recursive-include backend *.py
+recursive-exclude * __pycache__
+recursive-exclude * *.py[co]
+recursive-exclude venv *
+recursive-exclude tenants *
+recursive-exclude .git *
+recursive-exclude tests *
+exclude .gitignore
+exclude *.log
+exclude *.xlsx
+exclude *.xls

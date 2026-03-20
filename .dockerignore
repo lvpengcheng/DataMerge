@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# 测试
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# 文档
+*.md
+!README.md
+docs/
+
+# 日志
+*.log
+logs/
+
+# 临时文件
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# 租户数据（运行时生成）
+tenants/
+
+# 示例文件
+examples/
+
+# 构建脚本
+build_release.sh
+build_release.bat
+setup.py
+MANIFEST.in
+
+# 环境变量
+.env
+.env.*
+
+# 其他
+*.xlsx
+*.xls
+*.csv
+server.log
+test_server.py

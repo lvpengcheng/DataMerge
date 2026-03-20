@@ -1179,6 +1179,9 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
 
         # F列(6): 应发工资 - 含TEXT函数时用单引号f-string
         ws.cell(row=r, column=6).value = f'=IF(D{r}>0,D{r}*E{r},0)'
+        
+        # G列(7): 向左查找使用INDEX+MATCH
+        ws.cell(row=r, column=7).value = f"=IFERROR(INDEX(\'{sn_memo}\'!$A:$J, MATCH(A{r}, \'{sn_memo}\'!$A:$A, 0), {col_dept}), {EMPTY})"
 
     # === 6. 条件格式（如规则要求标红/高亮等，在循环结束后实现）===
     # 出勤天数>20标红
