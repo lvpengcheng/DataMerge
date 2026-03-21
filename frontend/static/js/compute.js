@@ -2,6 +2,107 @@
 let tenantListData = [];
 let currentTenantId = '';
 let currentScriptId = '';
+let _filePasswordsMap = null;  // 文件名→密码映射
+let _encryptionCheckInProgress = false;  // 加密检测进行中
+
+/**
+ * 弹出密码输入对话框，为加密文件输入密码
+ */
+function _promptFilePasswords(encryptedFiles) {
+    return new Promise((resolve) => {
+        const inputs = encryptedFiles.map((name, i) =>
+            `<div style="margin-bottom:10px;">
+                <label style="display:block;font-size:13px;margin-bottom:4px;color:#333;">
+                    <span style="color:#e65100;">🔒</span> ${name}
+                </label>
+                <input id="_enc_pwd_${i}" type="password" placeholder="请输入打开密码"
+                    style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box;">
+            </div>`
+        ).join('');
+
+        const overlay = document.createElement('div');
+        overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:9999;display:flex;align-items:center;justify-content:center;';
+        overlay.innerHTML = `
+            <div style="background:#fff;border-radius:10px;padding:24px;width:400px;max-width:90vw;box-shadow:0 4px 20px rgba(0,0,0,0.2);">
+                <h3 style="margin:0 0 6px;font-size:16px;">检测到加密文件</h3>
+                <p style="margin:0 0 16px;font-size:13px;color:#666;">以下文件有密码保护，请输入密码后继续：</p>
+                ${inputs}
+                <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px;">
+                    <button id="_enc_cancel" style="padding:8px 20px;border:1px solid #ddd;border-radius:4px;background:#fff;cursor:pointer;">取消</button>
+                    <button id="_enc_confirm" style="padding:8px 20px;border:none;border-radius:4px;background:#1976d2;color:#fff;cursor:pointer;">确认解锁</button>
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+
+        document.getElementById('_enc_cancel').onclick = () => {
+            document.body.removeChild(overlay);
+            resolve(null);
+        };
+        document.getElementById('_enc_confirm').onclick = () => {
+            const passwords = {};
+            encryptedFiles.forEach((name, i) => {
+                const pwd = document.getElementById(`_enc_pwd_${i}`).value;
+                if (pwd) passwords[name] = pwd;
+            });
+            const missing = encryptedFiles.filter(name => !passwords[name]);
+            if (missing.length > 0) {
+                alert('请为所有加密文件输入密码：\n' + missing.join('\n'));
+                return;
+            }
+            document.body.removeChild(overlay);
+            resolve(passwords);
+        };
+        setTimeout(() => document.getElementById('_enc_pwd_0')?.focus(), 100);
+    });
+}
+
+/**
+ * 文件选择后，调用服务端 Aspose 检测加密，有加密则立即弹窗
+ * @param {File[]} filesToCheck - 要检测的文件数组
+ */
+async function _autoCheckEncryption(filesToCheck) {
+    const btn = document.getElementById('compute-btn');
+
+    if (!filesToCheck || filesToCheck.length === 0) return;
+
+    _encryptionCheckInProgress = true;
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = '检测文件中...';
+    }
+
+    try {
+        const checkFd = new FormData();
+        filesToCheck.forEach(f => checkFd.append('files', f));
+
+        console.log('[加密检测] 发送检测请求, 文件:', filesToCheck.map(f => f.name));
+        const checkResp = await AUTH.authFetch('/api/files/check-encrypted', {
+            method: 'POST',
+            body: checkFd
+        });
+
+        if (checkResp.ok) {
+            const checkResult = await checkResp.json();
+            console.log('[加密检测] 服务端返回:', checkResult);
+            if (checkResult.encrypted_files && checkResult.encrypted_files.length > 0) {
+                const passwords = await _promptFilePasswords(checkResult.encrypted_files);
+                if (passwords) {
+                    _filePasswordsMap = { ...(_filePasswordsMap || {}), ...passwords };
+                }
+            }
+        } else {
+            console.error('[加密检测] 请求失败, status:', checkResp.status);
+        }
+    } catch (e) {
+        console.error('[加密检测] 异常:', e);
+    } finally {
+        _encryptionCheckInProgress = false;
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = '开始计算';
+        }
+    }
+}
 
 // 页面加载完成后初始化
 document.addEventListener('DOMContentLoaded', function() {
@@ -34,6 +135,7 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('source-files').addEventListener('change', () => {
         updateFileList();
         checkCanCompute();
+        _autoCheckEncryption(Array.from(document.getElementById('source-files').files));
     });
 
     // 计算按钮
@@ -223,6 +325,12 @@ async function startCompute() {
         return;
     }
 
+    // 如果加密检测正在进行中，等待完成
+    if (_encryptionCheckInProgress) {
+        alert('文件加密检测中，请稍候...');
+        return;
+    }
+
     btn.disabled = true;
     btn.textContent = '计算中...';
     clearResult();
@@ -257,6 +365,11 @@ async function startCompute() {
 
     if (standardHours) formData.append('standard_hours', standardHours);
 
+    // 添加文件密码（如果有加密文件）
+    if (_filePasswordsMap) {
+        formData.append('file_passwords', JSON.stringify(_filePasswordsMap));
+    }
+
     try {
         updateProgress(20);
         addLog('info', '正在连接服务器...');
@@ -267,38 +380,43 @@ async function startCompute() {
         });
 
         if (!resp.ok) {
-            throw new Error(`HTTP error! status: ${resp.status}`);
+            // 尝试读取错误详情
+            let errorData = null;
+            try { errorData = await resp.json(); } catch (e) {}
+
+            // 检测是否为加密文件错误（422 + encrypted_files）
+            if (resp.status === 422 && errorData && errorData.error_type === 'encrypted_files') {
+                addLog('warning', `检测到加密文件: ${errorData.encrypted_files.join(', ')}`);
+                const passwords = await _promptFilePasswords(errorData.encrypted_files);
+                if (!passwords) {
+                    addLog('info', '用户取消了密码输入');
+                    btn.disabled = false;
+                    btn.textContent = '开始计算';
+                    return;
+                }
+                addLog('info', '正在使用密码重新提交...');
+                _filePasswordsMap = passwords;  // 保存密码供后续使用
+                formData.set('file_passwords', JSON.stringify(passwords));
+                const retryResp = await AUTH.authFetch('/api/compute/stream', {
+                    method: 'POST',
+                    body: formData
+                });
+                if (!retryResp.ok) {
+                    let retryError = '';
+                    try { retryError = (await retryResp.json()).detail || ''; } catch (e) {}
+                    throw new Error(retryError || `HTTP error! status: ${retryResp.status}`);
+                }
+                addLog('info', '连接成功，开始接收数据...');
+                await _processComputeStream(retryResp);
+                return;
+            }
+
+            const errorMsg = errorData?.detail || errorData?.message || `HTTP error! status: ${resp.status}`;
+            throw new Error(typeof errorMsg === 'string' ? errorMsg : JSON.stringify(errorMsg));
         }
 
         addLog('info', '连接成功，开始接收数据...');
-        const reader = resp.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        updateProgress(30);
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop(); // 保留不完整的行
-
-            for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    const data = line.slice(6);
-                    if (data.trim()) {
-                        try {
-                            const event = JSON.parse(data);
-                            handleComputeEvent(event);
-                        } catch (e) {
-                            console.error('解析事件失败:', e, data);
-                        }
-                    }
-                }
-            }
-        }
+        await _processComputeStream(resp);
 
     } catch (e) {
         console.error('计算失败:', e);
@@ -308,6 +426,40 @@ async function startCompute() {
     } finally {
         btn.disabled = false;
         btn.textContent = '开始计算';
+    }
+}
+
+/**
+ * 处理计算流式响应
+ */
+async function _processComputeStream(resp) {
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    updateProgress(30);
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+
+        for (const line of lines) {
+            if (line.startsWith('data: ')) {
+                const data = line.slice(6);
+                if (data.trim()) {
+                    try {
+                        const event = JSON.parse(data);
+                        handleComputeEvent(event);
+                    } catch (e) {
+                        console.error('解析事件失败:', e, data);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -348,6 +500,14 @@ function handleComputeEvent(event) {
             if (event.data) {
                 showResult(event.data);
             }
+            break;
+
+        case 'encrypted_files':
+            // 在SSE流中检测到加密文件（计算流内部检测）
+            addLog('warning', `检测到加密文件: ${event.encrypted_files.join(', ')}`);
+            updateStatus('需要输入密码');
+            // 将加密文件列表暂存，handleComputeEvent后续error事件会触发显示
+            window._pendingEncryptedFiles = event.encrypted_files;
             break;
 
         case 'error':

@@ -11,10 +11,20 @@ import aspose_init  # noqa: F401 — 确保 Aspose 已初始化
 
 from Aspose.Cells import (  # type: ignore
     Workbook, SaveFormat, PdfSaveOptions, LoadOptions, EncryptionType,
+    FileFormatUtil,
 )
 from Aspose.Cells.Rendering.PdfSecurity import PdfSecurityOptions  # type: ignore
 
 logger = logging.getLogger(__name__)
+
+
+def is_encrypted(file_path: str) -> bool:
+    """检测 Excel 文件是否有打开密码"""
+    try:
+        info = FileFormatUtil.DetectFileFormat(file_path)
+        return bool(info.IsEncrypted)
+    except Exception:
+        return False
 
 
 def convert_to_pdf(input_path: str, output_path: str = None, active_sheet_only: bool = True) -> str:
@@ -109,10 +119,27 @@ def decrypt_excel(
     if not output_path:
         output_path = tempfile.mktemp(suffix=".xlsx")
 
-    load_opts = LoadOptions()
-    load_opts.Password = password
+    logger.info(f"[decrypt_excel] path={input_path}, pwd_len={len(password)}, pwd_repr={repr(password)}, pwd_type={type(password).__name__}")
 
-    wb = Workbook(input_path, load_opts)
+    try:
+        load_opts = LoadOptions()
+        load_opts.Password = password
+        wb = Workbook(input_path, load_opts)
+    except Exception as e:
+        err_str = str(e)
+        if 'Invalid password' in err_str:
+            # 密码不对。尝试无密码打开（文件可能实际未加密）
+            logger.warning(f"[decrypt_excel] 密码无效, 尝试无密码打开: {input_path}")
+            try:
+                wb = Workbook(input_path)
+            except Exception as e2:
+                # 两种方式都失败，文件确实加密但密码不对
+                logger.error(f"[decrypt_excel] 无密码打开也失败: {e2}")
+                raise ValueError(
+                    f"文件 '{input_path}' 加密且密码不正确 (pwd_len={len(password)}, pwd_repr={repr(password)})"
+                ) from e
+        else:
+            raise
     wb.Settings.Password = None
     wb.Save(output_path)
 

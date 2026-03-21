@@ -139,6 +139,47 @@ class CodeSandbox:
                     exec(code_obj, exec_globals)
                     output_buffer.write(f"代码编译和执行完成\n")
 
+                    # 【加密支持】如果有 file_passwords，monkey-patch IntelligentExcelParser
+                    # 使其在 parse_excel_file 时自动注入对应文件的密码
+                    # 注意：文件通常已在上游解密，仅对仍加密的文件注入密码
+                    _file_passwords = execution_env.get('file_passwords') or {}
+                    _iep_patched = False
+                    _iep_orig_parse = None
+                    if _file_passwords:
+                        try:
+                            from excel_parser import IntelligentExcelParser as _IEP
+                            try:
+                                from backend.utils.aspose_helper import is_encrypted as _chk_enc
+                            except ImportError:
+                                _chk_enc = None
+                            _iep_orig_parse = _IEP.parse_excel_file
+                            _fp_map = _file_passwords  # 闭包捕获
+
+                            def _auto_pwd_parse(self_parser, file_path, *args, **kwargs):
+                                if 'password' not in kwargs or kwargs.get('password') is None:
+                                    fname = os.path.basename(str(file_path))
+                                    pwd = _fp_map.get(fname)
+                                    if pwd:
+                                        # 先检查文件是否仍然加密
+                                        still_enc = True
+                                        if _chk_enc is not None:
+                                            try:
+                                                still_enc = _chk_enc(str(file_path))
+                                            except Exception:
+                                                still_enc = True
+                                        if still_enc:
+                                            kwargs['password'] = pwd
+                                            output_buffer.write(f"[加密支持] 为 {fname} 自动注入密码\n")
+                                        else:
+                                            output_buffer.write(f"[加密支持] {fname} 已解密，跳过密码注入\n")
+                                return _iep_orig_parse(self_parser, file_path, *args, **kwargs)
+
+                            _IEP.parse_excel_file = _auto_pwd_parse
+                            _iep_patched = True
+                            output_buffer.write(f"[加密支持] 已注入密码映射（{len(_file_passwords)}个文件）\n")
+                        except Exception as _e:
+                            output_buffer.write(f"[加密支持] 注入失败: {_e}\n")
+
                     # 【性能优化】如果有预加载的源数据，替换 load_source_data 避免重复解析
                     _pre_loaded = exec_globals.get('_pre_loaded_source_data')
                     if _pre_loaded and 'load_source_data' in exec_globals:
@@ -268,6 +309,14 @@ class CodeSandbox:
                 except Exception as e:
                     error_msg = f"执行错误: {str(e)}\n{traceback.format_exc()}"
                     error_buffer.write(error_msg)
+                finally:
+                    # 恢复 IntelligentExcelParser.parse_excel_file 原始方法
+                    if _iep_patched and _iep_orig_parse is not None:
+                        try:
+                            from excel_parser import IntelligentExcelParser as _IEP
+                            _IEP.parse_excel_file = _iep_orig_parse
+                        except Exception:
+                            pass
 
             # 收集输出
             full_output = output_buffer.getvalue()

@@ -31,7 +31,14 @@ class TrainingPersistence:
         source_asset_ids: Optional[List[int]] = None,
         expected_asset_id: Optional[int] = None,
     ) -> TrainingSession:
-        """创建训练会话"""
+        """创建训练会话（session_key重复时自动追加时间戳）"""
+        # 如果session_key已存在，追加时间戳使其唯一
+        existing = self.db.query(TrainingSession).filter(
+            TrainingSession.session_key == session_key
+        ).first()
+        if existing:
+            session_key = f"{session_key}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
         session = TrainingSession(
             tenant_id=tenant_id,
             session_key=session_key,

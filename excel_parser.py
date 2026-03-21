@@ -29,6 +29,7 @@ import aspose_init  # noqa: F401 — 触发全局初始化
 from Aspose.Cells import (
     License as _AsposeLicense,
     Workbook as _AsposeWorkbook,
+    LoadOptions as _AsposeLoadOptions,
     BorderType as _BorderType,
     CellBorderType as _CellBorderType,
     BackgroundType as _BackgroundType,
@@ -1269,7 +1270,8 @@ class IntelligentExcelParser:
     def parse_excel_file(self, file_path: str, max_data_rows: int = None, skip_rows: int = 0,
                         manual_headers: Dict[str, Any] = None, headers_only: bool = False,
                         active_sheet_only: bool = False,
-                        best_region_only: bool = False) -> List[SheetData]:
+                        best_region_only: bool = False,
+                        password: str = None) -> List[SheetData]:
         """读取并解析Excel文件
 
         Args:
@@ -1283,6 +1285,7 @@ class IntelligentExcelParser:
             active_sheet_only: 是否只加载当前激活的Sheet，默认False（加载所有Sheet）
             best_region_only: 是否只保留每个sheet的最优区域（使用_find_valid_region策略）
                             True时每个sheet最多保留1个最优区域（或合并后的区域组）
+            password: 文件打开密码（加密文件需要）
 
         Returns:
             解析后的Sheet数据列表
@@ -1291,7 +1294,19 @@ class IntelligentExcelParser:
 
         try:
             # 使用 Aspose.Cells for .NET 加载
-            aspose_wb = _AsposeWorkbook(str(file_path))
+            if password:
+                # 尝试用密码打开；如果文件已解密则 Aspose 会抛 "Invalid password"，此时回退到无密码打开
+                try:
+                    load_opts = _AsposeLoadOptions()
+                    load_opts.Password = password
+                    aspose_wb = _AsposeWorkbook(str(file_path), load_opts)
+                except Exception as _pwd_err:
+                    if 'Invalid password' in str(_pwd_err):
+                        aspose_wb = _AsposeWorkbook(str(file_path))
+                    else:
+                        raise
+            else:
+                aspose_wb = _AsposeWorkbook(str(file_path))
 
             # 提取当前文件的 manual_headers 配置
             file_manual_headers = self._extract_file_manual_headers(file_path, manual_headers)

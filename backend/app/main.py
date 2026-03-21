@@ -14,7 +14,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -67,6 +67,37 @@ app.include_router(training_api_router)
 app.include_router(compute_api_router)
 
 
+# ==================== 文件加密检测 API ====================
+
+@app.post("/api/files/check-encrypted")
+async def check_files_encrypted(
+    files: List[UploadFile] = File(...),
+):
+    """检测上传的文件是否有密码保护，返回加密文件列表"""
+    from ..utils.aspose_helper import is_encrypted
+    from pathlib import Path
+    encrypted_files = []
+    tmp_dir = tempfile.mkdtemp(prefix="enc_check_")
+    tmp_dir = str(Path(tmp_dir).resolve())  # 避免Windows短路径
+    try:
+        for f in files:
+            try:
+                tmp_path = os.path.join(tmp_dir, f.filename)
+                content = await f.read()
+                with open(tmp_path, "wb") as fp:
+                    fp.write(content)
+                await f.seek(0)  # 重置文件指针
+                if is_encrypted(tmp_path):
+                    encrypted_files.append(f.filename)
+            except Exception as e:
+                logger.warning(f"检测文件加密状态失败 {f.filename}: {e}")
+    except Exception as e:
+        logger.error(f"加密检测整体失败: {e}", exc_info=True)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return {"encrypted_files": encrypted_files}
+
+
 @app.on_event("startup")
 async def startup_event():
     db_models.Base.metadata.create_all(bind=engine)
@@ -101,7 +132,8 @@ async def train_model(
     salary_year: Optional[int] = Form(None),
     salary_month: Optional[int] = Form(None),
     monthly_standard_hours: Optional[float] = Form(None),  # 可选的当月标准工时
-    force_retrain: bool = Form(False)  # 是否强制重新训练
+    force_retrain: bool = Form(False),  # 是否强制重新训练
+    file_passwords: Optional[str] = Form(None),
 ):
     """训练AI生成数据处理脚本
 
@@ -139,9 +171,18 @@ async def train_model(
             )
 
         try:
+            # 解析文件密码
+            passwords_dict = {}
+            if file_passwords:
+                try:
+                    passwords_dict = json.loads(file_passwords)
+                except Exception:
+                    pass
+
             # 保存上传的文件
             saved_files = await _save_uploaded_files(
-                tenant_id, rule_files, source_files, expected_result
+                tenant_id, rule_files, source_files, expected_result,
+                file_passwords=passwords_dict,
             )
 
             # 解析手动表头规则
@@ -180,16 +221,19 @@ async def train_model(
                 salary_year=salary_year,
                 salary_month=salary_month,
                 monthly_standard_hours=monthly_standard_hours,
-                force_retrain=force_retrain
+                force_retrain=force_retrain,
+                file_passwords=saved_files.get("file_passwords", {})
             )
 
             # 提取文档格式模版
             if training_result["success"]:
                 # 解析预期文件以提取模版
+                _fps = saved_files.get("file_passwords", {})
                 parsed_data = excel_parser.parse_excel_file(
                     saved_files["expected"],
                     manual_headers=manual_headers_dict,
-                    active_sheet_only=True  # 只加载激活的sheet
+                    active_sheet_only=True,  # 只加载激活的sheet
+                    password=_fps.get(os.path.basename(saved_files["expected"]))
                 )
                 template_schema = document_validator.extract_document_schema(parsed_data)
 
@@ -290,7 +334,8 @@ async def train_model_stream(
     ai_provider: Optional[str] = Form(None),
     mode: Optional[str] = Form(None),
     max_iterations: Optional[int] = Form(None),
-    force_retrain: bool = Form(False)
+    force_retrain: bool = Form(False),
+    file_passwords: Optional[str] = Form(None),
 ):
     """流式训练AI生成数据处理脚本（支持实时日志输出）
 
@@ -327,9 +372,18 @@ async def train_model_stream(
                 detail=f"租户 {tenant_id} 正在训练中，请等待当前训练完成后再试"
             )
 
+        # 解析文件密码
+        passwords_dict = {}
+        if file_passwords:
+            try:
+                passwords_dict = json.loads(file_passwords)
+            except Exception:
+                pass
+
         # 保存上传的文件
         saved_files = await _save_uploaded_files(
-            tenant_id, rule_files, source_files, expected_result
+            tenant_id, rule_files, source_files, expected_result,
+            file_passwords=passwords_dict,
         )
 
         # 解析手动表头规则
@@ -468,16 +522,19 @@ async def train_model_stream(
                                 salary_year=salary_year,
                                 salary_month=salary_month,
                                 monthly_standard_hours=monthly_standard_hours,
-                                force_retrain=force_retrain
+                                force_retrain=force_retrain,
+                                file_passwords=saved_files.get("file_passwords", {})
                             )
                         )
 
                     # 提取文档格式模版并保存脚本
                     if training_result["success"]:
+                        _fps = saved_files.get("file_passwords", {})
                         parsed_data = excel_parser.parse_excel_file(
                             saved_files["expected"],
                             manual_headers=manual_headers_dict,
-                            active_sheet_only=True  # 只加载激活的sheet
+                            active_sheet_only=True,  # 只加载激活的sheet
+                            password=_fps.get(os.path.basename(saved_files["expected"]))
                         )
                         template_schema = document_validator.extract_document_schema(parsed_data)
 
@@ -613,6 +670,18 @@ async def train_model_stream(
     except HTTPException:
         # HTTPException直接抛出（包括409冲突错误）
         raise
+    except EncryptedFilesError as e:
+        # 检测到加密文件，返回422让前端提示输入密码
+        logger.warning(f"检测到加密文件: {e.encrypted_files}")
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error_type": "encrypted_files",
+                "encrypted_files": e.encrypted_files,
+                "message": str(e),
+            }
+        )
     except Exception as e:
         logger.error(f"流式训练初始化失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"流式训练初始化失败: {str(e)}")
@@ -1221,16 +1290,25 @@ def _find_best_sheet_match(
     return None
 
 
+class EncryptedFilesError(Exception):
+    """上传的文件有密码保护，需要用户提供密码"""
+    def __init__(self, encrypted_files: list):
+        self.encrypted_files = encrypted_files
+        super().__init__(f"以下文件有密码保护: {', '.join(encrypted_files)}")
+
+
 async def _save_uploaded_files(
     tenant_id: str,
     rule_files: List[UploadFile],
     source_files: List[UploadFile],
-    expected_result: UploadFile
+    expected_result: UploadFile,
+    file_passwords: Dict[str, str] = None,
 ) -> dict:
-    """保存上传的文件到临时目录"""
+    """保存上传的文件到临时目录，自动解密有密码的文件"""
     import tempfile
     import shutil
     from pathlib import Path
+    from ..utils.aspose_helper import is_encrypted, decrypt_excel
 
     temp_dir = tempfile.mkdtemp()
     # 将短路径转换为长路径，避免Windows 8.3短路径格式导致的问题
@@ -1239,6 +1317,9 @@ async def _save_uploaded_files(
     # 确保临时目录存在
     if not os.path.exists(temp_dir):
         os.makedirs(temp_dir, exist_ok=True)
+
+    passwords = file_passwords or {}
+    logger.info(f"[文件保存] 收到密码映射: {list(passwords.keys()) if passwords else '(空)'}")
 
     try:
         # 保存规则文件
@@ -1265,10 +1346,45 @@ async def _save_uploaded_files(
             content = await expected_result.read()
             f.write(content)
 
+        # 先检测所有文件的加密状态，收集加密文件列表
+        encrypted_files = []
+        all_files = [(p, os.path.basename(p)) for p in source_paths] + [(expected_path, expected_result.filename)]
+        for file_path, filename in all_files:
+            enc = is_encrypted(file_path)
+            has_pwd = bool(passwords.get(filename))
+            logger.info(f"[加密检测] {filename}: encrypted={enc}, has_password={has_pwd}")
+            if enc and not has_pwd:
+                encrypted_files.append(filename)
+
+        if encrypted_files:
+            raise EncryptedFilesError(encrypted_files)
+
+        # 解密有密码的文件
+        for file_path, filename in all_files:
+            if is_encrypted(file_path):
+                pwd = passwords.get(filename)
+                if pwd:
+                    decrypted = decrypt_excel(file_path, password=pwd)
+                    shutil.move(decrypted, file_path)
+                    # 验证解密是否成功
+                    if is_encrypted(file_path):
+                        logger.error(f"文件 {filename} 解密后仍然是加密状态！")
+                        raise ValueError(f"文件 '{filename}' 解密失败，请检查密码是否正确")
+                    else:
+                        logger.info(f"已解密文件: {filename}")
+
         # 保存到存储管理器
         saved_files = storage_manager.save_training_files(
             tenant_id, rule_paths, source_paths, expected_path
         )
+
+        # 验证保存到永久存储的文件是否也是解密状态
+        for sp in saved_files.get("source", []):
+            enc_after = is_encrypted(sp)
+            logger.info(f"[存储验证] {os.path.basename(sp)}: encrypted={enc_after} (path={sp})")
+
+        # 将密码映射也带出去，供下游 parser 做兜底
+        saved_files["file_passwords"] = passwords
 
         # 清理临时目录
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -3123,7 +3239,8 @@ async def compute_with_script_stream(
     source_files: List[UploadFile] = File(...),
     salary_year: Optional[int] = Form(None),
     salary_month: Optional[int] = Form(None),
-    standard_hours: Optional[float] = Form(None)
+    standard_hours: Optional[float] = Form(None),
+    file_passwords: Optional[str] = Form(None),
 ):
     """使用已训练的脚本进行计算（流式输出日志）
 
@@ -3189,10 +3306,22 @@ async def compute_with_script_stream(
                     }
                     await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
 
+                    # 解析文件密码
+                    passwords_dict = {}
+                    if file_passwords:
+                        try:
+                            passwords_dict = json.loads(file_passwords)
+                        except Exception:
+                            pass
+                    logger.info(f"[compute/stream密码] raw={repr(file_passwords)}")
+                    logger.info(f"[compute/stream密码] parsed keys={list(passwords_dict.keys())}, values_len={[len(str(v)) for v in passwords_dict.values()]}")
+
+                    # 保存所有源文件
                     for file in source_files:
                         file_path = source_dir / file.filename
                         with open(file_path, 'wb') as f:
                             shutil.copyfileobj(file.file, f)
+
                         log_msg = {
                             "type": "log",
                             "timestamp": datetime.now().strftime("%H:%M:%S"),
@@ -3200,6 +3329,44 @@ async def compute_with_script_stream(
                             "message": f"已保存源文件: {file.filename}"
                         }
                         await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+
+                    # 检测所有文件的加密状态
+                    from ..utils.aspose_helper import is_encrypted as _is_enc, decrypt_excel as _dec_excel
+                    encrypted_files = []
+                    for file in source_files:
+                        file_path = source_dir / file.filename
+                        file_path_resolved = str(file_path.resolve())
+                        if _is_enc(file_path_resolved) and not passwords_dict.get(file.filename):
+                            encrypted_files.append(file.filename)
+
+                    if encrypted_files:
+                        await logs_queue.put(json.dumps({
+                            "type": "encrypted_files",
+                            "timestamp": datetime.now().strftime("%H:%M:%S"),
+                            "encrypted_files": encrypted_files,
+                            "message": f"检测到加密文件: {', '.join(encrypted_files)}"
+                        }, ensure_ascii=False))
+                        raise ValueError(f"以下文件有密码保护: {', '.join(encrypted_files)}")
+
+                    # 解密有密码的文件
+                    for file in source_files:
+                        file_path = source_dir / file.filename
+                        # 将路径resolve为长路径（避免Windows 8.3短路径问题）
+                        file_path_str = str(file_path.resolve())
+                        enc_status = _is_enc(file_path_str)
+                        pwd = passwords_dict.get(file.filename)
+                        logger.info(f"[compute/stream解密] {file.filename}: encrypted={enc_status}, has_password={bool(pwd)}, pwd_repr={repr(pwd)}, path={file_path_str}")
+                        if enc_status:
+                            if pwd:
+                                decrypted = _dec_excel(file_path_str, password=pwd)
+                                shutil.move(decrypted, file_path_str)
+                                # 验证解密后状态
+                                enc_after = _is_enc(file_path_str)
+                                logger.info(f"[compute/stream解密] {file.filename}: 解密后 encrypted={enc_after}")
+                                await logs_queue.put(json.dumps({
+                                    "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                    "level": "info", "message": f"已解密文件: {file.filename}"
+                                }, ensure_ascii=False))
 
                     # DB持久化：注册源文件为数据资产
                     if db_session:
@@ -3399,6 +3566,37 @@ async def compute_with_script_stream(
 
                             spec.loader.exec_module(module)
 
+                            # 【加密支持】monkey-patch IntelligentExcelParser 自动注入密码
+                            # 注意：文件已在上游被 _dec_excel 解密，仅对仍加密的文件注入密码
+                            if passwords_dict:
+                                try:
+                                    from excel_parser import IntelligentExcelParser as _IEP
+                                    from backend.utils.aspose_helper import is_encrypted as _chk_enc
+                                    _IEP._orig_parse_backup = _IEP.parse_excel_file
+                                    _orig_parse = _IEP.parse_excel_file
+                                    _fp_map = passwords_dict
+
+                                    def _auto_pwd_parse(self_parser, file_path, *args, **kwargs):
+                                        if 'password' not in kwargs or kwargs.get('password') is None:
+                                            fname = os.path.basename(str(file_path))
+                                            pwd = _fp_map.get(fname)
+                                            if pwd:
+                                                try:
+                                                    still_enc = _chk_enc(str(file_path))
+                                                except Exception:
+                                                    still_enc = True  # 检测失败时保守注入
+                                                if still_enc:
+                                                    kwargs['password'] = pwd
+                                                    print(f"[加密支持] 为 {fname} 自动注入密码")
+                                                else:
+                                                    print(f"[加密支持] {fname} 已解密，跳过密码注入")
+                                        return _orig_parse(self_parser, file_path, *args, **kwargs)
+
+                                    _IEP.parse_excel_file = _auto_pwd_parse
+                                    print(f"[加密支持] 已注入密码映射（{len(passwords_dict)}个文件）")
+                                except Exception as _e:
+                                    logger.warning(f"[加密支持] 注入失败: {_e}")
+
                             # 【关键】替换 load_source_data，使用预加载数据
                             if pre_loaded_source_data and hasattr(module, 'load_source_data'):
                                 _original_load = module.load_source_data
@@ -3433,6 +3631,15 @@ async def compute_with_script_stream(
                             return {"success": True, "output": output_buffer.getvalue()}
                         finally:
                             sys.stdout = old_stdout
+                            # 恢复 monkey-patch
+                            if passwords_dict:
+                                try:
+                                    from excel_parser import IntelligentExcelParser as _IEP2
+                                    if hasattr(_IEP2, '_orig_parse_backup'):
+                                        _IEP2.parse_excel_file = _IEP2._orig_parse_backup
+                                        del _IEP2._orig_parse_backup
+                                except Exception:
+                                    pass
 
                     with concurrent.futures.ThreadPoolExecutor() as executor:
                         exec_result = await loop.run_in_executor(executor, execute_script)
@@ -3582,7 +3789,8 @@ async def compute_with_script(
     source_files: List[UploadFile] = File(...),
     salary_year: Optional[int] = Form(None),
     salary_month: Optional[int] = Form(None),
-    standard_hours: Optional[float] = Form(None)
+    standard_hours: Optional[float] = Form(None),
+    file_passwords: Optional[str] = Form(None),
 ):
     """使用已训练的脚本进行计算
 
@@ -3619,10 +3827,53 @@ async def compute_with_script(
             source_dir = temp_dir / "source"
             source_dir.mkdir(parents=True, exist_ok=True)
 
+            # 解析文件密码
+            passwords_dict = {}
+            if file_passwords:
+                try:
+                    passwords_dict = json.loads(file_passwords)
+                except Exception:
+                    pass
+
             for file in source_files:
                 file_path = source_dir / file.filename
                 with open(file_path, 'wb') as f:
                     shutil.copyfileobj(file.file, f)
+
+                # 检测并解密加密文件
+                from ..utils.aspose_helper import is_encrypted as _is_enc, decrypt_excel as _dec_excel
+
+            # 先检测所有文件加密状态
+            encrypted_files = []
+            for file in source_files:
+                file_path = source_dir / file.filename
+                if _is_enc(str(file_path)) and not passwords_dict.get(file.filename):
+                    encrypted_files.append(file.filename)
+
+            if encrypted_files:
+                from fastapi.responses import JSONResponse
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "error_type": "encrypted_files",
+                        "encrypted_files": encrypted_files,
+                        "message": f"以下文件有密码保护: {', '.join(encrypted_files)}",
+                    }
+                )
+
+            # 解密有密码的文件
+            for file in source_files:
+                file_path = source_dir / file.filename
+                enc_status = _is_enc(str(file_path))
+                has_pwd = bool(passwords_dict.get(file.filename))
+                logger.info(f"[compute解密] {file.filename}: encrypted={enc_status}, has_password={has_pwd}")
+                if enc_status:
+                    pwd = passwords_dict.get(file.filename)
+                    if pwd:
+                        decrypted = _dec_excel(str(file_path), password=pwd)
+                        shutil.move(decrypted, str(file_path))
+                        enc_after = _is_enc(str(file_path))
+                        logger.info(f"[compute解密] {file.filename}: 解密后 encrypted={enc_after}")
 
             # DB持久化：注册源文件为数据资产
             if db_session:
@@ -3661,6 +3912,35 @@ async def compute_with_script(
 
             spec.loader.exec_module(module)
 
+            # 【加密支持】monkey-patch IntelligentExcelParser 自动注入密码
+            # 注意：文件已在上游被 _dec_excel 解密，仅对仍加密的文件注入密码
+            if passwords_dict:
+                try:
+                    from excel_parser import IntelligentExcelParser as _IEP
+                    from backend.utils.aspose_helper import is_encrypted as _chk_enc
+                    _IEP._orig_parse_backup = _IEP.parse_excel_file
+                    _orig_parse = _IEP.parse_excel_file
+                    _fp_map = passwords_dict
+
+                    def _auto_pwd_parse(self_parser, file_path, *args, **kwargs):
+                        if 'password' not in kwargs or kwargs.get('password') is None:
+                            fname = os.path.basename(str(file_path))
+                            pwd = _fp_map.get(fname)
+                            if pwd:
+                                try:
+                                    still_enc = _chk_enc(str(file_path))
+                                except Exception:
+                                    still_enc = True  # 检测失败时保守注入
+                                if still_enc:
+                                    kwargs['password'] = pwd
+                                else:
+                                    pass  # 文件已解密，跳过密码注入
+                        return _orig_parse(self_parser, file_path, *args, **kwargs)
+
+                    _IEP.parse_excel_file = _auto_pwd_parse
+                except Exception:
+                    pass
+
             # 调用main函数（智能传递参数）
             if hasattr(module, 'main'):
                 # 检查main函数的签名，只传递它接受的参数
@@ -3693,6 +3973,16 @@ async def compute_with_script(
                     result = module.main(str(source_dir))
             else:
                 raise HTTPException(status_code=500, detail="脚本缺少main函数")
+
+            # 恢复 monkey-patch
+            if passwords_dict:
+                try:
+                    from excel_parser import IntelligentExcelParser as _IEP2
+                    if hasattr(_IEP2, '_orig_parse_backup'):
+                        _IEP2.parse_excel_file = _IEP2._orig_parse_backup
+                        del _IEP2._orig_parse_backup
+                except Exception:
+                    pass
 
             # 查找输出文件
             output_files = list(output_dir.glob("*.xlsx"))

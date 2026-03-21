@@ -332,7 +332,8 @@ class TrainingEngine:
         salary_year: Optional[int] = None,
         salary_month: Optional[int] = None,
         monthly_standard_hours: Optional[float] = None,
-        force_retrain: bool = False
+        force_retrain: bool = False,
+        file_passwords: Optional[Dict[str, str]] = None
     ) -> Dict[str, Any]:
         """训练AI生成数据处理脚本
 
@@ -353,6 +354,8 @@ class TrainingEngine:
         self.salary_year = salary_year
         self.salary_month = salary_month
         self.monthly_standard_hours = monthly_standard_hours
+        # 保存文件密码映射（文件名→密码），用于打开加密的Excel文件
+        self.file_passwords = file_passwords or {}
 
         # 从规则文件名中提取关键词
         keyword = "training"
@@ -424,11 +427,11 @@ class TrainingEngine:
         self._validate_input_files(source_files, expected_file, rule_files)
 
         # 1. 解析源文件结构
-        source_structure = self._analyze_source_structure(source_files, manual_headers)
+        source_structure = self._analyze_source_structure(source_files, manual_headers, file_passwords=self.file_passwords)
         self.training_logger.log_info(f"解析源文件结构完成，共 {len(source_structure.get('files', {}))} 个文件")
 
         # 2. 解析预期文件结构
-        expected_structure = self._analyze_expected_structure(expected_file, manual_headers)
+        expected_structure = self._analyze_expected_structure(expected_file, manual_headers, file_passwords=self.file_passwords)
         self.training_logger.log_info("解析预期文件结构完成")
 
         # 3. 提取规则内容
@@ -824,13 +827,21 @@ class TrainingEngine:
 
                 # 在沙箱中执行代码
                 self.training_logger.log_info("执行生成的代码...")
+                # 诊断日志：检查沙箱输入文件的加密状态
+                try:
+                    from backend.utils.aspose_helper import is_encrypted as _diag_enc
+                    for sf in source_files:
+                        self.training_logger.log_info(f"[沙箱诊断] {Path(sf).name}: encrypted={_diag_enc(sf)}")
+                except Exception as _de:
+                    self.training_logger.log_warning(f"[沙箱诊断] 检测失败: {_de}")
                 start_time = time.time()
 
                 execution_env = {
                     "input_folder": input_folder,
                     "output_folder": output_folder,
                     "source_files": [Path(f).name for f in source_files],
-                    "manual_headers": manual_headers or {}
+                    "manual_headers": manual_headers or {},
+                    "file_passwords": self.file_passwords or {}
                 }
 
                 # 添加薪资参数（如果有）
@@ -1417,7 +1428,8 @@ class TrainingEngine:
         self.training_logger.log_info(f"文件验证通过: {len(source_files)}个源文件, 1个预期文件, {len(rule_files)}个规则文件")
 
     def _analyze_source_structure(
-        self, source_files: List[str], manual_headers: Optional[Dict[str, Any]] = None
+        self, source_files: List[str], manual_headers: Optional[Dict[str, Any]] = None,
+        file_passwords: Optional[Dict[str, str]] = None
     ) -> Dict[str, Any]:
         """分析源文件结构"""
         structure = {
@@ -1433,11 +1445,13 @@ class TrainingEngine:
                     raise FileNotFoundError(f"源文件不存在: {file_path}")
 
                 file_name = Path(file_path).name
+                passwords = file_passwords or {}
                 parsed_data = self.excel_parser.parse_excel_file(
                       file_path,
                     max_data_rows=10,  # 训练时只读取10行数据用于分析结构
           manual_headers=manual_headers,
-                    active_sheet_only=True  # 只加载激活的sheet
+                    active_sheet_only=True,  # 只加载激活的sheet
+                    password=passwords.get(file_name)
                 )
 
                 file_structure = {
@@ -1479,7 +1493,8 @@ class TrainingEngine:
         return structure
 
     def _analyze_expected_structure(
-        self, expected_file: str, manual_headers: Optional[Dict[str, Any]] = None
+        self, expected_file: str, manual_headers: Optional[Dict[str, Any]] = None,
+        file_passwords: Optional[Dict[str, str]] = None
     ) -> Dict[str, Any]:
         """分析预期文件结构"""
         try:
@@ -1491,7 +1506,8 @@ class TrainingEngine:
                 expected_file,
              max_data_rows=10,  # 训练时只读取10行数据用于分析结构
                 manual_headers=manual_headers,
-                active_sheet_only=True  # 只加载激活的sheet
+                active_sheet_only=True,  # 只加载激活的sheet
+                password=(file_passwords or {}).get(Path(expected_file).name)
             )
 
             structure = {
@@ -1570,7 +1586,8 @@ class TrainingEngine:
                 "input_folder": str(input_dir),
                 "output_folder": str(output_dir),
                 "manual_headers": manual_headers or {},
-                "source_files": [Path(f).name for f in source_files]
+                "source_files": [Path(f).name for f in source_files],
+                "file_passwords": self.file_passwords if hasattr(self, 'file_passwords') else {}
             }
 
             # 添加薪资参数（如果有）- 直接使用传入的值，不自动计算
@@ -1669,10 +1686,12 @@ class TrainingEngine:
         return result
 
     def _compare_files(
-        self, actual_file: str, expected_file: str, manual_headers: Optional[Dict[str, Any]] = None
+        self, actual_file: str, expected_file: str, manual_headers: Optional[Dict[str, Any]] = None,
+        file_passwords: Optional[Dict[str, str]] = None
     ) -> str:
         """比较两个Excel文件"""
         try:
+            passwords = file_passwords or {}
             # 解析实际输出文件
             actual_data = self.excel_parser.parse_excel_file(
                 actual_file,
@@ -1682,7 +1701,8 @@ class TrainingEngine:
             expected_data = self.excel_parser.parse_excel_file(
                 expected_file,
                 manual_headers=manual_headers,
-                active_sheet_only=True  # 只加载激活的sheet
+                active_sheet_only=True,  # 只加载激活的sheet
+                password=passwords.get(Path(expected_file).name)
             )
 
             # 转换为结构化的字典
