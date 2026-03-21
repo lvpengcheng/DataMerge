@@ -23,19 +23,8 @@ from pathlib import Path
 from datetime import datetime
 
 # ==================== Aspose.Cells for .NET 初始化 ====================
-# 通过 pythonnet 调用 Aspose.Cells.dll（.NET 版本），替代 aspose-cells-python
-
-_libs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libs")
-os.add_dll_directory(_libs_dir)
-
-import pythonnet
-pythonnet.load("coreclr", runtime_config=os.path.join(_libs_dir, "runtimeconfig.json"))
-import clr
-clr.AddReference(os.path.join(_libs_dir, "SkiaSharp.dll"))
-clr.AddReference(os.path.join(_libs_dir, "Aspose.Cells.dll"))
-clr.AddReference("System.Text.Encoding.CodePages")
-import System.Text
-System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance)
+# 通过 aspose_init 模块统一初始化（pythonnet + 许可证），全局只执行一次
+import aspose_init  # noqa: F401 — 触发全局初始化
 
 from Aspose.Cells import (
     License as _AsposeLicense,
@@ -45,11 +34,10 @@ from Aspose.Cells import (
     BackgroundType as _BackgroundType,
 )
 
-# 设置许可证（避免评估模式水印）
-_lic_path = os.path.join(_libs_dir, "Aspose.Total.NET.lic")
-if os.path.exists(_lic_path):
-    _lic = _AsposeLicense()
-    _lic.SetLicense(_lic_path)
+# 许可证由 aspose_init 模块统一管理，此处保留兼容接口
+def set_license(lic_path: str = None) -> bool:
+    """兼容接口 — 许可证已由 aspose_init 全局注册，此方法直接返回状态"""
+    return aspose_init.is_licensed()
 
 
 # ==================== Aspose.Cells 适配器层 ====================
@@ -1280,7 +1268,8 @@ class IntelligentExcelParser:
     
     def parse_excel_file(self, file_path: str, max_data_rows: int = None, skip_rows: int = 0,
                         manual_headers: Dict[str, Any] = None, headers_only: bool = False,
-                        active_sheet_only: bool = False) -> List[SheetData]:
+                        active_sheet_only: bool = False,
+                        best_region_only: bool = False) -> List[SheetData]:
         """读取并解析Excel文件
 
         Args:
@@ -1292,6 +1281,8 @@ class IntelligentExcelParser:
                           2. 新格式: {"文件名.xlsx": {"Sheet1": [1, 1], "Sheet2": [3, 3]}}
             headers_only: 是否只读取表头，不读取数据行（用于快速匹配）
             active_sheet_only: 是否只加载当前激活的Sheet，默认False（加载所有Sheet）
+            best_region_only: 是否只保留每个sheet的最优区域（使用_find_valid_region策略）
+                            True时每个sheet最多保留1个最优区域（或合并后的区域组）
 
         Returns:
             解析后的Sheet数据列表
@@ -1330,7 +1321,14 @@ class IntelligentExcelParser:
 
                 sheet_data = self._parse_sheet(ws, max_data_rows, skip_rows, manual_header_range, headers_only)
                 if sheet_data and sheet_data.regions:
-                    result.append(sheet_data)
+                    if best_region_only:
+                        # 每个sheet只保留最优区域
+                        _, best_regions = self._find_valid_region([sheet_data])
+                        if best_regions:
+                            sheet_data.regions = best_regions
+                            result.append(sheet_data)
+                    else:
+                        result.append(sheet_data)
 
         except Exception as e:
             print(f"解析Excel文件时出错: {e}")
@@ -3246,28 +3244,391 @@ class IntelligentExcelParser:
             result = result * 26 + (ord(char) - ord('A') + 1)
         return result
 
+    # ==================== 有效区域查找与合并方法 ====================
+
+    def _find_valid_region(self, sheet_data_list: List[SheetData],
+                           active_sheet_name: str = None):
+        """从解析结果中找到有效区域
+
+        选取策略：
+        1. 若指定了 active_sheet_name，优先从该 sheet 中选取
+        2. 按列头数量降序排列，选第一个数据行>=1的区域
+        3. 若有其他区域列头完全一致 → 合并（列头取第一个，数据拼接）
+        4. 若最多列头的区域数据行<1，依次查找列头次多的
+
+        Args:
+            sheet_data_list: parse_excel_file返回的解析结果
+            active_sheet_name: 激活sheet名称，优先从该sheet中选取
+
+        Returns:
+            (sheet_name, regions_list) 元组；
+            regions_list 为 ExcelRegion 列表（同列头多区域时包含多个）；
+            未找到时返回 (None, None)
+        """
+        def _select(candidates: List[SheetData]):
+            # 有效列头：非空且非自动生成的 Column_X 占位符
+            def _is_real_header(k):
+                return bool(k and k.strip() and not k.startswith('Column_'))
+
+            # 有效列头数量
+            def _real_col_count(region):
+                return sum(1 for k in region.head_data if _is_real_header(k))
+
+            # 有效列头名称集合（用于合并判断）
+            def _real_headers(region):
+                return {k for k in region.head_data if _is_real_header(k)}
+
+            # 收集所有区域（保持从上到下的原始顺序）
+            all_regions = []
+            for sd in candidates:
+                for region in sd.regions:
+                    all_regions.append((sd.sheet_name, region))
+            if not all_regions:
+                return None, None
+
+            # 第一个区域（sheet内最上面的）
+            first_region = all_regions[0]
+            # 有效列头最多的区域
+            most_cols = max(all_regions, key=lambda x: _real_col_count(x[1]))
+
+            # 如果有效列头最多的区域就是第一个区域 → 无条件选它（不要求有数据行）
+            if most_cols[1] is first_region[1]:
+                best = most_cols
+            else:
+                # 否则按有效列头数量降序，找第一个数据行>=1的
+                sorted_by_cols = sorted(
+                    all_regions, key=lambda x: _real_col_count(x[1]), reverse=True
+                )
+                best = None
+                for sheet_name, region in sorted_by_cols:
+                    if len(region.data) >= 1:
+                        best = (sheet_name, region)
+                        break
+
+            if not best:
+                return None, None
+
+            best_headers = _real_headers(best[1])
+
+            # 收集所有有效列头一致且数据行>=1的区域（用于合并）
+            matching = [
+                (sn, rg) for sn, rg in all_regions
+                if _real_headers(rg) == best_headers and len(rg.data) >= 1
+            ]
+
+            # 如果best本身无数据（第一个区域特殊情况），也需包含
+            if best[1] not in [rg for _, rg in matching]:
+                matching.insert(0, best)
+
+            if len(matching) == 1:
+                return matching[0][0], [matching[0][1]]
+            else:
+                # 多区域列头一致 → 合并，列头使用第一个
+                return matching[0][0], [rg for _, rg in matching]
+
+        # 优先从激活 sheet 中查找
+        if active_sheet_name:
+            active_sheets = [sd for sd in sheet_data_list
+                             if sd.sheet_name == active_sheet_name]
+            name, regions = _select(active_sheets)
+            if regions:
+                return name, regions
+
+        # 回退：在所有 sheet 中查找
+        return _select(sheet_data_list)
+
+    @staticmethod
+    def _sanitize_sheet_name(name: str) -> str:
+        """清理sheet名称，确保符合Excel规范
+
+        规则：最长31字符，不能包含 \\ / : * ? [ ] 字符
+        """
+        for ch in '\\/:*?[]':
+            name = name.replace(ch, '_')
+        # 去除首尾单引号（Excel不允许）
+        name = name.strip("'")
+        if len(name) > 31:
+            name = name[:31]
+        return name or 'Sheet'
+
+    @staticmethod
+    def _unique_sheet_name(name: str, existing_names: set) -> str:
+        """确保sheet名称在工作簿中唯一"""
+        if name not in existing_names:
+            return name
+        for i in range(1, 1000):
+            max_base = 31 - len(str(i)) - 1  # 留出 _i 的空间
+            candidate = f"{name[:max_base]}_{i}"
+            if candidate not in existing_names:
+                return candidate
+        return name[:25] + '_' + str(abs(hash(name)))[-5:]
+
+    def merge_source_to_target(self, source_folder: str, expected_file: str,
+                               target_file: str, active_sheet_only: bool = False) -> str:
+        """将source文件夹内的Excel文件解析后合并到target文件
+
+        处理流程：
+        1. 解析source文件夹内所有Excel文件，找到每个文件的有效区域
+           （从上到下扫描，数据行>1且列头最多的区域）
+        2. 解析预期文件，找到其有效区域
+        3. 创建target工作簿：
+           - 第一个sheet：完全复制预期文件有效区域的表头及表头以上的所有行（保留格式）
+           - 后续sheet：每个source文件的有效区域数据，
+             sheet名格式为「源文件名_选取的sheet名」
+        4. 保存target文件
+
+        Args:
+            source_folder: 源文件夹路径，包含要解析的Excel文件
+            expected_file: 预期文件路径
+            target_file: 目标文件保存路径
+            active_sheet_only: 是否只读取激活的sheet，默认False
+
+        Returns:
+            保存的target文件路径
+        """
+        source_folder = Path(source_folder)
+        expected_file = Path(expected_file)
+        excel_extensions = ('.xlsx', '.xls', '.xlsm')
+        used_sheet_names = set()
+
+        # ---- 1. 解析source文件夹内所有Excel文件，找到各自的有效区域 ----
+        # 每个文件只打开一次，同时用于解析和Range.Copy
+        # active_sheet_only=True  → 只取激活sheet的最优区域
+        # active_sheet_only=False → 每个sheet各自的最优区域都收集
+        # 同sheet内多个同列头区域会合并为一组（regions列表）
+        source_results = []  # [(aspose_wb, file_stem, sheet_name, regions_list), ...]
+
+        for file_path in sorted(source_folder.iterdir()):
+            if file_path.suffix.lower() not in excel_extensions:
+                continue
+            if file_path.name.startswith('~$'):  # 跳过Excel临时文件
+                continue
+
+            try:
+                # 只打开一次，后续 Range.Copy 复用同一个 workbook 对象
+                aspose_wb = _AsposeWorkbook(str(file_path))
+
+                active_idx = aspose_wb.Worksheets.ActiveSheetIndex
+
+                if active_sheet_only:
+                    # 只解析激活sheet，取其最优区域
+                    ws = _AsposeWorksheet(aspose_wb.Worksheets[active_idx])
+                    sheet_data = self._parse_sheet(ws, max_data_rows=2)
+                    if sheet_data and sheet_data.regions:
+                        _, regions = self._find_valid_region([sheet_data])
+                        if regions:
+                            source_results.append(
+                                (aspose_wb, file_path.stem,
+                                 sheet_data.sheet_name, regions)
+                            )
+                else:
+                    # 每个sheet各自取最优区域
+                    for i in range(aspose_wb.Worksheets.Count):
+                        ws = _AsposeWorksheet(aspose_wb.Worksheets[i])
+                        sheet_data = self._parse_sheet(ws, max_data_rows=2)
+                        if sheet_data and sheet_data.regions:
+                            _, regions = self._find_valid_region([sheet_data])
+                            if regions:
+                                source_results.append(
+                                    (aspose_wb, file_path.stem,
+                                     sheet_data.sheet_name, regions)
+                                )
+            except Exception as e:
+                self.logger.warning(f"解析源文件 {file_path.name} 失败: {e}")
+                continue
+
+        self.logger.info(f"从source文件夹解析到 {len(source_results)} 个有效区域")
+
+        # ---- 2. 解析预期文件，找到有效区域（同样只打开一次） ----
+        expected_wb = _AsposeWorkbook(str(expected_file))
+
+        exp_active_idx = expected_wb.Worksheets.ActiveSheetIndex
+        exp_active_name = expected_wb.Worksheets[exp_active_idx].Name
+
+        if active_sheet_only:
+            exp_sheets = [expected_wb.Worksheets[exp_active_idx]]
+        else:
+            exp_sheets = [expected_wb.Worksheets[i]
+                          for i in range(expected_wb.Worksheets.Count)]
+
+        expected_data_list = []
+        for aspose_ws in exp_sheets:
+            ws = _AsposeWorksheet(aspose_ws)
+            sheet_data = self._parse_sheet(ws, max_data_rows=2)
+            if sheet_data and sheet_data.regions:
+                expected_data_list.append(sheet_data)
+
+        expected_sheet_name, expected_regions = self._find_valid_region(
+            expected_data_list, exp_active_name
+        )
+        expected_region = expected_regions[0] if expected_regions else None
+
+        # 回退：如果没有数据行>1的区域，选列头最多的区域
+        if not expected_region:
+            best_col_count = 0
+            for sheet_data in expected_data_list:
+                for region in sheet_data.regions:
+                    if len(region.head_data) > best_col_count:
+                        expected_region = region
+                        expected_sheet_name = sheet_data.sheet_name
+                        best_col_count = len(region.head_data)
+
+        # ---- 3. 创建target工作簿 ----
+        target_wb = _AsposeWorkbook()
+
+        # ---- 4. 第一个sheet：完全复制预期文件的表头及表头以上的行 ----
+        first_ws = target_wb.Worksheets[0]
+
+        if expected_region and expected_sheet_name:
+            # 从已打开的 expected_wb 中找对应 sheet
+            src_ws = None
+            for i in range(expected_wb.Worksheets.Count):
+                if expected_wb.Worksheets[i].Name == expected_sheet_name:
+                    src_ws = expected_wb.Worksheets[i]
+                    break
+
+            if src_ws:
+                safe_name = self._sanitize_sheet_name(expected_sheet_name)
+                safe_name = self._unique_sheet_name(safe_name, used_sheet_names)
+                first_ws.Name = safe_name
+                used_sheet_names.add(safe_name)
+
+                # 复制行：从第0行到head_row_end-1行 (0-indexed)
+                rows_to_copy = expected_region.head_row_end
+                max_src_col = src_ws.Cells.MaxColumn + 1
+
+                # 使用 Range.Copy 完全复制（值、公式、样式、合并单元格等）
+                source_range = src_ws.Cells.CreateRange(0, 0, rows_to_copy, max_src_col)
+                dest_range = first_ws.Cells.CreateRange(0, 0, rows_to_copy, max_src_col)
+                dest_range.Copy(source_range)
+
+                # 复制列宽
+                for col in range(max_src_col):
+                    first_ws.Cells.SetColumnWidth(col, src_ws.Cells.GetColumnWidth(col))
+
+                # 复制行高
+                for row in range(rows_to_copy):
+                    first_ws.Cells.SetRowHeight(row, src_ws.Cells.GetRowHeight(row))
+
+                self.logger.info(
+                    f"已复制预期文件 [{expected_sheet_name}] 的前 {rows_to_copy} 行到第一个sheet"
+                )
+        else:
+            first_ws.Name = "预期"
+            used_sheet_names.add("预期")
+            self.logger.warning("未在预期文件中找到有效区域")
+
+        # ---- 5. 为每个source文件的有效区域添加sheet（Range.Copy保留全部格式） ----
+        for aspose_wb_src, file_stem, sheet_name, regions in source_results:
+            raw_name = f"{file_stem}_{sheet_name}"
+            safe_name = self._sanitize_sheet_name(raw_name)
+            safe_name = self._unique_sheet_name(safe_name, used_sheet_names)
+            used_sheet_names.add(safe_name)
+
+            sheet_idx = target_wb.Worksheets.Add()
+            new_ws = target_wb.Worksheets[sheet_idx]
+            new_ws.Name = safe_name
+
+            # 直接复用步骤1已打开的 workbook，无需再次打开文件
+            src_ws = None
+            for i in range(aspose_wb_src.Worksheets.Count):
+                if aspose_wb_src.Worksheets[i].Name == sheet_name:
+                    src_ws = aspose_wb_src.Worksheets[i]
+                    break
+
+            if not src_ws:
+                self.logger.warning(f"未找到sheet [{sheet_name}] in {file_stem}")
+                continue
+
+            total_cols = src_ws.Cells.MaxColumn + 1
+            first_region = regions[0]
+
+            if len(regions) == 1:
+                # 单区域：整块 Range.Copy（表头+数据）
+                first_row = first_region.head_row_start - 1
+                total_rows = first_region.data_row_end - first_region.head_row_start + 1
+
+                source_range = src_ws.Cells.CreateRange(
+                    first_row, 0, total_rows, total_cols)
+                dest_range = new_ws.Cells.CreateRange(
+                    0, 0, total_rows, total_cols)
+                dest_range.Copy(source_range)
+
+                # 复制行高
+                for row in range(total_rows):
+                    new_ws.Cells.SetRowHeight(
+                        row, src_ws.Cells.GetRowHeight(first_row + row))
+            else:
+                # 多区域合并：表头取第一个区域，数据逐个区域追加
+                # -- 复制表头 --
+                head_start = first_region.head_row_start - 1
+                head_rows = first_region.head_row_end - first_region.head_row_start + 1
+
+                source_range = src_ws.Cells.CreateRange(
+                    head_start, 0, head_rows, total_cols)
+                dest_range = new_ws.Cells.CreateRange(
+                    0, 0, head_rows, total_cols)
+                dest_range.Copy(source_range)
+
+                for row in range(head_rows):
+                    new_ws.Cells.SetRowHeight(
+                        row, src_ws.Cells.GetRowHeight(head_start + row))
+
+                # -- 逐个区域追加数据 --
+                dest_row = head_rows
+                for region in regions:
+                    data_start = region.data_row_start - 1
+                    data_rows = region.data_row_end - region.data_row_start + 1
+                    if data_rows <= 0:
+                        continue
+
+                    source_range = src_ws.Cells.CreateRange(
+                        data_start, 0, data_rows, total_cols)
+                    dest_range = new_ws.Cells.CreateRange(
+                        dest_row, 0, data_rows, total_cols)
+                    dest_range.Copy(source_range)
+
+                    for row in range(data_rows):
+                        new_ws.Cells.SetRowHeight(
+                            dest_row + row,
+                            src_ws.Cells.GetRowHeight(data_start + row))
+                    dest_row += data_rows
+
+                total_rows = dest_row
+
+            # 复制列宽
+            for col in range(total_cols):
+                new_ws.Cells.SetColumnWidth(col, src_ws.Cells.GetColumnWidth(col))
+
+            self.logger.info(
+                f"已写入 [{safe_name}]: {total_rows} 行（含表头）, {total_cols} 列"
+                + (f", 合并了 {len(regions)} 个区域" if len(regions) > 1 else "")
+            )
+
+        # ---- 6. 保存 ----
+        target_wb.Save(str(target_file))
+        self.logger.info(f"Target文件已保存: {target_file}")
+
+        return str(target_file)
 
 # ==================== 使用示例 ====================
 
 if __name__ == "__main__":
-    # 使用示例
     parser = IntelligentExcelParser()
-    
-    # 解析Excel文件
-    results = parser.parse_excel_file("example.xlsx")
-    
-    # 输出结果
-    for sheet_data in results:
-        print(f"\n=== Sheet: {sheet_data.sheet_name} ===")
-        print(f"找到 {len(sheet_data.regions)} 个数据区域\n")
-        
-        for i, region in enumerate(sheet_data.regions, 1):
-            print(f"区域 {i}:")
-            print(f"  表头行: {region.head_row_start} - {region.head_row_end}")
-            print(f"  数据行: {region.data_row_start} - {region.data_row_end}")
-            print(f"  表头映射: {region.head_data}")
-            print(f"  数据行数: {len(region.data)}")
-            
-            if region.data:
-                print(f"  第一行数据示例: {region.data[0]}")
-            print()
+
+    # ---- 示例1: 解析单个Excel文件 ----
+    # results = parser.parse_excel_file("example.xlsx")
+    # for sheet_data in results:
+    #     print(f"\n=== Sheet: {sheet_data.sheet_name} ===")
+    #     for i, region in enumerate(sheet_data.regions, 1):
+    #         print(f"  区域{i}: 表头{region.head_row_start}-{region.head_row_end}, "
+    #               f"数据{len(region.data)}行, 列头{len(region.head_data)}个")
+
+    # ---- 示例2: 合并source文件夹到target ----
+    target = parser.merge_source_to_target(
+        source_folder="source",
+        expected_file="expected/薪资汇总表.xlsx",
+        target_file="target.xlsx",
+        active_sheet_only=False,
+    )
+    print(f"已生成: {target}")

@@ -15,21 +15,58 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def ensure_mysql_database():
-    """如果使用 MySQL，自动创建数据库（如果不存在）"""
+def ensure_database():
+    """自动创建数据库（如果不存在），支持 PostgreSQL 和 MySQL"""
     db_url = os.getenv("DATABASE_URL", "")
-    if not db_url.startswith("mysql"):
-        return
 
-    # 从 URL 中提取数据库名，连接到 MySQL 服务器（不指定数据库）
+    if db_url.startswith("postgresql"):
+        _ensure_postgresql_database(db_url)
+    elif db_url.startswith("mysql"):
+        _ensure_mysql_database(db_url)
+
+
+def _ensure_postgresql_database(db_url):
+    """PostgreSQL: 连接到默认 postgres 库，创建目标数据库"""
     from urllib.parse import urlparse
     parsed = urlparse(db_url)
     db_name = parsed.path.lstrip("/").split("?")[0]
-    server_url = db_url.replace(f"/{db_name}", "/", 1).split("?")[0]
+
+    try:
+        import psycopg2
+        from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+
+        conn = psycopg2.connect(
+            host=parsed.hostname or "localhost",
+            port=parsed.port or 5432,
+            user=parsed.username,
+            password=parsed.password,
+            dbname="postgres",
+        )
+        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+        cursor = conn.cursor()
+
+        # 检查数据库是否存在
+        cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s", (db_name,))
+        if not cursor.fetchone():
+            cursor.execute(f'CREATE DATABASE "{db_name}" ENCODING \'UTF8\'')
+            print(f"      数据库 '{db_name}' 创建成功。")
+        else:
+            print(f"      数据库 '{db_name}' 已存在。")
+
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"      警告: 无法自动创建数据库: {e}")
+
+
+def _ensure_mysql_database(db_url):
+    """MySQL: 连接到服务器，创建目标数据库"""
+    from urllib.parse import urlparse
+    parsed = urlparse(db_url)
+    db_name = parsed.path.lstrip("/").split("?")[0]
 
     try:
         import pymysql
-        # 从 parsed URL 中提取连接参数
         conn = pymysql.connect(
             host=parsed.hostname or "localhost",
             port=parsed.port or 3306,
@@ -46,10 +83,15 @@ def ensure_mysql_database():
         print(f"      警告: 无法自动创建数据库: {e}")
 
 
-ensure_mysql_database()
+ensure_database()
 
 from backend.database.connection import engine, SessionLocal, Base
-from backend.database.models import Role, Organization, User, TenantAuthorization
+from backend.database.models import (
+    Role, Organization, User, TenantAuthorization,
+    ReferenceCategory, DataAsset,
+    TrainingSession, TrainingIteration, Script,
+    ComputeTask, ComputeTaskInput,
+)
 from passlib.context import CryptContext
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -57,14 +99,14 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def init_database():
     """创建所有表"""
-    print("[1/4] 创建数据库表...")
+    print("[1/6] 创建数据库表...")
     Base.metadata.create_all(bind=engine)
     print("      表创建完成。")
 
 
 def seed_roles(db):
     """种子角色数据"""
-    print("[2/4] 初始化角色...")
+    print("[2/6] 初始化角色...")
     roles = [
         {
             "name": "admin",
@@ -107,7 +149,7 @@ def seed_roles(db):
 
 def seed_default_org(db):
     """种子默认组织"""
-    print("[3/4] 初始化默认组织...")
+    print("[3/6] 初始化默认组织...")
     org = db.query(Organization).filter_by(name="默认组织").first()
     if not org:
         org = Organization(name="默认组织", description="系统默认组织")
@@ -122,7 +164,7 @@ def seed_default_org(db):
 
 def seed_admin_user(db, org):
     """种子管理员用户"""
-    print("[4/4] 初始化管理员账号...")
+    print("[4/6] 初始化管理员账号...")
     admin_role = db.query(Role).filter_by(name="admin").first()
     admin_user = db.query(User).filter_by(username="admin").first()
     if not admin_user:
@@ -144,6 +186,7 @@ def seed_admin_user(db, org):
 
 def migrate_existing_tenants(db, org, admin_user):
     """将现有 tenants 目录下的租户自动关联到默认组织"""
+    print("[5/6] 迁移现有租户...")
     tenants_dir = project_root / "tenants"
     if not tenants_dir.exists():
         print("      tenants 目录不存在，跳过迁移。")
@@ -169,6 +212,29 @@ def migrate_existing_tenants(db, org, admin_user):
     print(f"      迁移了 {migrated} 个现有租户到默认组织。")
 
 
+def seed_reference_categories(db):
+    """种子基础数据分类"""
+    print("[6/6] 初始化基础数据分类...")
+    categories = [
+        {"code": "min_wage", "name": "最低工资标准", "description": "各地区最低工资标准表", "scope": "global", "sort_order": 1},
+        {"code": "salary_calendar", "name": "薪资日历", "description": "工作日/节假日/调休日历", "scope": "global", "sort_order": 2},
+        {"code": "social_insurance", "name": "社保基数", "description": "社会保险缴纳基数与比例", "scope": "global", "sort_order": 3},
+        {"code": "housing_fund", "name": "公积金基数", "description": "住房公积金缴纳基数与比例", "scope": "global", "sort_order": 4},
+        {"code": "tax_bracket", "name": "个税税率", "description": "个人所得税累进税率表", "scope": "global", "sort_order": 5},
+        {"code": "allowance", "name": "津贴补贴标准", "description": "各类津贴补贴标准表", "scope": "tenant", "sort_order": 6},
+        {"code": "position_salary", "name": "岗位薪资标准", "description": "各岗位级别薪资标准", "scope": "tenant", "sort_order": 7},
+        {"code": "other", "name": "其他基础数据", "description": "其他业务基础数据", "scope": "tenant", "sort_order": 99},
+    ]
+    for cat_data in categories:
+        existing = db.query(ReferenceCategory).filter_by(code=cat_data["code"]).first()
+        if not existing:
+            db.add(ReferenceCategory(**cat_data))
+            print(f"      创建分类: {cat_data['name']}")
+        else:
+            print(f"      分类已存在: {cat_data['name']}")
+    db.commit()
+
+
 def main():
     print("=" * 50)
     print("数据整合平台 - 数据库初始化")
@@ -182,6 +248,7 @@ def main():
         org = seed_default_org(db)
         admin_user = seed_admin_user(db, org)
         migrate_existing_tenants(db, org, admin_user)
+        seed_reference_categories(db)
     finally:
         db.close()
 

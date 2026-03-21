@@ -2,6 +2,9 @@
 主应用入口 - FastAPI应用
 """
 
+# Aspose.Cells 全局初始化（必须在 excel_parser 等模块之前）
+import aspose_init  # noqa: F401
+
 import os
 import json
 import logging
@@ -26,7 +29,10 @@ from ..sandbox.code_sandbox import CodeSandbox
 from ..email_processor.email_handler import EmailHandler
 from ..auth.router import router as auth_router
 from ..admin.router import router as admin_router
-from ..database.connection import engine, get_db
+from ..api.assets import router as assets_router
+from ..api.training import router as training_api_router
+from ..api.compute import router as compute_api_router
+from ..database.connection import engine, get_db, SessionLocal
 from ..database import models as db_models
 from ..auth.dependencies import get_current_user, get_accessible_tenants
 
@@ -56,6 +62,9 @@ app.add_middleware(
 # 注册认证和管理路由
 app.include_router(auth_router)
 app.include_router(admin_router)
+app.include_router(assets_router)
+app.include_router(training_api_router)
+app.include_router(compute_api_router)
 
 
 @app.on_event("startup")
@@ -148,7 +157,17 @@ async def train_model(
             # 创建训练引擎（会自动从配置创建AI提供者）
             # 从环境变量读取最大训练迭代次数，默认为2
             max_iterations = int(os.getenv("MAX_TRAINING_ITERATIONS", "2"))
-            training_engine = TrainingEngine(max_iterations=max_iterations)
+
+            db_persistence = None
+            try:
+                from ..api.training_persistence import TrainingPersistence
+                from ..database.connection import SessionLocal
+                db_session = SessionLocal()
+                db_persistence = TrainingPersistence(db_session)
+            except Exception as e:
+                logger.warning(f"训练持久化初始化失败，跳过DB记录: {e}")
+
+            training_engine = TrainingEngine(max_iterations=max_iterations, db_persistence=db_persistence)
 
             # 执行训练
             logger.info(f"开始调用训练引擎，源文件: {len(saved_files['source'])}, 规则文件: {len(saved_files['rules'])}")
@@ -398,9 +417,21 @@ async def train_model_stream(
 
             # 创建训练引擎并设置流式回调
             effective_max_iterations = max_iterations or int(os.getenv("MAX_TRAINING_ITERATIONS", "2"))
+
+            # 创建 DB 持久化（可选）
+            db_persistence = None
+            try:
+                from ..api.training_persistence import TrainingPersistence
+                from ..database.connection import SessionLocal
+                db_session = SessionLocal()
+                db_persistence = TrainingPersistence(db_session)
+            except Exception as e:
+                logger.warning(f"训练持久化初始化失败，跳过DB记录: {e}")
+
             training_engine = TrainingEngine(
                 max_iterations=effective_max_iterations,
-                stream_callback=log_callback
+                stream_callback=log_callback,
+                db_persistence=db_persistence,
             )
 
             # 如果前端指定了AI提供者，临时设置环境变量
@@ -2905,6 +2936,186 @@ def _extract_code_from_response(response: str):
     return response.strip() if response and response.strip() else None
 
 
+# ==================== 计算任务 DB 持久化辅助函数 ====================
+
+def _persist_compute_start(tenant_id: str, script_id_str: str):
+    """创建计算任务记录，返回 (db_session, task_id) 或 (None, None)"""
+    try:
+        db = SessionLocal()
+        # 尝试在数据库中查找脚本
+        db_script_id = None
+        try:
+            sid = int(script_id_str)
+            script = db.query(db_models.Script).filter_by(id=sid, is_active=True).first()
+            if script:
+                db_script_id = script.id
+        except (ValueError, TypeError):
+            pass
+
+        task = db_models.ComputeTask(
+            tenant_id=tenant_id,
+            script_id=db_script_id,
+            status="computing",
+            analysis_report={"original_script_id": script_id_str},
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        return db, task.id
+    except Exception as e:
+        logger.warning(f"DB持久化-创建任务失败: {e}")
+        try:
+            db.close()
+        except Exception:
+            pass
+        return None, None
+
+
+def _persist_source_file(db, task_id, tenant_id, src_file_path, file_name, file_size):
+    """注册源文件为数据资产并关联到计算任务"""
+    try:
+        project_root = Path(__file__).resolve().parent.parent.parent
+        asset_dir = project_root / "tenants" / tenant_id / "assets" / "source"
+        asset_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest_path = asset_dir / f"{timestamp}_{file_name}"
+        shutil.copy2(src_file_path, dest_path)
+
+        # 解析 Excel 完整内容存入 DB
+        parsed_data = None
+        sheet_summary = None
+        try:
+            import dataclasses as _dc
+            from excel_parser import IntelligentExcelParser
+            parser = IntelligentExcelParser()
+            results = parser.parse_excel_file(str(dest_path))
+            parsed_data = [_dc.asdict(s) for s in results]
+            sheet_summary = []
+            for sd in results:
+                headers = []
+                total_rows = 0
+                for r in sd.regions:
+                    headers.extend(list(r.head_data.keys()) if r.head_data else [])
+                    total_rows += len(r.data)
+                sheet_summary.append({"sheet_name": sd.sheet_name, "rows": total_rows, "headers": headers[:50], "regions": len(sd.regions)})
+        except Exception as parse_err:
+            logger.warning(f"解析源文件内容失败: {parse_err}")
+
+        asset = db_models.DataAsset(
+            tenant_id=tenant_id,
+            asset_type="source",
+            name=file_name,
+            file_path=str(dest_path),
+            file_name=file_name,
+            file_size=file_size,
+            sheet_summary=sheet_summary,
+            parsed_data=parsed_data,
+        )
+        db.add(asset)
+        db.commit()
+        db.refresh(asset)
+
+        inp = db_models.ComputeTaskInput(
+            task_id=task_id,
+            asset_id=asset.id,
+            role="source",
+        )
+        db.add(inp)
+        db.commit()
+        return asset.id
+    except Exception as e:
+        logger.warning(f"DB持久化-注册源文件失败: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
+
+
+def _persist_result_file(db, task_id, tenant_id, saved_file_path, original_name):
+    """注册计算结果为数据资产"""
+    try:
+        saved_path = Path(saved_file_path) if not isinstance(saved_file_path, Path) else saved_file_path
+
+        # 解析结果文件内容存入 DB
+        parsed_data = None
+        sheet_summary = None
+        try:
+            import dataclasses as _dc
+            from excel_parser import IntelligentExcelParser
+            parser = IntelligentExcelParser()
+            results = parser.parse_excel_file(str(saved_path))
+            parsed_data = [_dc.asdict(s) for s in results]
+            sheet_summary = []
+            for sd in results:
+                headers = []
+                total_rows = 0
+                for r in sd.regions:
+                    headers.extend(list(r.head_data.keys()) if r.head_data else [])
+                    total_rows += len(r.data)
+                sheet_summary.append({"sheet_name": sd.sheet_name, "rows": total_rows, "headers": headers[:50], "regions": len(sd.regions)})
+        except Exception as parse_err:
+            logger.warning(f"解析结果文件内容失败: {parse_err}")
+
+        asset = db_models.DataAsset(
+            tenant_id=tenant_id,
+            asset_type="result",
+            name=f"计算结果_{original_name}",
+            file_path=str(saved_path),
+            file_name=original_name,
+            file_size=saved_path.stat().st_size,
+            source_task_id=task_id,
+            sheet_summary=sheet_summary,
+            parsed_data=parsed_data,
+        )
+        db.add(asset)
+        db.commit()
+        db.refresh(asset)
+        return asset.id
+    except Exception as e:
+        logger.warning(f"DB持久化-注册结果文件失败: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
+
+
+def _persist_compute_complete(db, task_id, duration, result_summary):
+    """标记计算任务为已完成"""
+    try:
+        task = db.query(db_models.ComputeTask).filter_by(id=task_id).first()
+        if task:
+            task.status = "completed"
+            task.duration_seconds = duration
+            task.result_summary = result_summary
+            task.finished_at = datetime.utcnow()
+            db.commit()
+    except Exception as e:
+        logger.warning(f"DB持久化-完成任务失败: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
+def _persist_compute_failed(db, task_id, error_message):
+    """标记计算任务为失败"""
+    try:
+        task = db.query(db_models.ComputeTask).filter_by(id=task_id).first()
+        if task:
+            task.status = "failed"
+            task.error_message = error_message
+            task.finished_at = datetime.utcnow()
+            db.commit()
+    except Exception as e:
+        logger.warning(f"DB持久化-标记失败: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
 @app.post("/api/compute/stream")
 async def compute_with_script_stream(
     tenant_id: str = Form(...),
@@ -2945,7 +3156,14 @@ async def compute_with_script_stream(
 
             async def run_compute():
                 temp_dir = None
+                db_session = None
+                compute_task_id = None
+                compute_start_time = None
                 try:
+                    # DB持久化：创建计算任务记录
+                    db_session, compute_task_id = _persist_compute_start(tenant_id, script_id)
+                    compute_start_time = datetime.now()
+
                     # 发送开始消息
                     start_msg = {
                         "type": "status",
@@ -2982,6 +3200,15 @@ async def compute_with_script_stream(
                             "message": f"已保存源文件: {file.filename}"
                         }
                         await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+
+                    # DB持久化：注册源文件为数据资产
+                    if db_session:
+                        for src_file in source_dir.iterdir():
+                            if src_file.is_file():
+                                _persist_source_file(
+                                    db_session, compute_task_id, tenant_id,
+                                    str(src_file), src_file.name, src_file.stat().st_size
+                                )
 
                     # ========== 【关键修复】根据列头映射表名/sheet名/列名 ==========
                     pre_loaded_source_data = None
@@ -3259,6 +3486,18 @@ async def compute_with_script_stream(
                     }
                     await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
 
+                    # DB持久化：注册结果文件 + 标记任务完成
+                    if db_session:
+                        _persist_result_file(
+                            db_session, compute_task_id, tenant_id,
+                            saved_file, output_file.name
+                        )
+                        duration = (datetime.now() - compute_start_time).total_seconds() if compute_start_time else 0
+                        _persist_compute_complete(
+                            db_session, compute_task_id, duration,
+                            {"output_file": saved_file.name, "rows_processed": rows_processed}
+                        )
+
                     # 发送完成消息
                     final_result = {
                         "type": "complete",
@@ -3274,6 +3513,9 @@ async def compute_with_script_stream(
 
                 except Exception as e:
                     logger.error(f"计算执行失败: {e}", exc_info=True)
+                    # DB持久化：标记任务失败
+                    if db_session:
+                        _persist_compute_failed(db_session, compute_task_id, str(e))
                     error_result = {
                         "type": "error",
                         "message": str(e),
@@ -3286,6 +3528,12 @@ async def compute_with_script_stream(
                     # 清理临时目录
                     if temp_dir and temp_dir.exists():
                         shutil.rmtree(temp_dir, ignore_errors=True)
+                    # 关闭DB会话
+                    if db_session:
+                        try:
+                            db_session.close()
+                        except Exception:
+                            pass
                     # 发送结束标记
                     await logs_queue.put(None)
 
@@ -3350,11 +3598,18 @@ async def compute_with_script(
     import shutil
     from datetime import datetime
 
+    db_session = None
+    compute_task_id = None
+
     try:
         # 获取脚本内容
         script_content = storage_manager.get_script_content(tenant_id, script_id)
         if not script_content:
             raise HTTPException(status_code=404, detail=f"脚本不存在: {script_id}")
+
+        # DB持久化：创建计算任务记录
+        db_session, compute_task_id = _persist_compute_start(tenant_id, script_id)
+        compute_start_time = datetime.now()
 
         # 创建临时目录
         temp_dir = Path(tempfile.mkdtemp(prefix="compute_"))
@@ -3368,6 +3623,15 @@ async def compute_with_script(
                 file_path = source_dir / file.filename
                 with open(file_path, 'wb') as f:
                     shutil.copyfileobj(file.file, f)
+
+            # DB持久化：注册源文件为数据资产
+            if db_session:
+                for src_file in source_dir.iterdir():
+                    if src_file.is_file():
+                        _persist_source_file(
+                            db_session, compute_task_id, tenant_id,
+                            str(src_file), src_file.name, src_file.stat().st_size
+                        )
 
             # 保存脚本
             script_path = temp_dir / f"{script_id}.py"
@@ -3451,6 +3715,18 @@ async def compute_with_script(
             wb = openpyxl.load_workbook(saved_file)
             rows_processed = sum(ws.max_row for ws in wb.worksheets)
 
+            # DB持久化：注册结果文件 + 标记任务完成
+            if db_session:
+                _persist_result_file(
+                    db_session, compute_task_id, tenant_id,
+                    saved_file, output_file.name
+                )
+                duration = (datetime.now() - compute_start_time).total_seconds()
+                _persist_compute_complete(
+                    db_session, compute_task_id, duration,
+                    {"output_file": saved_file.name, "rows_processed": rows_processed}
+                )
+
             return {
                 "success": True,
                 "output_file": saved_file.name,
@@ -3462,9 +3738,24 @@ async def compute_with_script(
         finally:
             # 清理临时目录
             shutil.rmtree(temp_dir, ignore_errors=True)
+            # 关闭DB会话
+            if db_session:
+                try:
+                    db_session.close()
+                except Exception:
+                    pass
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"计算失败: {e}", exc_info=True)
+        # DB持久化：标记任务失败
+        if db_session:
+            _persist_compute_failed(db_session, compute_task_id, str(e))
+            try:
+                db_session.close()
+            except Exception:
+                pass
         raise HTTPException(status_code=500, detail=str(e))
 
 

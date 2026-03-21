@@ -22,7 +22,7 @@ class TrainingEngine:
 
     def __init__(self, ai_provider: BaseAIProvider = None, max_iterations: int = None,
                  stream_callback: Optional[callable] = None, use_modular: bool = None,
-                 use_formula_mode: bool = None):
+                 use_formula_mode: bool = None, db_persistence=None, user_id: int = None):
         """初始化训练引擎
 
         Args:
@@ -31,7 +31,11 @@ class TrainingEngine:
             stream_callback: 流式回调函数，用于实时显示日志
             use_modular: 是否使用模块化代码生成，如果为None则根据规则复杂度自动判断
             use_formula_mode: 是否使用公式模式（生成Excel公式而非Python代码）
+            db_persistence: TrainingPersistence 实例（可选，传入则写DB）
+            user_id: 当前用户ID（可选，用于DB记录）
         """
+        self.db_persistence = db_persistence
+        self.user_id = user_id
         if ai_provider is None:
             # 从配置自动创建AI提供者
             from .ai_provider import AIProviderFactory
@@ -77,6 +81,62 @@ class TrainingEngine:
         # 训练成功阈值配置
         self.training_success_threshold = float(os.getenv("TRAINING_SUCCESS_THRESHOLD", "0.95"))
         self.training_perfect_threshold = float(os.getenv("TRAINING_PERFECT_THRESHOLD", "1.0"))
+
+    # ==================== DB 持久化辅助方法 ====================
+
+    def _db_record_iteration(self, iteration_num, code=None, accuracy=None,
+                             prompt_text=None, ai_response=None,
+                             execution_result=None, error_details=None,
+                             duration_seconds=None, status="completed"):
+        """将迭代结果写入DB（如果启用了持久化）"""
+        if not self.db_persistence or not self._db_session_id:
+            return
+        try:
+            self.db_persistence.record_iteration(
+                session_id=self._db_session_id,
+                iteration_num=iteration_num,
+                prompt_text=prompt_text[:50000] if prompt_text else None,
+                ai_response=ai_response[:50000] if ai_response else None,
+                generated_code=code,
+                accuracy=accuracy,
+                execution_result=execution_result,
+                error_details=error_details,
+                duration_seconds=duration_seconds,
+                status=status,
+            )
+        except Exception as e:
+            if hasattr(self, 'training_logger') and self.training_logger:
+                self.training_logger.log_warning(f"DB记录迭代失败: {e}")
+
+    def _db_complete_session(self, best_score, total_iterations, best_code=None,
+                             status="completed", error_message=None, tenant_id=None, mode="formula"):
+        """完成DB训练会话并保存脚本"""
+        if not self.db_persistence or not self._db_session_id:
+            return
+        try:
+            script_id = None
+            if best_code and best_score and best_score > 0 and tenant_id:
+                script = self.db_persistence.save_script(
+                    tenant_id=tenant_id,
+                    name=f"training_{tenant_id}",
+                    code=best_code,
+                    mode=mode,
+                    source_session_id=self._db_session_id,
+                    accuracy=best_score,
+                    created_by=self.user_id,
+                )
+                script_id = script.id
+            self.db_persistence.complete_session(
+                session_id=self._db_session_id,
+                status=status,
+                best_accuracy=best_score,
+                total_iterations=total_iterations,
+                final_script_id=script_id,
+                error_message=error_message,
+            )
+        except Exception as e:
+            if hasattr(self, 'training_logger') and self.training_logger:
+                self.training_logger.log_warning(f"DB完成会话失败: {e}")
 
     def _is_natural_language_document(self, text: str) -> bool:
         """检查文本是否是自然语言文档（而非结构化规则）"""
@@ -338,6 +398,28 @@ class TrainingEngine:
             self.max_iterations, source_files, expected_file, rule_files
         )
 
+        # DB 持久化：创建训练会话
+        self._db_session_id = None
+        if self.db_persistence:
+            try:
+                mode = "formula" if self.use_formula_mode else "auto"
+                db_session = self.db_persistence.create_session(
+                    tenant_id=tenant_id,
+                    session_key=self.training_logger.session_dir.name if hasattr(self.training_logger, 'session_dir') else f"{tenant_id}_{keyword}",
+                    mode=mode,
+                    user_id=self.user_id,
+                    config={
+                        "max_iterations": self.max_iterations,
+                        "salary_year": salary_year,
+                        "salary_month": salary_month,
+                        "monthly_standard_hours": monthly_standard_hours,
+                        "force_retrain": force_retrain,
+                    },
+                )
+                self._db_session_id = db_session.id
+            except Exception as e:
+                self.training_logger.log_warning(f"DB持久化创建会话失败: {e}")
+
         # 0. 验证输入文件
         self._validate_input_files(source_files, expected_file, rule_files)
 
@@ -536,6 +618,11 @@ class TrainingEngine:
                     "raw_response": getattr(self.ai_provider, 'last_raw_response', "")
                 }
                 iteration_results.append(iteration_result)
+                self._db_record_iteration(
+                    iteration_num=iteration + 1, code=code, accuracy=score,
+                    ai_response=iteration_result.get("raw_response"),
+                    execution_result={"score": score, "error": iteration_result.get("error_description", "")},
+                )
 
                 # 更新最佳代码
                 is_best = score > best_score
@@ -579,6 +666,7 @@ class TrainingEngine:
         self.training_logger.log_training_complete(
             best_score, len(iteration_results), result["success"], len(best_code) if best_code else 0
         )
+        self._db_complete_session(best_score, len(iteration_results), best_code, tenant_id=tenant_id, mode="simple")
 
         return result
 
@@ -864,6 +952,10 @@ class TrainingEngine:
                     "code": code
                 }
                 iteration_results.append(iteration_result)
+                self._db_record_iteration(
+                    iteration_num=iteration_num, code=code, accuracy=score,
+                    execution_result={"score": score, "output_path": output_path},
+                )
 
                 # 更新最佳结果
                 if score > best_score:
@@ -935,6 +1027,7 @@ class TrainingEngine:
             final_score, len(iteration_results), result["success"],
             len(final_code) if final_code else 0
         )
+        self._db_complete_session(final_score, len(iteration_results), final_code, tenant_id=tenant_id, mode="formula")
 
         return result
 
@@ -1056,6 +1149,10 @@ class TrainingEngine:
                     "generation_mode": "modular"
                 }
                 iteration_results.append(iteration_result)
+                self._db_record_iteration(
+                    iteration_num=iteration_num, code=code, accuracy=score,
+                    execution_result={"score": score, "error": iteration_result.get("error_description", "")},
+                )
 
                 # 更新最佳代码
                 is_best = score > best_score
@@ -1117,6 +1214,7 @@ class TrainingEngine:
         self.training_logger.log_training_complete(
             best_score, len(iteration_results), result["success"], len(best_code) if best_code else 0
         )
+        self._db_complete_session(best_score, len(iteration_results), best_code, tenant_id=tenant_id, mode="modular")
 
         return result
 

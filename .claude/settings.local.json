@@ -53,7 +53,8 @@
       "Bash(powershell -command \"Compress-Archive -Path ''build_iis\\\\*'' -DestinationPath ''releases\\\\DataMerge-IIS-v1.0.0.zip'' -Force\")",
       "Read(//e/soft/soft/Aspose.Cells/python使用示例/**)",
       "Read(//e/soft/soft/Aspose.Cells/**)",
-      "Bash(dotnet --list-runtimes)"
+      "Bash(dotnet --list-runtimes)",
+      "Bash(echo \"EXIT_CODE=$?\")"
     ],
     "additionalDirectories": [
       "E:\\project\\DataMerge20260224\\DataMerge\\backend\\test_data\\data_cleaning_test",

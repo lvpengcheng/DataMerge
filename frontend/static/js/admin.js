@@ -39,6 +39,9 @@ const Admin = {
                 else if (tab === 'roles') this.loadRoles().then(() => this.renderRoles());
                 else if (tab === 'orgs') this.loadOrgs().then(() => this.renderOrgs());
                 else if (tab === 'tenant-auth') this.loadTenantAuth();
+                else if (tab === 'ref-data') this.loadRefCategories().then(() => this.loadRefData());
+                else if (tab === 'training-history') this.loadTrainingHistory();
+                else if (tab === 'compute-history') this.loadComputeHistory();
             });
         });
     },
@@ -417,6 +420,364 @@ const Admin = {
         });
         return html;
     },
+
+    // ==================== 基础数据管理 ====================
+    _refCategories: [],
+    _refTenants: [],
+
+    async loadRefCategories() {
+        // 并行加载分类和租户列表
+        const [catResp, tenantResp] = await Promise.all([
+            AUTH.authFetch('/api/assets/reference-categories'),
+            AUTH.authFetch('/api/assets/tenants'),
+        ]);
+        if (catResp.ok) {
+            this._refCategories = await catResp.json();
+            const sel = document.getElementById('ref-category-filter');
+            if (sel) {
+                sel.innerHTML = '<option value="">全部分类</option>' +
+                    this._refCategories.map(c => `<option value="${c.id}">${c.name}</option>`).join('');
+            }
+        }
+        if (tenantResp.ok) {
+            this._refTenants = await tenantResp.json();
+            // 填充作用域筛选中的租户选项
+            const scopeSel = document.getElementById('ref-scope-filter');
+            if (scopeSel) {
+                scopeSel.innerHTML = '<option value="">全部</option>' +
+                    '<option value="global">仅全局</option>' +
+                    this._refTenants.map(t => `<option value="tenant:${t.tenant_id}">租户: ${t.tenant_id}</option>`).join('');
+            }
+        }
+    },
+
+    async loadRefData() {
+        const categoryId = document.getElementById('ref-category-filter')?.value || '';
+        const scopeVal = document.getElementById('ref-scope-filter')?.value || '';
+        let url = '/api/assets?asset_type=reference';
+        if (categoryId) url += `&category_id=${categoryId}`;
+        // 解析作用域筛选
+        if (scopeVal === 'global') {
+            url += '&scope=global';
+        } else if (scopeVal.startsWith('tenant:')) {
+            url += '&scope=tenant&tenant_id=' + encodeURIComponent(scopeVal.replace('tenant:', ''));
+        }
+        const resp = await AUTH.authFetch(url);
+        if (!resp.ok) return;
+        const assets = await resp.json();
+        const tbody = document.querySelector('#ref-data-table tbody');
+        if (!assets.length) {
+            tbody.innerHTML = '<tr><td colspan="9" class="empty-state">暂无基础数据</td></tr>';
+            return;
+        }
+        tbody.innerHTML = assets.map(a => `<tr>
+            <td>${a.id}</td>
+            <td>${a.name}</td>
+            <td>${a.category_name || '-'}</td>
+            <td>${a.tenant_id ? '<span class="tag">租户: ' + a.tenant_id + '</span>' : '<span class="tag" style="background:#e8f5e9;color:#2e7d32">全局</span>'}</td>
+            <td>${a.file_name}</td>
+            <td>v${a.version}</td>
+            <td>${a.effective_from || '-'}</td>
+            <td>${a.is_active ? '<span style="color:green">启用</span>' : '<span style="color:#999">停用</span>'}</td>
+            <td>
+                <button class="btn btn-sm" onclick="Admin.previewAsset(${a.id})">预览</button>
+                <button class="btn btn-sm btn-danger" onclick="Admin.deleteAsset(${a.id})">停用</button>
+            </td>
+        </tr>`).join('');
+    },
+
+    showUploadRefData() {
+        const catOptions = this._refCategories.map(c =>
+            `<option value="${c.id}">${c.name}</option>`
+        ).join('');
+        const tenantOptions = this._refTenants.map(t =>
+            `<option value="${t.tenant_id}">租户: ${t.tenant_id}</option>`
+        ).join('');
+        this.openModal('上传基础数据', `
+            <div style="display:flex;flex-direction:column;gap:12px;">
+                <label>分类：<select id="ref-upload-category" style="padding:6px;border:1px solid #ddd;border-radius:4px;">${catOptions}</select></label>
+                <label>名称：<input id="ref-upload-name" type="text" placeholder="如：2025年最低工资标准" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;"></label>
+                <label>作用域：
+                    <select id="ref-upload-scope" style="padding:6px;border:1px solid #ddd;border-radius:4px;">
+                        <option value="">全局（所有租户可用）</option>
+                        ${tenantOptions}
+                    </select>
+                </label>
+                <label>生效日期：<input id="ref-upload-from" type="date" style="padding:6px;border:1px solid #ddd;border-radius:4px;"></label>
+                <label>失效日期：<input id="ref-upload-to" type="date" style="padding:6px;border:1px solid #ddd;border-radius:4px;"></label>
+                <label>文件：<input id="ref-upload-file" type="file" accept=".xlsx,.xls"></label>
+            </div>
+        `, async () => {
+            const fileInput = document.getElementById('ref-upload-file');
+            if (!fileInput.files.length) return alert('请选择文件');
+            const fd = new FormData();
+            fd.append('file', fileInput.files[0]);
+            fd.append('asset_type', 'reference');
+            fd.append('category_id', document.getElementById('ref-upload-category').value);
+            fd.append('name', document.getElementById('ref-upload-name').value || fileInput.files[0].name);
+            // 作用域 → tenant_id
+            const scopeVal = document.getElementById('ref-upload-scope').value;
+            if (scopeVal) fd.append('tenant_id', scopeVal);
+            // 日期
+            const ef = document.getElementById('ref-upload-from').value;
+            if (ef) fd.append('effective_from', ef);
+            const et = document.getElementById('ref-upload-to').value;
+            if (et) fd.append('effective_to', et);
+            const resp = await AUTH.authFetch('/api/assets/upload', {method: 'POST', body: fd});
+            if (resp.ok) {
+                this.closeModal();
+                this.loadRefData();
+            } else {
+                alert('上传失败: ' + (await resp.text()));
+            }
+        });
+    },
+
+    async previewAsset(assetId) {
+        const resp = await AUTH.authFetch(`/api/assets/${assetId}/preview?rows=10`);
+        if (!resp.ok) return alert('预览失败');
+        const data = await resp.json();
+        let html = '';
+        for (const [sheet, info] of Object.entries(data)) {
+            html += `<h4>${sheet}</h4><div style="overflow-x:auto;"><table class="data-table" style="font-size:12px;">`;
+            html += '<thead><tr>' + info.headers.map(h => `<th>${h}</th>`).join('') + '</tr></thead>';
+            html += '<tbody>' + info.data.map(row =>
+                '<tr>' + row.map(v => `<td>${v}</td>`).join('') + '</tr>'
+            ).join('') + '</tbody></table></div>';
+        }
+        this.openModal('数据预览', html, null);
+    },
+
+    async deleteAsset(assetId) {
+        if (!confirm('确定停用此数据？')) return;
+        await AUTH.authFetch(`/api/assets/${assetId}`, {method: 'DELETE'});
+        this.loadRefData();
+    },
+
+    // ==================== 训练历史 ====================
+    async loadTrainingHistory() {
+        const tenantId = document.getElementById('training-tenant-filter')?.value || '';
+        let url = '/api/training/sessions?limit=50';
+        if (tenantId) url += `&tenant_id=${tenantId}`;
+        const resp = await AUTH.authFetch(url);
+        if (!resp.ok) return;
+        const result = await resp.json();
+        const tbody = document.querySelector('#training-history-table tbody');
+        tbody.innerHTML = result.items.map(s => `<tr>
+            <td>${s.id}</td>
+            <td>${s.tenant_id}</td>
+            <td>${s.mode || '-'}</td>
+            <td><span class="status-${s.status}">${s.status}</span></td>
+            <td>${s.total_iterations || 0}</td>
+            <td>${s.best_accuracy != null ? (s.best_accuracy * 100).toFixed(1) + '%' : '-'}</td>
+            <td>${s.started_at ? new Date(s.started_at).toLocaleString() : '-'}</td>
+            <td>${s.finished_at ? new Date(s.finished_at).toLocaleString() : '-'}</td>
+            <td>
+                <button class="btn btn-sm" onclick="Admin.showTrainingDetail(${s.id})">详情</button>
+            </td>
+        </tr>`).join('');
+    },
+
+    async showTrainingDetail(sessionId) {
+        const resp = await AUTH.authFetch(`/api/training/sessions/${sessionId}/iterations`);
+        if (!resp.ok) return alert('获取详情失败');
+        const iterations = await resp.json();
+        let html = `<div style="max-height:500px;overflow-y:auto;">`;
+        if (!iterations.length) {
+            html += '<p>暂无迭代记录</p>';
+        }
+        iterations.forEach(it => {
+            html += `<div style="border:1px solid #eee;border-radius:8px;padding:12px;margin-bottom:10px;">
+                <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
+                    <strong>第 ${it.iteration_num} 轮</strong>
+                    <span>准确率: ${it.accuracy != null ? (it.accuracy * 100).toFixed(1) + '%' : '-'}</span>
+                    <span class="status-${it.status}">${it.status}</span>
+                </div>
+                ${it.generated_code ? `<details><summary>查看代码 (${it.generated_code.length} 字符)</summary><pre style="font-size:11px;max-height:200px;overflow:auto;background:#f5f5f5;padding:8px;border-radius:4px;">${it.generated_code.substring(0, 3000)}</pre></details>` : ''}
+                ${it.error_details ? `<div style="color:red;font-size:12px;">错误: ${JSON.stringify(it.error_details)}</div>` : ''}
+            </div>`;
+        });
+        html += '</div>';
+        this.openModal(`训练会话 #${sessionId} - 迭代详情`, html, null);
+    },
+
+    // ==================== 计算历史 ====================
+    async downloadAsset(assetId, fileName, format) {
+        try {
+            let url = `/api/assets/${assetId}/download`;
+            if (format) url += `?format=${format}`;
+            const resp = await AUTH.authFetch(url);
+            if (!resp.ok) return alert('下载失败: ' + resp.statusText);
+            const blob = await resp.blob();
+            const blobUrl = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = blobUrl;
+            // 根据格式调整文件名
+            let name = fileName || 'download.xlsx';
+            if (format === 'pdf') name = name.replace(/\.(xlsx?|csv)$/i, '') + '.pdf';
+            else if (format === 'encrypted') name = name.replace(/\.(xlsx?)$/i, '') + '_加密.xlsx';
+            a.download = name;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(blobUrl);
+        } catch (e) {
+            alert('下载失败: ' + e.message);
+        }
+    },
+
+    downloadAssetEncrypted(assetId, fileName) {
+        const password = prompt('请输入加密密码（默认123456）:', '123456');
+        if (password === null) return;  // 取消
+        let url = `/api/assets/${assetId}/download?format=encrypted`;
+        if (password) url += `&password=${encodeURIComponent(password)}`;
+        this._fetchAndDownload(url, fileName.replace(/\.(xlsx?)$/i, '') + '_加密.xlsx');
+    },
+
+    async _fetchAndDownload(url, fileName) {
+        try {
+            const resp = await AUTH.authFetch(url);
+            if (!resp.ok) return alert('下载失败: ' + resp.statusText);
+            const blob = await resp.blob();
+            const blobUrl = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = blobUrl;
+            a.download = fileName;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(blobUrl);
+        } catch (e) {
+            alert('下载失败: ' + e.message);
+        }
+    },
+
+    _buildDownloadDropdown(assetId, fileName, btnStyle) {
+        const id = `dl-${assetId}-${Date.now()}`;
+        const style = btnStyle || '';
+        return `<div style="position:relative;display:inline-block;">
+            <button class="btn btn-sm" style="${style}" onclick="document.getElementById('${id}').style.display=document.getElementById('${id}').style.display==='block'?'none':'block'">
+                下载 ▾
+            </button>
+            <div id="${id}" style="display:none;position:absolute;right:0;top:100%;background:#fff;border:1px solid #ddd;border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,.15);z-index:100;min-width:130px;">
+                <div style="padding:6px 12px;cursor:pointer;font-size:12px;white-space:nowrap;" onmouseover="this.style.background='#f0f0f0'" onmouseout="this.style.background='#fff'" onclick="Admin.downloadAsset(${assetId},'${fileName.replace(/'/g, "\\'")}');this.parentElement.style.display='none'">
+                    原始文件
+                </div>
+                <div style="padding:6px 12px;cursor:pointer;font-size:12px;white-space:nowrap;" onmouseover="this.style.background='#f0f0f0'" onmouseout="this.style.background='#fff'" onclick="Admin.downloadAsset(${assetId},'${fileName.replace(/'/g, "\\'")}','pdf');this.parentElement.style.display='none'">
+                    下载 PDF
+                </div>
+                <div style="padding:6px 12px;cursor:pointer;font-size:12px;white-space:nowrap;" onmouseover="this.style.background='#f0f0f0'" onmouseout="this.style.background='#fff'" onclick="Admin.downloadAssetEncrypted(${assetId},'${fileName.replace(/'/g, "\\'")}');this.parentElement.style.display='none'">
+                    加密 Excel
+                </div>
+            </div>
+        </div>`;
+    },
+
+    async loadComputeHistory() {
+        const tenantId = document.getElementById('compute-tenant-filter')?.value || '';
+        const status = document.getElementById('compute-status-filter')?.value || '';
+        let url = '/api/compute2/tasks?limit=50';
+        if (tenantId) url += `&tenant_id=${tenantId}`;
+        if (status) url += `&status=${status}`;
+        const resp = await AUTH.authFetch(url);
+        if (!resp.ok) return;
+        const result = await resp.json();
+        const tbody = document.querySelector('#compute-history-table tbody');
+        if (!result.items || !result.items.length) {
+            tbody.innerHTML = '<tr><td colspan="9" class="empty-state">暂无计算记录</td></tr>';
+            return;
+        }
+        tbody.innerHTML = result.items.map(t => `<tr>
+            <td>${t.id}</td>
+            <td>${t.tenant_id}</td>
+            <td>${t.script_id || (t.analysis_report?.original_script_id || '-')}</td>
+            <td><span class="status-${t.status}">${t.status}</span></td>
+            <td>${t.inputs ? t.inputs.length : 0}</td>
+            <td>${t.duration_seconds != null ? t.duration_seconds.toFixed(1) : '-'}</td>
+            <td>${t.created_at ? new Date(t.created_at).toLocaleString() : '-'}</td>
+            <td>${t.finished_at ? new Date(t.finished_at).toLocaleString() : '-'}</td>
+            <td>
+                <button class="btn btn-sm" onclick="Admin.showComputeDetail(${t.id})">详情</button>
+            </td>
+        </tr>`).join('');
+    },
+
+    async showComputeDetail(taskId) {
+        const resp = await AUTH.authFetch(`/api/compute2/tasks/${taskId}`);
+        if (!resp.ok) return alert('获取详情失败');
+        const task = await resp.json();
+
+        let html = '<div style="max-height:500px;overflow-y:auto;">';
+
+        // 基本信息
+        html += `<div style="margin-bottom:16px;">
+            <h4 style="margin:0 0 8px">基本信息</h4>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:13px;">
+                <div>租户: <strong>${task.tenant_id}</strong></div>
+                <div>状态: <span class="status-${task.status}">${task.status}</span></div>
+                <div>耗时: ${task.duration_seconds != null ? task.duration_seconds.toFixed(1) + '秒' : '-'}</div>
+                <div>脚本ID: ${task.script_id || '-'}</div>
+            </div>
+        </div>`;
+
+        // 输入文件（含下载下拉）
+        if (task.inputs && task.inputs.length) {
+            html += `<div style="margin-bottom:16px;">
+                <h4 style="margin:0 0 8px">输入文件 (${task.inputs.length})</h4>`;
+            task.inputs.forEach(inp => {
+                const downloadDropdown = inp.asset_id && inp.file_name
+                    ? this._buildDownloadDropdown(inp.asset_id, inp.file_name || '')
+                    : '';
+                html += `<div style="padding:6px 10px;background:#f8f9fa;border-radius:4px;margin-bottom:4px;font-size:13px;display:flex;align-items:center;justify-content:space-between;">
+                    <span>${inp.asset_name || inp.file_name || '未知'} <span style="color:#888;">(${inp.role})</span></span>
+                    <span style="display:flex;align-items:center;gap:6px;">${inp.file_name ? '<span style="color:#999;font-size:11px;">' + inp.file_name + '</span>' : ''}${downloadDropdown}</span>
+                </div>`;
+            });
+            html += '</div>';
+        }
+
+        // 输出文件（含下载下拉）
+        if (task.output_assets && task.output_assets.length) {
+            html += `<div style="margin-bottom:16px;">
+                <h4 style="margin:0 0 8px">结果文件 (${task.output_assets.length})</h4>`;
+            task.output_assets.forEach(asset => {
+                const sizeKb = asset.file_size ? (asset.file_size / 1024).toFixed(1) + ' KB' : '';
+                const downloadDropdown = this._buildDownloadDropdown(asset.id, asset.file_name || '', 'background:#2e7d32;color:#fff;');
+                html += `<div style="padding:6px 10px;background:#e8f5e9;border-radius:4px;margin-bottom:4px;font-size:13px;display:flex;align-items:center;justify-content:space-between;">
+                    <span>${asset.name} <span style="color:#999;font-size:11px;">${sizeKb}</span></span>
+                    ${downloadDropdown}
+                </div>`;
+            });
+            html += '</div>';
+        }
+
+        // 结果摘要
+        if (task.result_summary) {
+            html += `<div style="margin-bottom:16px;">
+                <h4 style="margin:0 0 8px">结果摘要</h4>
+                <pre style="font-size:12px;background:#f5f5f5;padding:8px;border-radius:4px;">${JSON.stringify(task.result_summary, null, 2)}</pre>
+            </div>`;
+        }
+
+        // 错误信息
+        if (task.error_message) {
+            html += `<div style="margin-bottom:16px;">
+                <h4 style="margin:0 0 8px;color:red;">错误信息</h4>
+                <div style="color:red;font-size:13px;background:#fff5f5;padding:8px;border-radius:4px;">${task.error_message}</div>
+            </div>`;
+        }
+
+        html += '</div>';
+        this.openModal(`计算任务 #${taskId} - 详情`, html, null);
+    },
 };
 
-document.addEventListener('DOMContentLoaded', () => Admin.init());
+document.addEventListener('DOMContentLoaded', () => {
+    Admin.init();
+    // 点击空白处关闭下载下拉菜单
+    document.addEventListener('click', (e) => {
+        if (!e.target.closest('[id^="dl-"]') && !e.target.closest('.btn')) {
+            document.querySelectorAll('[id^="dl-"]').forEach(el => el.style.display = 'none');
+        }
+    });
+});

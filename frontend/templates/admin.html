@@ -25,6 +25,9 @@
             <button class="tab-btn" data-tab="roles">角色管理</button>
             <button class="tab-btn" data-tab="orgs">组织管理</button>
             <button class="tab-btn" data-tab="tenant-auth">租户授权</button>
+            <button class="tab-btn" data-tab="ref-data">基础数据</button>
+            <button class="tab-btn" data-tab="training-history">训练历史</button>
+            <button class="tab-btn" data-tab="compute-history">计算历史</button>
         </div>
 
         <!-- 用户管理 Tab -->
@@ -101,6 +104,91 @@
                         <th>组织</th>
                         <th>授权类型</th>
                         <th>授权时间</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <!-- 基础数据管理 Tab -->
+        <div class="tab-content" id="tab-ref-data">
+            <div class="toolbar">
+                <select id="ref-category-filter" onchange="Admin.loadRefData()">
+                    <option value="">全部分类</option>
+                </select>
+                <select id="ref-scope-filter" onchange="Admin.loadRefData()">
+                    <option value="">全局+租户</option>
+                    <option value="global">仅全局</option>
+                    <option value="tenant">仅租户级</option>
+                </select>
+                <button class="btn btn-primary" onclick="Admin.showUploadRefData()">上传基础数据</button>
+            </div>
+            <table class="data-table" id="ref-data-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>名称</th>
+                        <th>分类</th>
+                        <th>作用域</th>
+                        <th>文件名</th>
+                        <th>版本</th>
+                        <th>生效日期</th>
+                        <th>状态</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <!-- 训练历史 Tab -->
+        <div class="tab-content" id="tab-training-history">
+            <div class="toolbar">
+                <input type="text" id="training-tenant-filter" placeholder="租户ID筛选" style="padding:6px 12px;border:1px solid #ddd;border-radius:6px;">
+                <button class="btn" onclick="Admin.loadTrainingHistory()">查询</button>
+            </div>
+            <table class="data-table" id="training-history-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>租户</th>
+                        <th>模式</th>
+                        <th>状态</th>
+                        <th>迭代次数</th>
+                        <th>最佳准确率</th>
+                        <th>开始时间</th>
+                        <th>完成时间</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <!-- 计算历史 Tab -->
+        <div class="tab-content" id="tab-compute-history">
+            <div class="toolbar">
+                <input type="text" id="compute-tenant-filter" placeholder="租户ID筛选" style="padding:6px 12px;border:1px solid #ddd;border-radius:6px;">
+                <select id="compute-status-filter" style="padding:6px 12px;border:1px solid #ddd;border-radius:6px;">
+                    <option value="">全部状态</option>
+                    <option value="computing">计算中</option>
+                    <option value="completed">已完成</option>
+                    <option value="failed">失败</option>
+                </select>
+                <button class="btn" onclick="Admin.loadComputeHistory()">查询</button>
+            </div>
+            <table class="data-table" id="compute-history-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>租户</th>
+                        <th>脚本ID</th>
+                        <th>状态</th>
+                        <th>输入文件数</th>
+                        <th>耗时(秒)</th>
+                        <th>创建时间</th>
+                        <th>完成时间</th>
                         <th>操作</th>
                     </tr>
                 </thead>
