@@ -1323,6 +1323,8 @@ class FormulaCodeGenerator:
 
         处理模式：
         1. ,"")" 或 ,"") → ,{EMPTY}) — Excel空字符串
+        1b. ="" → ={EMPTY} — 未转义的空字符串比较（单引号f-string中常见）
+        1c. ="text" → ={TXT_text} — 未转义的文本比较（单引号f-string中常见）
         2. ,\\"\\") → ,{EMPTY}) — 转义的Excel空字符串
         3. =\\"xxx\\" → ={TXT_xxx} — 文本比较（自动生成TXT_常量定义）
         4. excel_text('xxx') → TXT_xxx（自动生成TXT_常量定义）
@@ -1344,6 +1346,23 @@ class FormulaCodeGenerator:
 
             # 模式1: ,"") → ,{EMPTY}) — 未转义的Excel空字符串
             line = re.sub(r',\s*""\s*\)', ',{EMPTY})', line)
+
+            # 模式1b: ="" → ={EMPTY} — 未转义的空字符串比较
+            # 例: f'=IF(G{r}="",0,...)' 中的 ="" （单引号f-string中双引号不需转义）
+            line = re.sub(r'=""', '={EMPTY}', line)
+
+            # 模式1c: ,"" → ,{EMPTY} — 未转义的逗号+空字符串
+            # 例: f'=IFERROR(VLOOKUP(...),"",0)' 中的 ,""
+            line = re.sub(r',""\s*(?=[,)])', ',{EMPTY}', line)
+
+            # 模式1d: ="text" → ={TXT_text} — 未转义的文本比较
+            # 例: f'=IF(G{r}="全职",1,0)' 中的 ="全职"
+            def replace_unescaped_text_compare(m):
+                text = m.group(1)
+                var_name = self._text_to_var_name(text)
+                text_constants[var_name] = text
+                return f"={{{var_name}}}"
+            line = re.sub(r'="([^"{}]+)"', replace_unescaped_text_compare, line)
 
             # 模式2: ,\"\") → ,{EMPTY}) — 已转义的Excel空字符串
             line = re.sub(r',\s*\\"\\"[\s)]*\)', ',{EMPTY})', line)
@@ -1567,6 +1586,14 @@ EMPTY = '""'           # Excel空字符串，用法：f"=IFERROR(...,{EMPTY})"
 ZERO = '0'             # 数字0
 
 
+def excel_text(text):
+    """返回Excel文本值字符串，用于f-string中避免引号冲突
+    用法: TXT_XXX = excel_text('全职')  →  TXT_XXX = '"全职"'
+    在f-string中: f"=IF(A{r}={TXT_XXX},1,0)"  →  =IF(A2="全职",1,0)
+    """
+    return f'"{text}"'
+
+
 def get_vlookup_col_num(target_col: str, range_start_col: str) -> int:
     """计算VLOOKUP的相对列号
 
@@ -1738,6 +1765,10 @@ def write_source_sheets(wb, source_data):
                     except:
                         pass  # 转换失败则保留原值（可能是无效日期）
                 cell = ws.cell(row=row_idx, column=col_idx, value=value if pd.notna(value) else "")
+                # 源数据sheet只存值，防止公式字符串被Excel当公式执行（产生外部链接）
+                # 检查=、+、-开头的字符串（Excel会将这些前缀解释为公式）
+                if isinstance(value, str) and len(value) > 1 and value[0] in ('=', '+', '-'):
+                    cell.data_type = 's'
                 if '日期' in col_name:
                     cell.number_format = 'yyyy/mm/dd'  # 设置显示格式
 
@@ -2416,6 +2447,12 @@ ws.conditional_formatting.add(f"D2:D{{n_rows+1}}", FormulaRule(formula=[f"D2>200
         if corrected_fill_function:
             corrected_fill_function = self.ai_provider.validate_and_fix_code_format(corrected_fill_function)
 
+        # 修复级联缩进和f-string引号冲突（与generate_code主流程一致）
+        if corrected_fill_function:
+            corrected_fill_function = self._fix_cascading_indentation(corrected_fill_function)
+        if corrected_fill_function:
+            corrected_fill_function = self._fix_fstring_and_brackets(corrected_fill_function)
+
         if not corrected_fill_function:
             log("警告: 未能提取到修正代码，使用原始fill_result_sheets函数")
             corrected_fill_function = original_fill_function
@@ -2435,6 +2472,10 @@ ws.conditional_formatting.add(f"D2:D{{n_rows+1}}", FormulaRule(formula=[f"D2>200
 
         # 与固定代码模板拼接
         complete_code = self._build_complete_code(corrected_fill_function)
+
+        # 最终安全网：对完整代码做f-string修复（与generate_code主流程一致）
+        if complete_code:
+            complete_code = self.ai_provider._fix_fstring_quotes(complete_code)
 
         if complete_code:
             log(f"完整修正代码生成成功，长度: {len(complete_code)} 字符")

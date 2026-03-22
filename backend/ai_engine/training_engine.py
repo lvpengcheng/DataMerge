@@ -933,8 +933,13 @@ class TrainingEngine:
                 if total_cells > 0:
                     score = matched_cells / total_cells
                 else:
-                    # 如果无法获取单元格数，使用旧的计算方式
-                    score = 1.0 if total_diff == 0 else max(0, 1.0 - total_diff / 100.0)
+                    # total_cells=0 说明没有找到可对比的单元格（可能读了错误的sheet或无公共列）
+                    # 此时不应默认100%，而应视为对比失败
+                    if total_diff > 0:
+                        score = max(0, 1.0 - total_diff / 100.0)
+                    else:
+                        score = 0.0
+                        self.training_logger.log_warning("未找到可对比的单元格(total_cells=0)，请检查结果文件的sheet结构")
 
                 comparison_text = f"差异对比完成: 匹配 {matched_cells}/{total_cells} 个单元格, 匹配率 {score:.2%}, 差异 {total_diff} 处"
                 self.training_logger.log_info(comparison_text)

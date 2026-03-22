@@ -133,6 +133,10 @@ class CodeSandbox:
                 exec_globals.update(safe_env)
 
                 try:
+                    # 初始化monkey-patch标记（必须在exec之前，否则exec失败时finally无法访问）
+                    _iep_patched = False
+                    _iep_orig_parse = None
+
                     # 编译并执行代码
                     output_buffer.write(f"开始编译和执行代码...\n")
                     code_obj = compile(script_content, '<sandbox>', 'exec')
@@ -143,8 +147,6 @@ class CodeSandbox:
                     # 使其在 parse_excel_file 时自动注入对应文件的密码
                     # 注意：文件通常已在上游解密，仅对仍加密的文件注入密码
                     _file_passwords = execution_env.get('file_passwords') or {}
-                    _iep_patched = False
-                    _iep_orig_parse = None
                     if _file_passwords:
                         try:
                             from excel_parser import IntelligentExcelParser as _IEP
@@ -493,6 +495,11 @@ class CodeSandbox:
             safe_env['load_files_to_dataframes'] = load_files_to_dataframes
         except ImportError as e:
             self.logger.warning(f"无法导入data_helpers函数: {e}")
+
+        # 注入公式模式的辅助函数（兜底：模板代码中也有定义，但防止模板拼接异常）
+        safe_env['EMPTY'] = '""'
+        safe_env['ZERO'] = '0'
+        safe_env['excel_text'] = lambda text: f'"{text}"'
 
         # 注入历史数据查询工具（如果有tenant_id）
         tenant_id = execution_env.get('tenant_id')

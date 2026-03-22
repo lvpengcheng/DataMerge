@@ -404,7 +404,16 @@ class ExcelFormulaBuilder:
         for sheet_name, key_cols in all_key_info.items():
             columns = self.source_sheets[sheet_name]["columns"]
             if not key_cols:
-                lines.append(f"### {sheet_name}: (未识别到主键列，需根据数据判断)")
+                lines.append(f"### {sheet_name}")
+                lines.append(f"- 主键列: (未识别到常见主键列，需根据数据内容判断)")
+                last_col_idx = len(columns)
+                last_col_letter = get_column_letter(last_col_idx) if last_col_idx > 0 else "A"
+                lines.append(f"- 列范围: $A:${last_col_letter}")
+                lines.append(f"- 列 (按顺序):")
+                for col_idx_0, col_name in enumerate(columns):
+                    col_idx = col_idx_0 + 1
+                    col_letter = get_column_letter(col_idx)
+                    lines.append(f"  - {col_letter}列: {col_name}")
                 lines.append("")
                 continue
 
@@ -445,6 +454,10 @@ class ExcelFormulaBuilder:
         lines.append("1. 优先使用工号/员工编号/身份证号作为查找键，这里面是最可靠的唯一标识，能最大程度避免重复和错误匹配")
         lines.append("2. 其次使用姓名")
         lines.append("3. VLOOKUP范围必须从主键列开始，不能从$A列开始（除非主键就在A列）")
+        lines.append("4. **VLOOKUP只能向右查找**！当需要取主键列左边的数据时，必须改用INDEX+MATCH：")
+        lines.append("   `=IFERROR(INDEX('表名'!$返回列:$返回列, MATCH(查找值, '表名'!$查找列:$查找列, 0)), 0)`")
+        lines.append("5. 多条件匹配也必须用INDEX+MATCH：")
+        lines.append("   `=IFERROR(INDEX('表名'!$返回列:$返回列, MATCH(1, ('表名'!$A:$A=条件1)*('表名'!$B:$B=条件2), 0)), 0)`")
         lines.append("")
 
         return "\n".join(lines)

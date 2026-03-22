@@ -96,6 +96,21 @@ class BaseAIProvider(ABC):
         """生成完成文本（单轮对话）"""
         pass
 
+    def chat_stream(self, messages: List[Dict[str, str]], chunk_callback: callable = None, **kwargs) -> str:
+        """流式对话接口 - 逐块输出并返回完整内容
+
+        Args:
+            messages: OpenAI 格式消息列表 [{"role":"system/user/assistant","content":"..."}]
+            chunk_callback: 每个文本块的回调函数
+        Returns:
+            完整的回复文本
+        """
+        # 默认回退到非流式 chat
+        result = self.chat(messages, **kwargs)
+        if chunk_callback:
+            chunk_callback(result)
+        return result
+
     def _is_code_complete(self, code: str) -> bool:
         """检测代码是否完整（不仅依赖API的stop信号，还从代码本身判断）
 
@@ -1184,6 +1199,16 @@ if __name__ == "__main__":
         content, _ = self._openai_chat(messages, **kwargs)
         return content
 
+    def chat_stream(self, messages: List[Dict[str, str]], chunk_callback: callable = None, **kwargs) -> str:
+        """流式对话接口"""
+        full_content = ""
+        for text_chunk, _fr in self._openai_chat_stream(messages, **kwargs):
+            if text_chunk:
+                full_content += text_chunk
+                if chunk_callback:
+                    chunk_callback(text_chunk)
+        return full_content
+
     def generate_completion(self, prompt: str, **kwargs) -> str:
         """生成完成文本（单轮对话）"""
         messages = [
@@ -1566,6 +1591,28 @@ if __name__ == "__main__":
             **{k: v for k, v in kwargs.items() if k not in ("model", "messages", "max_tokens", "system")}
         )
         return content
+
+    def chat_stream(self, messages: List[Dict[str, str]], chunk_callback: callable = None, **kwargs) -> str:
+        """流式对话接口"""
+        anthropic_messages = []
+        system_message = ""
+        for msg in messages:
+            if msg["role"] == "system":
+                system_message = msg["content"]
+            else:
+                anthropic_messages.append({"role": msg["role"], "content": msg["content"]})
+
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ("model", "messages", "max_tokens", "system")}
+        full_content = ""
+        for text_chunk, _sr in self._claude_chat_stream(
+            system_message or "", anthropic_messages,
+            max_tokens=self.max_tokens, **filtered_kwargs
+        ):
+            if text_chunk:
+                full_content += text_chunk
+                if chunk_callback:
+                    chunk_callback(text_chunk)
+        return full_content
 
     def generate_completion(self, prompt: str, **kwargs) -> str:
         """生成完成文本（单轮对话）"""

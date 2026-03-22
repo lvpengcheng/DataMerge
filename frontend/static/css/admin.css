@@ -9,6 +9,7 @@ body {
     background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%);
     height: 100vh;
     padding: 20px;
+    overflow: hidden;
 }
 
 .container {
@@ -17,6 +18,7 @@ body {
     height: 100%;
     display: flex;
     flex-direction: column;
+    overflow-x: hidden;
 }
 
 /* Header */
@@ -131,10 +133,14 @@ header {
     border-radius: 12px;
     padding: 24px;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    overflow-x: auto;
+    flex: 1;
+    min-height: 0;
 }
 
 .tab-content.active {
     display: block;
+    overflow-y: auto;
 }
 
 /* Toolbar */
@@ -190,6 +196,7 @@ header {
 .data-table {
     width: 100%;
     border-collapse: collapse;
+    table-layout: auto;
 }
 
 .data-table th,
@@ -198,6 +205,7 @@ header {
     text-align: left;
     border-bottom: 1px solid #f0f0f0;
     font-size: 13px;
+    word-break: break-word;
 }
 
 .data-table th {

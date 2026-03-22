@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DataMerge - 规则整理</title>
+    <link rel="stylesheet" href="/static/css/rules.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="header-left">
+                <nav class="nav-links">
+                    <a href="/rules" class="active">规则</a>
+                    <a href="/training">智训</a>
+                    <a href="/compute">智算</a>
+                    <a href="/admin" id="nav-admin" style="display:none;">管理</a>
+                </nav>
+            </div>
+            <div class="user-info" id="user-info"></div>
+        </header>
+
+        <div class="main-content">
+            <!-- 左侧: 文件上传区 -->
+            <section class="config-section">
+                <h2>文件与配置</h2>
+
+                <div class="form-group">
+                    <label for="source-files">源文件:</label>
+                    <input type="file" id="source-files" multiple accept=".xlsx,.xls">
+                    <div class="file-list" id="source-file-list"></div>
+                </div>
+
+                <div class="form-group">
+                    <label for="target-file">目标文件:</label>
+                    <input type="file" id="target-file" accept=".xlsx,.xls">
+                    <div class="file-list" id="target-file-list"></div>
+                </div>
+
+                <div class="form-group">
+                    <label for="design-docs">设计文档 (可选):</label>
+                    <input type="file" id="design-docs" multiple accept=".pdf,.docx,.doc,.txt,.md,.xlsx,.xls">
+                    <div class="file-list" id="design-doc-list"></div>
+                </div>
+
+                <div class="form-group">
+                    <label for="ai-provider">AI 模型:</label>
+                    <select id="ai-provider">
+                        <option value="deepseek">DeepSeek</option>
+                        <option value="claude">Claude (推荐)</option>
+                        <option value="openai">OpenAI GPT-4</option>
+                    </select>
+                </div>
+
+                <button type="button" id="organize-btn" class="btn btn-primary" onclick="startOrganize()">
+                    开始整理
+                </button>
+            </section>
+
+            <!-- 右侧: AI 对话区 -->
+            <div class="chat-panel">
+                <div class="chat-header">
+                    <h2>AI 对话</h2>
+                    <div class="chat-actions">
+                        <button id="download-btn" class="btn btn-download" onclick="downloadRules()" style="display:none;">
+                            下载 rules.md
+                        </button>
+                        <button id="clear-btn" class="btn btn-clear" onclick="clearChat()">
+                            清空对话
+                        </button>
+                    </div>
+                </div>
+
+                <div class="chat-messages" id="chat-messages">
+                    <div class="chat-placeholder" id="chat-placeholder">
+                        <div class="placeholder-icon">📋</div>
+                        <p>上传源文件和目标文件后，点击"开始整理"</p>
+                        <p class="hint">AI 将分析文件结构和设计文档，生成结构化的规则文件</p>
+                    </div>
+                </div>
+
+                <div class="chat-input-area">
+                    <textarea id="chat-input" placeholder="输入补充说明或调整要求..." rows="2"
+                              onkeydown="handleInputKeydown(event)"></textarea>
+                    <button id="send-btn" class="btn btn-send" onclick="sendMessage()" disabled>
+                        发送
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/auth.js"></script>
+    <script src="/static/js/rules.js?v=20260322"></script>
+</body>
+</html>

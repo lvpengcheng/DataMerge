@@ -9,6 +9,7 @@ body {
     background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%);
     height: 100vh;
     padding: 20px;
+    overflow: hidden;
 }
 
 .container {
@@ -17,6 +18,7 @@ body {
     height: 100%;
     display: flex;
     flex-direction: column;
+    overflow-x: hidden;
 }
 
 header {
@@ -112,6 +114,9 @@ header h1 {
     align-items: stretch;
     flex: 1;
     min-height: 0;
+    min-width: 0;
+    overflow: hidden;
+    width: 100%;
 }
 
 section {
@@ -375,6 +380,8 @@ section h3 {
     flex-direction: column;
     gap: 30px;
     height: 100%;
+    min-width: 0;
+    overflow: hidden;
 }
 
 /* 配置区域 */
@@ -388,6 +395,7 @@ section h3 {
     display: flex;
     flex-direction: column;
     flex: 1;
+    min-height: 0;
 }
 
 .status-card {
@@ -573,7 +581,9 @@ section h3 {
     font-size: 12px;
     max-height: 400px;
     overflow-y: auto;
+    overflow-x: hidden;
     line-height: 1.6;
+    word-break: break-all;
 }
 
 .log-entry {

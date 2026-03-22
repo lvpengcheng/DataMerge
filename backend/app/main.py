@@ -14,7 +14,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Body, Request
 from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -96,6 +96,271 @@ async def check_files_encrypted(
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
     return {"encrypted_files": encrypted_files}
+
+
+# ==================== 规则整理 API ====================
+
+@app.post("/api/rules/organize")
+async def organize_rules_endpoint(
+    source_files: List[UploadFile] = File(...),
+    target_file: UploadFile = File(...),
+    design_docs: List[UploadFile] = File(default=[]),
+    ai_provider: Optional[str] = Form(None),
+    file_passwords: Optional[str] = Form(None),
+    current_user=Depends(get_current_user),
+):
+    """整理规则 - 从设计文档+源文件结构+目标文件结构生成结构化规则文件"""
+    from ..utils.aspose_helper import is_encrypted, decrypt_excel
+    from ..ai_engine.rule_organizer import RuleOrganizer
+
+    # 解析文件密码
+    passwords_dict: Dict[str, str] = {}
+    if file_passwords:
+        try:
+            passwords_dict = json.loads(file_passwords)
+        except Exception:
+            pass
+
+    temp_dir = tempfile.mkdtemp(prefix="rule_org_")
+    temp_dir = str(Path(temp_dir).resolve())
+
+    try:
+        # 保存源文件
+        source_paths = []
+        for f in source_files:
+            path = os.path.join(temp_dir, f.filename)
+            with open(path, "wb") as fp:
+                fp.write(await f.read())
+            source_paths.append(path)
+
+        # 保存目标文件
+        target_path = os.path.join(temp_dir, target_file.filename)
+        with open(target_path, "wb") as fp:
+            fp.write(await target_file.read())
+
+        # 保存设计文档
+        doc_paths = []
+        for f in design_docs:
+            path = os.path.join(temp_dir, f.filename)
+            with open(path, "wb") as fp:
+                fp.write(await f.read())
+            doc_paths.append(path)
+
+        # 解密加密的 Excel 文件
+        all_excel = [(p, os.path.basename(p)) for p in source_paths]
+        all_excel.append((target_path, target_file.filename))
+        for fpath, fname in all_excel:
+            if is_encrypted(fpath):
+                pwd = passwords_dict.get(fname)
+                if not pwd:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"文件 '{fname}' 有密码保护，请提供密码",
+                    )
+                decrypted = decrypt_excel(fpath, password=pwd)
+                shutil.move(decrypted, fpath)
+
+        # 创建 AI 提供者并执行规则整理
+        provider = AIProviderFactory.create_provider(ai_provider)
+        organizer = RuleOrganizer(provider)
+        content = organizer.organize_rules(
+            source_files=source_paths,
+            target_file=target_path,
+            design_doc_files=doc_paths,
+            file_passwords=passwords_dict,
+        )
+
+        return {"success": True, "content": content}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"规则整理失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"规则整理失败: {str(e)}")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+@app.post("/api/rules/organize/stream")
+async def organize_rules_stream_endpoint(
+    source_files: List[UploadFile] = File(...),
+    target_file: UploadFile = File(...),
+    design_docs: List[UploadFile] = File(default=[]),
+    ai_provider: Optional[str] = Form(None),
+    file_passwords: Optional[str] = Form(None),
+    current_user=Depends(get_current_user),
+):
+    """流式整理规则 - SSE 实时输出"""
+    from ..utils.aspose_helper import is_encrypted, decrypt_excel
+    from ..ai_engine.rule_organizer import RuleOrganizer
+    from concurrent.futures import ThreadPoolExecutor
+
+    # 解析文件密码
+    passwords_dict: Dict[str, str] = {}
+    if file_passwords:
+        try:
+            passwords_dict = json.loads(file_passwords)
+        except Exception:
+            pass
+
+    temp_dir = tempfile.mkdtemp(prefix="rule_org_stream_")
+    temp_dir = str(Path(temp_dir).resolve())
+
+    # 保存上传文件
+    source_paths = []
+    for f in source_files:
+        path = os.path.join(temp_dir, f.filename)
+        with open(path, "wb") as fp:
+            fp.write(await f.read())
+        source_paths.append(path)
+
+    target_path = os.path.join(temp_dir, target_file.filename)
+    with open(target_path, "wb") as fp:
+        fp.write(await target_file.read())
+
+    doc_paths = []
+    for f in design_docs:
+        path = os.path.join(temp_dir, f.filename)
+        with open(path, "wb") as fp:
+            fp.write(await f.read())
+        doc_paths.append(path)
+
+    # 解密
+    all_excel = [(p, os.path.basename(p)) for p in source_paths]
+    all_excel.append((target_path, target_file.filename))
+    for fpath, fname in all_excel:
+        if is_encrypted(fpath):
+            pwd = passwords_dict.get(fname)
+            if not pwd:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise HTTPException(status_code=422, detail=f"文件 '{fname}' 有密码保护，请提供密码")
+            decrypted = decrypt_excel(fpath, password=pwd)
+            shutil.move(decrypted, fpath)
+
+    logs_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
+    loop = asyncio.get_event_loop()
+    executor = ThreadPoolExecutor(max_workers=1)
+
+    def _run_organize():
+        def chunk_cb(chunk):
+            try:
+                loop.call_soon_threadsafe(
+                    logs_queue.put_nowait,
+                    json.dumps({"type": "chunk", "content": chunk}, ensure_ascii=False),
+                )
+            except Exception:
+                pass
+
+        try:
+            provider = AIProviderFactory.create_provider(ai_provider)
+            organizer = RuleOrganizer(provider)
+            full_content = organizer.organize_rules_stream(
+                source_files=source_paths,
+                target_file=target_path,
+                design_doc_files=doc_paths,
+                file_passwords=passwords_dict,
+                chunk_callback=chunk_cb,
+            )
+            loop.call_soon_threadsafe(
+                logs_queue.put_nowait,
+                json.dumps({"type": "complete", "content": full_content}, ensure_ascii=False),
+            )
+        except Exception as e:
+            logger.error(f"规则整理(流式)失败: {e}", exc_info=True)
+            loop.call_soon_threadsafe(
+                logs_queue.put_nowait,
+                json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False),
+            )
+        finally:
+            loop.call_soon_threadsafe(logs_queue.put_nowait, None)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    organize_task = loop.run_in_executor(executor, _run_organize)
+
+    async def stream_output():
+        try:
+            while True:
+                msg = await logs_queue.get()
+                if msg is None:
+                    break
+                yield f"data: {msg}\n\n"
+        finally:
+            if not organize_task.done():
+                organize_task.cancel()
+
+    return StreamingResponse(
+        stream_output(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/rules/chat")
+async def rules_chat_endpoint(
+    request: Request,
+    current_user=Depends(get_current_user),
+):
+    """规则整理多轮对话 - SSE 流式追问"""
+    from ..ai_engine.rule_organizer import RuleOrganizer
+    from concurrent.futures import ThreadPoolExecutor
+
+    request_body = await request.json()
+
+    messages = request_body.get("messages", [])
+    ai_provider_name = request_body.get("ai_provider")
+
+    if not messages:
+        raise HTTPException(status_code=400, detail="消息列表不能为空")
+
+    logs_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
+    loop = asyncio.get_event_loop()
+    executor = ThreadPoolExecutor(max_workers=1)
+
+    def _run_chat():
+        def chunk_cb(chunk):
+            try:
+                loop.call_soon_threadsafe(
+                    logs_queue.put_nowait,
+                    json.dumps({"type": "chunk", "content": chunk}, ensure_ascii=False),
+                )
+            except Exception:
+                pass
+
+        try:
+            provider = AIProviderFactory.create_provider(ai_provider_name)
+            organizer = RuleOrganizer(provider)
+            full_content = organizer.chat_followup(messages, chunk_callback=chunk_cb)
+            loop.call_soon_threadsafe(
+                logs_queue.put_nowait,
+                json.dumps({"type": "complete", "content": full_content}, ensure_ascii=False),
+            )
+        except Exception as e:
+            logger.error(f"规则对话失败: {e}", exc_info=True)
+            loop.call_soon_threadsafe(
+                logs_queue.put_nowait,
+                json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False),
+            )
+        finally:
+            loop.call_soon_threadsafe(logs_queue.put_nowait, None)
+
+    chat_task = loop.run_in_executor(executor, _run_chat)
+
+    async def stream_output():
+        try:
+            while True:
+                msg = await logs_queue.get()
+                if msg is None:
+                    break
+                yield f"data: {msg}\n\n"
+        finally:
+            if not chat_task.done():
+                chat_task.cancel()
+
+    return StreamingResponse(
+        stream_output(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.on_event("startup")
@@ -4132,6 +4397,16 @@ async def admin_page():
     if template_file.exists():
         return HTMLResponse(content=template_file.read_text(encoding="utf-8"))
     raise HTTPException(status_code=404, detail="管理页面未找到")
+
+
+@app.get("/rules", response_class=HTMLResponse)
+async def rules_page():
+    """规则整理页面"""
+    _frontend_dir = Path(__file__).resolve().parent.parent.parent / "frontend"
+    template_file = _frontend_dir / "templates" / "rules.html"
+    if template_file.exists():
+        return HTMLResponse(content=template_file.read_text(encoding="utf-8"))
+    raise HTTPException(status_code=404, detail="规则整理页面未找到")
 
 
 # ==================== 前端兼容API端点 ====================

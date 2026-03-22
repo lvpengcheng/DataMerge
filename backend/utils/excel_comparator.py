@@ -125,6 +125,53 @@ def calculate_excel_formulas(file_path: str) -> str:
         return file_path
 
 
+def _select_best_sheet(wb_data, wb_formula):
+    """智能选择最佳对比sheet
+
+    优先级：
+    1. 名称包含"结果"/"报表"/"汇总"/"output"/"result"的sheet
+    2. 如果只有1个sheet，直接用它
+    3. 如果有多个sheet，排除明显的源数据/参数sheet，选列数最多的
+    4. 回退到active sheet
+    """
+    sheet_names = wb_data.sheetnames
+
+    if len(sheet_names) == 1:
+        return wb_data[sheet_names[0]], wb_formula[sheet_names[0]]
+
+    # 优先匹配结果sheet的关键词
+    result_keywords = ["结果", "报表", "汇总", "output", "result", "summary"]
+    for name in sheet_names:
+        name_lower = name.lower()
+        if any(kw in name_lower for kw in result_keywords):
+            logger.info(f"通过关键词匹配到结果sheet: '{name}'")
+            return wb_data[name], wb_formula[name]
+
+    # 排除明显的源数据/参数sheet
+    skip_keywords = ["参数", "历史数据", "source", "param", "config"]
+    candidates = []
+    for name in sheet_names:
+        name_lower = name.lower()
+        if not any(kw in name_lower for kw in skip_keywords):
+            candidates.append(name)
+
+    if not candidates:
+        candidates = sheet_names
+
+    # 选列数最多的sheet（结果sheet通常列数最多）
+    best_name = candidates[0]
+    best_col_count = 0
+    for name in candidates:
+        ws = wb_data[name]
+        col_count = ws.max_column or 0
+        if col_count > best_col_count:
+            best_col_count = col_count
+            best_name = name
+
+    logger.info(f"选择列数最多的sheet: '{best_name}' ({best_col_count}列)")
+    return wb_data[best_name], wb_formula[best_name]
+
+
 def read_excel_with_formulas_calculated(file_path: str) -> pd.DataFrame:
     """读取Excel文件，获取公式计算后的值
 
@@ -144,10 +191,11 @@ def read_excel_with_formulas_calculated(file_path: str) -> pd.DataFrame:
     try:
         # 同时打开data_only和公式版本
         wb_data = openpyxl.load_workbook(file_path, data_only=True)
-        ws_data = wb_data.active
-
         wb_formula = openpyxl.load_workbook(file_path, data_only=False)
-        ws_formula = wb_formula.active
+
+        # 智能选择sheet：优先选择"结果"相关的sheet，而非源数据sheet
+        ws_data, ws_formula = _select_best_sheet(wb_data, wb_formula)
+        logger.info(f"对比使用sheet: '{ws_data.title}' (共 {len(wb_data.sheetnames)} 个sheet: {wb_data.sheetnames})")
 
         # 获取表头（第一行）
         headers = []
@@ -600,8 +648,12 @@ def compare_excel_files(
             available_keys = [first_col]
             logger.warning(f"所有指定主键都不存在，回退到第一列: {first_col}")
         else:
-            logger.error("无法确定有效的主键列，对比可能不准确")
-            available_keys = []
+            # 最终兜底：使用行号作为合成主键
+            logger.warning("无法确定有效的主键列，使用行号作为匹配键进行逐行对比")
+            synthetic_key = "__行号__"
+            expected_df[synthetic_key] = range(len(expected_df))
+            result_df[synthetic_key] = range(len(result_df))
+            available_keys = [synthetic_key]
 
     primary_keys = available_keys
 
@@ -904,6 +956,13 @@ def compare_dataframes(
         if first_col and first_col in result_df.columns:
             available_keys = [first_col]
             logger.warning(f"所有指定主键都不存在，回退到第一列: {first_col}")
+        else:
+            # 最终兜底：使用行号作为合成主键
+            logger.warning("无法确定有效的主键列，使用行号作为匹配键进行逐行对比")
+            synthetic_key = "__行号__"
+            expected_df[synthetic_key] = range(len(expected_df))
+            result_df[synthetic_key] = range(len(result_df))
+            available_keys = [synthetic_key]
     primary_keys = available_keys
 
     # 标准化主键列

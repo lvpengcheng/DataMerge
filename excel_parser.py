@@ -105,15 +105,13 @@ class _AsposeCell:
         # 读取公式（.NET 版 Formula 为 None 或字符串）
         raw_formula = aspose_cell.Formula
         self.formula = raw_formula if raw_formula else None
-        # 读取值：有公式时 value 存公式字符串（兼容原有 startswith('=') 检测）
-        if self.formula:
-            self.value = self.formula
+        # 读取值：始终使用计算结果值（不使用公式文本）
+        # 这样DataFrame中存的是实际数据，写入源数据sheet时不会产生外部链接
+        raw = aspose_cell.Value
+        if raw is None or (isinstance(raw, str) and raw == ''):
+            self.value = None
         else:
-            raw = aspose_cell.Value
-            if raw is None or (isinstance(raw, str) and raw == ''):
-                self.value = None
-            else:
-                self.value = raw
+            self.value = raw
         self.row = row_1idx
         self.column = col_1idx
 
@@ -2566,9 +2564,9 @@ class IntelligentExcelParser:
             
             data_row[column_letter] = self._get_cell_value(cell)
             
-            if cell.value and isinstance(cell.value, str) and cell.value.startswith('='):
+            if cell.formula:
                 cell_address = f"{column_letter}{row}"
-                formula_dict[cell_address] = cell.value
+                formula_dict[cell_address] = cell.formula
         
         return data_row
     

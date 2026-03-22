@@ -1207,3 +1207,20 @@ function updateFileList(inputId, listId) {
     list.innerHTML = html;
     console.log('File list updated:', list.innerHTML);
 }
+
+// ==================== 规则整理功能 ====================
+
+/**
+ * 将文本内容作为文件下载
+ */
+function _downloadAsTextFile(content, filename, mimeType) {
+    const blob = new Blob([content], { type: mimeType || 'text/plain; charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
