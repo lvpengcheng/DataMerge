@@ -22,6 +22,8 @@ from enum import Enum
 from pathlib import Path
 from datetime import datetime
 
+logger = logging.getLogger("excel_parser")
+
 # ==================== Aspose.Cells for .NET 初始化 ====================
 # 通过 aspose_init 模块统一初始化（pythonnet + 许可证），全局只执行一次
 import aspose_init  # noqa: F401 — 触发全局初始化
@@ -1346,9 +1348,7 @@ class IntelligentExcelParser:
                         result.append(sheet_data)
 
         except Exception as e:
-            print(f"解析Excel文件时出错: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"解析Excel文件失败 [{file_path}]: {e}", exc_info=True)
 
         return result
     

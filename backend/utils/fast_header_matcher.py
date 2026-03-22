@@ -149,7 +149,8 @@ class FastHeaderMatcher:
 
             parser = IntelligentExcelParser()
             sheet_list = parser.parse_excel_file(
-                file_path, manual_headers=file_manual_headers, active_sheet_only=True
+                file_path, manual_headers=file_manual_headers,
+                active_sheet_only=True, best_region_only=True
             )
             return file_path, file_name, sheet_list
 

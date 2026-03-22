@@ -84,41 +84,53 @@ class ExcelFormulaBuilder:
                 results = parser.parse_excel_file(
                     file_path,
                     manual_headers=manual_headers,
-                    active_sheet_only=True  # 只加载激活的sheet
+                    active_sheet_only=True,
+                    best_region_only=True  # 只取有效区域
                 )
 
                 for sheet_data in results:
+                    # 收集同sheet下所有region并合并（处理同列头多区域合并场景）
+                    dfs = []
+                    first_columns = None
                     for region in sheet_data.regions:
-                        # 转换为DataFrame
                         df = self._convert_region_to_dataframe(region)
-                        # 修改：即使DataFrame为空（只有表头没有数据），也要添加
-                        # 这样可以避免公式引用只有表头的sheet时出现KeyError
-                        # 只有当DataFrame连列名都没有时才跳过
                         if df.empty and len(df.columns) == 0:
                             continue
+                        if first_columns is None:
+                            first_columns = list(df.columns)
+                        dfs.append(df)
 
-                        # 生成sheet名称：文件名_sheet名（统一格式）
-                        sheet_name = f"{file_base}_{sheet_data.sheet_name}"
+                    if not dfs or first_columns is None:
+                        continue
 
-                        # 确保sheet名不超过31个字符（Excel限制）
-                        if len(sheet_name) > 31:
-                            sheet_name = sheet_name[:31]
+                    # 合并多个同列头区域的数据
+                    if len(dfs) == 1:
+                        merged_df = dfs[0]
+                    else:
+                        merged_df = pd.concat(dfs, ignore_index=True)
 
-                        self.source_sheets[sheet_name] = {
-                            "df": df,
-                            "columns": list(df.columns),
-                            "source_file": filename,
-                            "source_sheet": sheet_data.sheet_name
-                        }
+                    # 生成sheet名称：文件名_sheet名（统一格式）
+                    sheet_name = f"{file_base}_{sheet_data.sheet_name}"
 
-                        source_info["sheets"][sheet_name] = {
-                            "columns": list(df.columns),
-                            "row_count": len(df),
-                            "source_file": filename
-                        }
-                        source_info["all_columns"][sheet_name] = list(df.columns)
+                    # 确保sheet名不超过31个字符（Excel限制）
+                    if len(sheet_name) > 31:
+                        sheet_name = sheet_name[:31]
 
-                        logger.info(f"加载源数据: {sheet_name}, 列: {list(df.columns)}, 行数: {len(df)}")
+                    self.source_sheets[sheet_name] = {
+                        "df": merged_df,
+                        "columns": first_columns,
+                        "source_file": filename,
+                        "source_sheet": sheet_data.sheet_name
+                    }
+
+                    source_info["sheets"][sheet_name] = {
+                        "columns": first_columns,
+                        "row_count": len(merged_df),
+                        "source_file": filename
+                    }
+                    source_info["all_columns"][sheet_name] = first_columns
+
+                    logger.info(f"加载源数据: {sheet_name}, 列: {first_columns}, 行数: {len(merged_df)}")
 
             except Exception as e:
                 logger.error(f"加载文件失败 {filename}: {e}")

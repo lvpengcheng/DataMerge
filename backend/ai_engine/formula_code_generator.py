@@ -1656,20 +1656,38 @@ def load_source_data(input_folder, manual_headers):
         file_path = os.path.join(input_folder, filename)
         file_base = filename.replace('.xlsx','').replace('.xls','')
 
-        results = parser.parse_excel_file(
-            file_path,
-            manual_headers=manual_headers,
-            active_sheet_only=True  # 只加载激活的sheet
-        )
+        try:
+            results = parser.parse_excel_file(
+                file_path,
+                manual_headers=manual_headers,
+                active_sheet_only=True,
+                best_region_only=True  # 只取有效区域（与merge_source_to_target逻辑一致）
+            )
 
-        for sheet_data in results:
-            for region in sheet_data.regions:
-                df = convert_region_to_dataframe(region)
-                # 修改：即使DataFrame为空（只有表头没有数据），也要添加到source_data
-                # 这样可以避免公式引用只有表头的sheet时出现KeyError
-                # 只有当DataFrame连列名都没有时才跳过
-                if df.empty and len(df.columns) == 0:
+            if not results:
+                print(f"[警告] 文件 {filename} 解析结果为空，跳过")
+                continue
+
+            for sheet_data in results:
+                # 收集同sheet下所有region的DataFrame并合并（处理同列头多区域合并场景）
+                dfs = []
+                columns = None
+                for region in sheet_data.regions:
+                    df = convert_region_to_dataframe(region)
+                    if df.empty and len(df.columns) == 0:
+                        continue
+                    if columns is None:
+                        columns = list(df.columns)
+                    dfs.append(df)
+
+                if not dfs:
                     continue
+
+                # 合并多个同列头区域的数据
+                if len(dfs) == 1:
+                    merged_df = dfs[0]
+                else:
+                    merged_df = pd.concat(dfs, ignore_index=True)
 
                 # sheet名称格式：文件名_sheet名
                 sheet_name = f"{file_base}_{sheet_data.sheet_name}"
@@ -1677,13 +1695,18 @@ def load_source_data(input_folder, manual_headers):
                     sheet_name = sheet_name[:31]
 
                 source_data[sheet_name] = {
-                    "df": df,
-                    "columns": list(df.columns)
+                    "df": merged_df,
+                    "columns": columns
                 }
-                if len(df) > 0:
-                    print(f"加载源数据: {sheet_name}, 列: {list(df.columns)}, 行数: {len(df)}")
+                if len(merged_df) > 0:
+                    print(f"加载源数据: {sheet_name}, 列: {columns}, 行数: {len(merged_df)}")
                 else:
-                    print(f"加载源数据: {sheet_name}, 列: {list(df.columns)}, 行数: 0 (只有表头)")
+                    print(f"加载源数据: {sheet_name}, 列: {columns}, 行数: 0 (只有表头)")
+
+        except Exception as e:
+            print(f"[错误] 解析文件 {filename} 失败: {e}")
+            import traceback
+            traceback.print_exc()
 
 
     return source_data

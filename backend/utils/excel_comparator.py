@@ -30,10 +30,9 @@ def normalize_emp_code(emp_code) -> str:
 
 
 def calculate_excel_formulas(file_path: str) -> str:
-    """使用Excel计算所有公式并保存
+    """计算Excel文件中的所有公式并保存
 
-    在Windows上使用win32com打开Excel文件，强制计算所有公式后保存。
-    这样后续用openpyxl读取时可以获取到公式计算后的值。
+    优先使用 Aspose.Cells 内存计算（无需 Excel 软件），失败则回退 win32com。
 
     Args:
         file_path: Excel文件路径
@@ -41,85 +40,88 @@ def calculate_excel_formulas(file_path: str) -> str:
     Returns:
         计算后的文件路径（原文件会被覆盖）
     """
+    # ---- 方案1: Aspose.Cells（推荐，无进程开销） ----
+    try:
+        import aspose_init  # noqa: F401
+        from Aspose.Cells import Workbook as AsposeWorkbook, LoadOptions as AsposeLoadOptions
+
+        logger.info(f"[Aspose] 开始计算公式: {file_path}")
+        wb = AsposeWorkbook(str(file_path))
+        wb.CalculateFormula()
+        wb.Save(str(file_path))
+        logger.info(f"[Aspose] 公式计算完成: {file_path}")
+        return file_path
+    except ImportError:
+        logger.info("Aspose.Cells 不可用，尝试 win32com")
+    except Exception as e:
+        logger.warning(f"[Aspose] 公式计算失败: {e}，尝试 win32com 回退")
+
+    # ---- 方案2: win32com 回退 ----
     if platform.system() != 'Windows':
-        logger.warning("非Windows系统，跳过Excel公式计算")
+        logger.warning("非Windows系统且Aspose不可用，跳过公式计算")
         return file_path
 
     try:
         import pythoncom
         import win32com.client as win32
         import tempfile
-        import shutil
 
-        logger.info(f"使用Excel计算公式: {file_path}")
+        logger.info(f"[win32com] 开始计算公式: {file_path}")
 
-        # 初始化COM
         pythoncom.CoInitialize()
 
         try:
-            # 创建Excel应用
             excel = win32.gencache.EnsureDispatch('Excel.Application')
             excel.Visible = False
             excel.DisplayAlerts = False
 
-            # 打开文件 - 处理中文路径问题
             abs_path = str(Path(file_path).resolve())
 
-            # 如果路径包含非ASCII字符，先复制到临时目录
+            # 非ASCII路径处理
             use_temp = False
             temp_path = None
             try:
                 abs_path.encode('ascii')
             except UnicodeEncodeError:
-                # 路径包含非ASCII字符，复制到临时目录
                 use_temp = True
                 temp_dir = tempfile.mkdtemp()
                 temp_path = os.path.join(temp_dir, "temp_excel.xlsx")
                 shutil.copy(abs_path, temp_path)
-                logger.info(f"复制到临时路径处理: {temp_path}")
                 work_path = temp_path
             else:
                 work_path = abs_path
 
             wb = excel.Workbooks.Open(work_path, UpdateLinks=0)
-
-            # 强制计算所有工作表的公式
             for sheet in wb.Sheets:
                 sheet.Calculate()
-
-            # 使用Application级别的Calculate确保所有依赖都被计算
             wb.Application.Calculate()
             wb.Application.CalculateFull()
-
-            # 保存文件（使用SaveAs确保完全重写文件，包含计算后的值）
-            # FileFormat=51 对应 xlsx 格式
             wb.SaveAs(work_path, FileFormat=51)
-            wb.Close(SaveChanges=False)  # 已经SaveAs过了，不需要再保存
+            wb.Close(SaveChanges=False)
 
-            # 如果使用了临时文件，复制回原路径
             if use_temp and temp_path:
                 shutil.copy(temp_path, abs_path)
                 try:
                     os.remove(temp_path)
                     os.rmdir(os.path.dirname(temp_path))
-                except:
+                except Exception:
                     pass
 
-            logger.info(f"Excel公式计算完成: {file_path}")
+            logger.info(f"[win32com] 公式计算完成: {file_path}")
             return file_path
 
         finally:
             try:
                 excel.Quit()
-            except:
+            except Exception:
                 pass
             pythoncom.CoUninitialize()
 
     except ImportError:
-        logger.warning("未安装pywin32，跳过Excel公式计算。建议安装: pip install pywin32")
+        logger.warning("未安装pywin32，跳过Excel公式计算")
         return file_path
     except Exception as e:
-        logger.warning(f"Excel公式计算失败: {e}")
+        logger.warning(f"[win32com] 公式计算失败: {e}")
         return file_path
 
 

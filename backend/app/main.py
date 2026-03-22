@@ -1577,6 +1577,9 @@ def _build_pre_loaded_source_data(file_mapping: dict) -> dict:
             else:
                 target_sheet = sheet_data.sheet_name
 
+            # 收集同sheet下所有region并合并（处理同列头多区域合并场景）
+            dfs = []
+            first_columns = None
             for region in sheet_data.regions:
                 # needs_rewrite 时需要映射表头名
                 if needs_rewrite and header_mapping:
@@ -1585,7 +1588,6 @@ def _build_pre_loaded_source_data(file_mapping: dict) -> dict:
                     for col_name, col_letter in region.head_data.items():
                         mapped_name = header_mapping.get(col_name, col_name)
                         mapped_head[mapped_name] = col_letter
-                    # 构建映射后的 region 用于转 DataFrame
                     mapped_region = ExcelRegion(
                         head_data=mapped_head,
                         data=region.data,
@@ -1595,20 +1597,31 @@ def _build_pre_loaded_source_data(file_mapping: dict) -> dict:
                 else:
                     df = convert_region_to_dataframe(region)
 
-                # 与 load_source_data 保持一致：只有表头没有数据的sheet也要保留
-                # 只有当DataFrame连列名都没有时才跳过
                 if df.empty and len(df.columns) == 0:
                     continue
+                if first_columns is None:
+                    first_columns = list(df.columns)
+                dfs.append(df)
 
-                sheet_name = f"{file_base}_{target_sheet}"
-                if len(sheet_name) > 31:
-                    sheet_name = sheet_name[:31]
+            if not dfs:
+                continue
 
-                source_data[sheet_name] = {
-                    "df": df,
-                    "columns": list(df.columns)
-                }
-                logger.info(f"[性能优化] 预加载: {sheet_name} ({len(df)}行, {len(df.columns)}列)")
+            # 合并多个同列头区域的数据
+            if len(dfs) == 1:
+                merged_df = dfs[0]
+            else:
+                import pandas as _pd
+                merged_df = _pd.concat(dfs, ignore_index=True)
+
+            sheet_name = f"{file_base}_{target_sheet}"
+            if len(sheet_name) > 31:
+                sheet_name = sheet_name[:31]
+
+            source_data[sheet_name] = {
+                "df": merged_df,
+                "columns": first_columns
+            }
+            logger.info(f"[性能优化] 预加载: {sheet_name} ({len(merged_df)}行, {len(first_columns)}列)")
 
     return source_data
 

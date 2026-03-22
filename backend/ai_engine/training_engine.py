@@ -1451,6 +1451,7 @@ class TrainingEngine:
                     max_data_rows=10,  # 训练时只读取10行数据用于分析结构
           manual_headers=manual_headers,
                     active_sheet_only=True,  # 只加载激活的sheet
+                    best_region_only=True,  # 只取有效区域
                     password=passwords.get(file_name)
                 )
 
@@ -1507,6 +1508,7 @@ class TrainingEngine:
              max_data_rows=10,  # 训练时只读取10行数据用于分析结构
                 manual_headers=manual_headers,
                 active_sheet_only=True,  # 只加载激活的sheet
+                best_region_only=True,  # 只取有效区域
                 password=(file_passwords or {}).get(Path(expected_file).name)
             )
 
