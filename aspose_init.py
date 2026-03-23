@@ -72,11 +72,13 @@ def init_aspose():
         clr.AddReference("SkiaSharp")
         clr.AddReference("Aspose.Cells")
 
-        # 6. 注册中文编码支持
-        #    System.Text.Encoding.CodePages 已内置于 .NET 运行时，无需手动 AddReference
-        #    手动加载 libs/ 下的旧版本会导致版本冲突 (0x80131040)
-        import System.Text
-        System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance)
+        # 6. 注册中文编码支持（可选，失败不影响核心功能）
+        try:
+            import System.Text
+            System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance)
+            logger.info("[Aspose] CodePages 编码支持已注册")
+        except Exception as enc_err:
+            logger.warning(f"[Aspose] CodePages 编码注册跳过（不影响核心功能）: {enc_err}")
 
         _initialized = True
         logger.info("[Aspose] .NET 运行时初始化完成")

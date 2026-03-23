@@ -96,7 +96,11 @@
       "Bash(cp excel_parser.py aspose_init.py run.py requirements.txt Dockerfile docker-compose.yml .dockerignore releases/datamerge-1.0.0/)",
       "Bash(cp .env.example releases/datamerge-1.0.0/)",
       "Bash(cp build_docker.sh releases/datamerge-1.0.0/)",
-      "Read(//c/Windows/Fonts/**)"
+      "Read(//c/Windows/Fonts/**)",
+      "Bash(cp -r backend releases/datamerge-1.0.0/)",
+      "Bash(cp -r frontend releases/datamerge-1.0.0/)",
+      "Bash(cp -r fonts releases/datamerge-1.0.0/)",
+      "Bash(cp .env.example build_docker.sh releases/datamerge-1.0.0/)"
     ],
     "additionalDirectories": [
       "E:\\project\\DataMerge20260224\\DataMerge\\backend\\test_data\\data_cleaning_test",
