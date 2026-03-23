@@ -202,6 +202,42 @@ def read_all_sheets(
     return result
 
 
+def read_all_sheets_calculated(
+    path: str,
+    header_row: int = 0,
+    password: str = None,
+) -> Dict[str, pd.DataFrame]:
+    """
+    读取 Excel 所有 Sheet，先 CalculateFormula() 强制计算公式，
+    再提取计算后的值。适用于含公式的计算结果文件。
+
+    Args:
+        path:       Excel 文件路径
+        header_row: 列名所在行号（0-indexed）
+        password:   打开密码（可选）
+
+    Returns:
+        dict[str, pd.DataFrame]
+    """
+    if password:
+        opts = LoadOptions()
+        opts.Password = password
+        wb = Workbook(path, opts)
+    else:
+        wb = Workbook(path)
+
+    wb.CalculateFormula()
+
+    result: Dict[str, pd.DataFrame] = {}
+    for i in range(wb.Worksheets.Count):
+        ws = wb.Worksheets[i]
+        name = ws.Name or ""
+        if "Evaluation" in name:
+            continue
+        result[name] = _sheet_to_dataframe(ws, header_row)
+    return result
+
+
 # ═══════════════════════════════════════════════════════
 # 写入
 # ═══════════════════════════════════════════════════════

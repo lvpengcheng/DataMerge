@@ -722,41 +722,21 @@ async def generate_report(
     if not result_files:
         raise HTTPException(status_code=400, detail="未找到计算结果文件")
 
-    # 4. 用 excel_parser 解析结果文件，提取计算后的数据（非公式）
-    #    先用 Aspose CalculateFormula() 计算公式，保存到临时文件再解析
-    import tempfile
-    from Aspose.Cells import Workbook as _AsWb
-    from excel_parser import IntelligentExcelParser
-    parser = IntelligentExcelParser()
-    all_rows = []
+    # 4. 读取结果文件（CalculateFormula 后取计算值，非公式）
+    all_dfs = []
     for fpath in result_files:
-        tmp_path = None
         try:
-            # 预处理：强制计算公式后存到临时文件
-            wb = _AsWb(str(fpath))
-            wb.CalculateFormula()
-            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".xlsx")
-            os.close(tmp_fd)
-            wb.Save(tmp_path)
-
-            sheets = parser.parse_excel_file(tmp_path, best_region_only=True)
-            for sheet in sheets:
-                for region in sheet.regions:
-                    # head_data: {"姓名": "B", "部门": "C", ...}
-                    # data key 是列字母，需映射回表头名
-                    col_map = {v: k for k, v in region.head_data.items()}
-                    for row in region.data:
-                        all_rows.append({col_map.get(c, c): val for c, val in row.items()})
+            sheets = aspose_helper.read_all_sheets_calculated(fpath)
+            for df in sheets.values():
+                if not df.empty:
+                    all_dfs.append(df)
         except Exception as e:
-            logger.warning(f"解析结果文件失败 {fpath}: {e}")
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            logger.warning(f"读取结果文件失败 {fpath}: {e}")
 
-    if not all_rows:
+    if not all_dfs:
         raise HTTPException(status_code=400, detail="无法读取计算结果数据")
 
-    dataset = pd.DataFrame(all_rows)
+    dataset = pd.concat(all_dfs, ignore_index=True) if len(all_dfs) > 1 else all_dfs[0]
 
     # 5. 构建模版数据字典
     #    - "DataSource" = 完整数据集（模版中写 &=DataSource.列名）
