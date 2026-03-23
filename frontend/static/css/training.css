@@ -109,8 +109,8 @@ header h1 {
 
 .main-content {
     display: grid;
-    grid-template-columns: 400px 1fr;
-    gap: 30px;
+    grid-template-columns: minmax(280px, 28%) 1fr;
+    gap: 20px;
     align-items: stretch;
     flex: 1;
     min-height: 0;
@@ -121,7 +121,7 @@ header h1 {
 
 section {
     background: white;
-    padding: 30px;
+    padding: 20px;
     border-radius: 12px;
     box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
 }
@@ -370,8 +370,8 @@ section h3 {
 .right-panel {
     display: flex;
     flex-direction: column;
-    gap: 30px;
-    height: 100%;
+    gap: 20px;
+    min-height: 0;
     min-width: 0;
     overflow: hidden;
 }
@@ -388,14 +388,15 @@ section h3 {
     flex-direction: column;
     flex: 1;
     min-height: 0;
+    overflow: hidden;
 }
 
 .status-card {
     background: linear-gradient(135deg, #42a5f5 0%, #1976d2 100%);
-    padding: 25px;
+    padding: 15px 20px;
     border-radius: 10px;
     color: white;
-    margin-bottom: 25px;
+    margin-bottom: 12px;
 }
 
 .status-header {
@@ -441,18 +442,18 @@ section h3 {
     color: #333;
 }
 
-/* 迭代信息 */
+/* 迭代信息 - 三列网格紧凑布局 */
 .iteration-info {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
-    gap: 20px;
-    margin-bottom: 25px;
+    gap: 12px;
+    margin-bottom: 12px;
 }
 
 .info-item {
     background: #f8f9fa;
-    padding: 15px;
-    border-radius: 8px;
+    padding: 8px 10px;
+    border-radius: 6px;
     text-align: center;
 }
 
@@ -460,19 +461,19 @@ section h3 {
     display: block;
     color: #666;
     font-size: 12px;
-    margin-bottom: 8px;
+    margin-bottom: 4px;
 }
 
 .info-item .value {
     color: #333;
-    font-size: 24px;
+    font-size: 18px;
     font-weight: 600;
 }
 
 .info-item .separator {
     color: #999;
-    font-size: 20px;
-    margin: 0 4px;
+    font-size: 16px;
+    margin: 0 2px;
 }
 
 /* 迭代历史 */
@@ -557,7 +558,7 @@ section h3 {
 
 /* 日志区域 */
 .log-container {
-    margin-top: 25px;
+    margin-top: 0;
     flex: 1;
     display: flex;
     flex-direction: column;
@@ -571,7 +572,9 @@ section h3 {
     border-radius: 8px;
     font-family: 'Consolas', 'Monaco', monospace;
     font-size: 12px;
-    max-height: 400px;
+    flex: 1;
+    min-height: 0;
+    max-height: 45vh;
     overflow-y: auto;
     overflow-x: hidden;
     line-height: 1.6;

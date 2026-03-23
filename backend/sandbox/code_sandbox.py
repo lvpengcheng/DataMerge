@@ -501,6 +501,56 @@ class CodeSandbox:
         safe_env['ZERO'] = '0'
         safe_env['excel_text'] = lambda text: f'"{text}"'
 
+        # 安全包装 CellIsRule —— 防止 AI 生成错误的 operator 值
+        # 1. operator={'greaterThan'} (set) → 'greaterThan' (str)
+        # 2. operator='greater_than' (snake_case) → 'greaterThan'
+        # 3. operator='不等于' (中文) → 'notEqual'
+        # 必须 monkey-patch openpyxl 模块本身，因为 AI 代码通过 from ... import 直接导入
+        try:
+            import openpyxl.formatting.rule as _fmt_rule
+            _OrigCellIsRule = _fmt_rule.CellIsRule
+            # 只 patch 一次，避免重复包装
+            if not getattr(_OrigCellIsRule, '_patched', False):
+                _OPERATOR_MAP = {
+                    # 符号
+                    '>': 'greaterThan', '<': 'lessThan', '=': 'equal',
+                    '>=': 'greaterThanOrEqual', '<=': 'lessThanOrEqual',
+                    '!=': 'notEqual', '<>': 'notEqual', '==': 'equal',
+                    # snake_case
+                    'greater_than': 'greaterThan', 'less_than': 'lessThan',
+                    'greater_than_or_equal': 'greaterThanOrEqual',
+                    'less_than_or_equal': 'lessThanOrEqual',
+                    'not_equal': 'notEqual', 'not_between': 'notBetween',
+                    'not_contains': 'notContains', 'contains_text': 'containsText',
+                    'begins_with': 'beginsWith', 'ends_with': 'endsWith',
+                    # 中文
+                    '大于': 'greaterThan', '小于': 'lessThan', '等于': 'equal',
+                    '不等于': 'notEqual', '大于等于': 'greaterThanOrEqual',
+                    '小于等于': 'lessThanOrEqual', '介于': 'between',
+                    '不介于': 'notBetween', '包含': 'containsText',
+                    '不包含': 'notContains', '开头是': 'beginsWith',
+                    '结尾是': 'endsWith',
+                }
+                _VALID_OPS = {'notBetween', 'greaterThanOrEqual', 'containsText',
+                              'lessThanOrEqual', 'between', 'endsWith', 'greaterThan',
+                              'lessThan', 'equal', 'beginsWith', 'notEqual', 'notContains'}
+
+                def _safe_CellIsRule(operator=None, **kwargs):
+                    if isinstance(operator, (set, list, tuple)):
+                        operator = next(iter(operator)) if operator else None
+                    if isinstance(operator, str):
+                        # 去除可能被 TXT_ 常量包裹的引号，如 '"greaterThan"' → 'greaterThan'
+                        operator = operator.strip().strip('"').strip("'")
+                        if operator not in _VALID_OPS:
+                            operator = _OPERATOR_MAP.get(operator, operator)
+                    return _OrigCellIsRule(operator=operator, **kwargs)
+                _safe_CellIsRule._patched = True
+                _fmt_rule.CellIsRule = _safe_CellIsRule
+            safe_env['CellIsRule'] = _fmt_rule.CellIsRule
+            safe_env['FormulaRule'] = _fmt_rule.FormulaRule
+        except ImportError:
+            pass
+
         # 注入历史数据查询工具（如果有tenant_id）
         tenant_id = execution_env.get('tenant_id')
         if tenant_id:

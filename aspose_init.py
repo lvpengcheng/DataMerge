@@ -71,9 +71,10 @@ def init_aspose():
         import clr
         clr.AddReference("SkiaSharp")
         clr.AddReference("Aspose.Cells")
-        clr.AddReference("System.Text.Encoding.CodePages")
 
-        # 5. 注册中文编码支持
+        # 6. 注册中文编码支持
+        #    System.Text.Encoding.CodePages 已内置于 .NET 运行时，无需手动 AddReference
+        #    手动加载 libs/ 下的旧版本会导致版本冲突 (0x80131040)
         import System.Text
         System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance)
 

@@ -1349,7 +1349,8 @@ class FormulaCodeGenerator:
 
             # 模式1b: ="" → ={EMPTY} — 未转义的空字符串比较
             # 例: f'=IF(G{r}="",0,...)' 中的 ="" （单引号f-string中双引号不需转义）
-            line = re.sub(r'=""', '={EMPTY}', line)
+            # 排除Python关键字参数（如 param=""），只匹配Excel公式中的=""
+            line = re.sub(r'(?<![a-zA-Z_])=""', '={EMPTY}', line)
 
             # 模式1c: ,"" → ,{EMPTY} — 未转义的逗号+空字符串
             # 例: f'=IFERROR(VLOOKUP(...),"",0)' 中的 ,""
@@ -1357,12 +1358,14 @@ class FormulaCodeGenerator:
 
             # 模式1d: ="text" → ={TXT_text} — 未转义的文本比较
             # 例: f'=IF(G{r}="全职",1,0)' 中的 ="全职"
+            # 排除Python关键字参数（如 operator="greaterThan"），只匹配Excel公式中的="text"
+            # lookbehind: = 前不能是字母或下划线（排除 param="value" 模式）
             def replace_unescaped_text_compare(m):
                 text = m.group(1)
                 var_name = self._text_to_var_name(text)
                 text_constants[var_name] = text
                 return f"={{{var_name}}}"
-            line = re.sub(r'="([^"{}]+)"', replace_unescaped_text_compare, line)
+            line = re.sub(r'(?<![a-zA-Z_])="([^"{}]+)"', replace_unescaped_text_compare, line)
 
             # 模式2: ,\"\") → ,{EMPTY}) — 已转义的Excel空字符串
             line = re.sub(r',\s*\\"\\"[\s)]*\)', ',{EMPTY})', line)
@@ -2353,26 +2356,30 @@ def main():
 - 如果规则文档中要求对某些单元格进行颜色标记、标红、高亮等，必须用openpyxl的条件格式实现，不能跳过或只留注释
 - 需要额外导入：`from openpyxl.formatting.rule import CellIsRule, FormulaRule`
 - 条件格式代码放在**所有公式填充完成之后**
+- **关键：CellIsRule/FormulaRule 调用必须和 f-string 分开写，不能在同一行！先用变量保存范围字符串**
 
 ### 数值条件格式（CellIsRule）
 - 适用于：大于/小于/等于某个数值
-- 格式：
+- **正确写法（范围和CellIsRule分两行）**：
 ```python
 from openpyxl.formatting.rule import CellIsRule
 red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
 # 出勤天数>20标红（E列）
-ws.conditional_formatting.add(f"E2:E{{n_rows+1}}", CellIsRule(operator="greaterThan", formula=["20"], fill=red_fill))
+cell_range = f"E2:E{n_rows+1}"
+ws.conditional_formatting.add(cell_range, CellIsRule(operator="greaterThan", formula=["20"], fill=red_fill))
 ```
 - 支持的operator：greaterThan, lessThan, equal, notEqual, greaterThanOrEqual, lessThanOrEqual, between
+- **注意：operator参数必须是字符串**，如 `operator="greaterThan"`
 
 ### 公式条件格式（FormulaRule）
 - 适用于：复杂条件、跨列判断、文本匹配
-- 格式：
+- **正确写法（范围和FormulaRule分两行）**：
 ```python
 from openpyxl.formatting.rule import FormulaRule
 yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
 # 基本工资>20000标黄警告（D列）
-ws.conditional_formatting.add(f"D2:D{{n_rows+1}}", FormulaRule(formula=[f"D2>20000"], fill=yellow_fill))
+cell_range = f"D2:D{n_rows+1}"
+ws.conditional_formatting.add(cell_range, FormulaRule(formula=["D2>20000"], fill=yellow_fill))
 ```
 
 ### 常用颜色
@@ -2388,7 +2395,7 @@ ws.conditional_formatting.add(f"D2:D{{n_rows+1}}", FormulaRule(formula=[f"D2>200
 3. [ ] 是否有文本比较？→ 是 → 值加双引号（如"是"）
 4. [ ] 是否有中文标点？→ 是 → 全部改为英文
 5. [ ] f-string内有双引号？→ 是 → 外层用单引号
-6. [ ] 规则是否要求条件格式（标红/高亮等）？→ 是 → 在公式填充后用CellIsRule/FormulaRule实现
+6. [ ] 规则是否要求条件格式（标红/高亮等）？→ 是 → 在公式填充后用循环遍历+直接设置fill实现
 
 # ==================== 快速参考 ====================
 ## VLOOKUP列号计算
