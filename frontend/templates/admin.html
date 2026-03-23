@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>系统管理 - 数据整合平台</title>
-    <link rel="stylesheet" href="/static/css/admin.css">
+    <link rel="stylesheet" href="/static/css/admin.css?v=20260323t">
 </head>
 <body>
     <div class="container">
@@ -27,6 +27,7 @@
             <button class="tab-btn" data-tab="orgs">组织管理</button>
             <button class="tab-btn" data-tab="tenant-auth">租户授权</button>
             <button class="tab-btn" data-tab="ref-data">基础数据</button>
+            <button class="tab-btn" data-tab="templates">模版管理</button>
             <button class="tab-btn" data-tab="training-history">训练历史</button>
             <button class="tab-btn" data-tab="compute-history">计算历史</button>
         </div>
@@ -143,6 +144,32 @@
             </table>
         </div>
 
+        <!-- 模版管理 Tab -->
+        <div class="tab-content" id="tab-templates">
+            <div class="toolbar">
+                <select id="tpl-tenant-filter" onchange="Admin.loadTemplates()">
+                    <option value="">全部</option>
+                    <option value="__global__">仅全局</option>
+                </select>
+                <button class="btn btn-primary" onclick="Admin.showCreateTemplate()">新建模版</button>
+            </div>
+            <table class="data-table" id="templates-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>模版名称</th>
+                        <th>租户</th>
+                        <th>模版文件</th>
+                        <th>文件名规则</th>
+                        <th>加密规则</th>
+                        <th>状态</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
         <!-- 训练历史 Tab -->
         <div class="tab-content" id="tab-training-history">
             <div class="toolbar">
@@ -213,7 +240,7 @@
         </div>
     </div>
 
-    <script src="/static/js/auth.js"></script>
-    <script src="/static/js/admin.js"></script>
+    <script src="/static/js/auth.js?v=20260323t3"></script>
+    <script src="/static/js/admin.js?v=20260323t5"></script>
 </body>
 </html>

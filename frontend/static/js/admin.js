@@ -40,6 +40,7 @@ const Admin = {
                 else if (tab === 'orgs') this.loadOrgs().then(() => this.renderOrgs());
                 else if (tab === 'tenant-auth') this.loadTenantAuth();
                 else if (tab === 'ref-data') this.loadRefCategories().then(() => this.loadRefData());
+                else if (tab === 'templates') this.loadTemplateTenants().then(() => this.loadTemplates());
                 else if (tab === 'training-history') this.loadTrainingHistory();
                 else if (tab === 'compute-history') this.loadComputeHistory();
             });
@@ -601,6 +602,164 @@ const Admin = {
         this.openModal(`训练会话 #${sessionId} - 迭代详情`, html, null);
     },
 
+    // ==================== 模版管理 ====================
+    _tplTenants: [],
+
+    async loadTemplateTenants() {
+        const resp = await AUTH.authFetch('/api/admin/tenant-auth/tenants');
+        if (!resp.ok) return;
+        this._tplTenants = await resp.json();
+        const sel = document.getElementById('tpl-tenant-filter');
+        if (sel) {
+            sel.innerHTML = '<option value="">全部</option><option value="__global__">仅全局</option>' +
+                this._tplTenants.map(t => `<option value="${t}">租户: ${t}</option>`).join('');
+        }
+    },
+
+    async loadTemplates() {
+        const tenantId = document.getElementById('tpl-tenant-filter')?.value || '';
+        let url = '/api/admin/templates';
+        if (tenantId) url += `?tenant_id=${encodeURIComponent(tenantId)}`;
+        const resp = await AUTH.authFetch(url);
+        if (!resp.ok) return;
+        const list = await resp.json();
+        this.renderTemplates(list);
+    },
+
+    renderTemplates(list) {
+        const tbody = document.querySelector('#templates-table tbody');
+        if (!list.length) {
+            tbody.innerHTML = '<tr><td colspan="8" class="empty-state">暂无模版</td></tr>';
+            return;
+        }
+        tbody.innerHTML = list.map(t => `<tr>
+            <td>${t.id}</td>
+            <td>${t.name}</td>
+            <td>${t.tenant_id ? '<span class="tag">租户: ' + t.tenant_id + '</span>' : '<span class="tag" style="background:#e8f5e9;color:#2e7d32">全局</span>'}</td>
+            <td>${t.file_name}</td>
+            <td>${t.file_name_rule || '-'}</td>
+            <td>${t.encrypt_password || '<span style="color:#999">不加密</span>'}</td>
+            <td>${t.is_active ? '<span style="color:green">启用</span>' : '<span style="color:#999">停用</span>'}</td>
+            <td class="actions">
+                <button class="btn btn-sm" onclick="Admin.downloadTemplate(${t.id}, '${t.file_name.replace(/'/g, "\\'")}')">下载</button>
+                <button class="btn btn-sm" onclick="Admin.showEditTemplate(${t.id})">编辑</button>
+                <button class="btn btn-sm btn-danger" onclick="Admin.deleteTemplate(${t.id}, '${t.name.replace(/'/g, "\\'")}')">停用</button>
+            </td>
+        </tr>`).join('');
+    },
+
+    showCreateTemplate() {
+        const tenantOptions = this._tplTenants.map(t =>
+            `<option value="${t}">租户: ${t}</option>`
+        ).join('');
+        this.openModal('新建模版', `
+            <div style="display:flex;flex-direction:column;gap:12px;">
+                <div class="form-group"><label>租户</label>
+                    <select id="m-tpl-tenant" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                        <option value="">全局（所有租户可用）</option>
+                        ${tenantOptions}
+                    </select>
+                </div>
+                <div class="form-group"><label>模版名称</label>
+                    <input id="m-tpl-name" required style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                </div>
+                <div class="form-group"><label>描述</label>
+                    <input id="m-tpl-desc" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                </div>
+                <div class="form-group"><label>模版文件</label>
+                    <input id="m-tpl-file" type="file" accept=".xlsx,.xls,.xlsm">
+                </div>
+                <div class="form-group"><label>文件名规则</label>
+                    <input id="m-tpl-name-rule" placeholder="如: {year}{month}_薪资表_{姓名}" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                    <small style="color:#888;">可用变量: {year} {month} {date} {tenant} {列名} {列名[:N]} {列名[-N:]}</small>
+                </div>
+                <div class="form-group"><label>加密规则</label>
+                    <input id="m-tpl-encrypt-rule" placeholder="如: {身份证号码[:6]} 或 {姓名[:1]}{身份证号码[-6:]}" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                    <small style="color:#888;">留空表示不加密。可用变量: {列名} {列名[:N]}前N位 {列名[-N:]}后N位</small>
+                </div>
+            </div>
+        `, async () => {
+            const fileInput = document.getElementById('m-tpl-file');
+            if (!fileInput.files.length) return alert('请选择模版文件');
+            const name = document.getElementById('m-tpl-name').value.trim();
+            if (!name) return alert('请输入模版名称');
+            const encryptRule = document.getElementById('m-tpl-encrypt-rule').value.trim();
+            const fd = new FormData();
+            fd.append('file', fileInput.files[0]);
+            fd.append('name', name);
+            fd.append('tenant_id', document.getElementById('m-tpl-tenant').value);
+            fd.append('description', document.getElementById('m-tpl-desc').value || '');
+            fd.append('file_name_rule', document.getElementById('m-tpl-name-rule').value || '');
+            fd.append('encrypt_type', encryptRule ? 'password' : 'none');
+            fd.append('encrypt_password', encryptRule);
+            const resp = await AUTH.authFetch('/api/admin/templates', { method: 'POST', body: fd });
+            if (resp.ok) { this.closeModal(); this.loadTemplates(); }
+            else { const e = await resp.json(); alert(e.detail || '创建失败'); }
+        });
+    },
+
+    async showEditTemplate(id) {
+        const resp = await AUTH.authFetch(`/api/admin/templates/${id}`);
+        if (!resp.ok) return alert('获取模版失败');
+        const t = await resp.json();
+        const tenantOptions = this._tplTenants.map(tn =>
+            `<option value="${tn}" ${t.tenant_id === tn ? 'selected' : ''}>租户: ${tn}</option>`
+        ).join('');
+        this.openModal('编辑模版', `
+            <div style="display:flex;flex-direction:column;gap:12px;">
+                <div class="form-group"><label>租户</label>
+                    <select id="m-tpl-tenant" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                        <option value="" ${!t.tenant_id ? 'selected' : ''}>全局（所有租户可用）</option>
+                        ${tenantOptions}
+                    </select>
+                </div>
+                <div class="form-group"><label>模版名称</label>
+                    <input id="m-tpl-name" value="${t.name}" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                </div>
+                <div class="form-group"><label>描述</label>
+                    <input id="m-tpl-desc" value="${t.description || ''}" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                </div>
+                <div class="form-group"><label>替换文件（可选）</label>
+                    <input id="m-tpl-file" type="file" accept=".xlsx,.xls,.xlsm">
+                    <small style="color:#888;">当前文件: ${t.file_name}</small>
+                </div>
+                <div class="form-group"><label>文件名规则</label>
+                    <input id="m-tpl-name-rule" value="${t.file_name_rule || ''}" placeholder="如: {year}{month}_薪资表_{姓名}" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                    <small style="color:#888;">可用变量: {year} {month} {date} {tenant} {列名} {列名[:N]} {列名[-N:]}</small>
+                </div>
+                <div class="form-group"><label>加密规则</label>
+                    <input id="m-tpl-encrypt-rule" value="${t.encrypt_password || ''}" placeholder="如: {身份证号码[:6]} 或 {姓名[:1]}{身份证号码[-6:]}" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                    <small style="color:#888;">留空表示不加密。可用变量: {列名} {列名[:N]}前N位 {列名[-N:]}后N位</small>
+                </div>
+            </div>
+        `, async () => {
+            const fd = new FormData();
+            const fileInput = document.getElementById('m-tpl-file');
+            if (fileInput.files.length) fd.append('file', fileInput.files[0]);
+            const encryptRule = document.getElementById('m-tpl-encrypt-rule').value.trim();
+            fd.append('tenant_id', document.getElementById('m-tpl-tenant').value);
+            fd.append('name', document.getElementById('m-tpl-name').value);
+            fd.append('description', document.getElementById('m-tpl-desc').value || '');
+            fd.append('file_name_rule', document.getElementById('m-tpl-name-rule').value || '');
+            fd.append('encrypt_type', encryptRule ? 'password' : 'none');
+            fd.append('encrypt_password', encryptRule);
+            const resp = await AUTH.authFetch(`/api/admin/templates/${id}`, { method: 'PUT', body: fd });
+            if (resp.ok) { this.closeModal(); this.loadTemplates(); }
+            else { const e = await resp.json(); alert(e.detail || '更新失败'); }
+        });
+    },
+
+    async deleteTemplate(id, name) {
+        if (!confirm(`确定停用模版 ${name}？`)) return;
+        const resp = await AUTH.authFetch(`/api/admin/templates/${id}`, { method: 'DELETE' });
+        if (resp.ok) this.loadTemplates();
+        else alert('操作失败');
+    },
+
+    downloadTemplate(id, fileName) {
+        this._fetchAndDownload(`/api/admin/templates/${id}/download`, fileName);
+    },
+
     // ==================== 计算历史 ====================
     async downloadAsset(assetId, fileName, format) {
         try {
@@ -698,6 +857,7 @@ const Admin = {
             <td>${t.finished_at ? new Date(t.finished_at).toLocaleString() : '-'}</td>
             <td>
                 <button class="btn btn-sm" onclick="Admin.showComputeDetail(${t.id})">详情</button>
+                ${t.status === 'completed' ? `<button class="btn btn-sm btn-primary" style="margin-left:4px;" onclick="Admin.showGenerateReport(${t.id}, '${t.tenant_id}')">下载报表</button>` : ''}
             </td>
         </tr>`).join('');
     },
@@ -769,6 +929,99 @@ const Admin = {
 
         html += '</div>';
         this.openModal(`计算任务 #${taskId} - 详情`, html, null);
+    },
+
+    async showGenerateReport(taskId, tenantId) {
+        // 加载全局+该租户的模版
+        const resp = await AUTH.authFetch(`/api/admin/templates?tenant_id=${encodeURIComponent(tenantId)}&include_global=true`);
+        if (!resp.ok) return alert('加载模版列表失败');
+        const templates = await resp.json();
+        if (!templates.length) return alert('暂无可用模版，请先在模版管理中创建');
+
+        const tplOptions = templates.map(t =>
+            `<option value="${t.id}">${t.name}${t.tenant_id ? '' : ' (全局)'}</option>`
+        ).join('');
+
+        this.openModal('下载报表', `
+            <div style="display:flex;flex-direction:column;gap:14px;">
+                <div class="form-group"><label>选择模版</label>
+                    <select id="m-rpt-tpl" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                        ${tplOptions}
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                        启用历史数据（合并多个周期的计算结果）
+                        <input type="checkbox" id="m-rpt-history" onchange="document.getElementById('m-rpt-period').style.display=this.checked?'flex':'none'">
+                    </label>
+                </div>
+                <div id="m-rpt-period" style="display:none;gap:10px;align-items:center;">
+                    <label>薪资周期从
+                        <input type="month" id="m-rpt-from" style="padding:6px;border:1px solid #ddd;border-radius:4px;">
+                    </label>
+                    <label>至
+                        <input type="month" id="m-rpt-to" style="padding:6px;border:1px solid #ddd;border-radius:4px;">
+                    </label>
+                </div>
+            </div>
+        `, async () => {
+            const tplId = document.getElementById('m-rpt-tpl').value;
+            const useHistory = document.getElementById('m-rpt-history').checked;
+            const periodFrom = document.getElementById('m-rpt-from').value;
+            const periodTo = document.getElementById('m-rpt-to').value;
+
+            if (useHistory && (!periodFrom || !periodTo)) {
+                return alert('启用历史时请选择薪资周期范围');
+            }
+
+            // 显示加载状态
+            const confirmBtn = document.getElementById('modal-confirm');
+            const origText = confirmBtn.textContent;
+            confirmBtn.textContent = '生成中...';
+            confirmBtn.disabled = true;
+
+            try {
+                const fd = new FormData();
+                fd.append('task_id', taskId);
+                fd.append('use_history', useHistory);
+                if (useHistory) {
+                    fd.append('period_from', periodFrom);
+                    fd.append('period_to', periodTo);
+                }
+
+                const resp = await AUTH.authFetch(`/api/admin/templates/${tplId}/generate-report`, {
+                    method: 'POST', body: fd
+                });
+                if (!resp.ok) {
+                    const err = await resp.json();
+                    alert(err.detail || '报表生成失败');
+                    return;
+                }
+
+                // 下载生成的文件
+                const blob = await resp.blob();
+                const cd = resp.headers.get('content-disposition') || '';
+                let fileName = '报表.xlsx';
+                const fnMatch = cd.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i);
+                if (fnMatch) fileName = decodeURIComponent(fnMatch[1].replace(/"/g, ''));
+
+                const blobUrl = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = blobUrl;
+                a.download = fileName;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(blobUrl);
+
+                this.closeModal();
+            } catch (e) {
+                alert('报表生成失败: ' + e.message);
+            } finally {
+                confirmBtn.textContent = origText;
+                confirmBtn.disabled = false;
+            }
+        });
     },
 };
 

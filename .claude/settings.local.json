@@ -100,7 +100,8 @@
       "Bash(cp -r backend releases/datamerge-1.0.0/)",
       "Bash(cp -r frontend releases/datamerge-1.0.0/)",
       "Bash(cp -r fonts releases/datamerge-1.0.0/)",
-      "Bash(cp .env.example build_docker.sh releases/datamerge-1.0.0/)"
+      "Bash(cp .env.example build_docker.sh releases/datamerge-1.0.0/)",
+      "Read(//c/Users/Administrator/Desktop/asposetest/**)"
     ],
     "additionalDirectories": [
       "E:\\project\\DataMerge20260224\\DataMerge\\backend\\test_data\\data_cleaning_test",

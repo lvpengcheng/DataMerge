@@ -4,14 +4,19 @@
 """
 
 import os
+import re
+import shutil
+import logging
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile, Form
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 
 from ..database.connection import get_db
-from ..database.models import User, Role, Organization, TenantAuthorization
+from ..database.models import User, Role, Organization, TenantAuthorization, Template, ComputeTask, DataAsset
 from ..auth.dependencies import require_admin, get_current_user
 from ..auth.schemas import (
     UserCreate, UserUpdate, UserResponse,
@@ -402,3 +407,455 @@ def _build_org_tree(orgs: list) -> List[OrgResponse]:
         else:
             roots.append(org_resp)
     return roots
+
+
+# ========================= 模版管理 =========================
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def _save_template_file(file: UploadFile, tenant_id: Optional[str]) -> tuple:
+    """保存模版文件，返回 (file_path, file_name)"""
+    if tenant_id:
+        base_dir = _PROJECT_ROOT / "tenants" / tenant_id / "templates"
+    else:
+        base_dir = _PROJECT_ROOT / "global_assets" / "templates"
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    safe_name = file.filename.replace(" ", "_")
+    saved_name = f"{timestamp}_{safe_name}"
+    saved_path = base_dir / saved_name
+
+    with open(saved_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    return str(saved_path), file.filename
+
+
+def _build_template_resp(t: Template) -> dict:
+    return {
+        "id": t.id,
+        "tenant_id": t.tenant_id,
+        "name": t.name,
+        "description": t.description or "",
+        "file_name": t.file_name,
+        "file_name_rule": t.file_name_rule or "",
+        "encrypt_type": t.encrypt_type or "none",
+        "encrypt_password": t.encrypt_password or "",
+        "is_active": t.is_active,
+        "created_by": t.created_by,
+        "creator_name": t.creator.display_name if t.creator else "",
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+        "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+    }
+
+
+@router.get("/templates")
+async def list_templates(
+    tenant_id: Optional[str] = Query(None),
+    include_global: bool = Query(False),
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    """获取模版列表"""
+    query = db.query(Template).filter(Template.is_active == True)
+    if tenant_id:
+        if tenant_id == "__global__":
+            query = query.filter(Template.tenant_id.is_(None))
+        elif include_global:
+            query = query.filter(or_(Template.tenant_id == tenant_id, Template.tenant_id.is_(None)))
+        else:
+            query = query.filter(Template.tenant_id == tenant_id)
+    templates = query.order_by(Template.id.desc()).all()
+    return [_build_template_resp(t) for t in templates]
+
+
+@router.post("/templates")
+async def create_template(
+    file: UploadFile = File(...),
+    tenant_id: Optional[str] = Form(None),
+    name: str = Form(...),
+    description: str = Form(""),
+    file_name_rule: str = Form(""),
+    encrypt_type: str = Form("none"),
+    encrypt_password: str = Form(""),
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """创建模版（含文件上传）"""
+    file_path, file_name = _save_template_file(file, tenant_id)
+
+    tpl = Template(
+        tenant_id=tenant_id or None,
+        name=name,
+        description=description,
+        file_path=file_path,
+        file_name=file_name,
+        file_name_rule=file_name_rule,
+        encrypt_type=encrypt_type,
+        encrypt_password=encrypt_password,
+        created_by=admin.id,
+    )
+    db.add(tpl)
+    db.commit()
+    db.refresh(tpl)
+    return _build_template_resp(tpl)
+
+
+@router.get("/templates/{template_id}")
+async def get_template(
+    template_id: int,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    """获取模版详情"""
+    tpl = db.query(Template).filter(Template.id == template_id).first()
+    if not tpl:
+        raise HTTPException(status_code=404, detail="模版不存在")
+    return _build_template_resp(tpl)
+
+
+@router.put("/templates/{template_id}")
+async def update_template(
+    template_id: int,
+    file: Optional[UploadFile] = File(None),
+    tenant_id: Optional[str] = Form(None),
+    name: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    file_name_rule: Optional[str] = Form(None),
+    encrypt_type: Optional[str] = Form(None),
+    encrypt_password: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    """更新模版（可选替换文件）"""
+    tpl = db.query(Template).filter(Template.id == template_id).first()
+    if not tpl:
+        raise HTTPException(status_code=404, detail="模版不存在")
+
+    if file and file.filename:
+        file_path, file_name = _save_template_file(file, tenant_id or tpl.tenant_id)
+        tpl.file_path = file_path
+        tpl.file_name = file_name
+
+    if tenant_id is not None:
+        tpl.tenant_id = tenant_id or None
+    if name is not None:
+        tpl.name = name
+    if description is not None:
+        tpl.description = description
+    if file_name_rule is not None:
+        tpl.file_name_rule = file_name_rule
+    if encrypt_type is not None:
+        tpl.encrypt_type = encrypt_type
+    if encrypt_password is not None:
+        tpl.encrypt_password = encrypt_password
+
+    db.commit()
+    db.refresh(tpl)
+    return _build_template_resp(tpl)
+
+
+@router.delete("/templates/{template_id}")
+async def delete_template(
+    template_id: int,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    """停用模版（软删除）"""
+    tpl = db.query(Template).filter(Template.id == template_id).first()
+    if not tpl:
+        raise HTTPException(status_code=404, detail="模版不存在")
+    tpl.is_active = False
+    db.commit()
+    return {"message": f"模版 {tpl.name} 已停用"}
+
+
+@router.get("/templates/{template_id}/download")
+async def download_template(
+    template_id: int,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    """下载模版文件"""
+    tpl = db.query(Template).filter(Template.id == template_id).first()
+    if not tpl:
+        raise HTTPException(status_code=404, detail="模版不存在")
+    if not os.path.exists(tpl.file_path):
+        raise HTTPException(status_code=404, detail="模版文件不存在")
+    return FileResponse(
+        path=tpl.file_path,
+        filename=tpl.file_name,
+        media_type="application/octet-stream",
+    )
+
+
+# ========================= 报表生成 =========================
+
+logger = logging.getLogger(__name__)
+
+# 匹配 {变量名} 或 {变量名[:N]} 或 {变量名[-N:]} 模式
+_RULE_PATTERN = re.compile(r'\{([^{}]+)\}')
+_SLICE_PATTERN = re.compile(r'^(.+?)\[(-?\d*):(-?\d*)\]$')
+
+
+def _resolve_rule_pattern(pattern: str, data_row: dict, system_vars: dict) -> str:
+    """解析规则表达式，替换 {变量} 为实际值。
+
+    支持:
+      {year} {month} {date} {tenant} — 系统变量
+      {列名}       — 取数据行中该列的完整值
+      {列名[:N]}   — 取前 N 位
+      {列名[-N:]}  — 取后 N 位
+    """
+    def _replace(m):
+        expr = m.group(1).strip()
+        # 先检查系统变量
+        if expr in system_vars:
+            return str(system_vars[expr])
+        # 检查切片语法
+        slice_m = _SLICE_PATTERN.match(expr)
+        if slice_m:
+            col_name = slice_m.group(1).strip()
+            start = slice_m.group(2)
+            end = slice_m.group(3)
+            val = str(data_row.get(col_name, ""))
+            if start and end:
+                return val[int(start):int(end)]
+            elif start:
+                return val[int(start):]
+            elif end:
+                return val[:int(end)]
+            return val
+        # 普通列名
+        return str(data_row.get(expr, ""))
+
+    return _RULE_PATTERN.sub(_replace, pattern)
+
+
+@router.post("/templates/{template_id}/generate-report")
+async def generate_report(
+    template_id: int,
+    task_id: int = Form(...),
+    use_history: bool = Form(False),
+    period_from: Optional[str] = Form(None),
+    period_to: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """基于模版 + 计算结果生成报表"""
+    import pandas as pd
+    from ..utils import aspose_helper
+
+    # 1. 查模版
+    tpl = db.query(Template).filter(Template.id == template_id).first()
+    if not tpl:
+        raise HTTPException(status_code=404, detail="模版不存在")
+    if not os.path.exists(tpl.file_path):
+        raise HTTPException(status_code=404, detail="模版文件不存在")
+
+    # 2. 查当前任务
+    task = db.query(ComputeTask).filter(ComputeTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="计算任务不存在")
+    tenant_id = task.tenant_id
+
+    # 3. 收集数据
+    result_files = []
+    if use_history and period_from and period_to:
+        # 解析周期范围 YYYY-MM
+        try:
+            dt_from = datetime.strptime(period_from, "%Y-%m")
+            # period_to 取该月最后一天
+            if len(period_to) == 7:
+                y, m = int(period_to[:4]), int(period_to[5:7])
+                if m == 12:
+                    dt_to = datetime(y + 1, 1, 1)
+                else:
+                    dt_to = datetime(y, m + 1, 1)
+            else:
+                dt_to = datetime.strptime(period_to, "%Y-%m")
+                dt_to = datetime(dt_to.year, dt_to.month + 1, 1) if dt_to.month < 12 else datetime(dt_to.year + 1, 1, 1)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="薪资周期格式错误，请使用 YYYY-MM")
+
+        # 查询时间范围内所有已完成任务
+        tasks = (
+            db.query(ComputeTask)
+            .filter(
+                ComputeTask.tenant_id == tenant_id,
+                ComputeTask.status == "completed",
+                ComputeTask.created_at >= dt_from,
+                ComputeTask.created_at < dt_to,
+            )
+            .order_by(ComputeTask.created_at)
+            .all()
+        )
+        task_ids = [t.id for t in tasks]
+        if not task_ids:
+            raise HTTPException(status_code=400, detail="所选周期范围内没有已完成的计算任务")
+
+        assets = (
+            db.query(DataAsset)
+            .filter(
+                DataAsset.source_task_id.in_(task_ids),
+                DataAsset.asset_type == "result",
+                DataAsset.is_active == True,
+            )
+            .all()
+        )
+        result_files = [a.file_path for a in assets if os.path.exists(a.file_path)]
+    else:
+        # 只使用当前任务的结果
+        assets = (
+            db.query(DataAsset)
+            .filter(
+                DataAsset.source_task_id == task_id,
+                DataAsset.asset_type == "result",
+                DataAsset.is_active == True,
+            )
+            .all()
+        )
+        result_files = [a.file_path for a in assets if os.path.exists(a.file_path)]
+
+    if not result_files:
+        raise HTTPException(status_code=400, detail="未找到计算结果文件")
+
+    # 4. 用 excel_parser 解析结果文件，提取计算后的数据（非公式）
+    #    先用 Aspose CalculateFormula() 计算公式，保存到临时文件再解析
+    import tempfile
+    from Aspose.Cells import Workbook as _AsWb
+    from excel_parser import IntelligentExcelParser
+    parser = IntelligentExcelParser()
+    all_rows = []
+    for fpath in result_files:
+        tmp_path = None
+        try:
+            # 预处理：强制计算公式后存到临时文件
+            wb = _AsWb(str(fpath))
+            wb.CalculateFormula()
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".xlsx")
+            os.close(tmp_fd)
+            wb.Save(tmp_path)
+
+            sheets = parser.parse_excel_file(tmp_path, best_region_only=True)
+            for sheet in sheets:
+                for region in sheet.regions:
+                    # head_data: {"姓名": "B", "部门": "C", ...}
+                    # data key 是列字母，需映射回表头名
+                    col_map = {v: k for k, v in region.head_data.items()}
+                    for row in region.data:
+                        all_rows.append({col_map.get(c, c): val for c, val in row.items()})
+        except Exception as e:
+            logger.warning(f"解析结果文件失败 {fpath}: {e}")
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    if not all_rows:
+        raise HTTPException(status_code=400, detail="无法读取计算结果数据")
+
+    dataset = pd.DataFrame(all_rows)
+
+    # 5. 构建模版数据字典
+    #    - "DataSource" = 完整数据集（模版中写 &=DataSource.列名）
+    #    - 系统变量（模版中写 &=$year &=$month 等）
+    now = datetime.utcnow()
+    system_vars = {
+        "year": str(now.year),
+        "month": f"{now.month:02d}",
+        "date": now.strftime("%Y%m%d"),
+        "tenant": tenant_id,
+    }
+
+    template_data = {
+        "DT": dataset,
+        "$year": system_vars["year"],
+        "$month": system_vars["month"],
+        "$date": system_vars["date"],
+        "$tenant": tenant_id,
+    }
+
+    # 6. 用数据集第一行来解析文件名和加密规则
+    first_row = dataset.iloc[0].to_dict() if len(dataset) > 0 else {}
+
+    if tpl.file_name_rule:
+        output_name = _resolve_rule_pattern(tpl.file_name_rule, first_row, system_vars)
+        if not output_name.endswith(('.xlsx', '.xls')):
+            output_name += '.xlsx'
+    else:
+        output_name = f"报表_{tpl.name}_{now.strftime('%Y%m%d%H%M%S')}.xlsx"
+
+    # 7. 解析加密规则（可以是固定值或参数表达式）
+    password = None
+    if tpl.encrypt_password:
+        password = _resolve_rule_pattern(tpl.encrypt_password, first_row, system_vars)
+        if password:
+            logger.info(f"报表加密: 模版={tpl.name}, 密码长度={len(password)}")
+        else:
+            logger.warning(f"加密规则解析为空: rule={tpl.encrypt_password}, columns={list(first_row.keys())[:10]}")
+
+    # 8. 打印 template_data 前5条用于调试
+    logger.info("=== template_data 调试信息 ===")
+    for k, v in template_data.items():
+        if isinstance(v, pd.DataFrame):
+            logger.info(f"[{k}] DataFrame shape={v.shape}, columns={list(v.columns)}")
+            logger.info(f"[{k}] 前5条:\n{v.head(5).to_string()}")
+        else:
+            logger.info(f"[{k}] = {v}")
+    logger.info(f"文件名规则: {tpl.file_name_rule} -> {output_name if tpl.file_name_rule else '(默认)'}")
+    logger.info(f"加密规则: {tpl.encrypt_password} -> {'***' if password else '无'}")
+    logger.info("=== end ===")
+
+    # 9. 生成报表
+    output_dir = _PROJECT_ROOT / "tenants" / tenant_id / "reports"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = now.strftime("%Y%m%d%H%M%S")
+    output_path = str(output_dir / f"{timestamp}_{output_name}")
+
+    try:
+        aspose_helper.generate_from_template(
+            output_path=output_path,
+            template_path=tpl.file_path,
+            data=template_data,
+            password=password,
+        )
+    except Exception as e:
+        logger.error(f"报表生成失败: {e}")
+        raise HTTPException(status_code=500, detail=f"报表生成失败: {str(e)}")
+
+    # 9. 留痕 — 保存为 DataAsset
+    try:
+        report_asset = DataAsset(
+            tenant_id=tenant_id,
+            asset_type="report",
+            name=f"报表_{tpl.name}_{now.strftime('%Y%m%d')}",
+            file_path=output_path,
+            file_name=output_name,
+            file_size=os.path.getsize(output_path),
+            source_task_id=task_id,
+            uploaded_by=admin.id,
+            tags={
+                "template_id": template_id,
+                "template_name": tpl.name,
+                "period_from": period_from,
+                "period_to": period_to,
+                "use_history": use_history,
+            },
+        )
+        db.add(report_asset)
+        db.commit()
+    except Exception as e:
+        logger.warning(f"报表留痕失败: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+    # 10. 返回文件下载
+    return FileResponse(
+        path=output_path,
+        filename=output_name,
+        media_type="application/octet-stream",
+    )

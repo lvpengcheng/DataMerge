@@ -130,6 +130,43 @@ class TenantAuthResponse(BaseModel):
         from_attributes = True
 
 
+# ---- Template ----
+class TemplateCreate(BaseModel):
+    tenant_id: Optional[str] = None
+    name: str
+    description: Optional[str] = ""
+    file_name_rule: Optional[str] = ""
+    encrypt_type: Optional[str] = "none"
+    encrypt_password: Optional[str] = ""
+
+
+class TemplateUpdate(BaseModel):
+    tenant_id: Optional[str] = None
+    name: Optional[str] = None
+    description: Optional[str] = None
+    file_name_rule: Optional[str] = None
+    encrypt_type: Optional[str] = None
+    encrypt_password: Optional[str] = None
+
+
+class TemplateResponse(BaseModel):
+    id: int
+    tenant_id: Optional[str]
+    name: str
+    description: str
+    file_name: str
+    file_name_rule: str
+    encrypt_type: str
+    is_active: bool
+    created_by: Optional[int]
+    creator_name: Optional[str] = ""
+    created_at: Optional[str]
+    updated_at: Optional[str]
+
+    class Config:
+        from_attributes = True
+
+
 # 更新前向引用
 LoginResponse.model_rebuild()
 OrgResponse.model_rebuild()

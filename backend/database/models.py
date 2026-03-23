@@ -78,6 +78,28 @@ class TenantAuthorization(Base):
     )
 
 
+# ==================== 模版管理 ====================
+
+class Template(Base):
+    __tablename__ = "templates"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(100), nullable=True, index=True)          # NULL = 全局模版
+    name = Column(String(200), nullable=False)                           # 模版名称
+    description = Column(Text, default="")                               # 描述
+    file_path = Column(String(500), nullable=False)                      # 模版文件物理路径
+    file_name = Column(String(200), nullable=False)                      # 原始上传文件名
+    file_name_rule = Column(String(500), default="")                     # 输出文件命名规则
+    encrypt_type = Column(String(20), default="none")                    # none / password / write_protect
+    encrypt_password = Column(String(100), default="")                   # 加密密码
+    is_active = Column(Boolean, default=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    creator = relationship("User", foreign_keys=[created_by])
+
+
 # ==================== 基础数据分类 ====================
 
 class ReferenceCategory(Base):
