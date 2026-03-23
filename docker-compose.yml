@@ -1,57 +1,43 @@
 version: '3.8'
 
 services:
-  backend:
+  app:
     build: .
+    image: datamerge:latest
+    container_name: datamerge-app
     ports:
       - "8000:8000"
     env_file:
       - .env
     environment:
       - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=sqlite:///./data/data.db
+      - LD_LIBRARY_PATH=/app/libs:/usr/lib
+      - DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
+      - DOTNET_ROLL_FORWARD=LatestMajor
     volumes:
       - ./tenants:/app/tenants
       - ./data:/app/data
+      - ./logs:/app/logs
+      - ./output:/app/output
+      - ./compare_results:/app/compare_results
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
   redis:
     image: redis:7-alpine
+    container_name: datamerge-redis
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
-    restart: unless-stopped
-
-  celery-worker:
-    build: .
-    command: celery -A backend.app.celery_app worker --loglevel=info
-    env_file:
-      - .env
-    environment:
-      - REDIS_URL=redis://redis:6379/0
-    volumes:
-      - ./tenants:/app/tenants
-      - ./data:/app/data
-    depends_on:
-      - backend
-      - redis
-    restart: unless-stopped
-
-  celery-beat:
-    build: .
-    command: celery -A backend.app.celery_app beat --loglevel=info
-    env_file:
-      - .env
-    environment:
-      - REDIS_URL=redis://redis:6379/0
-    volumes:
-      - ./tenants:/app/tenants
-      - ./data:/app/data
-    depends_on:
-      - backend
-      - redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     restart: unless-stopped
 
 volumes:

@@ -1,19 +1,21 @@
-# Python
+# Python 缓存
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-venv/
-env/
-ENV/
 *.egg-info/
 dist/
 build/
 *.egg
 
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv/
+
 # 测试
-tests/
 .pytest_cache/
 .coverage
 htmlcov/
@@ -21,6 +23,7 @@ htmlcov/
 # IDE
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *~
@@ -30,40 +33,58 @@ htmlcov/
 .gitignore
 .gitattributes
 
-# 文档
-*.md
-!README.md
-docs/
-
-# 日志
+# 日志和临时文件
 *.log
 logs/
-
-# 临时文件
 *.tmp
 *.temp
 .DS_Store
 Thumbs.db
+nul
 
-# 租户数据（运行时生成）
+# 运行时数据（通过 volume 挂载）
 tenants/
+data/
+data.db
+output/
+compare_results/
+temp/
+
+# 构建脚本和文档（镜像内不需要）
+build_*.bat
+build_*.sh
+setup.py
+MANIFEST.in
+releases/
+docs/
+CLAUDE.md
+CLAUDE1.md
+BUILD_GUIDE.md
+BUILD_SUMMARY.md
+DEPLOYMENT.md
+DEPLOYMENT_GUIDE.md
+IIS_QUICK_START.md
+PACKAGING.md
+训练可视化使用指南.md
+邮件自动处理API文档.md
 
 # 示例文件
 examples/
 
-# 构建脚本
-build_release.sh
-build_release.bat
-setup.py
-MANIFEST.in
-
-# 环境变量
+# 环境变量（运行时传入）
 .env
 .env.*
 
-# 其他
-*.xlsx
-*.xls
-*.csv
-server.log
-test_server.py
+# 测试/调试脚本
+test_*.py
+*_test.py
+check_server.py
+direct_stream_test.py
+final_stream_test.py
+force_reload_server.py
+force_restart.py
+verify_package.py
+install_deps.py
+email_api_code.txt
+email_config.json
+temp_email_function.py

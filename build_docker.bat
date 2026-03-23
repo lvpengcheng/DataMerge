@@ -1,120 +1,85 @@
 @echo off
-REM DataMerge Docker镜像打包脚本 (Windows)
+chcp 65001 >nul 2>nul
+REM ==========================================
+REM  DataMerge 打包脚本（用于 Ubuntu Docker 部署）
+REM  在 Windows 上运行，生成 .tar.gz 部署包
+REM ==========================================
 
 echo ==========================================
-echo DataMerge Docker镜像打包脚本
+echo   DataMerge 部署包打包
 echo ==========================================
 
-REM 设置版本号
 set VERSION=1.0.0
-set IMAGE_NAME=datamerge
-set IMAGE_TAG=%IMAGE_NAME%:%VERSION%
-set IMAGE_LATEST=%IMAGE_NAME%:latest
+set PACKAGE_NAME=datamerge-%VERSION%
+set RELEASES_DIR=releases
+set STAGE_DIR=%RELEASES_DIR%\%PACKAGE_NAME%
 
 echo.
-echo 镜像名称: %IMAGE_TAG%
+echo 版本: %VERSION%
+echo 输出: %RELEASES_DIR%\%PACKAGE_NAME%.tar.gz
 echo.
 
-REM 1. 构建Docker镜像
-echo [1/4] 构建Docker镜像...
-docker build -t %IMAGE_TAG% -t %IMAGE_LATEST% .
+REM 清理旧的暂存目录
+if exist "%STAGE_DIR%" rd /s /q "%STAGE_DIR%"
+mkdir "%STAGE_DIR%"
 
-if errorlevel 1 (
-    echo 错误: Docker镜像构建失败
-    pause
-    exit /b 1
-)
+echo [1/5] 复制后端代码...
+xcopy /E /I /Q /Y backend "%STAGE_DIR%\backend" >nul
+REM 清理 __pycache__
+for /d /r "%STAGE_DIR%\backend" %%d in (__pycache__) do @if exist "%%d" rd /s /q "%%d"
+REM 清理 test 文件
+del /q "%STAGE_DIR%\backend\test_*.py" 2>nul
 
-echo 镜像构建成功
+echo [2/5] 复制前端和静态资源...
+xcopy /E /I /Q /Y frontend "%STAGE_DIR%\frontend" >nul
+if exist global_assets xcopy /E /I /Q /Y global_assets "%STAGE_DIR%\global_assets" >nul
+
+echo [3/5] 复制 libs（Aspose.Cells .NET DLL）...
+xcopy /E /I /Q /Y libs "%STAGE_DIR%\libs" >nul
+
+echo [4/5] 复制配置文件...
+copy /Y excel_parser.py "%STAGE_DIR%\" >nul
+copy /Y aspose_init.py "%STAGE_DIR%\" >nul
+copy /Y run.py "%STAGE_DIR%\" >nul
+copy /Y requirements.txt "%STAGE_DIR%\" >nul
+copy /Y Dockerfile "%STAGE_DIR%\" >nul
+copy /Y docker-compose.yml "%STAGE_DIR%\" >nul
+copy /Y .dockerignore "%STAGE_DIR%\" >nul
+if exist .env.example copy /Y .env.example "%STAGE_DIR%\" >nul
+
+echo [5/5] 打包 tar.gz...
+cd "%RELEASES_DIR%"
+tar -czf "%PACKAGE_NAME%.tar.gz" "%PACKAGE_NAME%"
+cd ..
+
+REM 清理暂存目录
+rd /s /q "%STAGE_DIR%"
+
 echo.
-
-REM 2. 测试镜像
-echo [2/4] 测试Docker镜像...
-docker run --rm %IMAGE_TAG% python -c "from backend.app.main import app; print('应用导入成功')"
-
-if errorlevel 1 (
-    echo 错误: 镜像测试失败
-    pause
-    exit /b 1
-)
-
-echo.
-
-REM 3. 保存镜像为tar文件
-echo [3/4] 导出Docker镜像...
-if not exist releases mkdir releases
-docker save %IMAGE_TAG% -o releases\%IMAGE_NAME%-%VERSION%.tar
-
-if errorlevel 1 (
-    echo 错误: 镜像导出失败
-    pause
-    exit /b 1
-)
-
-echo 镜像已导出到: releases\%IMAGE_NAME%-%VERSION%.tar
-echo.
-
-REM 4. 创建部署说明
-echo [4/4] 创建部署说明...
-echo # DataMerge Docker部署指南 > releases\DOCKER_DEPLOY.md
-echo. >> releases\DOCKER_DEPLOY.md
-echo ## 镜像信息 >> releases\DOCKER_DEPLOY.md
-echo. >> releases\DOCKER_DEPLOY.md
-echo - 镜像名称: %IMAGE_TAG% >> releases\DOCKER_DEPLOY.md
-echo - 镜像文件: %IMAGE_NAME%-%VERSION%.tar >> releases\DOCKER_DEPLOY.md
-echo. >> releases\DOCKER_DEPLOY.md
-echo ## 部署步骤 >> releases\DOCKER_DEPLOY.md
-echo. >> releases\DOCKER_DEPLOY.md
-echo ### 1. 加载镜像 >> releases\DOCKER_DEPLOY.md
-echo ```bash >> releases\DOCKER_DEPLOY.md
-echo docker load -i %IMAGE_NAME%-%VERSION%.tar >> releases\DOCKER_DEPLOY.md
-echo ``` >> releases\DOCKER_DEPLOY.md
-echo. >> releases\DOCKER_DEPLOY.md
-echo ### 2. 运行容器 >> releases\DOCKER_DEPLOY.md
-echo ```bash >> releases\DOCKER_DEPLOY.md
-echo docker run -d ^\ >> releases\DOCKER_DEPLOY.md
-echo   --name datamerge ^\ >> releases\DOCKER_DEPLOY.md
-echo   -p 8000:8000 ^\ >> releases\DOCKER_DEPLOY.md
-echo   -v ${PWD}/tenants:/app/tenants ^\ >> releases\DOCKER_DEPLOY.md
-echo   -e OPENAI_API_KEY=your_key ^\ >> releases\DOCKER_DEPLOY.md
-echo   %IMAGE_TAG% >> releases\DOCKER_DEPLOY.md
-echo ``` >> releases\DOCKER_DEPLOY.md
-echo. >> releases\DOCKER_DEPLOY.md
-echo ### 3. 访问应用 >> releases\DOCKER_DEPLOY.md
-echo http://localhost:8000 >> releases\DOCKER_DEPLOY.md
-echo. >> releases\DOCKER_DEPLOY.md
-echo ## 常用命令 >> releases\DOCKER_DEPLOY.md
-echo. >> releases\DOCKER_DEPLOY.md
-echo ```bash >> releases\DOCKER_DEPLOY.md
-echo # 查看日志 >> releases\DOCKER_DEPLOY.md
-echo docker logs -f datamerge >> releases\DOCKER_DEPLOY.md
-echo. >> releases\DOCKER_DEPLOY.md
-echo # 停止容器 >> releases\DOCKER_DEPLOY.md
-echo docker stop datamerge >> releases\DOCKER_DEPLOY.md
-echo. >> releases\DOCKER_DEPLOY.md
-echo # 启动容器 >> releases\DOCKER_DEPLOY.md
-echo docker start datamerge >> releases\DOCKER_DEPLOY.md
-echo ``` >> releases\DOCKER_DEPLOY.md
-
-echo 部署说明已创建: releases\DOCKER_DEPLOY.md
-echo.
-
-REM 显示镜像信息
 echo ==========================================
-echo Docker镜像打包完成！
+echo   打包完成!
 echo ==========================================
 echo.
-echo 镜像信息:
-docker images | findstr %IMAGE_NAME%
+for %%A in (%RELEASES_DIR%\%PACKAGE_NAME%.tar.gz) do echo 文件: %%~fA
+for %%A in (%RELEASES_DIR%\%PACKAGE_NAME%.tar.gz) do echo 大小: %%~zA bytes
 echo.
-echo 导出文件:
-dir releases\%IMAGE_NAME%-%VERSION%.tar | findstr ".tar"
+echo ---- Ubuntu 部署步骤 ----
 echo.
-echo 部署说明: releases\DOCKER_DEPLOY.md
+echo   1. 上传到服务器:
+echo      scp %RELEASES_DIR%\%PACKAGE_NAME%.tar.gz user@server:~/
 echo.
-echo 快速部署:
-echo   docker load -i releases\%IMAGE_NAME%-%VERSION%.tar
-echo   docker run -d -p 8000:8000 %IMAGE_TAG%
+echo   2. 在服务器上解压:
+echo      tar -xzf %PACKAGE_NAME%.tar.gz
+echo      cd %PACKAGE_NAME%
+echo.
+echo   3. 配置环境变量:
+echo      cp .env.example .env
+echo      vi .env   # 填入 AI_PROVIDER 和 API Key
+echo.
+echo   4. 构建并启动:
+echo      docker-compose up -d --build
+echo.
+echo   5. 访问: http://服务器IP:8000
 echo.
 echo ==========================================
 pause

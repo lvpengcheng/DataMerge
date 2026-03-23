@@ -10,6 +10,7 @@ Aspose.Cells for .NET 全局初始化模块
 """
 
 import os
+import sys
 import logging
 
 logger = logging.getLogger(__name__)
@@ -34,28 +35,52 @@ def init_aspose():
         return True
 
     try:
-        # 1. 注册 DLL 目录（Windows Python 3.8+ 必需）
+        # 1. 将 libs 目录加入程序集搜索路径
+        #    pythonnet 3.x + .NET Core: clr.AddReference 需要从 sys.path 中搜索
+        #    用全路径会被当成程序集名而非文件路径，导致 Linux 上加载失败
+        if _libs_dir not in sys.path:
+            sys.path.append(_libs_dir)
+
+        # 2. Windows: 注册 DLL 目录（Python 3.8+ 必需）
         if hasattr(os, 'add_dll_directory'):
             os.add_dll_directory(_libs_dir)
 
-        # 2. 加载 .NET Core 运行时
+        # 3. Linux: 用 ctypes 预加载 libSkiaSharp.so 原生库
+        #    .NET P/Invoke 通过 pythonnet 加载时可能找不到原生库，
+        #    预加载到进程内存后 P/Invoke 就能直接命中
+        if sys.platform == 'linux':
+            import ctypes
+            so_path = os.path.join(_libs_dir, "libSkiaSharp.so")
+            if os.path.exists(so_path):
+                try:
+                    ctypes.cdll.LoadLibrary(so_path)
+                    logger.info(f"[Aspose] Linux: 预加载 libSkiaSharp.so 成功")
+                except OSError as e:
+                    logger.warning(f"[Aspose] Linux: 预加载 libSkiaSharp.so 失败: {e}")
+                    try:
+                        ctypes.cdll.LoadLibrary("libSkiaSharp.so")
+                        logger.info(f"[Aspose] Linux: 从系统路径加载 libSkiaSharp.so 成功")
+                    except OSError as e2:
+                        logger.error(f"[Aspose] Linux: libSkiaSharp.so 加载全部失败: {e2}")
+
+        # 4. 加载 .NET Core 运行时
         import pythonnet
         pythonnet.load("coreclr", runtime_config=os.path.join(_libs_dir, "runtimeconfig.json"))
 
-        # 3. 加载程序集（SkiaSharp 必须先于 Aspose.Cells）
+        # 5. 加载程序集（用短名，从 sys.path 搜索；SkiaSharp 必须先于 Aspose.Cells）
         import clr
-        clr.AddReference(os.path.join(_libs_dir, "SkiaSharp.dll"))
-        clr.AddReference(os.path.join(_libs_dir, "Aspose.Cells.dll"))
+        clr.AddReference("SkiaSharp")
+        clr.AddReference("Aspose.Cells")
         clr.AddReference("System.Text.Encoding.CodePages")
 
-        # 4. 注册中文编码支持
+        # 5. 注册中文编码支持
         import System.Text
         System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance)
 
         _initialized = True
         logger.info("[Aspose] .NET 运行时初始化完成")
 
-        # 5. 自动注册许可证
+        # 6. 自动注册许可证
         _apply_license()
 
         return True

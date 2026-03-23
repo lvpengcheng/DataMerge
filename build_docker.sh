@@ -1,247 +1,83 @@
 #!/bin/bash
-# DataMerge Docker镜像打包脚本
-
+# ==========================================
+#  DataMerge Docker 部署脚本（Ubuntu 服务器上运行）
+# ==========================================
 set -e
 
-echo "=========================================="
-echo "DataMerge Docker镜像打包脚本"
-echo "=========================================="
-
-# 设置版本号
 VERSION="1.0.0"
 IMAGE_NAME="datamerge"
 IMAGE_TAG="${IMAGE_NAME}:${VERSION}"
-IMAGE_LATEST="${IMAGE_NAME}:latest"
 
+echo "=========================================="
+echo "  DataMerge Docker 部署"
+echo "=========================================="
 echo ""
-echo "镜像名称: ${IMAGE_TAG}"
-echo ""
 
-# 1. 构建Docker镜像
-echo "[1/4] 构建Docker镜像..."
-docker build -t ${IMAGE_TAG} -t ${IMAGE_LATEST} .
-
-if [ $? -ne 0 ]; then
-    echo "错误: Docker镜像构建失败"
-    exit 1
+# 检查 Docker
+if ! command -v docker &> /dev/null; then
+    echo "[!] Docker 未安装，开始自动安装..."
+    curl -fsSL https://get.docker.com | sh
+    sudo usermod -aG docker $USER
+    echo "[OK] Docker 已安装，请重新登录后再运行此脚本"
+    exit 0
 fi
 
-echo "✓ 镜像构建成功"
-
-# 2. 测试镜像
-echo ""
-echo "[2/4] 测试Docker镜像..."
-docker run --rm ${IMAGE_TAG} python -c "from backend.app.main import app; print('✓ 应用导入成功')"
-
-if [ $? -ne 0 ]; then
-    echo "错误: 镜像测试失败"
-    exit 1
+# 检查 docker-compose
+if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
+    echo "[!] docker-compose 未安装，安装中..."
+    sudo apt-get update && sudo apt-get install -y docker-compose-plugin
 fi
 
-# 3. 保存镜像为tar文件
+# 检查 .env
+if [ ! -f .env ]; then
+    if [ -f .env.example ]; then
+        cp .env.example .env
+        echo "[!] 已创建 .env 文件，请先编辑配置 API Key："
+        echo "    vi .env"
+        echo ""
+        echo "  必填项："
+        echo "    AI_PROVIDER=deepseek          # 或 openai / claude"
+        echo "    DEEPSEEK_API_KEY=sk-xxx       # 对应的 API Key"
+        echo ""
+        read -p "是否现在编辑 .env? [Y/n] " answer
+        if [ "$answer" != "n" ] && [ "$answer" != "N" ]; then
+            ${EDITOR:-vi} .env
+        fi
+    else
+        echo "[错误] 缺少 .env 和 .env.example 文件"
+        exit 1
+    fi
+fi
+
 echo ""
-echo "[3/4] 导出Docker镜像..."
-mkdir -p releases
-docker save ${IMAGE_TAG} -o releases/${IMAGE_NAME}-${VERSION}.tar
+echo "[1/3] 构建 Docker 镜像（首次约 5-10 分钟）..."
+docker build -t ${IMAGE_TAG} -t ${IMAGE_NAME}:latest .
 
-if [ $? -eq 0 ]; then
-    echo "✓ 镜像已导出到: releases/${IMAGE_NAME}-${VERSION}.tar"
+echo ""
+echo "[2/3] 创建数据目录..."
+mkdir -p tenants data logs output
 
-    # 压缩tar文件
-    echo "  压缩镜像文件..."
-    gzip -f releases/${IMAGE_NAME}-${VERSION}.tar
-    echo "✓ 压缩完成: releases/${IMAGE_NAME}-${VERSION}.tar.gz"
+echo ""
+echo "[3/3] 启动服务..."
+
+# 优先使用 docker compose (v2)，回退到 docker-compose (v1)
+if docker compose version &> /dev/null 2>&1; then
+    docker compose up -d
 else
-    echo "错误: 镜像导出失败"
-    exit 1
+    docker-compose up -d
 fi
 
-# 4. 创建部署说明
-echo ""
-echo "[4/4] 创建部署说明..."
-cat > releases/DOCKER_DEPLOY.md << EOF
-# DataMerge Docker部署指南
-
-## 镜像信息
-
-- 镜像名称: ${IMAGE_TAG}
-- 镜像文件: ${IMAGE_NAME}-${VERSION}.tar.gz
-- 构建时间: $(date)
-
-## 部署步骤
-
-### 方式1: 使用导出的镜像文件
-
-1. 解压并加载镜像
-\`\`\`bash
-gunzip ${IMAGE_NAME}-${VERSION}.tar.gz
-docker load -i ${IMAGE_NAME}-${VERSION}.tar
-\`\`\`
-
-2. 运行容器
-\`\`\`bash
-docker run -d \\
-  --name datamerge \\
-  -p 8000:8000 \\
-  -v \$(pwd)/tenants:/app/tenants \\
-  -v \$(pwd)/logs:/app/logs \\
-  -e AI_PROVIDER=openai \\
-  -e OPENAI_API_KEY=your_api_key_here \\
-  ${IMAGE_TAG}
-\`\`\`
-
-3. 访问应用
-\`\`\`
-http://localhost:8000
-\`\`\`
-
-### 方式2: 使用docker-compose
-
-1. 创建 docker-compose.yml
-\`\`\`yaml
-version: '3.8'
-
-services:
-  datamerge:
-    image: ${IMAGE_TAG}
-    container_name: datamerge
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./tenants:/app/tenants
-      - ./logs:/app/logs
-    environment:
-      - AI_PROVIDER=openai
-      - OPENAI_API_KEY=your_api_key_here
-    restart: unless-stopped
-\`\`\`
-
-2. 启动服务
-\`\`\`bash
-docker-compose up -d
-\`\`\`
-
-## 环境变量
-
-| 变量名 | 说明 | 默认值 |
-|--------|------|--------|
-| AI_PROVIDER | AI提供商 | openai |
-| OPENAI_API_KEY | OpenAI API密钥 | - |
-| ANTHROPIC_API_KEY | Claude API密钥 | - |
-| DEEPSEEK_API_KEY | DeepSeek API密钥 | - |
-| MAX_TRAINING_ITERATIONS | 最大训练次数 | 10 |
-
-## 常用命令
-
-\`\`\`bash
-# 查看日志
-docker logs -f datamerge
-
-# 停止容器
-docker stop datamerge
-
-# 启动容器
-docker start datamerge
-
-# 重启容器
-docker restart datamerge
-
-# 进入容器
-docker exec -it datamerge bash
-
-# 删除容器
-docker rm -f datamerge
-
-# 查看镜像
-docker images | grep datamerge
-\`\`\`
-
-## 数据持久化
-
-重要目录需要挂载到宿主机:
-- \`/app/tenants\`: 租户数据
-- \`/app/logs\`: 日志文件
-
-## 健康检查
-
-容器内置健康检查，可通过以下命令查看:
-\`\`\`bash
-docker inspect --format='{{.State.Health.Status}}' datamerge
-\`\`\`
-
-## 故障排查
-
-### 容器无法启动
-\`\`\`bash
-# 查看详细日志
-docker logs datamerge
-
-# 检查容器状态
-docker ps -a | grep datamerge
-\`\`\`
-
-### 端口冲突
-\`\`\`bash
-# 修改映射端口
-docker run -p 8080:8000 ...
-\`\`\`
-
-### 权限问题
-\`\`\`bash
-# 确保挂载目录有正确权限
-chmod -R 755 tenants logs
-\`\`\`
-
-## 生产环境建议
-
-1. 使用环境变量文件
-\`\`\`bash
-docker run --env-file .env ...
-\`\`\`
-
-2. 限制资源使用
-\`\`\`bash
-docker run --memory="2g" --cpus="2" ...
-\`\`\`
-
-3. 配置日志驱动
-\`\`\`bash
-docker run --log-driver json-file --log-opt max-size=10m ...
-\`\`\`
-
-4. 使用反向代理（Nginx）
-\`\`\`nginx
-server {
-    listen 80;
-    server_name your-domain.com;
-
-    location / {
-        proxy_pass http://localhost:8000;
-        proxy_set_header Host \$host;
-        proxy_buffering off;
-    }
-}
-\`\`\`
-EOF
-
-echo "✓ 部署说明已创建: releases/DOCKER_DEPLOY.md"
-
-# 显示镜像信息
 echo ""
 echo "=========================================="
-echo "Docker镜像打包完成！"
+echo "  部署完成!"
 echo "=========================================="
 echo ""
-echo "镜像信息:"
-docker images | grep ${IMAGE_NAME} | head -2
+echo "  访问地址: http://$(hostname -I | awk '{print $1}'):8000"
 echo ""
-echo "导出文件:"
-ls -lh releases/${IMAGE_NAME}-${VERSION}.tar.gz
-echo ""
-echo "部署说明: releases/DOCKER_DEPLOY.md"
-echo ""
-echo "快速部署:"
-echo "  docker load -i releases/${IMAGE_NAME}-${VERSION}.tar.gz"
-echo "  docker run -d -p 8000:8000 ${IMAGE_TAG}"
+echo "  常用命令:"
+echo "    docker compose logs -f app     # 查看日志"
+echo "    docker compose restart app     # 重启服务"
+echo "    docker compose down            # 停止所有"
+echo "    docker compose up -d --build   # 重新构建并启动"
 echo ""
 echo "=========================================="
