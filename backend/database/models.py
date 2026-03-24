@@ -243,6 +243,8 @@ class ComputeTask(Base):
     result_summary = Column(JSON, nullable=True)                    # 结果摘要（行数/sheet数等）
     error_message = Column(Text, nullable=True)
     duration_seconds = Column(Float, nullable=True)
+    salary_year = Column(Integer, nullable=True, index=True)        # 薪资年份
+    salary_month = Column(Integer, nullable=True, index=True)       # 薪资月份
     created_at = Column(DateTime, default=datetime.utcnow)
     finished_at = Column(DateTime, nullable=True)
 

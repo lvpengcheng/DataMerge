@@ -366,6 +366,9 @@ async def rules_chat_endpoint(
 @app.on_event("startup")
 async def startup_event():
     db_models.Base.metadata.create_all(bind=engine)
+    # 增量迁移：为已有表添加新列
+    from backend.database.init_db import _migrate_add_columns
+    _migrate_add_columns()
 
 
 # 挂载前端静态文件
@@ -3332,7 +3335,8 @@ def _extract_code_from_response(response: str):
 
 # ==================== 计算任务 DB 持久化辅助函数 ====================
 
-def _persist_compute_start(tenant_id: str, script_id_str: str):
+def _persist_compute_start(tenant_id: str, script_id_str: str,
+                           salary_year: int = None, salary_month: int = None):
     """创建计算任务记录，返回 (db_session, task_id) 或 (None, None)"""
     try:
         db = SessionLocal()
@@ -3350,6 +3354,8 @@ def _persist_compute_start(tenant_id: str, script_id_str: str):
             tenant_id=tenant_id,
             script_id=db_script_id,
             status="computing",
+            salary_year=salary_year,
+            salary_month=salary_month,
             analysis_report={"original_script_id": script_id_str},
         )
         db.add(task)
@@ -3431,12 +3437,20 @@ def _persist_result_file(db, task_id, tenant_id, saved_file_path, original_name)
     try:
         saved_path = Path(saved_file_path) if not isinstance(saved_file_path, Path) else saved_file_path
 
-        # 解析结果文件内容存入 DB
+        # 解析结果文件内容存入 DB（先计算公式再解析，确保存的是计算值）
         parsed_data = None
         sheet_summary = None
         try:
             import dataclasses as _dc
+            import aspose_init  # noqa: F401
+            from Aspose.Cells import Workbook as _RWb
             from excel_parser import IntelligentExcelParser
+
+            # 先用 Aspose 计算公式并覆盖保存，确保缓存值可用
+            _rwb = _RWb(str(saved_path))
+            _rwb.CalculateFormula()
+            _rwb.Save(str(saved_path))
+
             parser = IntelligentExcelParser()
             results = parser.parse_excel_file(str(saved_path))
             parsed_data = [_dc.asdict(s) for s in results]
@@ -3556,10 +3570,10 @@ async def compute_with_script_stream(
                 compute_start_time = None
                 try:
                     # DB持久化：创建计算任务记录
-                    db_session, compute_task_id = _persist_compute_start(tenant_id, script_id)
+                    db_session, compute_task_id = _persist_compute_start(tenant_id, script_id,
+                                                                          salary_year=salary_year, salary_month=salary_month)
                     compute_start_time = datetime.now()
 
-                    # 发送开始消息
                     start_msg = {
                         "type": "status",
                         "message": "计算开始",
@@ -4094,7 +4108,8 @@ async def compute_with_script(
             raise HTTPException(status_code=404, detail=f"脚本不存在: {script_id}")
 
         # DB持久化：创建计算任务记录
-        db_session, compute_task_id = _persist_compute_start(tenant_id, script_id)
+        db_session, compute_task_id = _persist_compute_start(tenant_id, script_id,
+                                                              salary_year=salary_year, salary_month=salary_month)
         compute_start_time = datetime.now()
 
         # 创建临时目录

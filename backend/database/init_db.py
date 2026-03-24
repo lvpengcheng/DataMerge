@@ -103,6 +103,30 @@ def init_database():
     Base.metadata.create_all(bind=engine)
     print("      表创建完成。")
 
+    # 增量迁移：为已有表添加新列
+    _migrate_add_columns()
+
+
+def _migrate_add_columns():
+    """安全地为已有表添加新列（列已存在时跳过）"""
+    from sqlalchemy import text, inspect
+    insp = inspect(engine)
+
+    migrations = [
+        ("compute_tasks", "salary_year", "INTEGER"),
+        ("compute_tasks", "salary_month", "INTEGER"),
+    ]
+
+    with engine.connect() as conn:
+        for table, column, col_type in migrations:
+            if table not in insp.get_table_names():
+                continue
+            existing = [c["name"] for c in insp.get_columns(table)]
+            if column not in existing:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"))
+                print(f"      迁移: {table}.{column} 已添加")
+        conn.commit()
+
 
 def seed_roles(db):
     """种子角色数据"""

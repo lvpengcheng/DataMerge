@@ -661,40 +661,45 @@ async def generate_report(
         raise HTTPException(status_code=404, detail="计算任务不存在")
     tenant_id = task.tenant_id
 
-    # 3. 收集数据
-    result_files = []
+    # 3. 收集数据资产
     if use_history and period_from and period_to:
         # 解析周期范围 YYYY-MM
         try:
-            dt_from = datetime.strptime(period_from, "%Y-%m")
-            # period_to 取该月最后一天
-            if len(period_to) == 7:
-                y, m = int(period_to[:4]), int(period_to[5:7])
-                if m == 12:
-                    dt_to = datetime(y + 1, 1, 1)
-                else:
-                    dt_to = datetime(y, m + 1, 1)
-            else:
-                dt_to = datetime.strptime(period_to, "%Y-%m")
-                dt_to = datetime(dt_to.year, dt_to.month + 1, 1) if dt_to.month < 12 else datetime(dt_to.year + 1, 1, 1)
-        except ValueError:
+            from_y, from_m = int(period_from[:4]), int(period_from[5:7])
+            to_y, to_m = int(period_to[:4]), int(period_to[5:7])
+        except (ValueError, IndexError):
             raise HTTPException(status_code=400, detail="薪资周期格式错误，请使用 YYYY-MM")
 
-        # 查询时间范围内所有已完成任务
-        tasks = (
+        # 查询该租户所有已完成且有薪资周期的任务
+        all_tasks = (
             db.query(ComputeTask)
             .filter(
                 ComputeTask.tenant_id == tenant_id,
                 ComputeTask.status == "completed",
-                ComputeTask.created_at >= dt_from,
-                ComputeTask.created_at < dt_to,
+                ComputeTask.salary_year.isnot(None),
+                ComputeTask.salary_month.isnot(None),
             )
-            .order_by(ComputeTask.created_at)
             .all()
         )
-        task_ids = [t.id for t in tasks]
+
+        # 周期范围内，每月取最后一次
+        ym_from = from_y * 100 + from_m
+        ym_to = to_y * 100 + to_m
+        last_per_month = {}  # {(year, month): ComputeTask}
+        for t in all_tasks:
+            ym = t.salary_year * 100 + t.salary_month
+            if ym_from <= ym <= ym_to:
+                key = (t.salary_year, t.salary_month)
+                if key not in last_per_month or t.created_at > last_per_month[key].created_at:
+                    last_per_month[key] = t
+
+        # 始终包含当前任务
+        task_ids = set(t.id for t in last_per_month.values())
+        task_ids.add(task_id)
+        task_ids = list(task_ids)
+
         if not task_ids:
-            raise HTTPException(status_code=400, detail="所选周期范围内没有已完成的计算任务")
+            raise HTTPException(status_code=400, detail="所选薪资周期范围内没有已完成的计算任务")
 
         assets = (
             db.query(DataAsset)
@@ -705,9 +710,8 @@ async def generate_report(
             )
             .all()
         )
-        result_files = [a.file_path for a in assets if os.path.exists(a.file_path)]
     else:
-        # 只使用当前任务的结果
+        # 不启用历史：仅当前任务的结果
         assets = (
             db.query(DataAsset)
             .filter(
@@ -717,21 +721,39 @@ async def generate_report(
             )
             .all()
         )
-        result_files = [a.file_path for a in assets if os.path.exists(a.file_path)]
 
-    if not result_files:
-        raise HTTPException(status_code=400, detail="未找到计算结果文件")
+    if not assets:
+        raise HTTPException(status_code=400, detail="未找到计算结果")
 
-    # 4. 读取结果文件（CalculateFormula 后取计算值，非公式）
+    # 4. 从 DB parsed_data 读取数据（优先），无 parsed_data 时回退到读文件
+    #    只取 sheet0 的数据作为 dt
     all_dfs = []
-    for fpath in result_files:
-        try:
-            sheets = aspose_helper.read_all_sheets_calculated(fpath)
-            for df in sheets.values():
-                if not df.empty:
-                    all_dfs.append(df)
-        except Exception as e:
-            logger.warning(f"读取结果文件失败 {fpath}: {e}")
+    for asset in assets:
+        if asset.parsed_data:
+            # parsed_data: [{"sheet_name": "...", "regions": [...]}, ...]
+            # 只取第一个 sheet
+            first_sheet = asset.parsed_data[0] if asset.parsed_data else None
+            if first_sheet:
+                for region in (first_sheet.get("regions") or []):
+                    head_data = region.get("head_data") or {}
+                    data_rows = region.get("data") or []
+                    if not head_data or not data_rows:
+                        continue
+                    col_map = {v: k for k, v in head_data.items()}
+                    mapped_rows = [{col_map.get(c, c): val for c, val in row.items()} for row in data_rows]
+                    df = pd.DataFrame(mapped_rows)
+                    if not df.empty:
+                        all_dfs.append(df)
+        elif os.path.exists(asset.file_path):
+            # 回退：从文件读取，只取第一个 sheet
+            try:
+                sheets = aspose_helper.read_all_sheets_calculated(asset.file_path)
+                if sheets:
+                    first_df = list(sheets.values())[0]
+                    if not first_df.empty:
+                        all_dfs.append(first_df)
+            except Exception as e:
+                logger.warning(f"读取结果文件失败 {asset.file_path}: {e}")
 
     if not all_dfs:
         raise HTTPException(status_code=400, detail="无法读取计算结果数据")

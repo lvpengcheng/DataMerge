@@ -843,12 +843,13 @@ const Admin = {
         const result = await resp.json();
         const tbody = document.querySelector('#compute-history-table tbody');
         if (!result.items || !result.items.length) {
-            tbody.innerHTML = '<tr><td colspan="9" class="empty-state">暂无计算记录</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="10" class="empty-state">暂无计算记录</td></tr>';
             return;
         }
         tbody.innerHTML = result.items.map(t => `<tr>
             <td>${t.id}</td>
             <td>${t.tenant_id}</td>
+            <td>${t.salary_year && t.salary_month ? t.salary_year + '-' + String(t.salary_month).padStart(2,'0') : '-'}</td>
             <td>${t.script_id || (t.analysis_report?.original_script_id || '-')}</td>
             <td><span class="status-${t.status}">${t.status}</span></td>
             <td>${t.inputs ? t.inputs.length : 0}</td>

@@ -66,6 +66,8 @@ def _task_to_dict(task: ComputeTask) -> dict:
         "id": task.id,
         "tenant_id": task.tenant_id,
         "script_id": task.script_id,
+        "salary_year": task.salary_year,
+        "salary_month": task.salary_month,
         "status": task.status,
         "parent_task_id": task.parent_task_id,
         "analysis_report": task.analysis_report,
@@ -118,6 +120,8 @@ async def analyze_compute(
         tenant_id=req.tenant_id,
         user_id=current_user.id,
         script_id=req.script_id,
+        salary_year=req.salary_year,
+        salary_month=req.salary_month,
         status="analyzing",
     )
     db.add(task)
