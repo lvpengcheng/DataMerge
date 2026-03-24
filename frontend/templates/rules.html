@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>DataMerge - 规则整理</title>
-    <link rel="stylesheet" href="/static/css/rules.css">
+    <link rel="stylesheet" href="/static/css/rules.css?v=20260324d">
 </head>
 <body>
     <div class="container">
@@ -21,76 +21,76 @@
         </header>
 
         <div class="main-content">
-            <!-- 左侧: 文件上传区 -->
-            <section class="config-section">
-                <h2>文件与配置</h2>
-
-                <div class="form-group">
-                    <label for="source-files">源文件:</label>
-                    <input type="file" id="source-files" multiple accept=".xlsx,.xls">
-                    <div class="file-list" id="source-file-list"></div>
+            <!-- 左侧: 会话列表 -->
+            <section class="session-sidebar">
+                <div class="sidebar-header">
+                    <h2>会话历史</h2>
+                    <button class="btn-new-session" onclick="createNewSession()">+ 新建</button>
                 </div>
-
-                <div class="form-group">
-                    <label for="target-file">目标文件:</label>
-                    <input type="file" id="target-file" accept=".xlsx,.xls">
-                    <div class="file-list" id="target-file-list"></div>
+                <div class="session-list" id="session-list">
+                    <div class="session-list-empty" id="session-list-empty">暂无历史会话</div>
                 </div>
-
-                <div class="form-group">
-                    <label for="design-docs">设计文档 (可选):</label>
-                    <input type="file" id="design-docs" multiple accept=".pdf,.docx,.doc,.txt,.md,.xlsx,.xls">
-                    <div class="file-list" id="design-doc-list"></div>
-                </div>
-
-                <div class="form-group">
-                    <label for="ai-provider">AI 模型:</label>
-                    <select id="ai-provider">
-                        <option value="deepseek">DeepSeek</option>
-                        <option value="claude">Claude (推荐)</option>
-                        <option value="openai">OpenAI GPT-4</option>
-                    </select>
-                </div>
-
-                <button type="button" id="organize-btn" class="btn btn-primary" onclick="startOrganize()">
-                    开始整理
-                </button>
             </section>
 
             <!-- 右侧: AI 对话区 -->
             <div class="chat-panel">
                 <div class="chat-header">
-                    <h2>AI 对话</h2>
+                    <h2 id="chat-title">AI 对话</h2>
                     <div class="chat-actions">
-                        <button id="download-btn" class="btn btn-download" onclick="downloadRules()" style="display:none;">
-                            下载 rules.md
-                        </button>
-                        <button id="clear-btn" class="btn btn-clear" onclick="clearChat()">
-                            清空对话
-                        </button>
+                        <button id="download-btn" class="btn btn-download" onclick="downloadRules()" style="display:none;">下载 rules.md</button>
+                        <button class="btn btn-clear" onclick="clearChat()">清空</button>
                     </div>
                 </div>
 
                 <div class="chat-messages" id="chat-messages">
                     <div class="chat-placeholder" id="chat-placeholder">
-                        <div class="placeholder-icon">📋</div>
-                        <p>上传源文件和目标文件后，点击"开始整理"</p>
-                        <p class="hint">AI 将分析文件结构和设计文档，生成结构化的规则文件</p>
+                        <p>点击下方 📎 上传文件，输入需求后发送</p>
                     </div>
                 </div>
 
                 <div class="chat-input-area">
-                    <textarea id="chat-input" placeholder="输入补充说明或调整要求..." rows="2"
-                              onkeydown="handleInputKeydown(event)"></textarea>
-                    <button id="send-btn" class="btn btn-send" onclick="sendMessage()" disabled>
-                        发送
-                    </button>
+                    <button class="btn-attach" id="attach-btn" onclick="toggleAttachPopover()" title="文件与配置">📎</button>
+                    <textarea id="chat-input" placeholder="输入整理要求或追问..." rows="2" onkeydown="handleInputKeydown(event)"></textarea>
+                    <button id="send-btn" class="btn btn-send" onclick="sendMessage()">发送</button>
+                </div>
+
+                <!-- 附件弹窗 -->
+                <div class="attach-popover" id="attach-popover" style="display:none;">
+                    <div class="popover-header">
+                        <span>文件与配置</span>
+                        <button class="popover-close" onclick="toggleAttachPopover()">&times;</button>
+                    </div>
+                    <div class="popover-body">
+                        <div class="form-group">
+                            <label>源文件:</label>
+                            <input type="file" id="source-files" multiple accept=".xlsx,.xls">
+                            <div class="file-list" id="source-file-list"></div>
+                        </div>
+                        <div class="form-group">
+                            <label>目标文件:</label>
+                            <input type="file" id="target-file" accept=".xlsx,.xls">
+                            <div class="file-list" id="target-file-list"></div>
+                        </div>
+                        <div class="form-group">
+                            <label>设计文档 (可选):</label>
+                            <input type="file" id="design-docs" multiple accept=".pdf,.docx,.doc,.txt,.md,.xlsx,.xls">
+                            <div class="file-list" id="design-doc-list"></div>
+                        </div>
+                        <div class="form-group">
+                            <label>AI 模型:</label>
+                            <select id="ai-provider">
+                                <option value="deepseek">DeepSeek</option>
+                                <option value="claude">Claude (推荐)</option>
+                                <option value="openai">OpenAI GPT-4</option>
+                            </select>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
     </div>
 
     <script src="/static/js/auth.js"></script>
-    <script src="/static/js/rules.js?v=20260322"></script>
+    <script src="/static/js/rules.js?v=20260324d"></script>
 </body>
 </html>

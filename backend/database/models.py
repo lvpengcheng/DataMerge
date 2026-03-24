@@ -269,3 +269,24 @@ class ComputeTaskInput(Base):
 
     task = relationship("ComputeTask", back_populates="inputs")
     asset = relationship("DataAsset")
+
+
+# ==================== 规则整理会话 ====================
+
+class RuleSession(Base):
+    __tablename__ = "rule_sessions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    title = Column(String(200), nullable=False)
+    status = Column(String(20), default="active")                   # active / completed
+    ai_provider = Column(String(50), default="deepseek")
+    source_file_names = Column(JSON, nullable=True)                 # ["file1.xlsx", ...]
+    target_file_name = Column(String(200), nullable=True)
+    design_doc_names = Column(JSON, nullable=True)                  # ["design.docx", ...]
+    messages = Column(JSON, nullable=False, default=list)           # OpenAI 格式对话历史
+    final_result = Column(Text, nullable=True)                      # 最终 rules.md 内容
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User", foreign_keys=[user_id])

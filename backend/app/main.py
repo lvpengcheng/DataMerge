@@ -32,6 +32,7 @@ from ..admin.router import router as admin_router
 from ..api.assets import router as assets_router
 from ..api.training import router as training_api_router
 from ..api.compute import router as compute_api_router
+from ..api.rules import router as rules_api_router
 from ..database.connection import engine, get_db, SessionLocal
 from ..database import models as db_models
 from ..auth.dependencies import get_current_user, get_accessible_tenants
@@ -65,6 +66,7 @@ app.include_router(admin_router)
 app.include_router(assets_router)
 app.include_router(training_api_router)
 app.include_router(compute_api_router)
+app.include_router(rules_api_router)
 
 
 # ==================== 文件加密检测 API ====================
@@ -188,9 +190,10 @@ async def organize_rules_stream_endpoint(
     design_docs: List[UploadFile] = File(default=[]),
     ai_provider: Optional[str] = Form(None),
     file_passwords: Optional[str] = Form(None),
+    session_id: Optional[int] = Form(None),
     current_user=Depends(get_current_user),
 ):
-    """流式整理规则 - SSE 实时输出"""
+    """流式整理规则 - SSE 实时输出，自动创建/更新会话"""
     from ..utils.aspose_helper import is_encrypted, decrypt_excel
     from ..ai_engine.rule_organizer import RuleOrganizer
     from concurrent.futures import ThreadPoolExecutor
@@ -208,22 +211,27 @@ async def organize_rules_stream_endpoint(
 
     # 保存上传文件
     source_paths = []
+    source_names = []
     for f in source_files:
         path = os.path.join(temp_dir, f.filename)
         with open(path, "wb") as fp:
             fp.write(await f.read())
         source_paths.append(path)
+        source_names.append(f.filename)
 
     target_path = os.path.join(temp_dir, target_file.filename)
     with open(target_path, "wb") as fp:
         fp.write(await target_file.read())
+    target_name = target_file.filename
 
     doc_paths = []
+    doc_names = []
     for f in design_docs:
         path = os.path.join(temp_dir, f.filename)
         with open(path, "wb") as fp:
             fp.write(await f.read())
         doc_paths.append(path)
+        doc_names.append(f.filename)
 
     # 解密
     all_excel = [(p, os.path.basename(p)) for p in source_paths]
@@ -236,6 +244,10 @@ async def organize_rules_stream_endpoint(
                 raise HTTPException(status_code=422, detail=f"文件 '{fname}' 有密码保护，请提供密码")
             decrypted = decrypt_excel(fpath, password=pwd)
             shutil.move(decrypted, fpath)
+
+    # 捕获外层变量供线程使用
+    _user_id = current_user.id
+    _session_id = session_id
 
     logs_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
     loop = asyncio.get_event_loop()
@@ -261,9 +273,55 @@ async def organize_rules_stream_endpoint(
                 file_passwords=passwords_dict,
                 chunk_callback=chunk_cb,
             )
+
+            # ---- 持久化会话 ----
+            saved_session_id = None
+            try:
+                db = SessionLocal()
+                initial_messages = [
+                    {"role": "user", "content": f"请根据源文件({', '.join(source_names)})和目标文件({target_name})整理数据处理规则"},
+                    {"role": "assistant", "content": full_content},
+                ]
+                if _session_id:
+                    sess = db.query(db_models.RuleSession).filter(
+                        db_models.RuleSession.id == _session_id
+                    ).first()
+                    if sess:
+                        sess.messages = initial_messages
+                        sess.final_result = full_content
+                        sess.source_file_names = source_names
+                        sess.target_file_name = target_name
+                        sess.design_doc_names = doc_names or None
+                        sess.ai_provider = ai_provider or "deepseek"
+                        sess.updated_at = datetime.utcnow()
+                        db.commit()
+                        saved_session_id = sess.id
+                if not saved_session_id:
+                    sess = db_models.RuleSession(
+                        user_id=_user_id,
+                        title=f"规则整理 - {target_name}",
+                        ai_provider=ai_provider or "deepseek",
+                        source_file_names=source_names,
+                        target_file_name=target_name,
+                        design_doc_names=doc_names or None,
+                        messages=initial_messages,
+                        final_result=full_content,
+                    )
+                    db.add(sess)
+                    db.commit()
+                    db.refresh(sess)
+                    saved_session_id = sess.id
+                db.close()
+            except Exception as db_err:
+                logger.error(f"规则会话持久化失败: {db_err}", exc_info=True)
+
             loop.call_soon_threadsafe(
                 logs_queue.put_nowait,
-                json.dumps({"type": "complete", "content": full_content}, ensure_ascii=False),
+                json.dumps({
+                    "type": "complete",
+                    "content": full_content,
+                    "session_id": saved_session_id,
+                }, ensure_ascii=False),
             )
         except Exception as e:
             logger.error(f"规则整理(流式)失败: {e}", exc_info=True)
@@ -300,7 +358,7 @@ async def rules_chat_endpoint(
     request: Request,
     current_user=Depends(get_current_user),
 ):
-    """规则整理多轮对话 - SSE 流式追问"""
+    """规则整理多轮对话 - SSE 流式追问，自动更新会话"""
     from ..ai_engine.rule_organizer import RuleOrganizer
     from concurrent.futures import ThreadPoolExecutor
 
@@ -308,9 +366,12 @@ async def rules_chat_endpoint(
 
     messages = request_body.get("messages", [])
     ai_provider_name = request_body.get("ai_provider")
+    _session_id = request_body.get("session_id")
 
     if not messages:
         raise HTTPException(status_code=400, detail="消息列表不能为空")
+
+    _user_id = current_user.id
 
     logs_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
     loop = asyncio.get_event_loop()
@@ -330,9 +391,34 @@ async def rules_chat_endpoint(
             provider = AIProviderFactory.create_provider(ai_provider_name)
             organizer = RuleOrganizer(provider)
             full_content = organizer.chat_followup(messages, chunk_callback=chunk_cb)
+
+            # ---- 持久化会话 ----
+            saved_session_id = _session_id
+            try:
+                if _session_id:
+                    db = SessionLocal()
+                    sess = db.query(db_models.RuleSession).filter(
+                        db_models.RuleSession.id == int(_session_id)
+                    ).first()
+                    if sess:
+                        updated_messages = list(messages) + [
+                            {"role": "assistant", "content": full_content}
+                        ]
+                        sess.messages = updated_messages
+                        sess.final_result = full_content
+                        sess.updated_at = datetime.utcnow()
+                        db.commit()
+                    db.close()
+            except Exception as db_err:
+                logger.error(f"规则会话更新失败: {db_err}", exc_info=True)
+
             loop.call_soon_threadsafe(
                 logs_queue.put_nowait,
-                json.dumps({"type": "complete", "content": full_content}, ensure_ascii=False),
+                json.dumps({
+                    "type": "complete",
+                    "content": full_content,
+                    "session_id": saved_session_id,
+                }, ensure_ascii=False),
             )
         except Exception as e:
             logger.error(f"规则对话失败: {e}", exc_info=True)

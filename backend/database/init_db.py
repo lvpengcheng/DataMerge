@@ -90,7 +90,7 @@ from backend.database.models import (
     Role, Organization, User, TenantAuthorization,
     ReferenceCategory, DataAsset,
     TrainingSession, TrainingIteration, Script,
-    ComputeTask, ComputeTaskInput,
+    ComputeTask, ComputeTaskInput, RuleSession,
 )
 from passlib.context import CryptContext
 
