@@ -381,7 +381,7 @@ section h3 {
     gap: 20px;
     min-height: 0;
     min-width: 0;
-    overflow: hidden;
+    overflow-y: auto;
 }
 
 /* 配置区域 */
@@ -396,7 +396,7 @@ section h3 {
     flex-direction: column;
     flex: 1;
     min-height: 0;
-    overflow: hidden;
+    overflow: visible;
 }
 
 .status-card {
@@ -581,8 +581,8 @@ section h3 {
     font-family: 'Consolas', 'Monaco', monospace;
     font-size: 12px;
     flex: 1;
-    min-height: 0;
-    max-height: 45vh;
+    min-height: 25vh;
+    max-height: 50vh;
     overflow-y: auto;
     overflow-x: hidden;
     line-height: 1.6;
