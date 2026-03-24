@@ -106,9 +106,21 @@ def _apply_license(lic_path: str = None):
     try:
         from Aspose.Cells import License
         lic = License()
-        lic.SetLicense(path)
+
+        # 优先使用 Stream 方式（pythonnet 下更可靠）
+        try:
+            from System.IO import FileStream, FileMode, FileAccess, FileShare
+            stream = FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read)
+            lic.SetLicense(stream)
+            stream.Close()
+            logger.info(f"[Aspose] 许可证已生效（Stream 方式）: {os.path.basename(path)}")
+        except Exception as stream_err:
+            logger.warning(f"[Aspose] Stream 方式失败: {stream_err}, 尝试路径方式")
+            lic2 = License()
+            lic2.SetLicense(path)
+            logger.info(f"[Aspose] 许可证已生效（路径方式）: {os.path.basename(path)}")
+
         _license_applied = True
-        logger.info(f"[Aspose] 许可证已生效: {os.path.basename(path)}")
         return True
     except Exception as e:
         logger.error(f"[Aspose] 许可证设置失败: {e}")

@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List
-from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile, Form
+from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile, Form, Request
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
@@ -530,6 +530,7 @@ async def get_template(
 
 @router.put("/templates/{template_id}")
 async def update_template(
+    request: Request,
     template_id: int,
     file: Optional[UploadFile] = File(None),
     tenant_id: Optional[str] = Form(None),
@@ -555,25 +556,39 @@ async def update_template(
         tpl.file_path = file_path
         tpl.file_name = file_name
 
+    # 读取原始表单数据，解决 FastAPI 把空字符串转为 None 的问题
+    form = await request.form()
+
     if tenant_id is not None:
         tpl.tenant_id = tenant_id or None
     if name is not None:
         tpl.name = name
     if description is not None:
         tpl.description = description
-    if file_name_rule is not None:
+    # 可清空的字段：检查原始表单是否包含该字段（即使值为空字符串）
+    if 'file_name_rule' in form:
+        tpl.file_name_rule = str(form.get('file_name_rule', ''))
+    elif file_name_rule is not None:
         tpl.file_name_rule = file_name_rule
     if encrypt_type is not None:
         tpl.encrypt_type = encrypt_type
-    if encrypt_password is not None:
+    if 'encrypt_password' in form:
+        new_pwd = str(form.get('encrypt_password', ''))
+        logger.info(f"[模版更新] encrypt_password: '{tpl.encrypt_password}' -> '{new_pwd}'")
+        tpl.encrypt_password = new_pwd
+    elif encrypt_password is not None:
         tpl.encrypt_password = encrypt_password
     if report_mode is not None:
         tpl.report_mode = report_mode
-    if group_by is not None:
+    if 'group_by' in form:
+        tpl.group_by = str(form.get('group_by', ''))
+    elif group_by is not None:
         tpl.group_by = group_by
     if skip_rows is not None:
         tpl.skip_rows = skip_rows
-    if name_field is not None:
+    if 'name_field' in form:
+        tpl.name_field = str(form.get('name_field', ''))
+    elif name_field is not None:
         tpl.name_field = name_field
 
     db.commit()
@@ -815,6 +830,7 @@ async def generate_report(
 
     # 7. 解析加密规则（可以是固定值或参数表达式）
     password = None
+    logger.info(f"数据库 encrypt_password='{tpl.encrypt_password}', encrypt_type='{tpl.encrypt_type}'")
     if tpl.encrypt_password:
         password = _resolve_rule_pattern(tpl.encrypt_password, first_row, system_vars)
         if password:

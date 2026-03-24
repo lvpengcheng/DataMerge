@@ -723,6 +723,11 @@ def generate_from_template(
       fill/block → output_path (xlsx)
       zip        → output_path (zip)
     """
+    import aspose_init
+    if not aspose_init.is_licensed():
+        logger.warning("[SmartMarker] Aspose 许可证未生效，尝试重新加载")
+        aspose_init._apply_license()
+
     if mode == "block":
         return _generate_block(
             output_path, template_path, data,
@@ -782,6 +787,12 @@ def _finalize_workbook(
     if password:
         wb.SetEncryptionOptions(EncryptionType.StrongCryptographicProvider, 128)
         wb.Settings.Password = password
+    else:
+        # 主动清除模板可能继承的密码属性
+        try:
+            wb.Settings.Password = ""
+        except Exception:
+            pass
     return save_as(wb, output_path)
 
 
@@ -885,6 +896,11 @@ def _generate_zip(
             if password:
                 filled_wb.SetEncryptionOptions(EncryptionType.StrongCryptographicProvider, 128)
                 filled_wb.Settings.Password = password
+            else:
+                try:
+                    filled_wb.Settings.Password = ""
+                except Exception:
+                    pass
 
             # 确定文件名
             if name_field and name_field in group_df.columns:
