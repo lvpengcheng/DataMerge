@@ -33,8 +33,8 @@ Aspose.Cells 工具类 (.NET via pythonnet)
   add_chart(ws, data_range, ...)
 
   ── 模板与水印 ────────────────────────────────────────
-  generate_from_template(output_path, template_path, data, password, watermark_text)
-      模板填充生成文件（xlsx / pdf / html）
+  generate_from_template(output_path, template_path, data, ...)
+      模板填充生成文件 — 支持 fill / block / zip 三种模式
   add_excel_watermark(wb, text)
 
   ── 加密 / 解密 ──────────────────────────────────────
@@ -44,11 +44,13 @@ Aspose.Cells 工具类 (.NET via pythonnet)
   change_error_message(msg)      Aspose 英文异常转中文
 """
 
+import io
 import logging
 import os
 import re
 import tempfile
-from typing import Optional, Union, Dict
+import zipfile
+from typing import Optional, Union, Dict, List
 
 import pandas as pd
 
@@ -618,61 +620,319 @@ def add_chart(
 # 模板与水印
 # ═══════════════════════════════════════════════════════
 
+def _fix_smart_marker_spacing(wb) -> int:
+    """修复模板中 SmartMarker 标记字段名与修饰符括号之间的空格。
+
+    例如: "&=DT.工号 (group:repeat,skip:1)" → "&=DT.工号(group:repeat,skip:1)"
+    空格会导致 Aspose 无法识别修饰符，必须紧跟括号。
+    返回修复的标记数量。
+    """
+    fixed = 0
+    pattern = re.compile(r'(&=\S+)\s+(\([^)]+\))')
+
+    for ws_idx in range(wb.Worksheets.Count):
+        ws = wb.Worksheets[ws_idx]
+        cells = ws.Cells
+        max_row = cells.MaxDataRow
+        max_col = cells.MaxDataColumn
+        if max_row < 0 or max_col < 0:
+            continue
+        for r in range(max_row + 1):
+            for c in range(max_col + 1):
+                val = str(cells[r, c].StringValue or "")
+                if "&=" in val and "(" in val:
+                    new_val = pattern.sub(r'\1\2', val)
+                    if new_val != val:
+                        cells[r, c].PutValue(new_val)
+                        logger.info(f"[SmartMarker] 修复标记空格: '{val}' → '{new_val}'")
+                        fixed += 1
+    return fixed
+
+
+def _dataframe_to_datatable(df: pd.DataFrame, table_name: str):
+    """将 DataFrame 通过独立 Aspose Workbook 导出为 .NET DataTable。
+
+    使用独立临时 Workbook（不影响模板），
+    将 DataFrame 写入 → ExportDataTable() 导出原生 .NET DataTable。
+    """
+    temp_wb = Workbook()
+    cells = temp_wb.Worksheets[0].Cells
+
+    n_rows = len(df)
+    n_cols = len(df.columns)
+
+    # 第 0 行: 表头
+    for c, col_name in enumerate(df.columns):
+        cells[0, c].PutValue(str(col_name))
+
+    # 第 1~N 行: 数据
+    for r in range(n_rows):
+        for c in range(n_cols):
+            val = df.iloc[r, c]
+            is_null = val is None
+            if not is_null:
+                try:
+                    is_null = pd.isna(val)
+                except (TypeError, ValueError):
+                    is_null = False
+            if not is_null:
+                cells[r + 1, c].PutValue(val)
+
+    # 用 Aspose 原生方法导出 DataTable（类型完全兼容 WorkbookDesigner）
+    dt = cells.ExportDataTable(0, 0, n_rows + 1, n_cols, True)
+    dt.TableName = table_name
+
+    # 验证导出结果
+    col_names = [dt.Columns[i].ColumnName for i in range(dt.Columns.Count)]
+    logger.info(f"[DataTable] {table_name}: {dt.Rows.Count} rows x {dt.Columns.Count} cols, 列名={col_names}")
+    if dt.Rows.Count > 0:
+        first_row = [str(dt.Rows[0][i]) for i in range(min(5, dt.Columns.Count))]
+        logger.info(f"[DataTable] {table_name} 首行前5列: {first_row}")
+
+    return dt
+
+
 def generate_from_template(
     output_path: str,
     template_path: str,
     data: Dict,
     password: Optional[str] = None,
     watermark_text: Optional[str] = None,
+    mode: str = "fill",
+    group_by: str = "",
+    skip_rows: int = 1,
+    name_field: str = "",
 ) -> str:
     """
-    以 Excel 模板 + 数据集生成目标文件。
+    使用 Aspose WorkbookDesigner（SmartMarker 引擎）填充模板生成文件。
 
-    模板标记方式：
-      - 数据集标记: &=DataSource.Column  （对应 data 中的 DataFrame 或 list[dict]）
-      - 单值标记:   &=$Variable          （对应 data 中以 $ 开头的键值）
+    三种模式:
+      fill  — 整个 DataFrame 一次性填入模板（默认，适合汇总表）
+      block — 按 group_by 字段分组，每组独立填充模板后合并到一个文件
+      zip   — 按 group_by 字段分组，每组生成独立 xlsx，打包为 zip 下载
+
+    模板标记:
+      &=DT.Column              数据集字段
+      &=DT.Column(skip:1)      带修饰符
+      &=$year                  单值变量
 
     data 示例:
-      {
-          "员工": pd.DataFrame({"姓名": [...], "薪资": [...]}),
-          "$公司名称": "XX科技有限公司",
-          "$日期": "2026-03-23",
-      }
-
-    模板中写 &=员工.姓名、&=员工.薪资 → 自动展开为多行
-    模板中写 &=$公司名称       → 替换为单个值
-
-    输出格式由 output_path 的扩展名决定（xlsx/pdf/html/csv）
-
-    Args:
-        output_path:    输出文件路径
-        template_path:  模板 xlsx 文件路径
-        data:           数据字典
-        password:       可选，加密密码
-        watermark_text: 可选，水印文字
+      {"DT": pd.DataFrame(...), "$year": "2026", "$month": "03"}
 
     Returns:
-        output_path
+      fill/block → output_path (xlsx)
+      zip        → output_path (zip)
     """
+    if mode == "block":
+        return _generate_block(
+            output_path, template_path, data,
+            group_by=group_by, skip_rows=skip_rows,
+            password=password, watermark_text=watermark_text,
+        )
+    elif mode == "zip":
+        return _generate_zip(
+            output_path, template_path, data,
+            group_by=group_by, name_field=name_field,
+            password=password, watermark_text=watermark_text,
+        )
+    else:
+        return _generate_fill(
+            output_path, template_path, data,
+            password=password, watermark_text=watermark_text,
+        )
+
+
+def _smartmarker_fill(template_path: str, data: Dict) -> Workbook:
+    """SmartMarker 核心填充: 打开模板 → 设置数据源 → Process → 返回填好的 Workbook。
+    fill / block / zip 三种模式复用此函数。
+    """
+    from Aspose.Cells import WorkbookDesigner
+
     wb = Workbook(template_path)
+    _fix_smart_marker_spacing(wb)
+
+    designer = WorkbookDesigner()
+    designer.Workbook = wb
+    designer.RepeatFormulasWithSubtotal = True
 
     for name, value in data.items():
         if name.startswith("$"):
-            _fill_single_value(wb, name, value)
+            var_name = name[1:]
+            designer.SetDataSource(var_name, str(value))
+            designer.SetDataSource(name, str(value))
         else:
             df = value if isinstance(value, pd.DataFrame) else pd.DataFrame(value)
-            _fill_template_data(wb, name, df)
+            dt = _dataframe_to_datatable(df, name)
+            designer.SetDataSource(dt)
+            logger.info(f"[SmartMarker] 数据源 {name}: {len(df)} 行, 列={list(df.columns)}")
 
+    designer.Process()
     wb.CalculateFormula()
+    return wb
 
+
+def _finalize_workbook(
+    wb, output_path: str,
+    password: Optional[str] = None,
+    watermark_text: Optional[str] = None,
+) -> str:
+    """统一收尾: 水印 → 加密 → 保存"""
     if watermark_text:
         add_excel_watermark(wb, watermark_text)
-
     if password:
         wb.SetEncryptionOptions(EncryptionType.StrongCryptographicProvider, 128)
         wb.Settings.Password = password
-
     return save_as(wb, output_path)
+
+
+# ── fill 模式 ──────────────────────────────────────────
+
+def _generate_fill(
+    output_path: str, template_path: str, data: Dict,
+    password: Optional[str] = None, watermark_text: Optional[str] = None,
+) -> str:
+    """整个 DataFrame 一次性填入模板"""
+    logger.info(f"[报表生成] fill 模式: {template_path}")
+    wb = _smartmarker_fill(template_path, data)
+    return _finalize_workbook(wb, output_path, password, watermark_text)
+
+
+# ── block 模式 ─────────────────────────────────────────
+
+def _generate_block(
+    output_path: str, template_path: str, data: Dict,
+    group_by: str = "", skip_rows: int = 1,
+    password: Optional[str] = None, watermark_text: Optional[str] = None,
+) -> str:
+    """按 group_by 分组，每组用 SmartMarker 填充模板，合并到一个文件。"""
+    # 找到主数据源（非 $ 开头的第一个 DataFrame）
+    ds_name, full_df, vars_data = _extract_datasource(data)
+
+    if not group_by or group_by not in full_df.columns:
+        logger.warning(f"[block] group_by='{group_by}' 不在列 {list(full_df.columns)} 中，回退到 fill 模式")
+        return _generate_fill(output_path, template_path, data, password, watermark_text)
+
+    groups = full_df.groupby(group_by, sort=False)
+    logger.info(f"[报表生成] block 模式: {len(groups)} 组, group_by={group_by}, skip_rows={skip_rows}")
+
+    # 用第一组填充，确定一个块占多少行
+    result_wb = None
+    result_ws = None
+    current_row = 0
+
+    for group_idx, (group_key, group_df) in enumerate(groups):
+        group_df = group_df.reset_index(drop=True)
+        group_data = {ds_name: group_df, **vars_data}
+
+        # SmartMarker 填充该组
+        filled_wb = _smartmarker_fill(template_path, group_data)
+        filled_ws = filled_wb.Worksheets[0]
+        block_rows = filled_ws.Cells.MaxDataRow + 1
+
+        if result_wb is None:
+            # 第一组: 直接用填好的 workbook 作为结果
+            result_wb = filled_wb
+            result_ws = result_wb.Worksheets[0]
+            current_row = block_rows
+        else:
+            # 后续组: 空行 + 复制块
+            current_row += skip_rows
+
+            # 从填好的 sheet 复制行到结果 sheet
+            result_ws.Cells.CopyRows(
+                filled_ws.Cells,       # 源
+                0,                     # 源起始行
+                current_row,           # 目标起始行
+                block_rows,            # 行数
+            )
+            current_row += block_rows
+
+        logger.info(f"[block] 组 {group_idx+1}/{len(groups)}: {group_key}, {len(group_df)} 行数据, 块={block_rows} 行")
+
+    return _finalize_workbook(result_wb, output_path, password, watermark_text)
+
+
+# ── zip 模式 ──────────────────────────────────────────
+
+def _generate_zip(
+    output_path: str, template_path: str, data: Dict,
+    group_by: str = "", name_field: str = "",
+    password: Optional[str] = None, watermark_text: Optional[str] = None,
+) -> str:
+    """按 group_by 分组，每组生成独立 xlsx，打包为 zip。"""
+    ds_name, full_df, vars_data = _extract_datasource(data)
+
+    if not group_by or group_by not in full_df.columns:
+        logger.warning(f"[zip] group_by='{group_by}' 不在列中，回退到 fill 模式")
+        return _generate_fill(output_path, template_path, data, password, watermark_text)
+
+    # 确保输出路径是 .zip
+    if not output_path.endswith(".zip"):
+        output_path = os.path.splitext(output_path)[0] + ".zip"
+
+    groups = full_df.groupby(group_by, sort=False)
+    logger.info(f"[报表生成] zip 模式: {len(groups)} 组, group_by={group_by}")
+
+    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for group_idx, (group_key, group_df) in enumerate(groups):
+            group_df = group_df.reset_index(drop=True)
+            group_data = {ds_name: group_df, **vars_data}
+
+            filled_wb = _smartmarker_fill(template_path, group_data)
+
+            if watermark_text:
+                add_excel_watermark(filled_wb, watermark_text)
+            if password:
+                filled_wb.SetEncryptionOptions(EncryptionType.StrongCryptographicProvider, 128)
+                filled_wb.Settings.Password = password
+
+            # 确定文件名
+            if name_field and name_field in group_df.columns:
+                file_label = str(group_df[name_field].iloc[0])
+            else:
+                file_label = str(group_key)
+            # 清理非法文件名字符
+            file_label = re.sub(r'[\\/:*?"<>|]', '_', file_label)
+            inner_name = f"{file_label}.xlsx"
+
+            # 保存到内存 → 写入 zip
+            with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                filled_wb.Save(tmp_path, SaveFormat.Xlsx)
+                zf.write(tmp_path, inner_name)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+
+            logger.info(f"[zip] 组 {group_idx+1}/{len(groups)}: {inner_name}, {len(group_df)} 行")
+
+    logger.info(f"[报表生成] zip 完成: {output_path}")
+    return output_path
+
+
+# ── 公共工具 ──────────────────────────────────────────
+
+def _extract_datasource(data: Dict):
+    """从 data dict 中分离主数据源 DataFrame 和 $ 变量。
+    Returns: (ds_name, DataFrame, vars_dict)
+    """
+    ds_name = None
+    full_df = None
+    vars_data = {}
+
+    for name, value in data.items():
+        if name.startswith("$"):
+            vars_data[name] = value
+        else:
+            if ds_name is None:
+                ds_name = name
+                full_df = value if isinstance(value, pd.DataFrame) else pd.DataFrame(value)
+
+    if full_df is None:
+        raise ValueError("data 中未找到 DataFrame 数据源")
+
+    return ds_name, full_df, vars_data
 
 
 def _fill_template_data(wb, name: str, df: pd.DataFrame) -> None:

@@ -443,6 +443,10 @@ def _build_template_resp(t: Template) -> dict:
         "file_name_rule": t.file_name_rule or "",
         "encrypt_type": t.encrypt_type or "none",
         "encrypt_password": t.encrypt_password or "",
+        "report_mode": getattr(t, "report_mode", "fill") or "fill",
+        "group_by": getattr(t, "group_by", "") or "",
+        "skip_rows": getattr(t, "skip_rows", 1) or 1,
+        "name_field": getattr(t, "name_field", "") or "",
         "is_active": t.is_active,
         "created_by": t.created_by,
         "creator_name": t.creator.display_name if t.creator else "",
@@ -480,6 +484,10 @@ async def create_template(
     file_name_rule: str = Form(""),
     encrypt_type: str = Form("none"),
     encrypt_password: str = Form(""),
+    report_mode: str = Form("fill"),
+    group_by: str = Form(""),
+    skip_rows: int = Form(1),
+    name_field: str = Form(""),
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
@@ -495,6 +503,10 @@ async def create_template(
         file_name_rule=file_name_rule,
         encrypt_type=encrypt_type,
         encrypt_password=encrypt_password,
+        report_mode=report_mode,
+        group_by=group_by,
+        skip_rows=skip_rows,
+        name_field=name_field,
         created_by=admin.id,
     )
     db.add(tpl)
@@ -526,6 +538,10 @@ async def update_template(
     file_name_rule: Optional[str] = Form(None),
     encrypt_type: Optional[str] = Form(None),
     encrypt_password: Optional[str] = Form(None),
+    report_mode: Optional[str] = Form(None),
+    group_by: Optional[str] = Form(None),
+    skip_rows: Optional[int] = Form(None),
+    name_field: Optional[str] = Form(None),
     db: Session = Depends(get_db),
     _admin: User = Depends(require_admin),
 ):
@@ -551,6 +567,14 @@ async def update_template(
         tpl.encrypt_type = encrypt_type
     if encrypt_password is not None:
         tpl.encrypt_password = encrypt_password
+    if report_mode is not None:
+        tpl.report_mode = report_mode
+    if group_by is not None:
+        tpl.group_by = group_by
+    if skip_rows is not None:
+        tpl.skip_rows = skip_rows
+    if name_field is not None:
+        tpl.name_field = name_field
 
     db.commit()
     db.refresh(tpl)
@@ -811,10 +835,24 @@ async def generate_report(
     logger.info("=== end ===")
 
     # 9. 生成报表
+    report_mode = getattr(tpl, "report_mode", "fill") or "fill"
+    group_by_field = getattr(tpl, "group_by", "") or ""
+    skip_rows_val = getattr(tpl, "skip_rows", 1) or 1
+    name_field_val = getattr(tpl, "name_field", "") or ""
+
+    # zip 模式输出 .zip，其余输出原始扩展名
+    if report_mode == "zip":
+        output_ext = ".zip"
+        output_name_final = os.path.splitext(output_name)[0] + output_ext
+    else:
+        output_name_final = output_name
+
     output_dir = _PROJECT_ROOT / "tenants" / tenant_id / "reports"
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = now.strftime("%Y%m%d%H%M%S")
-    output_path = str(output_dir / f"{timestamp}_{output_name}")
+    output_path = str(output_dir / f"{timestamp}_{output_name_final}")
+
+    logger.info(f"报表模式: {report_mode}, group_by={group_by_field}, skip_rows={skip_rows_val}")
 
     try:
         aspose_helper.generate_from_template(
@@ -822,19 +860,23 @@ async def generate_report(
             template_path=tpl.file_path,
             data=template_data,
             password=password,
+            mode=report_mode,
+            group_by=group_by_field,
+            skip_rows=skip_rows_val,
+            name_field=name_field_val,
         )
     except Exception as e:
         logger.error(f"报表生成失败: {e}")
         raise HTTPException(status_code=500, detail=f"报表生成失败: {str(e)}")
 
-    # 9. 留痕 — 保存为 DataAsset
+    # 10. 留痕 — 保存为 DataAsset
     try:
         report_asset = DataAsset(
             tenant_id=tenant_id,
             asset_type="report",
             name=f"报表_{tpl.name}_{now.strftime('%Y%m%d')}",
             file_path=output_path,
-            file_name=output_name,
+            file_name=output_name_final,
             file_size=os.path.getsize(output_path),
             source_task_id=task_id,
             uploaded_by=admin.id,
@@ -855,9 +897,10 @@ async def generate_report(
         except Exception:
             pass
 
-    # 10. 返回文件下载
+    # 11. 返回文件下载
+    media = "application/zip" if report_mode == "zip" else "application/octet-stream"
     return FileResponse(
         path=output_path,
-        filename=output_name,
-        media_type="application/octet-stream",
+        filename=output_name_final,
+        media_type=media,
     )

@@ -639,6 +639,7 @@ const Admin = {
             <td>${t.file_name}</td>
             <td>${t.file_name_rule || '-'}</td>
             <td>${t.encrypt_password || '<span style="color:#999">不加密</span>'}</td>
+            <td>${t.report_mode === 'block' ? '<span class="tag" style="background:#fff3e0;color:#e65100">block</span>' : t.report_mode === 'zip' ? '<span class="tag" style="background:#e8eaf6;color:#283593">zip</span>' : 'fill'}${t.group_by ? ' <small>(' + t.group_by + ')</small>' : ''}</td>
             <td>${t.is_active ? '<span style="color:green">启用</span>' : '<span style="color:#999">停用</span>'}</td>
             <td class="actions">
                 <button class="btn btn-sm" onclick="Admin.downloadTemplate(${t.id}, '${t.file_name.replace(/'/g, "\\'")}')">下载</button>
@@ -677,6 +678,25 @@ const Admin = {
                     <input id="m-tpl-encrypt-rule" placeholder="如: {身份证号码[:6]} 或 {姓名[:1]}{身份证号码[-6:]}" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
                     <small style="color:#888;">留空表示不加密。可用变量: {列名} {列名[:N]}前N位 {列名[-N:]}后N位</small>
                 </div>
+                <div class="form-group"><label>报表模式</label>
+                    <select id="m-tpl-report-mode" onchange="Admin._toggleModeFields()" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                        <option value="fill">fill — 整表填充</option>
+                        <option value="block">block — 分组合并（每组一块）</option>
+                        <option value="zip">zip — 分组打包（每组一文件）</option>
+                    </select>
+                </div>
+                <div id="m-tpl-mode-fields" style="display:none;">
+                    <div class="form-group"><label>分组字段</label>
+                        <input id="m-tpl-group-by" placeholder="如: 工号" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                        <small style="color:#888;">按此列的值分组，每组独立填充模板</small>
+                    </div>
+                    <div class="form-group" id="m-tpl-skip-rows-group"><label>块间空行数</label>
+                        <input id="m-tpl-skip-rows" type="number" value="1" min="0" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                    </div>
+                    <div class="form-group" id="m-tpl-name-field-group" style="display:none;"><label>文件命名字段</label>
+                        <input id="m-tpl-name-field" placeholder="如: 姓名（用于 zip 内文件名）" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                    </div>
+                </div>
             </div>
         `, async () => {
             const fileInput = document.getElementById('m-tpl-file');
@@ -692,6 +712,10 @@ const Admin = {
             fd.append('file_name_rule', document.getElementById('m-tpl-name-rule').value || '');
             fd.append('encrypt_type', encryptRule ? 'password' : 'none');
             fd.append('encrypt_password', encryptRule);
+            fd.append('report_mode', document.getElementById('m-tpl-report-mode').value);
+            fd.append('group_by', document.getElementById('m-tpl-group-by')?.value || '');
+            fd.append('skip_rows', document.getElementById('m-tpl-skip-rows')?.value || '1');
+            fd.append('name_field', document.getElementById('m-tpl-name-field')?.value || '');
             const resp = await AUTH.authFetch('/api/admin/templates', { method: 'POST', body: fd });
             if (resp.ok) { this.closeModal(); this.loadTemplates(); }
             else { const e = await resp.json(); alert(e.detail || '创建失败'); }
@@ -731,6 +755,25 @@ const Admin = {
                     <input id="m-tpl-encrypt-rule" value="${t.encrypt_password || ''}" placeholder="如: {身份证号码[:6]} 或 {姓名[:1]}{身份证号码[-6:]}" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
                     <small style="color:#888;">留空表示不加密。可用变量: {列名} {列名[:N]}前N位 {列名[-N:]}后N位</small>
                 </div>
+                <div class="form-group"><label>报表模式</label>
+                    <select id="m-tpl-report-mode" onchange="Admin._toggleModeFields()" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                        <option value="fill" ${(t.report_mode||'fill')==='fill'?'selected':''}>fill — 整表填充</option>
+                        <option value="block" ${t.report_mode==='block'?'selected':''}>block — 分组合并（每组一块）</option>
+                        <option value="zip" ${t.report_mode==='zip'?'selected':''}>zip — 分组打包（每组一文件）</option>
+                    </select>
+                </div>
+                <div id="m-tpl-mode-fields" style="display:${(t.report_mode==='block'||t.report_mode==='zip')?'block':'none'};">
+                    <div class="form-group"><label>分组字段</label>
+                        <input id="m-tpl-group-by" value="${t.group_by || ''}" placeholder="如: 工号" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                        <small style="color:#888;">按此列的值分组，每组独立填充模板</small>
+                    </div>
+                    <div class="form-group" id="m-tpl-skip-rows-group" style="display:${t.report_mode==='block'?'block':'none'};"><label>块间空行数</label>
+                        <input id="m-tpl-skip-rows" type="number" value="${t.skip_rows ?? 1}" min="0" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                    </div>
+                    <div class="form-group" id="m-tpl-name-field-group" style="display:${t.report_mode==='zip'?'block':'none'};"><label>文件命名字段</label>
+                        <input id="m-tpl-name-field" value="${t.name_field || ''}" placeholder="如: 姓名（用于 zip 内文件名）" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                    </div>
+                </div>
             </div>
         `, async () => {
             const fd = new FormData();
@@ -743,6 +786,10 @@ const Admin = {
             fd.append('file_name_rule', document.getElementById('m-tpl-name-rule').value || '');
             fd.append('encrypt_type', encryptRule ? 'password' : 'none');
             fd.append('encrypt_password', encryptRule);
+            fd.append('report_mode', document.getElementById('m-tpl-report-mode').value);
+            fd.append('group_by', document.getElementById('m-tpl-group-by')?.value || '');
+            fd.append('skip_rows', document.getElementById('m-tpl-skip-rows')?.value || '1');
+            fd.append('name_field', document.getElementById('m-tpl-name-field')?.value || '');
             const resp = await AUTH.authFetch(`/api/admin/templates/${id}`, { method: 'PUT', body: fd });
             if (resp.ok) { this.closeModal(); this.loadTemplates(); }
             else { const e = await resp.json(); alert(e.detail || '更新失败'); }
@@ -754,6 +801,16 @@ const Admin = {
         const resp = await AUTH.authFetch(`/api/admin/templates/${id}`, { method: 'DELETE' });
         if (resp.ok) this.loadTemplates();
         else alert('操作失败');
+    },
+
+    _toggleModeFields() {
+        const mode = document.getElementById('m-tpl-report-mode')?.value || 'fill';
+        const fields = document.getElementById('m-tpl-mode-fields');
+        const skipGroup = document.getElementById('m-tpl-skip-rows-group');
+        const nameGroup = document.getElementById('m-tpl-name-field-group');
+        if (fields) fields.style.display = (mode === 'block' || mode === 'zip') ? 'block' : 'none';
+        if (skipGroup) skipGroup.style.display = mode === 'block' ? 'block' : 'none';
+        if (nameGroup) nameGroup.style.display = mode === 'zip' ? 'block' : 'none';
     },
 
     downloadTemplate(id, fileName) {
