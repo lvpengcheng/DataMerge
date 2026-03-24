@@ -128,17 +128,17 @@ section {
 
 section h2 {
     color: #333;
-    font-size: 20px;
-    margin-bottom: 20px;
-    padding-bottom: 10px;
+    font-size: 18px;
+    margin-bottom: 12px;
+    padding-bottom: 8px;
     border-bottom: 2px solid #f0f0f0;
 }
 
 section h3 {
     color: #555;
-    font-size: 16px;
-    margin-bottom: 15px;
-    margin-top: 20px;
+    font-size: 14px;
+    margin-bottom: 6px;
+    margin-top: 0;
 }
 
 /* 表单样式 */
@@ -386,49 +386,47 @@ section h3 {
 .progress-section {
     display: flex;
     flex-direction: column;
-    flex: 1;
     min-height: 0;
     overflow: visible;
-}
 }
 
 .status-card {
     background: linear-gradient(135deg, #42a5f5 0%, #1976d2 100%);
-    padding: 15px 20px;
+    padding: 10px 16px;
     border-radius: 10px;
     color: white;
-    margin-bottom: 12px;
+    margin-bottom: 8px;
 }
 
 .status-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    margin-bottom: 15px;
+    margin-bottom: 8px;
 }
 
 .status-label {
-    font-size: 14px;
+    font-size: 13px;
     opacity: 0.9;
 }
 
 .status-value {
-    font-size: 18px;
+    font-size: 15px;
     font-weight: 600;
 }
 
 .progress-bar-container {
     position: relative;
     background: rgba(255, 255, 255, 0.2);
-    height: 30px;
-    border-radius: 15px;
+    height: 22px;
+    border-radius: 11px;
     overflow: hidden;
 }
 
 .progress-bar {
     height: 100%;
     background: white;
-    border-radius: 15px;
+    border-radius: 11px;
     transition: width 0.5s ease;
     width: 0%;
 }
@@ -439,7 +437,7 @@ section h3 {
     left: 50%;
     transform: translate(-50%, -50%);
     font-weight: 600;
-    font-size: 14px;
+    font-size: 12px;
     color: #333;
 }
 
@@ -447,13 +445,13 @@ section h3 {
 .iteration-info {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
-    gap: 12px;
-    margin-bottom: 12px;
+    gap: 8px;
+    margin-bottom: 8px;
 }
 
 .info-item {
     background: #f8f9fa;
-    padding: 8px 10px;
+    padding: 5px 8px;
     border-radius: 6px;
     text-align: center;
 }
@@ -461,19 +459,19 @@ section h3 {
 .info-item .label {
     display: block;
     color: #666;
-    font-size: 12px;
-    margin-bottom: 4px;
+    font-size: 11px;
+    margin-bottom: 2px;
 }
 
 .info-item .value {
     color: #333;
-    font-size: 18px;
+    font-size: 15px;
     font-weight: 600;
 }
 
 .info-item .separator {
     color: #999;
-    font-size: 16px;
+    font-size: 14px;
     margin: 0 2px;
 }
 
@@ -560,7 +558,6 @@ section h3 {
 /* 日志区域 */
 .log-container {
     margin-top: 0;
-    flex: 1;
     display: flex;
     flex-direction: column;
     min-height: 0;
@@ -569,12 +566,11 @@ section h3 {
 .log-content {
     background: #1e1e1e;
     color: #d4d4d4;
-    padding: 15px;
+    padding: 10px 12px;
     border-radius: 8px;
     font-family: 'Consolas', 'Monaco', monospace;
     font-size: 12px;
-    flex: 1;
-    min-height: 25vh;
+    min-height: 58px;
     max-height: 50vh;
     overflow-y: auto;
     overflow-x: hidden;
@@ -691,13 +687,14 @@ section h3 {
 
 /* 结果区域 */
 .result-section {
+    flex-shrink: 0;
 }
 
 .result-card {
     background: #f8f9fa;
-    padding: 20px 25px;
+    padding: 10px 16px;
     border-radius: 8px;
-    margin-bottom: 15px;
+    margin-bottom: 10px;
 }
 
 .result-success {
