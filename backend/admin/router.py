@@ -447,6 +447,7 @@ def _build_template_resp(t: Template) -> dict:
         "group_by": getattr(t, "group_by", "") or "",
         "skip_rows": getattr(t, "skip_rows", 1) or 1,
         "name_field": getattr(t, "name_field", "") or "",
+        "show_empty_period": getattr(t, "show_empty_period", True),
         "is_active": t.is_active,
         "created_by": t.created_by,
         "creator_name": t.creator.display_name if t.creator else "",
@@ -488,6 +489,7 @@ async def create_template(
     group_by: str = Form(""),
     skip_rows: int = Form(1),
     name_field: str = Form(""),
+    show_empty_period: bool = Form(True),
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
@@ -507,6 +509,7 @@ async def create_template(
         group_by=group_by,
         skip_rows=skip_rows,
         name_field=name_field,
+        show_empty_period=show_empty_period,
         created_by=admin.id,
     )
     db.add(tpl)
@@ -543,6 +546,7 @@ async def update_template(
     group_by: Optional[str] = Form(None),
     skip_rows: Optional[int] = Form(None),
     name_field: Optional[str] = Form(None),
+    show_empty_period: Optional[bool] = Form(None),
     db: Session = Depends(get_db),
     _admin: User = Depends(require_admin),
 ):
@@ -590,6 +594,8 @@ async def update_template(
         tpl.name_field = str(form.get('name_field', ''))
     elif name_field is not None:
         tpl.name_field = name_field
+    if show_empty_period is not None:
+        tpl.show_empty_period = show_empty_period
 
     db.commit()
     db.refresh(tpl)
@@ -740,6 +746,14 @@ async def generate_report(
         if not task_ids:
             raise HTTPException(status_code=400, detail="所选薪资周期范围内没有已完成的计算任务")
 
+        # 构建 task_id → (salary_year, salary_month) 映射，用于自动补月份列
+        task_ym_map = {}
+        for ym_key, t_obj in last_per_month.items():
+            task_ym_map[t_obj.id] = ym_key  # (year, month)
+        # 当前任务也加入映射
+        if task_id not in task_ym_map and task.salary_year and task.salary_month:
+            task_ym_map[task_id] = (task.salary_year, task.salary_month)
+
         assets = (
             db.query(DataAsset)
             .filter(
@@ -766,8 +780,11 @@ async def generate_report(
 
     # 4. 从 DB parsed_data 读取数据（优先），无 parsed_data 时回退到读文件
     #    只取 sheet0 的数据作为 dt
+    #    use_history 模式下自动补 salary_year / salary_month / 月份 列
+    is_multi_month = use_history and period_from and period_to
     all_dfs = []
     for asset in assets:
+        asset_dfs = []
         if asset.parsed_data:
             # parsed_data: [{"sheet_name": "...", "regions": [...]}, ...]
             # 只取第一个 sheet
@@ -782,7 +799,7 @@ async def generate_report(
                     mapped_rows = [{col_map.get(c, c): val for c, val in row.items()} for row in data_rows]
                     df = pd.DataFrame(mapped_rows)
                     if not df.empty:
-                        all_dfs.append(df)
+                        asset_dfs.append(df)
         elif os.path.exists(asset.file_path):
             # 回退：从文件读取，只取第一个 sheet
             try:
@@ -790,14 +807,47 @@ async def generate_report(
                 if sheets:
                     first_df = list(sheets.values())[0]
                     if not first_df.empty:
-                        all_dfs.append(first_df)
+                        asset_dfs.append(first_df)
             except Exception as e:
                 logger.warning(f"读取结果文件失败 {asset.file_path}: {e}")
+
+        # 多月合并时，自动补 salary_year / salary_month / 月份 列
+        if is_multi_month and asset_dfs and asset.source_task_id in task_ym_map:
+            y, m = task_ym_map[asset.source_task_id]
+            for df in asset_dfs:
+                if "salary_year" not in df.columns:
+                    df["salary_year"] = y
+                if "salary_month" not in df.columns:
+                    df["salary_month"] = m
+                if "月份" not in df.columns:
+                    df["月份"] = f"{m}月"
+
+        all_dfs.extend(asset_dfs)
 
     if not all_dfs:
         raise HTTPException(status_code=400, detail="无法读取计算结果数据")
 
     dataset = pd.concat(all_dfs, ignore_index=True) if len(all_dfs) > 1 else all_dfs[0]
+
+    # 多月合并时：show_empty_period 补齐缺失月份的空行
+    show_empty = getattr(tpl, "show_empty_period", True)
+    if is_multi_month and show_empty and "月份" in dataset.columns:
+        # 生成完整月份列表
+        all_months = []
+        cy, cm = from_y, from_m
+        while cy * 100 + cm <= to_y * 100 + to_m:
+            all_months.append(f"{cm}月")
+            cm += 1
+            if cm > 12:
+                cm = 1
+                cy += 1
+        existing_months = set(dataset["月份"].unique())
+        for month_label in all_months:
+            if month_label not in existing_months:
+                empty_row = {col: None for col in dataset.columns}
+                empty_row["月份"] = month_label
+                dataset = pd.concat([dataset, pd.DataFrame([empty_row])], ignore_index=True)
+                logger.info(f"[多月合并] 补齐空月份: {month_label}")
 
     # 5. 构建模版数据字典
     #    - "DataSource" = 完整数据集（模版中写 &=DataSource.列名）
@@ -855,6 +905,7 @@ async def generate_report(
     group_by_field = getattr(tpl, "group_by", "") or ""
     skip_rows_val = getattr(tpl, "skip_rows", 1) or 1
     name_field_val = getattr(tpl, "name_field", "") or ""
+    show_empty = getattr(tpl, "show_empty_period", True)
 
     # zip 模式输出 .zip，其余输出原始扩展名
     if report_mode == "zip":
@@ -880,6 +931,7 @@ async def generate_report(
             group_by=group_by_field,
             skip_rows=skip_rows_val,
             name_field=name_field_val,
+            show_empty_period=show_empty,
         )
     except Exception as e:
         logger.error(f"报表生成失败: {e}")

@@ -96,6 +96,7 @@ class Template(Base):
     group_by = Column(String(100), default="")                           # block/zip 分组字段名
     skip_rows = Column(Integer, default=1)                               # block 块间空行数
     name_field = Column(String(100), default="")                         # zip 文件命名字段
+    show_empty_period = Column(Boolean, default=True)                    # 多月合并时是否显示空月份
     is_active = Column(Boolean, default=True)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)

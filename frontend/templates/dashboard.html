@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DataMerge - 首页</title>
+    <link rel="stylesheet" href="/static/css/dashboard.css?v=20260325">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="header-left">
+                <nav class="nav-links">
+                    <a href="/dashboard" class="active">首页</a>
+                    <a href="/rules">规则</a>
+                    <a href="/training">智训</a>
+                    <a href="/compute">智算</a>
+                    <a href="/admin" id="nav-admin" style="display:none;">管理</a>
+                </nav>
+            </div>
+            <div class="user-info" id="user-info"></div>
+        </header>
+
+        <div class="main-content">
+            <div class="dashboard-header">
+                <h2>租户计算总览</h2>
+                <div class="dashboard-summary" id="dashboard-summary"></div>
+            </div>
+            <div class="loading-indicator" id="loading-indicator">
+                <div class="spinner"></div>
+                <span>加载中...</span>
+            </div>
+            <div class="tenant-grid" id="tenant-grid"></div>
+            <div class="empty-state" id="empty-state" style="display:none;">
+                <p>暂无可访问的租户</p>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/auth.js"></script>
+    <script src="/static/js/dashboard.js?v=20260325"></script>
+</body>
+</html>

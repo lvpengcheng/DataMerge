@@ -696,8 +696,10 @@ const Admin = {
                     <div class="form-group" id="m-tpl-name-field-group" style="display:none;"><label>文件命名字段</label>
                         <input id="m-tpl-name-field" placeholder="如: 姓名（用于 zip 内文件名）" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
                     </div>
+                    <div class="form-group" id="m-tpl-show-empty-group"><label style="display:flex;align-items:center;gap:6px;">
+                        <input id="m-tpl-show-empty" type="checkbox" checked> 显示空月份（多月合并时补齐无数据的月份）
+                    </label></div>
                 </div>
-            </div>
         `, async () => {
             const fileInput = document.getElementById('m-tpl-file');
             if (!fileInput.files.length) return alert('请选择模版文件');
@@ -716,6 +718,7 @@ const Admin = {
             fd.append('group_by', document.getElementById('m-tpl-group-by')?.value || '');
             fd.append('skip_rows', document.getElementById('m-tpl-skip-rows')?.value || '1');
             fd.append('name_field', document.getElementById('m-tpl-name-field')?.value || '');
+            fd.append('show_empty_period', document.getElementById('m-tpl-show-empty')?.checked ? 'true' : 'false');
             const resp = await AUTH.authFetch('/api/admin/templates', { method: 'POST', body: fd });
             if (resp.ok) { this.closeModal(); this.loadTemplates(); }
             else { const e = await resp.json(); alert(e.detail || '创建失败'); }
@@ -773,8 +776,10 @@ const Admin = {
                     <div class="form-group" id="m-tpl-name-field-group" style="display:${t.report_mode==='zip'?'block':'none'};"><label>文件命名字段</label>
                         <input id="m-tpl-name-field" value="${t.name_field || ''}" placeholder="如: 姓名（用于 zip 内文件名）" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
                     </div>
+                    <div class="form-group" id="m-tpl-show-empty-group"><label style="display:flex;align-items:center;gap:6px;">
+                        <input id="m-tpl-show-empty" type="checkbox" ${t.show_empty_period !== false ? 'checked' : ''}> 显示空月份（多月合并时补齐无数据的月份）
+                    </label></div>
                 </div>
-            </div>
         `, async () => {
             const fd = new FormData();
             const fileInput = document.getElementById('m-tpl-file');
@@ -790,6 +795,7 @@ const Admin = {
             fd.append('group_by', document.getElementById('m-tpl-group-by')?.value || '');
             fd.append('skip_rows', document.getElementById('m-tpl-skip-rows')?.value || '1');
             fd.append('name_field', document.getElementById('m-tpl-name-field')?.value || '');
+            fd.append('show_empty_period', document.getElementById('m-tpl-show-empty')?.checked ? 'true' : 'false');
             const resp = await AUTH.authFetch(`/api/admin/templates/${id}`, { method: 'PUT', body: fd });
             if (resp.ok) { this.closeModal(); this.loadTemplates(); }
             else { const e = await resp.json(); alert(e.detail || '更新失败'); }

@@ -33,6 +33,7 @@ from ..api.assets import router as assets_router
 from ..api.training import router as training_api_router
 from ..api.compute import router as compute_api_router
 from ..api.rules import router as rules_api_router
+from ..api.dashboard import router as dashboard_api_router
 from ..database.connection import engine, get_db, SessionLocal
 from ..database import models as db_models
 from ..auth.dependencies import get_current_user, get_accessible_tenants
@@ -67,6 +68,7 @@ app.include_router(assets_router)
 app.include_router(training_api_router)
 app.include_router(compute_api_router)
 app.include_router(rules_api_router)
+app.include_router(dashboard_api_router)
 
 
 # ==================== 文件加密检测 API ====================
@@ -674,10 +676,148 @@ async def train_model(
         raise HTTPException(status_code=500, detail=f"训练失败: {str(e)}")
 
 
+async def _handle_direct_import(
+    tenant_id: str,
+    source_files: List[UploadFile],
+):
+    """直接导入模式：源文件即输出文件，跳过AI训练，直接保存到租户目录"""
+    import shutil as _shutil
+
+    async def stream_direct_import():
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            # 1. 发送开始消息
+            yield f"data: {json.dumps({'type': 'status', 'message': '直接导入模式 - 开始保存文件'}, ensure_ascii=False)}\n\n"
+
+            # 2. 保存源文件到租户目录
+            tenant_dir = storage_manager.get_tenant_dir(tenant_id)
+            training_dir = tenant_dir / "training"
+            source_dir = training_dir / "source"
+            logs_dir = tenant_dir / "training_logs"
+            for d in [training_dir, source_dir, logs_dir]:
+                d.mkdir(parents=True, exist_ok=True)
+
+            saved_paths = []
+            for sf in source_files:
+                dest = source_dir / sf.filename
+                content = await sf.read()
+                with open(dest, "wb") as f:
+                    f.write(content)
+                saved_paths.append(str(dest))
+
+                # 同时复制到 training_logs 作为输出
+                log_dest = logs_dir / f"{ts}_output_{sf.filename}"
+                _shutil.copy2(str(dest), str(log_dest))
+
+                yield f"data: {json.dumps({'type': 'log', 'message': f'已保存: {sf.filename}'}, ensure_ascii=False)}\n\n"
+
+            # 3. 创建通透脚本（直接复制源文件到输出）
+            passthrough_code = '''"""直接导入模式 - 源文件即输出文件，无需数据转换"""
+import shutil
+import os
+import glob
+
+def main(source_dir, output_dir, **kwargs):
+    """直接复制源文件到输出目录"""
+    os.makedirs(output_dir, exist_ok=True)
+    files = glob.glob(os.path.join(source_dir, "*.xls*"))
+    for src in files:
+        dest = os.path.join(output_dir, os.path.basename(src))
+        shutil.copy2(src, dest)
+        print(f"直接导入: {os.path.basename(src)}")
+    return {"success": True, "files": [os.path.basename(f) for f in files]}
+'''
+            script_info = storage_manager.save_script(
+                tenant_id,
+                passthrough_code,
+                {
+                    "success": True,
+                    "best_score": 1.0,
+                    "total_iterations": 0,
+                    "best_code": passthrough_code,
+                    "mode": "direct",
+                },
+                {}  # 无模板 schema
+            )
+            script_id = script_info.get("script_id")
+
+            yield f"data: {json.dumps({'type': 'log', 'message': f'脚本已保存: {script_id}'}, ensure_ascii=False)}\n\n"
+
+            # 4. 写入 training_summary.json
+            summary = {
+                "best_score": 1.0,
+                "script_id": script_id,
+                "training_mode": "direct",
+                "last_training": ts,
+                "source_files": [sf.filename for sf in source_files],
+            }
+            summary_path = logs_dir / "training_summary.json"
+            with open(summary_path, "w", encoding="utf-8") as f:
+                json.dump(summary, f, ensure_ascii=False, indent=2)
+
+            # 5. 写入 DB 记录（如果有持久层）
+            try:
+                from ..api.training_persistence import TrainingPersistence
+                db_session = SessionLocal()
+                try:
+                    persistence = TrainingPersistence(db_session)
+                    session = persistence.create_session(
+                        tenant_id=tenant_id,
+                        mode="direct",
+                        config={"direct_import": True, "source_files": [sf.filename for sf in source_files]},
+                    )
+                    persistence.complete_session(
+                        session_id=session.id,
+                        success=True,
+                        best_accuracy=1.0,
+                        script_id=script_id,
+                    )
+                    db_session.commit()
+                finally:
+                    db_session.close()
+            except Exception as db_err:
+                logger.warning(f"直接导入 DB 记录失败（不影响功能）: {db_err}")
+
+            # 6. 发送完成消息
+            final_result = {
+                "type": "complete",
+                "success": True,
+                "data": {
+                    "script_id": script_id,
+                    "iterations": 0,
+                    "final_accuracy": 1.0,
+                    "tenant_id": tenant_id,
+                    "status": "completed",
+                    "training_result": {
+                        "success": True,
+                        "best_score": 1.0,
+                        "total_iterations": 0,
+                        "mode": "direct",
+                    }
+                }
+            }
+            yield f"data: {json.dumps(final_result, ensure_ascii=False)}\n\n"
+
+        except Exception as e:
+            logger.error(f"直接导入失败: {e}", exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        stream_direct_import(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+
 @app.post("/api/train/stream")
 async def train_model_stream(
     tenant_id: str = Form(...),
-    rule_files: List[UploadFile] = File(...),
+    rule_files: List[UploadFile] = File(default=[]),
     source_files: List[UploadFile] = File(...),
     expected_result: Optional[UploadFile] = File(None),
     target_file: Optional[UploadFile] = File(None),
@@ -707,12 +847,15 @@ async def train_model_stream(
             - True: 清除所有历史训练数据和最佳代码，从头开始全新训练
     """
     try:
-        logger.info(f"开始流式训练，租户: {tenant_id}")
+        logger.info(f"开始流式训练，租户: {tenant_id}, 模式: {mode}")
+
+        # 直接导入模式：不需要 target_file 和 rule_files
+        is_direct = (mode == "direct")
 
         # 兼容前端字段名：target_file 和 expected_result 二选一
         if expected_result is None and target_file is not None:
             expected_result = target_file
-        if expected_result is None:
+        if not is_direct and expected_result is None:
             raise HTTPException(status_code=400, detail="缺少预期结果文件（expected_result 或 target_file）")
 
         # 获取租户的训练锁
@@ -734,6 +877,12 @@ async def train_model_stream(
             except Exception:
                 pass
 
+        if is_direct:
+            # ============ 直接导入模式 ============
+            # 源文件即输出文件，跳过训练，直接保存
+            return await _handle_direct_import(tenant_id, source_files)
+
+        # ============ 正常训练模式 ============
         # 保存上传的文件
         saved_files = await _save_uploaded_files(
             tenant_id, rule_files, source_files, expected_result,
@@ -4450,6 +4599,16 @@ async def download_compute_result(tenant_id: str, filename: str):
 
 # ==================== 前端页面路由 ====================
 
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_page():
+    """首页 - Dashboard"""
+    _frontend_dir = Path(__file__).resolve().parent.parent.parent / "frontend"
+    template_file = _frontend_dir / "templates" / "dashboard.html"
+    if template_file.exists():
+        return HTMLResponse(content=template_file.read_text(encoding="utf-8"))
+    raise HTTPException(status_code=404, detail="首页未找到")
+
+
 @app.get("/training", response_class=HTMLResponse)
 async def training_page():
     """训练可视化页面"""
@@ -4462,12 +4621,12 @@ async def training_page():
 
 @app.get("/", response_class=HTMLResponse)
 async def index_page():
-    """首页 - 返回训练页面"""
+    """首页 - 重定向到Dashboard"""
     _frontend_dir = Path(__file__).resolve().parent.parent.parent / "frontend"
-    template_file = _frontend_dir / "templates" / "training.html"
+    template_file = _frontend_dir / "templates" / "dashboard.html"
     if template_file.exists():
         return HTMLResponse(content=template_file.read_text(encoding="utf-8"))
-    return HTMLResponse(content="<h1>DataMerge - 请访问 <a href='/training'>训练页面</a></h1>")
+    return HTMLResponse(content="<h1>DataMerge - 请访问 <a href='/dashboard'>首页</a></h1>")
 
 
 @app.get("/compute", response_class=HTMLResponse)

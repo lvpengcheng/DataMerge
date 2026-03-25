@@ -109,8 +109,7 @@ async function _autoCheckEncryption(filesToCheck) {
     } finally {
         _encryptionCheckInProgress = false;
         if (btn) {
-            btn.disabled = false;
-            btn.textContent = '开始训练';
+            _resetTrainingBtn();
         }
     }
 }
@@ -183,7 +182,43 @@ document.addEventListener('DOMContentLoaded', function() {
             updateFileList('rule-files', 'rule-file-list');
         });
     }
+
+    // 模式切换：直接导入模式隐藏不需要的字段
+    const modeSelect = document.getElementById('mode');
+    if (modeSelect) {
+        modeSelect.addEventListener('change', _toggleDirectMode);
+        _toggleDirectMode();  // 初始化
+    }
 });
+
+function _resetTrainingBtn() {
+    const btn = document.getElementById('start-training-btn');
+    if (btn) {
+        btn.disabled = false;
+        const mode = document.getElementById('mode').value;
+        btn.textContent = mode === 'direct' ? '直接导入' : '开始训练';
+    }
+}
+function _toggleDirectMode() {
+    const mode = document.getElementById('mode').value;
+    const isDirect = mode === 'direct';
+
+    // 需要隐藏的字段组 ID 列表
+    const hideIds = ['target-file', 'rule-files', 'ai-provider', 'max-iterations', 'force-retrain'];
+    hideIds.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) {
+            const group = el.closest('.form-group');
+            if (group) group.style.display = isDirect ? 'none' : '';
+        }
+    });
+
+    // 更新按钮文字
+    const btn = document.getElementById('start-training-btn');
+    if (btn && !btn.disabled) {
+        btn.textContent = isDirect ? '直接导入' : '开始训练';
+    }
+}
 
 // 初始化表单
 function initializeForm() {
@@ -492,8 +527,12 @@ async function startTraining() {
     const maxIterations = parseInt(document.getElementById('max-iterations').value);
     const forceRetrain = document.getElementById('force-retrain').checked;
 
-    if (!tenantId || sourceFiles.length === 0 || !targetFile) {
-        alert('请填写所有必填项');
+    if (!tenantId || sourceFiles.length === 0) {
+        alert('请填写租户ID并选择源文件');
+        return;
+    }
+    if (mode !== 'direct' && !targetFile) {
+        alert('请选择目标文件（直接导入模式除外）');
         return;
     }
 
@@ -522,8 +561,10 @@ async function startTraining() {
     formData.append('max_iterations', maxIterations);
     formData.append('force_retrain', forceRetrain);
     Array.from(sourceFiles).forEach(file => formData.append('source_files', file));
-    formData.append('target_file', targetFile);
-    Array.from(ruleFiles).forEach(file => formData.append('rule_files', file));
+    if (mode !== 'direct') {
+        if (targetFile) formData.append('target_file', targetFile);
+        Array.from(ruleFiles).forEach(file => formData.append('rule_files', file));
+    }
 
     // 添加可选参数
     const salaryMonth = document.getElementById('salary-month').value.trim();
@@ -554,8 +595,8 @@ async function startTraining() {
     trainingStartTime = Date.now();
     startTimer();
 
-    addLog('info', '开始训练...');
-    addLog('info', `租户: ${tenantId}  模型: ${aiProvider}  模式: ${mode}  最大迭代: ${maxIterations}`);
+    addLog('info', mode === 'direct' ? '开始直接导入...' : '开始训练...');
+    addLog('info', `租户: ${tenantId}  模式: ${mode}${mode !== 'direct' ? '  模型: ' + aiProvider + '  最大迭代: ' + maxIterations : ''}`);
 
     try {
         const response = await AUTH.authFetch('/api/train/stream', {
@@ -574,8 +615,7 @@ async function startTraining() {
                 const passwords = await _promptFilePasswords(errorData.encrypted_files);
                 if (!passwords) {
                     addLog('info', '用户取消了密码输入');
-                    document.getElementById('start-training-btn').disabled = false;
-                    document.getElementById('start-training-btn').textContent = '开始训练';
+                    _resetTrainingBtn();
                     return;
                 }
                 // 用密码重新提交
@@ -742,8 +782,7 @@ function completeTraining(success, data) {
         showError(data.message || '训练过程中发生错误');
     }
 
-    document.getElementById('start-training-btn').disabled = false;
-    document.getElementById('start-training-btn').textContent = '开始训练';
+    _resetTrainingBtn();
 
     // 刷新
     const tenantId = document.getElementById('tenant-input').value.trim();
@@ -870,8 +909,7 @@ function clearResultSection() {
 
 function resetTraining() {
     clearResultSection();
-    document.getElementById('start-training-btn').disabled = false;
-    document.getElementById('start-training-btn').textContent = '开始训练';
+    _resetTrainingBtn();
     resetProgress();
 }
 

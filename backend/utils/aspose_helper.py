@@ -702,6 +702,7 @@ def generate_from_template(
     group_by: str = "",
     skip_rows: int = 1,
     name_field: str = "",
+    show_empty_period: bool = True,
 ) -> str:
     """
     使用 Aspose WorkbookDesigner（SmartMarker 引擎）填充模板生成文件。
@@ -733,12 +734,14 @@ def generate_from_template(
             output_path, template_path, data,
             group_by=group_by, skip_rows=skip_rows,
             password=password, watermark_text=watermark_text,
+            show_empty_period=show_empty_period,
         )
     elif mode == "zip":
         return _generate_zip(
             output_path, template_path, data,
             group_by=group_by, name_field=name_field,
             password=password, watermark_text=watermark_text,
+            show_empty_period=show_empty_period,
         )
     else:
         return _generate_fill(
@@ -814,6 +817,7 @@ def _generate_block(
     output_path: str, template_path: str, data: Dict,
     group_by: str = "", skip_rows: int = 1,
     password: Optional[str] = None, watermark_text: Optional[str] = None,
+    show_empty_period: bool = True,
 ) -> str:
     """按 group_by 分组，每组用 SmartMarker 填充模板，合并到一个文件。"""
     # 找到主数据源（非 $ 开头的第一个 DataFrame）
@@ -833,7 +837,9 @@ def _generate_block(
 
     for group_idx, (group_key, group_df) in enumerate(groups):
         group_df = group_df.reset_index(drop=True)
-        group_data = {ds_name: group_df, **vars_data}
+        # 从分组数据首行自动提取 $变量（覆盖全局同名变量）
+        group_vars = _extract_group_vars(group_df, vars_data)
+        group_data = {ds_name: group_df, **group_vars}
 
         # SmartMarker 填充该组
         filled_wb = _smartmarker_fill(template_path, group_data)
@@ -869,6 +875,7 @@ def _generate_zip(
     output_path: str, template_path: str, data: Dict,
     group_by: str = "", name_field: str = "",
     password: Optional[str] = None, watermark_text: Optional[str] = None,
+    show_empty_period: bool = True,
 ) -> str:
     """按 group_by 分组，每组生成独立 xlsx，打包为 zip。"""
     ds_name, full_df, vars_data = _extract_datasource(data)
@@ -887,7 +894,9 @@ def _generate_zip(
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for group_idx, (group_key, group_df) in enumerate(groups):
             group_df = group_df.reset_index(drop=True)
-            group_data = {ds_name: group_df, **vars_data}
+            # 从分组数据首行自动提取 $变量（覆盖全局同名变量）
+            group_vars = _extract_group_vars(group_df, vars_data)
+            group_data = {ds_name: group_df, **group_vars}
 
             filled_wb = _smartmarker_fill(template_path, group_data)
 
@@ -949,6 +958,34 @@ def _extract_datasource(data: Dict):
         raise ValueError("data 中未找到 DataFrame 数据源")
 
     return ds_name, full_df, vars_data
+
+
+def _extract_group_vars(group_df: pd.DataFrame, global_vars: Dict) -> Dict:
+    """从分组 DataFrame 首行提取 $变量，用于 block/zip 模式。
+
+    逻辑：
+    1. 以全局 vars_data 为基础（复制一份）
+    2. 遍历 group_df 的列名，如果全局存在同名 $变量（$col_name），
+       则用该组首行的实际值覆盖
+    3. 这样模版中的 &=$month 等变量会自动取到当前分组对应的值
+
+    例: 全局 $month="03"，但当前分组首行 salary_month=1 → $salary_month="1"
+        全局 $tenant="XXX"，分组中无 tenant 列 → 保持 $tenant="XXX"
+    """
+    result = dict(global_vars)  # 复制全局变量作为基础
+
+    if group_df.empty:
+        return result
+
+    first_row = group_df.iloc[0]
+    for col in group_df.columns:
+        var_key = f"${col}"
+        # 将分组首行的列值作为 $变量，覆盖全局同名变量
+        val = first_row[col]
+        if val is not None and str(val).strip() != "":
+            result[var_key] = str(val)
+
+    return result
 
 
 def _fill_template_data(wb, name: str, df: pd.DataFrame) -> None:

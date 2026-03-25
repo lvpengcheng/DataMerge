@@ -115,6 +115,7 @@ def _migrate_add_columns():
     migrations = [
         ("compute_tasks", "salary_year", "INTEGER"),
         ("compute_tasks", "salary_month", "INTEGER"),
+        ("templates", "show_empty_period", "BOOLEAN DEFAULT TRUE"),
     ]
 
     with engine.connect() as conn:
