@@ -633,6 +633,7 @@ async def start_training(
     ai_provider: str = Form("deepseek"),
     mode: str = Form("formula"),
     salary_year_month: Optional[str] = Form(None),
+    monthly_standard_hours: Optional[float] = Form(None),
     manual_headers: Optional[str] = Form(None),
     force_retrain: bool = Form(False),
     session_id: Optional[int] = Form(None),  # 传入已有 session_id 则继续
@@ -765,6 +766,7 @@ async def start_training(
                     "ai_provider": ai_provider,
                     "salary_year": salary_year,
                     "salary_month": salary_month,
+                    "monthly_standard_hours": monthly_standard_hours,
                     "manual_headers": manual_headers_dict,
                 }
                 ts = persistence.create_session(
@@ -1028,6 +1030,7 @@ def main(source_dir, output_dir, **kwargs):
                 iteration_num,
                 salary_year=salary_year,
                 salary_month=salary_month,
+                monthly_standard_hours=monthly_standard_hours,
                 pre_loaded_source_data=_full_source_data,
             )
 
@@ -1375,6 +1378,7 @@ async def send_message(
                 iteration_num,
                 salary_year=config.get("salary_year"),
                 salary_month=config.get("salary_month"),
+                monthly_standard_hours=config.get("monthly_standard_hours"),
                 pre_loaded_source_data=_full_source_data,
             )
 
@@ -1614,8 +1618,9 @@ async def upload_code(
         config.get("source_dir", ""),
         config.get("expected_file", ""),
         iteration_num,
-        config.get("salary_year"),
-        config.get("salary_month"),
+        salary_year=config.get("salary_year"),
+        salary_month=config.get("salary_month"),
+        monthly_standard_hours=config.get("monthly_standard_hours"),
     )
 
     from ..api.training_persistence import TrainingPersistence

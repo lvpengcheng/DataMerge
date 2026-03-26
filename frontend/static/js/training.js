@@ -660,6 +660,7 @@ function _startTraining(userText) {
     const aiProvider = document.getElementById('ai-provider').value;
     const mode = document.getElementById('mode').value;
     const salaryMonth = document.getElementById('salary-month').value.trim();
+    const standardHours = document.getElementById('standard-hours').value.trim();
 
     const formData = new FormData();
     formData.append('tenant_id', _currentTenantId);
@@ -671,6 +672,7 @@ function _startTraining(userText) {
     formData.append('ai_provider', aiProvider);
     formData.append('mode', mode);
     if (salaryMonth) formData.append('salary_year_month', salaryMonth);
+    if (standardHours) formData.append('monthly_standard_hours', standardHours);
     const manualHeaders = document.getElementById('manual-headers').value.trim();
     if (manualHeaders) formData.append('manual_headers', manualHeaders);
     if (_currentSessionId) formData.append('session_id', _currentSessionId);
