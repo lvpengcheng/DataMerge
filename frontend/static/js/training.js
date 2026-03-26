@@ -1,1264 +1,1380 @@
-// 全局变量
-let trainingStartTime = null;
-let timerInterval = null;
-let eventSource = null;
-let tenantListData = [];
-let trainingHistoryData = {};
-let codeStreamBuffer = '';
-let _filePasswordsMap = null;  // 文件名→密码映射
-let _encryptionCheckInProgress = false;  // 加密检测进行中
-
 /**
- * 弹出密码输入对话框，为加密文件输入密码
- * @param {string[]} encryptedFiles - 加密文件名列表
- * @returns {Promise<object|null>} 文件名→密码映射，取消返回null
+ * 智训页面 JS — 对话式训练
  */
+
+// ==================== 状态 ====================
+let _currentTenantId = null;
+let _currentSessionId = null;
+let _sessions = [];
+let _chatMessages = [];
+let _isStreaming = false;
+let _currentAccuracy = null;
+let _currentCode = null;
+let _filePasswordsMap = {};
+let _chatStreamEl = null;   // AI 对话流式输出的 DOM 元素
+let _chatStreamBuf = '';    // AI 对话流式输出的文本缓冲
+
+// ==================== 初始化 ====================
+document.addEventListener('DOMContentLoaded', function () {
+    AUTH.requireAuth();
+    AUTH.renderUserInfo(document.querySelector('header'));
+    if (AUTH.isAdmin()) {
+        const el = document.getElementById('nav-admin');
+        if (el) el.style.display = '';
+    }
+
+    // 租户输入框
+    const tenantInput = document.getElementById('tenant-input');
+    tenantInput.addEventListener('focus', () => _showTenantDropdown());
+    tenantInput.addEventListener('input', () => {
+        _filterTenantDropdown();
+        // 同步手动输入的值到 _currentTenantId
+        _currentTenantId = tenantInput.value.trim() || null;
+    });
+    document.addEventListener('click', (e) => {
+        const combo = document.getElementById('tenant-combo');
+        if (!combo.contains(e.target)) {
+            document.getElementById('tenant-dropdown').style.display = 'none';
+        }
+    });
+
+    // 文件监听
+    document.getElementById('source-files').addEventListener('change', function () {
+        _renderFileList('source-file-list', this.files);
+        _checkEncryption(Array.from(this.files));
+        _updateAttachBadge();
+    });
+    document.getElementById('target-file').addEventListener('change', function () {
+        _renderFileList('target-file-list', this.files);
+        _checkEncryption(Array.from(this.files));
+        _updateAttachBadge();
+    });
+    document.getElementById('rule-files').addEventListener('change', function () {
+        _renderFileList('rule-file-list', this.files);
+        _updateAttachBadge();
+    });
+
+    // 加载租户列表
+    _loadTenants();
+});
+
+// ==================== 租户列表 ====================
+let _tenantList = [];
+
+async function _loadTenants() {
+    try {
+        const resp = await AUTH.authFetch('/api/tenants');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        _tenantList = data.tenants || data || [];
+    } catch (e) {
+        console.warn('加载租户列表失败:', e);
+    }
+}
+
+function _showTenantDropdown() {
+    _filterTenantDropdown();
+    document.getElementById('tenant-dropdown').style.display = 'block';
+}
+
+function _filterTenantDropdown() {
+    const input = document.getElementById('tenant-input');
+    const dropdown = document.getElementById('tenant-dropdown');
+    const filter = input.value.trim().toLowerCase();
+
+    const filtered = _tenantList.filter(t => {
+        const id = (t.tenant_id || t.name || '').toLowerCase();
+        return !filter || id.includes(filter);
+    });
+
+    dropdown.innerHTML = filtered.map(t => {
+        const tid = t.tenant_id || t.name || '';
+        const score = t.best_score;
+        const scoreHtml = score != null
+            ? `<span class="combo-score">${(score * 100).toFixed(0)}%</span>`
+            : `<span class="combo-score untrained">未训练</span>`;
+        return `<div class="combo-item" onclick="_selectTenant('${tid}')">
+            <span class="combo-id">${tid}</span>
+            ${scoreHtml}
+        </div>`;
+    }).join('');
+
+    if (filtered.length === 0) {
+        dropdown.innerHTML = '<div style="padding:10px;color:#999;text-align:center;font-size:13px;">无匹配租户</div>';
+    }
+    dropdown.style.display = 'block';
+}
+
+function _selectTenant(tenantId) {
+    document.getElementById('tenant-input').value = tenantId;
+    document.getElementById('tenant-dropdown').style.display = 'none';
+    _currentTenantId = tenantId;
+    _currentSessionId = null;
+    _chatMessages = [];
+    _currentAccuracy = null;
+    _currentCode = null;
+    _clearChatUI();
+    _hideActionButtons();
+    loadSessions();
+}
+
+// ==================== 会话管理 ====================
+async function loadSessions() {
+    if (!_currentTenantId) return;
+    try {
+        const resp = await AUTH.authFetch(`/api/training/chat/sessions?tenant_id=${encodeURIComponent(_currentTenantId)}`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        _sessions = data.sessions || [];
+        _renderSessionList();
+    } catch (e) {
+        console.warn('加载会话列表失败:', e);
+    }
+}
+
+function _renderSessionList() {
+    const container = document.getElementById('session-list');
+    const emptyHint = document.getElementById('session-list-empty');
+    container.querySelectorAll('.session-item').forEach(el => el.remove());
+
+    if (_sessions.length === 0) {
+        if (emptyHint) {
+            emptyHint.style.display = '';
+            emptyHint.textContent = '暂无训练记录，点击 "+ 新建" 开始';
+        }
+        return;
+    }
+    if (emptyHint) emptyHint.style.display = 'none';
+
+    _sessions.forEach(s => {
+        const div = document.createElement('div');
+        div.className = 'session-item' + (s.id === _currentSessionId ? ' active' : '');
+        div.onclick = () => selectSession(s.id);
+
+        const titleRow = document.createElement('div');
+        titleRow.className = 'session-item-title-row';
+
+        const title = document.createElement('div');
+        title.className = 'session-item-title';
+        // 显示版本号（session_key，格式 {tenant_id}_yyyyMMddHHmmss 或自定义名称）
+        const versionLabel = s.session_key || '';
+        const time = s.started_at ? new Date(s.started_at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
+        title.textContent = versionLabel || `${s.mode || 'formula'} - ${time}`;
+        title.title = `版本: ${versionLabel} | 会话 #${s.id}`;
+
+        // 重命名按钮
+        const renameBtn = document.createElement('button');
+        renameBtn.className = 'session-item-rename';
+        renameBtn.innerHTML = '&#x270E;';  // ✎
+        renameBtn.title = '重命名';
+        renameBtn.onclick = (e) => {
+            e.stopPropagation();
+            _renameSession(s.id, versionLabel);
+        };
+
+        titleRow.appendChild(title);
+        titleRow.appendChild(renameBtn);
+
+        const meta = document.createElement('div');
+        meta.className = 'session-item-meta';
+
+        const accSpan = document.createElement('span');
+        accSpan.className = 'session-item-accuracy';
+        accSpan.textContent = s.best_accuracy != null ? `${(s.best_accuracy * 100).toFixed(1)}%` : '—';
+
+        const statusSpan = document.createElement('span');
+        statusSpan.className = `session-item-status ${s.status}`;
+        statusSpan.textContent = _statusText(s.status);
+
+        const iterSpan = document.createElement('span');
+        iterSpan.style.cssText = 'font-size:11px;color:#999;';
+        iterSpan.textContent = `${s.total_iterations || 0}轮`;
+
+        meta.appendChild(accSpan);
+        meta.appendChild(statusSpan);
+        meta.appendChild(iterSpan);
+
+        const delBtn = document.createElement('button');
+        delBtn.className = 'session-item-delete';
+        delBtn.innerHTML = '&#x2715;';
+        delBtn.title = '删除';
+        delBtn.onclick = (e) => { e.stopPropagation(); deleteSession(s.id); };
+
+        div.appendChild(titleRow);
+        div.appendChild(meta);
+        div.appendChild(delBtn);
+        container.appendChild(div);
+    });
+}
+
+function _statusText(status) {
+    const map = { running: '进行中', completed: '已完成', failed: '失败', cancelled: '已取消' };
+    return map[status] || status || '';
+}
+
+function createNewSession() {
+    // 允许手动输入租户名称
+    if (!_currentTenantId) {
+        const typed = document.getElementById('tenant-input').value.trim();
+        if (typed) {
+            _currentTenantId = typed;
+        } else {
+            alert('请先输入或选择租户');
+            return;
+        }
+    }
+    _currentSessionId = null;
+    _chatMessages = [];
+    _currentAccuracy = null;
+    _currentCode = null;
+    _clearChatUI();
+    _hideActionButtons();
+    _highlightActiveSession();
+    document.getElementById('chat-title').textContent = '新训练';
+    document.getElementById('chat-status').textContent = '';
+    document.getElementById('chat-status').className = 'chat-status';
+
+    // 提示用户上传文件
+    _addSystemMessage('请通过左下角 📎 上传源文件和目标文件，然后发送消息开始训练。');
+}
+
+async function selectSession(sessionId) {
+    if (_isStreaming) return;
+    try {
+        const resp = await AUTH.authFetch(`/api/training/chat/sessions/${sessionId}/messages`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+
+        _currentSessionId = data.session.id;
+        _currentAccuracy = data.current_accuracy;
+        _currentCode = data.current_code;
+        // 从会话数据同步租户，防止 _currentTenantId 丢失
+        if (data.session.tenant_id) {
+            _currentTenantId = data.session.tenant_id;
+        }
+
+        _clearChatUI();
+
+        // 显示原始训练文件信息
+        _showSessionFilesInfo(data);
+
+        // 合并消息 + 迭代记录，构建完整时间线
+        _renderFullHistory(data.messages || [], data.iterations || []);
+
+        // 显示历史训练产物的下载按钮（脚本/输出/差异 + 提示词）
+        const latestFiles = data.latest_files || {};
+        const hasAnyFile = latestFiles.script_file || latestFiles.output_file || latestFiles.diff_file;
+        if (hasAnyFile || data.has_rules || data.session.total_iterations > 0) {
+            _showHistoryDownloadBar(_currentSessionId, latestFiles, data.has_rules);
+        }
+
+        // 如果训练文件存在且准确率未达100%，显示"分析差异"操作按钮
+        const canRetrain = data.session.has_source_files && data.session.has_expected_file;
+        if (_currentCode && _currentAccuracy != null && _currentAccuracy < 1.0 && canRetrain) {
+            _showAnalyzeDiffButton();
+        }
+        // 如果训练文件已丢失，提示用户
+        if (!canRetrain && data.session.total_iterations > 0) {
+            _addSystemMessage('训练源文件已丢失，如需继续训练请创建新会话并重新上传文件。', 'status', { error: true });
+        }
+
+        // 更新头部
+        document.getElementById('chat-title').textContent = `训练 #${data.session.id}`;
+        _updateChatStatus(data.session.status);
+        _updateActionButtons(data.session);
+
+        _highlightActiveSession();
+    } catch (e) {
+        console.error('加载会话失败:', e);
+    }
+}
+
+async function deleteSession(sessionId) {
+    if (!confirm('确定删除此训练会话？相关的迭代数据也将被删除。')) return;
+    if (_currentSessionId === sessionId) {
+        _currentSessionId = null;
+        _chatMessages = [];
+        _clearChatUI();
+        _hideActionButtons();
+    }
+    _sessions = _sessions.filter(s => s.id !== sessionId);
+    _renderSessionList();
+}
+
+function _highlightActiveSession() {
+    document.querySelectorAll('.session-item').forEach(el => el.classList.remove('active'));
+    if (_currentSessionId) {
+        const idx = _sessions.findIndex(s => s.id === _currentSessionId);
+        const items = document.querySelectorAll('.session-item');
+        if (idx >= 0 && items[idx]) items[idx].classList.add('active');
+    }
+}
+
+async function _renameSession(sessionId, currentName) {
+    const newName = prompt('修改版本名称:', currentName || '');
+    if (newName === null || newName.trim() === '') return;
+
+    try {
+        const resp = await AUTH.authFetch(`/api/training/chat/sessions/${sessionId}/rename`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: newName.trim() }),
+        });
+        if (resp.ok) {
+            loadSessions();
+        } else {
+            const err = await resp.json().catch(() => ({}));
+            alert('重命名失败: ' + (err.detail || '未知错误'));
+        }
+    } catch (e) {
+        alert('重命名失败: ' + e.message);
+    }
+}
+
+// ==================== 附件弹窗 ====================
+function toggleAttachPopover() {
+    const popover = document.getElementById('attach-popover');
+    popover.style.display = popover.style.display === 'none' ? '' : 'none';
+}
+
+function _updateAttachBadge() {
+    const btn = document.getElementById('attach-btn');
+    const has = document.getElementById('source-files').files.length > 0
+             || document.getElementById('target-file').files.length > 0;
+    btn.classList.toggle('has-files', has);
+}
+
+// ==================== 文件列表 ====================
+function _renderFileList(containerId, files) {
+    const container = document.getElementById(containerId);
+    if (!files || files.length === 0) {
+        container.innerHTML = '';
+        return;
+    }
+    container.innerHTML = Array.from(files)
+        .map(f => `<span class="file-item">${f.name}</span>`)
+        .join('');
+}
+
+// ==================== 加密检测 ====================
+async function _checkEncryption(filesToCheck) {
+    if (!filesToCheck || filesToCheck.length === 0) return;
+    try {
+        const formData = new FormData();
+        filesToCheck.forEach(f => formData.append('files', f));
+        const resp = await AUTH.authFetch('/api/files/check-encrypted', { method: 'POST', body: formData });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const encrypted = data.encrypted_files || [];
+        if (encrypted.length === 0) return;
+        const passwords = await _promptFilePasswords(encrypted);
+        if (passwords) _filePasswordsMap = { ..._filePasswordsMap, ...passwords };
+    } catch (e) {
+        console.warn('加密检测失败:', e);
+    }
+}
+
 function _promptFilePasswords(encryptedFiles) {
     return new Promise((resolve) => {
         const inputs = encryptedFiles.map((name, i) =>
             `<div style="margin-bottom:10px;">
-                <label style="display:block;font-size:13px;margin-bottom:4px;color:#333;">
-                    <span style="color:#e65100;">🔒</span> ${name}
-                </label>
+                <label style="display:block;font-size:13px;margin-bottom:4px;color:#333;">${name}</label>
                 <input id="_enc_pwd_${i}" type="password" placeholder="请输入打开密码"
-                    style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box;">
+                    style="width:100%;padding:8px 12px;border:1.5px solid #d1d5db;border-radius:8px;box-sizing:border-box;font-size:13px;">
             </div>`
         ).join('');
 
         const overlay = document.createElement('div');
         overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:9999;display:flex;align-items:center;justify-content:center;';
         overlay.innerHTML = `
-            <div style="background:#fff;border-radius:10px;padding:24px;width:400px;max-width:90vw;box-shadow:0 4px 20px rgba(0,0,0,0.2);">
-                <h3 style="margin:0 0 6px;font-size:16px;">检测到加密文件</h3>
-                <p style="margin:0 0 16px;font-size:13px;color:#666;">以下文件有密码保护，请输入密码后继续：</p>
+            <div style="background:#fff;border-radius:16px;padding:28px;width:400px;max-width:90vw;box-shadow:0 10px 40px rgba(0,0,0,0.2);">
+                <h3 style="margin:0 0 6px;font-size:16px;font-weight:600;">检测到加密文件</h3>
+                <p style="margin:0 0 18px;font-size:13px;color:#6b7280;">以下文件有密码保护，请输入密码：</p>
                 ${inputs}
-                <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px;">
-                    <button id="_enc_cancel" style="padding:8px 20px;border:1px solid #ddd;border-radius:4px;background:#fff;cursor:pointer;">取消</button>
-                    <button id="_enc_confirm" style="padding:8px 20px;border:none;border-radius:4px;background:#1976d2;color:#fff;cursor:pointer;">确认解锁</button>
+                <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px;">
+                    <button id="_enc_cancel" style="padding:8px 20px;border:1.5px solid #d1d5db;border-radius:8px;background:#fff;cursor:pointer;font-size:13px;">取消</button>
+                    <button id="_enc_confirm" style="padding:8px 20px;border:none;border-radius:8px;background:#1976d2;color:#fff;cursor:pointer;font-size:13px;">确认</button>
                 </div>
             </div>`;
         document.body.appendChild(overlay);
 
-        document.getElementById('_enc_cancel').onclick = () => {
-            document.body.removeChild(overlay);
-            resolve(null);
-        };
+        document.getElementById('_enc_cancel').onclick = () => { document.body.removeChild(overlay); resolve(null); };
         document.getElementById('_enc_confirm').onclick = () => {
             const passwords = {};
             encryptedFiles.forEach((name, i) => {
                 const pwd = document.getElementById(`_enc_pwd_${i}`).value;
                 if (pwd) passwords[name] = pwd;
             });
-            // 检查是否所有文件都输入了密码
             const missing = encryptedFiles.filter(name => !passwords[name]);
-            if (missing.length > 0) {
-                alert('请为所有加密文件输入密码：\n' + missing.join('\n'));
-                return;
-            }
+            if (missing.length > 0) { alert('请为所有加密文件输入密码'); return; }
             document.body.removeChild(overlay);
             resolve(passwords);
         };
-
-        // 聚焦第一个输入框
         setTimeout(() => document.getElementById('_enc_pwd_0')?.focus(), 100);
     });
 }
 
-/**
- * 文件选择后，调用服务端 Aspose 检测加密，有加密则立即弹窗
- * @param {File[]} filesToCheck - 要检测的文件数组
- */
-async function _autoCheckEncryption(filesToCheck) {
-    const btn = document.getElementById('start-training-btn');
-
-    if (!filesToCheck || filesToCheck.length === 0) return;
-
-    // 禁用按钮，显示检测状态
-    _encryptionCheckInProgress = true;
-    if (btn) {
-        btn.disabled = true;
-        btn.textContent = '检测文件中...';
-    }
-
-    try {
-        const checkFd = new FormData();
-        filesToCheck.forEach(f => checkFd.append('files', f));
-
-        console.log('[加密检测] 发送检测请求, 文件:', filesToCheck.map(f => f.name));
-        const checkResp = await AUTH.authFetch('/api/files/check-encrypted', {
-            method: 'POST',
-            body: checkFd
-        });
-
-        if (checkResp.ok) {
-            const checkResult = await checkResp.json();
-            console.log('[加密检测] 服务端返回:', checkResult);
-            if (checkResult.encrypted_files && checkResult.encrypted_files.length > 0) {
-                // 有加密文件，立即弹窗
-                const passwords = await _promptFilePasswords(checkResult.encrypted_files);
-                if (passwords) {
-                    // 合并到全局密码映射（保留之前其他文件的密码）
-                    _filePasswordsMap = { ...(_filePasswordsMap || {}), ...passwords };
-                }
-            }
-        } else {
-            console.error('[加密检测] 请求失败, status:', checkResp.status);
-        }
-    } catch (e) {
-        console.error('[加密检测] 异常:', e);
-    } finally {
-        _encryptionCheckInProgress = false;
-        if (btn) {
-            _resetTrainingBtn();
-        }
-    }
-}
-
-// 页面加载完成后初始化
-document.addEventListener('DOMContentLoaded', function() {
-    // 认证检查
-    if (!AUTH.requireAuth()) return;
-    AUTH.renderUserInfo(document.querySelector('header'));
-    if (AUTH.isAdmin()) {
-        const adminNav = document.getElementById('nav-admin');
-        if (adminNav) adminNav.style.display = '';
-    }
-
-    initializeForm();
-    loadTenantList();
-    loadTrainingHistory();
-
-    // 输入框失焦时加载状态
-    const input = document.getElementById('tenant-input');
-    if (input) {
-        input.addEventListener('blur', function() {
-            setTimeout(() => {
-                document.getElementById('tenant-dropdown').style.display = 'none';
-                if (input.value.trim()) {
-                    onTenantSelected(input.value.trim());
-                }
-            }, 200);
-        });
-
-        // 添加focus和input事件
-        input.addEventListener('focus', showTenantDropdown);
-        input.addEventListener('input', filterTenantDropdown);
-    }
-
-    // 监听文件选择
-    const sourceFiles = document.getElementById('source-files');
-    const targetFile = document.getElementById('target-file');
-    const ruleFiles = document.getElementById('rule-files');
-
-    console.log('File inputs found:', {
-        sourceFiles: !!sourceFiles,
-        targetFile: !!targetFile,
-        ruleFiles: !!ruleFiles
+// ==================== Markdown 渲染 ====================
+function _renderMarkdown(text) {
+    let html = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => `<pre><code>${code}</code></pre>`);
+    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+    html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+    html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+    html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+    html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
+    html = html.replace(/(<li>.*<\/li>\n?)+/g, m => '<ul>' + m + '</ul>');
+    html = html.replace(/^\|(.+)\|$/gm, function (line) {
+        const cells = line.split('|').filter(c => c.trim() !== '');
+        if (cells.every(c => /^[\s\-:]+$/.test(c))) return '';
+        return '<tr>' + cells.map(c => `<td>${c.trim()}</td>`).join('') + '</tr>';
     });
-
-    if (sourceFiles) {
-        sourceFiles.addEventListener('change', () => {
-            console.log('source-files changed');
-            updateFileList('source-files', 'source-file-list');
-            // 只检测源文件
-            _autoCheckEncryption(Array.from(sourceFiles.files));
-        });
-    }
-
-    if (targetFile) {
-        targetFile.addEventListener('change', () => {
-            console.log('target-file changed');
-            updateFileList('target-file', 'target-file-list');
-            // 只检测目标文件
-            if (targetFile.files[0]) {
-                _autoCheckEncryption([targetFile.files[0]]);
-            }
-        });
-    }
-
-    if (ruleFiles) {
-        ruleFiles.addEventListener('change', () => {
-            console.log('rule-files changed');
-            updateFileList('rule-files', 'rule-file-list');
-        });
-    }
-
-    // 模式切换：直接导入模式隐藏不需要的字段
-    const modeSelect = document.getElementById('mode');
-    if (modeSelect) {
-        modeSelect.addEventListener('change', _toggleDirectMode);
-        _toggleDirectMode();  // 初始化
-    }
-});
-
-function _resetTrainingBtn() {
-    const btn = document.getElementById('start-training-btn');
-    if (btn) {
-        btn.disabled = false;
-        const mode = document.getElementById('mode').value;
-        btn.textContent = mode === 'direct' ? '直接导入' : '开始训练';
-    }
-}
-function _toggleDirectMode() {
-    const mode = document.getElementById('mode').value;
-    const isDirect = mode === 'direct';
-
-    // 需要隐藏的字段组 ID 列表
-    const hideIds = ['target-file', 'rule-files', 'ai-provider', 'max-iterations', 'force-retrain'];
-    hideIds.forEach(id => {
-        const el = document.getElementById(id);
-        if (el) {
-            const group = el.closest('.form-group');
-            if (group) group.style.display = isDirect ? 'none' : '';
-        }
-    });
-
-    // 更新按钮文字
-    const btn = document.getElementById('start-training-btn');
-    if (btn && !btn.disabled) {
-        btn.textContent = isDirect ? '直接导入' : '开始训练';
-    }
+    html = html.replace(/(<tr>.*<\/tr>\n?)+/g, m => '<table>' + m + '</table>');
+    html = html.replace(/\n\n/g, '</p><p>');
+    html = html.replace(/\n/g, '<br>');
+    return html;
 }
 
-// 初始化表单
-function initializeForm() {
-    const form = document.getElementById('training-form');
-    const sourceFiles = document.getElementById('source-files');
-    const targetFile = document.getElementById('target-file');
-    const ruleFiles = document.getElementById('rule-files');
+// ==================== 对话 UI ====================
+function _addMessage(role, content, isStreaming) {
+    const container = document.getElementById('chat-messages');
+    const placeholder = document.getElementById('chat-placeholder');
+    if (placeholder) placeholder.style.display = 'none';
 
-    sourceFiles.addEventListener('change', function(e) {
-        displayFileList(e.target.files, 'source-file-list');
-    });
+    const msgDiv = document.createElement('div');
+    msgDiv.className = `message ${role}`;
 
-    targetFile.addEventListener('change', function(e) {
-        displayFileList(e.target.files, 'target-file-list');
-    });
+    const label = document.createElement('div');
+    label.className = 'message-label';
+    label.textContent = role === 'user' ? '你' : 'AI';
 
-    ruleFiles.addEventListener('change', function(e) {
-        displayFileList(e.target.files, 'rule-file-list');
-    });
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'message-content';
+    if (isStreaming) contentDiv.classList.add('streaming-cursor');
 
-    form.addEventListener('submit', function(e) {
-        e.preventDefault();
-        startTraining();
-    });
-}
-
-function displayFileList(files, containerId) {
-    const container = document.getElementById(containerId);
-    container.innerHTML = '';
-    Array.from(files).forEach(file => {
-        const div = document.createElement('div');
-        div.textContent = `${file.name} (${formatFileSize(file.size)})`;
-        container.appendChild(div);
-    });
-}
-
-function formatFileSize(bytes) {
-    if (bytes < 1024) return bytes + ' B';
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
-    return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
-}
-
-// ==================== 租户下拉框 ====================
-
-async function loadTenantList() {
-    try {
-        const response = await AUTH.authFetch('/api/tenants');
-        if (!response.ok) return;
-        const data = await response.json();
-        tenantListData = data.tenants || [];
-        renderTenantDropdown(tenantListData);
-    } catch (e) {
-        console.error('加载租户列表失败:', e);
+    if (role === 'assistant') {
+        contentDiv.innerHTML = _renderMarkdown(content);
+    } else {
+        contentDiv.textContent = content;
     }
+
+    msgDiv.appendChild(label);
+    msgDiv.appendChild(contentDiv);
+    container.appendChild(msgDiv);
+    container.scrollTop = container.scrollHeight;
+    return contentDiv;
 }
 
-function renderTenantDropdown(tenants) {
-    const dropdown = document.getElementById('tenant-dropdown');
-    dropdown.innerHTML = '';
-    if (tenants.length === 0) {
-        dropdown.innerHTML = '<div class="combo-item disabled">暂无租户</div>';
-        return;
+function _addSystemMessage(content, msgType, metadata) {
+    const container = document.getElementById('chat-messages');
+    const placeholder = document.getElementById('chat-placeholder');
+    if (placeholder) placeholder.style.display = 'none';
+
+    const msgDiv = document.createElement('div');
+    msgDiv.className = 'message system';
+
+    // 根据内容类型添加样式
+    if (metadata) {
+        if (metadata.error) msgDiv.classList.add('error');
+        else if (metadata.rollback) msgDiv.classList.add('warning');
+        else if (metadata.accuracy >= 1.0) msgDiv.classList.add('success');
     }
-    tenants.forEach(tenant => {
-        const item = document.createElement('div');
-        item.className = 'combo-item';
-        const score = tenant.best_score !== null
-            ? `<span class="combo-score">${(tenant.best_score * 100).toFixed(1)}%</span>`
-            : '<span class="combo-score untrained">未训练</span>';
-        item.innerHTML = `<span class="combo-id">${tenant.tenant_id}</span>${score}`;
-        item.addEventListener('mousedown', function(e) {
-            e.preventDefault();
-            document.getElementById('tenant-input').value = tenant.tenant_id;
-            dropdown.style.display = 'none';
-            onTenantSelected(tenant.tenant_id);
-        });
-        dropdown.appendChild(item);
-    });
-}
+    if (msgType === 'status' && content.includes('失败')) msgDiv.classList.add('error');
 
-function showTenantDropdown() {
-    filterTenantDropdown();
-    document.getElementById('tenant-dropdown').style.display = 'block';
-}
+    const label = document.createElement('div');
+    label.className = 'message-label';
+    label.textContent = '系统';
 
-function filterTenantDropdown() {
-    const input = document.getElementById('tenant-input').value.trim().toLowerCase();
-    const filtered = input
-        ? tenantListData.filter(t => t.tenant_id.toLowerCase().includes(input))
-        : tenantListData;
-    renderTenantDropdown(filtered);
-    document.getElementById('tenant-dropdown').style.display = 'block';
-}
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'message-content';
+    contentDiv.innerHTML = _renderMarkdown(content);
 
-document.addEventListener('click', function(e) {
-    const combo = document.getElementById('tenant-combo');
-    const dropdown = document.getElementById('tenant-dropdown');
-    if (combo && dropdown && !combo.contains(e.target)) {
-        dropdown.style.display = 'none';
+    // 添加准确率徽章
+    if (metadata && metadata.accuracy != null) {
+        const badge = document.createElement('span');
+        badge.className = 'accuracy-badge';
+        const acc = metadata.accuracy;
+        badge.classList.add(acc >= 0.95 ? 'high' : acc >= 0.7 ? 'medium' : 'low');
+        badge.textContent = `${(acc * 100).toFixed(1)}%`;
+        label.appendChild(badge);
     }
-});
 
-// 选中租户后
-function onTenantSelected(tenantId) {
-    if (!tenantId) return;
-    // 租户ID已选择，加载状态和脚本
-    loadTenantStatus();
-    loadTenantScripts(tenantId);
+    msgDiv.appendChild(label);
+    msgDiv.appendChild(contentDiv);
+    container.appendChild(msgDiv);
+    container.scrollTop = container.scrollHeight;
+    return contentDiv;
+}
 
-    // 重置右侧
-    resetProgress();
-    clearResultSection();
+function _updateStreamingMessage(contentDiv, text) {
+    contentDiv.innerHTML = _renderMarkdown(text);
+    const container = document.getElementById('chat-messages');
+    container.scrollTop = container.scrollHeight;
+}
 
-    // 如果有训练历史，显示结果
-    const tenantHistory = trainingHistoryData[tenantId];
-    if (tenantHistory && tenantHistory.sessions && tenantHistory.sessions.length > 0) {
-        showHistoryResult(tenantId, tenantHistory);
+function _finishStreamingMessage(contentDiv) {
+    contentDiv.classList.remove('streaming-cursor');
+}
+
+// 代码流式追加：将 AI 生成的代码片段逐步显示
+let _codeStreamEl = null;
+let _codeStreamBuf = '';
+
+function _appendCodeStream(chunk) {
+    const container = document.getElementById('chat-messages');
+    if (!_codeStreamEl) {
+        // 创建一个 assistant 类型的消息用于代码流
+        const placeholder = document.getElementById('chat-placeholder');
+        if (placeholder) placeholder.style.display = 'none';
+
+        const msgDiv = document.createElement('div');
+        msgDiv.className = 'message assistant';
+
+        const label = document.createElement('div');
+        label.className = 'message-label';
+        label.textContent = 'AI';
+
+        const contentDiv = document.createElement('div');
+        contentDiv.className = 'message-content streaming-cursor';
+
+        msgDiv.appendChild(label);
+        msgDiv.appendChild(contentDiv);
+        container.appendChild(msgDiv);
+
+        _codeStreamEl = contentDiv;
+        _codeStreamBuf = '';
+    }
+
+    _codeStreamBuf += chunk;
+    // 渲染为 markdown 代码块
+    _codeStreamEl.innerHTML = _renderMarkdown('```python\n' + _codeStreamBuf + '\n```');
+    container.scrollTop = container.scrollHeight;
+}
+
+function _finishCodeStream() {
+    if (_codeStreamEl) {
+        _codeStreamEl.classList.remove('streaming-cursor');
+        _codeStreamEl = null;
+        _codeStreamBuf = '';
     }
 }
 
-// ==================== 训练ID下拉 ====================
-
-async function loadTenantScripts(tenantId) {
-    const group = document.getElementById('script-selector-group');
-    const select = document.getElementById('script-select');
-
-    try {
-        const response = await AUTH.authFetch(`/api/tenant-scripts/${tenantId}`);
-        if (!response.ok) { group.style.display = 'none'; return; }
-        const data = await response.json();
-        const scripts = data.scripts || [];
-
-        if (scripts.length === 0) {
-            group.style.display = 'none';
-            return;
-        }
-
-        select.innerHTML = '';
-        scripts.forEach(s => {
-            const opt = document.createElement('option');
-            opt.value = s.script_id;
-            const scoreText = s.score != null ? ` (${(s.score * 100).toFixed(1)}%)` : '';
-            const activeText = s.is_active ? ' [当前]' : '';
-            const shortId = s.script_id.length > 20 ? s.script_id.substring(0, 20) + '...' : s.script_id;
-            opt.textContent = `${shortId}${scoreText}${activeText}`;
-            if (s.is_active) opt.selected = true;
-            select.appendChild(opt);
-        });
-
-        group.style.display = 'block';
-    } catch (e) {
-        console.error('加载训练ID失败:', e);
-        group.style.display = 'none';
-    }
-}
-
-// ==================== 训练状态面板 ====================
-
-async function loadTenantStatus() {
-    const tenantId = document.getElementById('tenant-input').value.trim();
-    const card = document.getElementById('tenant-status-card');
-    if (!tenantId) { card.style.display = 'none'; return; }
-
-    try {
-        const response = await AUTH.authFetch(`/api/training-status/${tenantId}`);
-        if (!response.ok) {
-            card.style.display = 'block';
-            document.getElementById('tenant-training-status').textContent = '未找到';
-            document.getElementById('tenant-best-score').textContent = '-';
-            document.getElementById('tenant-script-id').textContent = '-';
-            document.getElementById('tenant-last-training').textContent = '-';
-            return;
-        }
-
-        const data = await response.json();
-        card.style.display = 'block';
-
-        const statusEl = document.getElementById('tenant-training-status');
-        if (data.is_training) {
-            statusEl.textContent = '训练中...';
-            statusEl.style.color = '#ffc107';
-        } else if (data.has_trained) {
-            statusEl.textContent = '已完成';
-            statusEl.style.color = '#28a745';
-        } else {
-            statusEl.textContent = '未训练';
-            statusEl.style.color = '#6c757d';
-        }
-
-        const scoreEl = document.getElementById('tenant-best-score');
-        if (data.best_score != null) {
-            const pct = (data.best_score * 100).toFixed(2) + '%';
-            scoreEl.textContent = pct;
-            scoreEl.style.color = data.best_score >= 0.95 ? '#28a745' : data.best_score >= 0.8 ? '#ffc107' : '#dc3545';
-        } else {
-            scoreEl.textContent = '-';
-        }
-
-        document.getElementById('tenant-script-id').textContent = data.script_id || '-';
-
-        if (data.last_training && data.last_training.completed) {
-            document.getElementById('tenant-last-training').textContent =
-                new Date(data.last_training.completed).toLocaleString('zh-CN');
-        } else {
-            document.getElementById('tenant-last-training').textContent = '-';
-        }
-    } catch (e) {
-        console.error('查询训练状态失败:', e);
-    }
-}
-
-// ==================== 训练历史 ====================
-
-async function loadTrainingHistory() {
-    try {
-        const response = await AUTH.authFetch('/api/training-history');
-        if (!response.ok) return;
-        const data = await response.json();
-        trainingHistoryData = data.history || {};
-    } catch (e) {
-        console.error('加载训练历史失败:', e);
-    }
-}
-
-// 显示已训练租户的结果
-function showHistoryResult(tenantId, tenantHistory) {
-    const sessions = tenantHistory.sessions;
-    const lastSession = sessions[sessions.length - 1];
-    const files = lastSession.files || [];
-
-    const tenant = tenantListData.find(t => t.tenant_id === tenantId);
-    const bestScore = tenant && tenant.best_score != null
-        ? (tenant.best_score * 100).toFixed(2) + '%'
-        : 'N/A';
-
-    const ts = lastSession.timestamp;
-    const displayTime = ts !== 'unknown'
-        ? `${ts.substring(0,4)}-${ts.substring(4,6)}-${ts.substring(6,8)} ${ts.substring(9,11)}:${ts.substring(11,13)}:${ts.substring(13,15)}`
-        : '未知时间';
-
-    // 更新进度区汇总
-    document.getElementById('current-status').textContent = '训练已完成';
-    document.getElementById('current-iteration').textContent = sessions.length;
-    document.getElementById('max-iteration').textContent = sessions.length;
-    document.getElementById('accuracy').textContent = bestScore;
-    updateProgressBar(100);
-
-    // 填充结果区
-    const resultSection = document.getElementById('result-section');
-    const resultCard = document.getElementById('result-card');
-    const resultDownloads = document.getElementById('result-downloads');
-
-    resultCard.className = 'result-card result-success';
-    resultCard.innerHTML = `
-        <div class="result-row">
-            <div class="result-item">
-                <div class="label">训练状态</div>
-                <div class="value" style="color: #28a745; font-size: 20px;">已完成</div>
-            </div>
-            <div class="result-item">
-                <div class="label">最佳准确率</div>
-                <div class="value score">${bestScore}</div>
-            </div>
-            <div class="result-item">
-                <div class="label">训练次数</div>
-                <div class="value">${sessions.length}</div>
-            </div>
-            <div class="result-item">
-                <div class="label">最后训练</div>
-                <div class="value" style="font-size: 13px;">${displayTime}</div>
+function _clearChatUI() {
+    const container = document.getElementById('chat-messages');
+    container.innerHTML = `
+        <div class="chat-placeholder" id="chat-placeholder">
+            <div class="placeholder-content">
+                <div class="placeholder-icon">&#x1F9E0;</div>
+                <p class="placeholder-title">智能训练对话</p>
+                <p class="placeholder-hint">选择租户 → 新建或选择训练会话 → 上传文件开始训练</p>
             </div>
         </div>
     `;
-
-    const codeFile = files.find(f => f.type === 'code');
-    const outputFile = files.find(f => f.type === 'output');
-    const compFile = files.find(f => f.type === 'comparison');
-
-    let downloadHtml = '<div class="download-row">';
-    downloadHtml += `<button class="btn btn-download" onclick="downloadScript()">下载脚本 (.py)</button>`;
-    if (outputFile) {
-        downloadHtml += `<button class="btn btn-download" onclick="window.location.href='/api/download-log/${tenantId}/${outputFile.filename}'">下载输出结果 (.xlsx)</button>`;
-    } else {
-        downloadHtml += `<button class="btn btn-download" onclick="downloadTrainingFiles('${tenantId}', 'output')">下载输出结果 (.xlsx)</button>`;
-    }
-    if (compFile) {
-        downloadHtml += `<button class="btn btn-download" onclick="window.location.href='/api/download-log/${tenantId}/${compFile.filename}'">下载差异对比 (.xlsx)</button>`;
-    } else {
-        downloadHtml += `<button class="btn btn-download" onclick="downloadTrainingFiles('${tenantId}', 'comparison')">下载差异对比 (.xlsx)</button>`;
-    }
-    downloadHtml += `<button class="btn btn-adjust" onclick="openAdjustModal('${tenantId}')">调整逻辑</button>`;
-    downloadHtml += '</div>';
-
-    resultDownloads.innerHTML = downloadHtml;
 }
 
-// ==================== 训练流程 ====================
+function _updateChatStatus(status) {
+    const el = document.getElementById('chat-status');
+    el.textContent = _statusText(status);
+    el.className = `chat-status ${status || ''}`;
+}
 
-async function startTraining() {
-    const tenantId = document.getElementById('tenant-input').value;
+function _updateActionButtons(session) {
+    const btnSetBest = document.getElementById('btn-set-best');
+    const btnUploadCode = document.getElementById('btn-upload-code');
+    const btnDownloadCode = document.getElementById('btn-download-code');
+
+    const hasSession = !!_currentSessionId;
+    const hasCode = !!_currentCode;
+    const isCompleted = session && session.status === 'completed';
+
+    btnSetBest.style.display = hasSession && hasCode ? '' : 'none';
+    btnUploadCode.style.display = hasSession ? '' : 'none';
+    btnDownloadCode.style.display = hasCode ? '' : 'none';
+
+    if (isCompleted && session.has_script) {
+        btnSetBest.disabled = true;
+        btnSetBest.textContent = '已设置';
+    } else {
+        btnSetBest.disabled = false;
+        btnSetBest.textContent = '设为最佳';
+    }
+}
+
+function _hideActionButtons() {
+    document.getElementById('btn-set-best').style.display = 'none';
+    document.getElementById('btn-upload-code').style.display = 'none';
+    document.getElementById('btn-download-code').style.display = 'none';
+}
+
+// ==================== 发送消息 ====================
+function sendMessage(action) {
+    const input = document.getElementById('chat-input');
+    const text = input.value.trim();
+    if (_isStreaming) return;
+
+    // action: undefined/'chat' = 对话讨论, 'generate' = 执行代码修正
+    action = action || 'chat';
+
+    // 已在会话中 → 直接发消息，无需再选租户
+    if (_currentSessionId) {
+        if (!text && action === 'chat') return;
+        _sendChatMessage(text || '请根据之前的讨论修正代码', action);
+        input.value = '';
+        input.style.height = '';
+        return;
+    }
+
+    // 新会话：需要租户
+    if (!_currentTenantId) {
+        const typed = document.getElementById('tenant-input').value.trim();
+        if (typed) {
+            _currentTenantId = typed;
+        } else {
+            alert('请先输入或选择租户');
+            return;
+        }
+    }
+
+    const sourceFiles = document.getElementById('source-files').files;
+    const targetFile = document.getElementById('target-file').files[0];
+    const hasFiles = sourceFiles.length > 0 && targetFile;
+
+    if (hasFiles) {
+        _startTraining(text || '请根据文件生成数据处理脚本');
+    } else {
+        alert('请先通过 📎 上传源文件和目标文件，然后开始训练');
+        return;
+    }
+
+    input.value = '';
+    input.style.height = '';
+}
+
+function _startTraining(userText) {
+    if (_isStreaming) return;  // 防止重复触发
     const sourceFiles = document.getElementById('source-files').files;
     const targetFile = document.getElementById('target-file').files[0];
     const ruleFiles = document.getElementById('rule-files').files;
     const aiProvider = document.getElementById('ai-provider').value;
     const mode = document.getElementById('mode').value;
-    const maxIterations = parseInt(document.getElementById('max-iterations').value);
-    const forceRetrain = document.getElementById('force-retrain').checked;
-
-    if (!tenantId || sourceFiles.length === 0) {
-        alert('请填写租户ID并选择源文件');
-        return;
-    }
-    if (mode !== 'direct' && !targetFile) {
-        alert('请选择目标文件（直接导入模式除外）');
-        return;
-    }
-
-    // 如果加密检测正在进行中，等待完成
-    if (_encryptionCheckInProgress) {
-        alert('文件加密检测中，请稍候...');
-        return;
-    }
-
-    // 更新训练参数显示（如果元素存在）
-    const maxIterationEl = document.getElementById('max-iteration');
-    if (maxIterationEl) {
-        maxIterationEl.textContent = maxIterations;
-    }
-
-    document.getElementById('start-training-btn').disabled = true;
-    document.getElementById('start-training-btn').textContent = '训练中...';
-
-    clearResultSection();
-    resetProgress();
+    const salaryMonth = document.getElementById('salary-month').value.trim();
 
     const formData = new FormData();
-    formData.append('tenant_id', tenantId);
+    formData.append('tenant_id', _currentTenantId);
+    Array.from(sourceFiles).forEach(f => formData.append('source_files', f));
+    if (targetFile) formData.append('target_file', targetFile);
+    if (ruleFiles.length > 0) {
+        Array.from(ruleFiles).forEach(f => formData.append('rule_files', f));
+    }
     formData.append('ai_provider', aiProvider);
     formData.append('mode', mode);
-    formData.append('max_iterations', maxIterations);
-    formData.append('force_retrain', forceRetrain);
-    Array.from(sourceFiles).forEach(file => formData.append('source_files', file));
-    if (mode !== 'direct') {
-        if (targetFile) formData.append('target_file', targetFile);
-        Array.from(ruleFiles).forEach(file => formData.append('rule_files', file));
-    }
-
-    // 添加可选参数
-    const salaryMonth = document.getElementById('salary-month').value.trim();
-    const standardHours = document.getElementById('standard-hours').value.trim();
+    if (salaryMonth) formData.append('salary_year_month', salaryMonth);
     const manualHeaders = document.getElementById('manual-headers').value.trim();
-
-    // 解析薪资年月（格式：2026-03）
-    if (salaryMonth) {
-        const parts = salaryMonth.split('-');
-        if (parts.length === 2) {
-            const year = parseInt(parts[0]);
-            const month = parseInt(parts[1]);
-            if (!isNaN(year) && !isNaN(month)) {
-                formData.append('salary_year', year);
-                formData.append('salary_month', month);
-            }
-        }
-    }
-
-    if (standardHours) formData.append('monthly_standard_hours', standardHours);
     if (manualHeaders) formData.append('manual_headers', manualHeaders);
+    if (_currentSessionId) formData.append('session_id', _currentSessionId);
 
-    // 添加文件密码（如果有加密文件）
-    if (_filePasswordsMap) {
-        formData.append('file_passwords', JSON.stringify(_filePasswordsMap));
+    _addMessage('user', userText);
+    document.getElementById('attach-popover').style.display = 'none';
+    _setUIStreaming(true);
+
+    _fetchTrainingSSE('/api/training/chat/start', { method: 'POST', body: formData });
+}
+
+function _sendChatMessage(text, action) {
+    const ruleFiles = document.getElementById('rule-files').files;
+
+    const formData = new FormData();
+    formData.append('message', text);
+    formData.append('action', action || 'chat');
+    if (ruleFiles.length > 0) {
+        Array.from(ruleFiles).forEach(f => formData.append('rule_files', f));
     }
 
-    trainingStartTime = Date.now();
-    startTimer();
+    _addMessage('user', text);
+    _setUIStreaming(true);
 
-    addLog('info', mode === 'direct' ? '开始直接导入...' : '开始训练...');
-    addLog('info', `租户: ${tenantId}  模式: ${mode}${mode !== 'direct' ? '  模型: ' + aiProvider + '  最大迭代: ' + maxIterations : ''}`);
+    _fetchTrainingSSE(`/api/training/chat/sessions/${_currentSessionId}/message`, {
+        method: 'POST',
+        body: formData,
+    });
+}
 
+// ==================== SSE ====================
+async function _fetchTrainingSSE(url, options) {
     try {
-        const response = await AUTH.authFetch('/api/train/stream', {
-            method: 'POST',
-            body: formData
-        });
-
+        // 使用 AUTH.authFetch 保证 token 正确携带 + 401 自动跳转登录
+        const response = await AUTH.authFetch(url, options);
         if (!response.ok) {
-            // 尝试读取错误详情
-            let errorData = null;
-            try { errorData = await response.json(); } catch (e) {}
-
-            // 检测是否为加密文件错误（422 + encrypted_files）
-            if (response.status === 422 && errorData && errorData.error_type === 'encrypted_files') {
-                addLog('warning', `检测到加密文件: ${errorData.encrypted_files.join(', ')}`);
-                const passwords = await _promptFilePasswords(errorData.encrypted_files);
-                if (!passwords) {
-                    addLog('info', '用户取消了密码输入');
-                    _resetTrainingBtn();
-                    return;
-                }
-                // 用密码重新提交
-                addLog('info', '正在使用密码重新提交...');
-                _filePasswordsMap = passwords;  // 保存密码供后续使用
-                formData.set('file_passwords', JSON.stringify(passwords));
-                const retryResp = await AUTH.authFetch('/api/train/stream', {
-                    method: 'POST',
-                    body: formData
-                });
-                if (!retryResp.ok) {
-                    let retryError = '';
-                    try { retryError = (await retryResp.json()).detail || ''; } catch (e) {}
-                    throw new Error(retryError || `HTTP error! status: ${retryResp.status}`);
-                }
-                // 重用下方流式处理逻辑
-                await _processTrainingStream(retryResp);
-                return;
-            }
-
-            const errorMsg = errorData?.detail || errorData?.message || `HTTP error! status: ${response.status}`;
-            throw new Error(typeof errorMsg === 'string' ? errorMsg : JSON.stringify(errorMsg));
+            let errMsg = `HTTP ${response.status}`;
+            try { errMsg = (await response.json()).detail || errMsg; } catch (e) {}
+            throw new Error(errMsg);
         }
 
-        await _processTrainingStream(response);
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
 
-    } catch (error) {
-        console.error('Training error:', error);
-        addLog('error', `训练失败: ${error.message}`);
-        showError(error.message);
-    }
-}
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
 
-/**
- * 处理训练流式响应
- */
-async function _processTrainingStream(response) {
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const parts = buffer.split('\n\n');
-        buffer = parts.pop();
-
-        for (const part of parts) {
-            const lines = part.split('\n');
             for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    const data = line.substring(6).trim();
-                    if (data) {
-                        try {
-                            handleTrainingEvent(JSON.parse(data));
-                        } catch (e) {
-                            addLog('info', data);
-                        }
-                    }
+                if (!line.startsWith('data: ')) continue;
+                const jsonStr = line.slice(6).trim();
+                if (!jsonStr) continue;
+                try {
+                    const event = JSON.parse(jsonStr);
+                    _handleSSEEvent(event);
+                } catch (parseErr) {
+                    if (parseErr.message && !parseErr.message.includes('JSON')) throw parseErr;
                 }
             }
         }
-    }
-
-    if (buffer.trim()) {
-        const lines = buffer.split('\n');
-        for (const line of lines) {
-            if (line.startsWith('data: ')) {
-                const data = line.substring(6).trim();
-                if (data) {
-                    try { handleTrainingEvent(JSON.parse(data)); } catch (e) { addLog('info', data); }
-                }
-            }
-        }
+    } catch (e) {
+        console.error('SSE error:', e);
+        _addSystemMessage('请求失败: ' + e.message, 'status', { error: true });
+    } finally {
+        _setUIStreaming(false);
     }
 }
 
-function handleTrainingEvent(event) {
+function _handleSSEEvent(event) {
     switch (event.type) {
+        case 'session_created':
+            _currentSessionId = event.session_id;
+            document.getElementById('chat-title').textContent = `训练 #${event.session_id}`;
+            // 刷新租户列表（新租户目录可能刚被创建）
+            _loadTenants();
+            break;
+
         case 'status':
-            updateStatus(event.message);
-            addLog('info', event.message);
+            _addSystemMessage(event.message, 'status');
             break;
 
-        case 'iteration_start':
-            startIteration(event.iteration, event.total);
-            addLog('info', `开始第 ${event.iteration}/${event.total} 轮`);
-            break;
+        case 'iteration_complete': {
+            _finishCodeStream();  // 结束代码流式显示
+            const acc = event.accuracy;
+            _currentAccuracy = acc;
 
-        case 'iteration_progress':
-            updateIterationProgress(event.iteration, event.message);
-            addLog('info', event.message);
-            break;
-
-        case 'iteration_complete':
-            flushCodeStreamBuffer();
-            completeIteration(event.iteration, event.success, event.accuracy, event.message);
+            // 设置 _currentCode 标记，使 "设为最佳"/"下载代码" 按钮可见
             if (event.success) {
-                addLog('success', `第 ${event.iteration} 轮 - 准确率: ${event.accuracy ? (event.accuracy * 100).toFixed(2) + '%' : 'N/A'}`);
-            } else {
-                addLog('warning', `第 ${event.iteration} 轮: ${event.message}`);
+                _currentCode = 'generated';
             }
+
+            if (event.rollback) {
+                const msg = `本轮修改导致准确率从 ${(event.accuracy * 100).toFixed(1)}% 下降到 ${(event.attempted_accuracy * 100).toFixed(1)}%，已自动回滚到之前的最佳代码。`;
+                _addSystemMessage(msg, 'status', { rollback: true, accuracy: event.accuracy });
+            } else if (event.success) {
+                const accPct = (acc * 100).toFixed(1);
+                if (acc >= 1.0) {
+                    _addSystemMessage(
+                        `第 ${event.iteration} 轮完成，准确率 ${accPct}%，所有数据匹配！`,
+                        'status', { accuracy: acc }
+                    );
+                } else {
+                    let msg = `第 ${event.iteration} 轮完成，准确率 ${accPct}%`;
+                    if (event.diff_details) {
+                        msg += '\n\n' + _formatDiffDetails(event.diff_details);
+                    }
+                    msg += '\n\n请描述需要调整的逻辑，AI 将根据反馈修正代码。';
+                    _addSystemMessage(msg, 'diff', { accuracy: acc, diff_details: event.diff_details });
+                }
+            } else {
+                _addSystemMessage(
+                    `第 ${event.iteration} 轮执行失败: ${event.error || '未知错误'}`,
+                    'status', { error: event.error }
+                );
+            }
+
+            // 显示下载按钮区
+            if (event.success && _currentSessionId) {
+                _showDownloadBar(_currentSessionId, event.files);
+            }
+
+            _updateActionButtons({ status: event.success ? 'running' : 'failed', has_script: false });
+            _updateChatStatus(event.success ? 'running' : 'failed');
+            loadSessions();
+            _loadTenants();   // 刷新租户训练分数
+            break;
+        }
+
+        case 'assistant_message':
+            _addMessage('assistant', event.content);
             break;
 
-        case 'complete':
-            flushCodeStreamBuffer();
-            completeTraining(event.success, event.data);
+        case 'chat_chunk':
+            // AI 对话流式输出
+            if (!_chatStreamEl) {
+                _chatStreamEl = _addMessage('assistant', '', true);
+                _chatStreamBuf = '';
+            }
+            _chatStreamBuf += event.content;
+            _updateStreamingMessage(_chatStreamEl, _chatStreamBuf);
+            break;
+
+        case 'chat_done':
+            // AI 对话完成
+            if (_chatStreamEl) {
+                _finishStreamingMessage(_chatStreamEl);
+                // 用最终完整内容重新渲染（确保 markdown 完整）
+                _chatStreamEl.innerHTML = _renderMarkdown(_chatStreamBuf || event.content);
+                _chatStreamEl = null;
+                _chatStreamBuf = '';
+            } else {
+                _addMessage('assistant', event.content);
+            }
             break;
 
         case 'error':
-            addLog('error', event.message);
-            showError(event.message);
+            _finishCodeStream();
+            _addSystemMessage(event.message, 'status', { error: true });
             break;
 
         case 'log':
-            addLog(event.level || 'info', event.message);
-            break;
-
-        case 'code_stream':
-            codeStreamBuffer += (event.chunk || '');
-            const codeLines = codeStreamBuffer.split('\n');
-            codeStreamBuffer = codeLines.pop();
-            for (const line of codeLines) {
-                if (line.trim()) addLog('info', line);
+            // 训练引擎的日志输出（含代码流）— 追加到对话框
+            if (event.message) {
+                // 匹配 [HH:MM:SS] [CODE] chunk 格式
+                const codeMatch = event.message.match(/\[CODE\]\s*([\s\S]*)/);
+                if (codeMatch) {
+                    _appendCodeStream(codeMatch[1]);
+                }
+                // 其他日志不显示在对话框（避免刷屏），但可以 console.log
             }
             break;
     }
 }
 
-// ==================== UI 更新 ====================
+function _formatDiffDetails(diff) {
+    if (!diff) return '';
+    let text = '**差异详情:**\n';
 
-function updateStatus(message) {
-    document.getElementById('current-status').textContent = message;
-}
-
-function startIteration(iteration, total) {
-    document.getElementById('current-iteration').textContent = iteration;
-    updateProgressBar((iteration / total) * 100);
-}
-
-function updateIterationProgress(iteration, message) {
-    // 进度信息写入日志即可
-}
-
-function completeIteration(iteration, success, accuracy, message) {
-    if (accuracy != null) {
-        document.getElementById('accuracy').textContent = `${(accuracy * 100).toFixed(2)}%`;
-    }
-}
-
-function completeTraining(success, data) {
-    stopTimer();
-    updateProgressBar(100);
-
-    if (success) {
-        updateStatus('训练完成');
-        addLog('success', '训练成功完成!');
-        showResult(data);
-    } else {
-        updateStatus('训练失败');
-        addLog('error', '训练失败');
-        showError(data.message || '训练过程中发生错误');
+    if (diff.field_diff_samples) {
+        const samples = diff.field_diff_samples;
+        if (Array.isArray(samples)) {
+            text += '\n| 字段 | 期望值 | 实际值 |\n|---|---|---|\n';
+            samples.slice(0, 10).forEach(s => {
+                text += `| ${s.field || s.column || '—'} | ${s.expected ?? '—'} | ${s.actual ?? '—'} |\n`;
+            });
+            if (samples.length > 10) {
+                text += `\n... 共 ${samples.length} 处差异\n`;
+            }
+        } else if (typeof samples === 'object') {
+            for (const [field, details] of Object.entries(samples)) {
+                if (Array.isArray(details)) {
+                    text += `\n**${field}**: ${details.length} 处差异\n`;
+                    details.slice(0, 3).forEach(d => {
+                        text += `  - 行${d.row || '?'}: 期望 \`${d.expected ?? ''}\` / 实际 \`${d.actual ?? ''}\`\n`;
+                    });
+                }
+            }
+        }
     }
 
-    _resetTrainingBtn();
-
-    // 刷新
-    const tenantId = document.getElementById('tenant-input').value.trim();
-    loadTenantList();
-    loadTrainingHistory();
-    if (tenantId) loadTenantScripts(tenantId);
-}
-
-function showResult(data) {
-    const resultSection = document.getElementById('result-section');
-    const resultCard = document.getElementById('result-card');
-    const resultDownloads = document.getElementById('result-downloads');
-    const tenantId = document.getElementById('tenant-input').value.trim();
-
-    resultCard.className = 'result-card result-success';
-    resultCard.innerHTML = `
-        <div class="result-row">
-            <div class="result-item">
-                <div class="label">训练状态</div>
-                <div class="value" style="color: #28a745; font-size: 20px;">成功</div>
-            </div>
-            <div class="result-item">
-                <div class="label">最终准确率</div>
-                <div class="value score">${data.final_accuracy ? (data.final_accuracy * 100).toFixed(2) + '%' : 'N/A'}</div>
-            </div>
-            <div class="result-item">
-                <div class="label">训练轮次</div>
-                <div class="value">${data.iterations || 'N/A'}</div>
-            </div>
-            <div class="result-item">
-                <div class="label">训练时长</div>
-                <div class="value">${document.getElementById('elapsed-time').textContent}</div>
-            </div>
-            <div class="result-item">
-                <div class="label">脚本ID</div>
-                <div class="value" style="font-size: 12px;">${data.script_id || 'N/A'}</div>
-            </div>
-        </div>
-    `;
-
-    resultDownloads.innerHTML = `
-        <div class="download-row">
-            <button class="btn btn-download" onclick="downloadScript()">下载脚本 (.py)</button>
-            <button class="btn btn-download" onclick="downloadTrainingFiles('${tenantId}', 'output')">下载输出结果 (.xlsx)</button>
-            <button class="btn btn-download" onclick="downloadTrainingFiles('${tenantId}', 'comparison')">下载差异对比 (.xlsx)</button>
-            <button class="btn btn-adjust" onclick="openAdjustModal('${tenantId}')">调整逻辑</button>
-            <button class="btn btn-secondary" onclick="resetTraining()">重新训练</button>
-        </div>
-    `;
-}
-
-function showError(message) {
-    const resultSection = document.getElementById('result-section');
-    const resultCard = document.getElementById('result-card');
-
-    resultCard.className = 'result-card result-error';
-    resultCard.innerHTML = `
-        <div class="result-row">
-            <div class="result-item">
-                <div class="label">训练状态</div>
-                <div class="value" style="color: #dc3545; font-size: 20px;">失败</div>
-            </div>
-            <div class="result-item" style="flex: 3;">
-                <div class="label">错误信息</div>
-                <div class="value" style="font-size: 13px; color: #dc3545;">${message}</div>
-            </div>
-        </div>
-    `;
-}
-
-// ==================== 进度条和日志 ====================
-
-function flushCodeStreamBuffer() {
-    if (codeStreamBuffer.trim()) addLog('info', codeStreamBuffer);
-    codeStreamBuffer = '';
-}
-
-function updateProgressBar(percent) {
-    document.getElementById('progress-bar').style.width = percent + '%';
-    document.getElementById('progress-text').textContent = Math.round(percent) + '%';
-}
-
-function addLog(level, message) {
-    const logContent = document.getElementById('log-content');
-    const timestamp = new Date().toLocaleTimeString();
-    const entry = document.createElement('div');
-    entry.className = `log-entry ${level}`;
-    entry.innerHTML = `<span class="log-timestamp">[${timestamp}]</span>${message}`;
-    logContent.appendChild(entry);
-    logContent.scrollTop = logContent.scrollHeight;
-}
-
-function startTimer() {
-    timerInterval = setInterval(() => {
-        const elapsed = Date.now() - trainingStartTime;
-        const minutes = Math.floor(elapsed / 60000);
-        const seconds = Math.floor((elapsed % 60000) / 1000);
-        document.getElementById('elapsed-time').textContent =
-            `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-    }, 1000);
-}
-
-function stopTimer() {
-    if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
-}
-
-function resetProgress() {
-    codeStreamBuffer = '';
-    document.getElementById('current-status').textContent = '等待训练';
-    document.getElementById('current-iteration').textContent = '0';
-    document.getElementById('elapsed-time').textContent = '--:--';
-    document.getElementById('accuracy').textContent = '-';
-    document.getElementById('log-content').innerHTML =
-        '<div class="log-entry info"><span class="log-timestamp">[--:--:--]</span>等待训练开始...</div>';
-    updateProgressBar(0);
-}
-
-function clearResultSection() {
-    const resultCard = document.getElementById('result-card');
-    const resultDownloads = document.getElementById('result-downloads');
-    resultCard.innerHTML = '<p style="color: #999; text-align: center; padding: 20px;">等待训练完成...</p>';
-    resultDownloads.innerHTML = '';
-}
-
-function resetTraining() {
-    clearResultSection();
-    _resetTrainingBtn();
-    resetProgress();
-}
-
-// ==================== 下载 ====================
-
-function downloadScript() {
-    const tenantId = document.getElementById('tenant-input').value.trim();
-    if (tenantId && tenantId !== '-') {
-        window.location.href = `/api/download-script/${tenantId}`;
-    } else {
-        alert('无法下载脚本：租户ID无效');
+    if (diff.total_cells != null && diff.matched_cells != null) {
+        text += `\n总单元格: ${diff.total_cells}, 匹配: ${diff.matched_cells}\n`;
     }
+
+    return text;
 }
 
-async function downloadTrainingFiles(tenantId, fileType) {
+async function _downloadFile(sessionId, fileType) {
     try {
-        const response = await AUTH.authFetch(`/api/training-logs/${tenantId}`);
-        if (!response.ok) { alert('获取训练日志失败'); return; }
-        const data = await response.json();
-        const logs = data.logs || [];
-
-        let pattern;
-        if (fileType === 'output') {
-            pattern = /_output_.*\.xlsx$/i;
-        } else if (fileType === 'comparison') {
-            pattern = /(_comparison_|差异对比).*\.xlsx$/i;
+        const resp = await AUTH.authFetch(`/api/training/chat/sessions/${sessionId}/download/${fileType}`);
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            alert('下载失败: ' + (err.detail || `HTTP ${resp.status}`));
+            return;
         }
+        const blob = await resp.blob();
+        const disposition = resp.headers.get('content-disposition') || '';
+        const fnMatch = disposition.match(/filename[*]?=(?:UTF-8'')?["']?([^"';\n]+)/i);
+        const filename = fnMatch ? decodeURIComponent(fnMatch[1]) : `${fileType}_${sessionId}`;
 
-        const matched = logs.find(f => pattern && pattern.test(f.filename));
-        if (matched) {
-            window.location.href = `/api/download-log/${tenantId}/${matched.filename}`;
-        } else {
-            alert(`未找到${fileType === 'output' ? '输出结果' : '差异对比'}文件`);
-        }
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
     } catch (e) {
         alert('下载失败: ' + e.message);
     }
 }
 
-// ==================== 调整逻辑弹窗 ====================
+function _showDownloadBar(sessionId, files) {
+    const container = document.getElementById('chat-messages');
+    const bar = document.createElement('div');
+    bar.className = 'message system download-bar';
 
-let adjustDiffData = {};
+    const label = document.createElement('div');
+    label.className = 'message-label';
+    label.textContent = '下载';
 
-async function openAdjustModal(tenantId) {
-    const modal = document.getElementById('adjust-modal');
-    const loading = document.getElementById('adjust-loading');
-    const columnsList = document.getElementById('adjust-columns-list');
-    const rulesSummary = document.getElementById('adjust-rules-summary');
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'message-content download-buttons';
 
-    modal.style.display = 'flex';
-    loading.style.display = 'block';
-    loading.innerHTML = '<div class="loading">正在实时验证脚本并分析差异列...</div>';
-    columnsList.innerHTML = '';
-    rulesSummary.innerHTML = '';
-    adjustDiffData = {};
+    const baseUrl = `/api/training/chat/sessions/${sessionId}/download`;
 
-    // 调用增强版 training-detail（live=true，实时执行脚本对比）
-    let detail = null;
-    try {
-        // 构建URL，附带薪资参数（避免脚本因参数为空报错）
-        let detailUrl = `/api/training-detail/${tenantId}?live=true`;
-        const salaryMonthEl = document.getElementById('salary-month');
-        const standardHoursEl = document.getElementById('standard-hours');
-        if (salaryMonthEl && salaryMonthEl.value.trim()) {
-            const parts = salaryMonthEl.value.trim().split('-');
-            if (parts.length === 2) {
-                const year = parseInt(parts[0]);
-                const month = parseInt(parts[1]);
-                if (!isNaN(year) && !isNaN(month)) {
-                    detailUrl += `&salary_year=${year}&salary_month=${month}`;
-                }
-            }
-        }
-        if (standardHoursEl && standardHoursEl.value.trim()) {
-            detailUrl += `&monthly_standard_hours=${standardHoursEl.value.trim()}`;
-        }
-        const response = await AUTH.authFetch(detailUrl);
-        if (response.ok) {
-            detail = await response.json();
-        }
-    } catch (e) {
-        console.error('training-detail failed:', e);
-    }
+    const items = [
+        { type: 'script', label: '脚本 (.py)', icon: '📄' },
+        { type: 'output', label: '生成结果 (.xlsx)', icon: '📊' },
+        { type: 'diff', label: '差异对比 (.xlsx)', icon: '📋' },
+    ];
 
-    let fieldDiffs = (detail && detail.field_diff_samples) || {};
-    adjustDiffData = fieldDiffs;
+    items.forEach(item => {
+        // 检查是否有对应文件
+        const hasFile = files && (
+            (item.type === 'script' && files.script_file) ||
+            (item.type === 'output' && files.output_file) ||
+            (item.type === 'diff' && files.diff_file)
+        );
+        if (!hasFile) return;
 
-    // 显示规则摘要
-    if (detail && detail.rules_content) {
-        const rulesPreview = detail.rules_content.length > 500
-            ? detail.rules_content.substring(0, 500) + '...'
-            : detail.rules_content;
-        rulesSummary.innerHTML = `
-            <div class="adjust-rules-box">
-                <div class="adjust-rules-header" onclick="this.parentElement.classList.toggle('expanded')">
-                    当前使用的规则 <span class="toggle-icon">&#9654;</span>
-                </div>
-                <div class="adjust-rules-content"><pre>${escapeHtml(rulesPreview)}</pre></div>
-            </div>
-        `;
-    }
-
-    renderAdjustColumns(tenantId, fieldDiffs, detail);
-}
-
-function renderAdjustColumns(tenantId, fieldDiffs, detail) {
-    const loading = document.getElementById('adjust-loading');
-    const columnsList = document.getElementById('adjust-columns-list');
-    loading.style.display = 'none';
-
-    const diffColumns = Object.keys(fieldDiffs);
-    const columnCodeMap = (detail && detail.column_code_map) || {};
-    const liveValidated = detail && detail.live_validated;
-
-    if (diffColumns.length === 0) {
-        // 无差异列，提供手动输入（同时列出所有预期列名供参考）
-        let expectedInfo = '';
-        if (detail && detail.expected_columns && detail.expected_columns.length > 0) {
-            expectedInfo = `<div class="adjust-column-info"><span>预期输出列: ${detail.expected_columns.join(', ')}</span></div>`;
-        }
-        columnsList.innerHTML = `
-            <div class="adjust-column-card no-diff" style="border-left-color: #667eea;">
-                <div class="adjust-column-header">
-                    <span class="adjust-column-name">手动调整</span>
-                    <span class="adjust-column-badge" style="background: #e7f3ff; color: #667eea;">自定义</span>
-                </div>
-                ${expectedInfo}
-                <div class="form-group" style="margin-bottom: 8px;">
-                    <input type="text" id="manual-target-columns" placeholder="输入目标列名，多列用逗号分隔" style="width:100%; padding:8px 10px; border:1px solid #ddd; border-radius:6px; font-size:13px;">
-                </div>
-                <textarea class="adjust-column-textarea" id="manual-adjust-request" placeholder="输入修改意见，如：加班费改为按1.5倍计算"></textarea>
-            </div>
-        `;
-        return;
-    }
-
-    // 渲染差异列
-    const currentScore = detail && detail.score != null ? (detail.score * 100).toFixed(2) + '%' : 'N/A';
-    let html = `<div style="font-size:13px; color:#666; margin-bottom:12px;">
-        当前准确率: <strong>${currentScore}</strong>${liveValidated ? ' (实时验证)' : ''} |
-        共 <strong>${diffColumns.length}</strong> 个差异列，在需要修改的列中填写修改意见：
-    </div>`;
-
-    const sorted = diffColumns.sort((a, b) => (fieldDiffs[b].count || 0) - (fieldDiffs[a].count || 0));
-
-    sorted.forEach(col => {
-        const info = fieldDiffs[col];
-        const count = info.count || 0;
-        const formula = info.formula || '';
-        const codeLogic = columnCodeMap[col] || '';
-
-        let codeSection = '';
-        if (codeLogic) {
-            const codeId = 'code-' + col.replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '_');
-            codeSection = `
-                <div class="adjust-code-box" id="box-${codeId}">
-                    <div class="adjust-code-header" onclick="this.parentElement.classList.toggle('expanded')">
-                        当前代码逻辑 <span class="toggle-icon">&#9654;</span>
-                    </div>
-                    <div class="adjust-code-content"><pre>${escapeHtml(codeLogic)}</pre></div>
-                </div>
-            `;
-        }
-
-        html += `
-            <div class="adjust-column-card has-diff">
-                <div class="adjust-column-header">
-                    <span class="adjust-column-name">${escapeHtml(col)}</span>
-                    <span class="adjust-column-badge diff">${count} 处差异</span>
-                </div>
-                <div class="adjust-column-info">
-                    <span>当前公式: <code>${escapeHtml(formula) || '无公式/纯值'}</code></span>
-                </div>
-                ${codeSection}
-                <textarea class="adjust-column-textarea" data-column="${escapeHtml(col)}" placeholder="填写修改意见（留空则不调整此列）"></textarea>
-            </div>
-        `;
+        const btn = document.createElement('button');
+        btn.className = 'download-btn';
+        btn.textContent = `${item.icon} ${item.label}`;
+        btn.onclick = () => _downloadFile(sessionId, item.type);
+        contentDiv.appendChild(btn);
     });
 
-    columnsList.innerHTML = html;
+    if (contentDiv.children.length === 0) return;  // 没有可下载的文件
+
+    bar.appendChild(label);
+    bar.appendChild(contentDiv);
+    container.appendChild(bar);
+    container.scrollTop = container.scrollHeight;
 }
 
-function escapeHtml(str) {
-    if (!str) return '';
-    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+function _showAnalyzeDiffButton() {
+    const container = document.getElementById('chat-messages');
+    const bar = document.createElement('div');
+    bar.className = 'message system analyze-bar';
+
+    const label = document.createElement('div');
+    label.className = 'message-label';
+    label.textContent = '操作';
+
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'message-content';
+
+    const btn = document.createElement('button');
+    btn.className = 'download-btn analyze-btn';
+    btn.textContent = '分析差异并修正';
+    btn.onclick = () => {
+        if (_isStreaming) return;
+        const input = document.getElementById('chat-input');
+        input.value = '请分析上次执行结果与预期的差异，找出代码中的问题并给出修改建议';
+        sendMessage();
+    };
+
+    contentDiv.appendChild(btn);
+    bar.appendChild(label);
+    bar.appendChild(contentDiv);
+    container.appendChild(bar);
+    container.scrollTop = container.scrollHeight;
 }
 
-function closeAdjustModal() {
-    document.getElementById('adjust-modal').style.display = 'none';
-}
+function _showSessionFilesInfo(data) {
+    const container = document.getElementById('chat-messages');
+    const placeholder = document.getElementById('chat-placeholder');
+    if (placeholder) placeholder.style.display = 'none';
 
-async function submitAdjustment() {
-    const tenantId = document.getElementById('tenant-input').value.trim();
-    if (!tenantId) { alert('租户ID不能为空'); return; }
+    const sourceNames = data.source_file_names || [];
+    const expectedName = data.expected_file_name;
+    if (sourceNames.length === 0 && !expectedName) return;
 
-    let targetColumns = [];
-    let adjustmentParts = [];
+    const msgDiv = document.createElement('div');
+    msgDiv.className = 'message system files-info';
 
-    const manualInput = document.getElementById('manual-target-columns');
-    const manualRequest = document.getElementById('manual-adjust-request');
+    const label = document.createElement('div');
+    label.className = 'message-label';
+    label.textContent = '训练文件';
 
-    if (manualInput && manualInput.value.trim()) {
-        targetColumns = manualInput.value.trim().split(/[,，]/).map(s => s.trim()).filter(Boolean);
-        adjustmentParts.push(manualRequest ? manualRequest.value.trim() : '');
-    } else {
-        const textareas = document.querySelectorAll('#adjust-columns-list textarea[data-column]');
-        textareas.forEach(ta => {
-            const text = ta.value.trim();
-            if (text) {
-                const col = ta.getAttribute('data-column');
-                targetColumns.push(col);
-                adjustmentParts.push(`${col}: ${text}`);
-            }
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'message-content session-files-content';
+
+    // 源文件列表 + 下载
+    if (sourceNames.length > 0) {
+        const srcSection = document.createElement('div');
+        srcSection.className = 'files-section';
+        srcSection.innerHTML = '<strong>源文件:</strong> ';
+        sourceNames.forEach(fn => {
+            const link = document.createElement('a');
+            link.className = 'file-download-link';
+            link.textContent = fn;
+            link.href = '#';
+            link.onclick = (e) => {
+                e.preventDefault();
+                _downloadOriginalFile(_currentSessionId, 'source', fn);
+            };
+            srcSection.appendChild(link);
+            srcSection.appendChild(document.createTextNode(' '));
         });
+        contentDiv.appendChild(srcSection);
     }
 
-    if (targetColumns.length === 0 || adjustmentParts.join('').trim() === '') {
-        alert('请至少填写一列的修改意见');
-        return;
+    // 预期文件 + 下载
+    if (expectedName) {
+        const expSection = document.createElement('div');
+        expSection.className = 'files-section';
+        expSection.innerHTML = '<strong>预期文件:</strong> ';
+        const link = document.createElement('a');
+        link.className = 'file-download-link';
+        link.textContent = expectedName;
+        link.href = '#';
+        link.onclick = (e) => {
+            e.preventDefault();
+            _downloadOriginalFile(_currentSessionId, 'expected');
+        };
+        expSection.appendChild(link);
+        contentDiv.appendChild(expSection);
     }
 
-    const adjustmentRequest = adjustmentParts.join('\n');
-    const submitBtn = document.getElementById('adjust-submit-btn');
-    submitBtn.disabled = true;
-    submitBtn.textContent = '修正中...';
-
-    addLog('info', `开始调整逻辑: 目标列=[${targetColumns.join(', ')}]`);
-    addLog('info', `修改意见: ${adjustmentRequest}`);
-
-    try {
-        const formData = new FormData();
-        formData.append('tenant_id', tenantId);
-        formData.append('adjustment_request', adjustmentRequest);
-        formData.append('target_columns', targetColumns.join(','));
-
-        // 附带薪资参数（避免脚本因参数为空报错）
-        const salaryMonthEl = document.getElementById('salary-month');
-        const standardHoursEl = document.getElementById('standard-hours');
-        if (salaryMonthEl && salaryMonthEl.value.trim()) {
-            const parts = salaryMonthEl.value.trim().split('-');
-            if (parts.length === 2) {
-                const year = parseInt(parts[0]);
-                const month = parseInt(parts[1]);
-                if (!isNaN(year) && !isNaN(month)) {
-                    formData.append('salary_year', year);
-                    formData.append('salary_month', month);
-                }
-            }
-        }
-        if (standardHoursEl && standardHoursEl.value.trim()) {
-            formData.append('monthly_standard_hours', standardHoursEl.value.trim());
-        }
-
-        const response = await AUTH.authFetch('/api/adjust-code', {
-            method: 'POST',
-            body: formData
-        });
-
-        const result = await response.json();
-
-        if (!response.ok) {
-            throw new Error(result.detail || '调整请求失败');
-        }
-
-        const columnsList = document.getElementById('adjust-columns-list');
-
-        // 处理执行失败的情况（脚本出错才显示失败）
-        if (result.status === 'execution_failed' || result.status === 'ai_generation_failed' || result.status === 'no_output') {
-            columnsList.innerHTML += `
-                <div class="adjust-result rejected">
-                    <strong>脚本执行失败</strong> — ${escapeHtml(result.error || result.message || '未知错误')}
-                    <br>执行耗时: ${result.execution_time || '-'}秒
-                </div>
-            `;
-            addLog('error', `调整失败: ${result.error || result.message || '未知错误'}`);
-        } else {
-            // 正常完成：显示对比结果
-            const adopted = result.adopted;
-            const origScore = result.original_score != null ? result.original_score : '-';
-            const newScore = result.new_score != null ? result.new_score : '-';
-            const matchedCells = result.matched_cells != null ? result.matched_cells : '-';
-            const totalCells = result.total_cells != null ? result.total_cells : '-';
-            const totalDiff = result.total_differences != null ? result.total_differences : '-';
-
-            columnsList.innerHTML += `
-                <div class="adjust-result adopted">
-                    <strong>已采纳</strong> — 新脚本ID: ${result.new_script_id || '-'}
-                    <br>原始分数: ${origScore}% → 新分数: ${newScore}%
-                    <br>匹配: ${matchedCells}/${totalCells} 个单元格，差异 ${totalDiff} 处
-                    <br>执行耗时: ${result.execution_time || '-'}秒
-                </div>
-            `;
-
-            addLog('success', `调整完成: 已采纳 原始=${origScore}% 新=${newScore}%`);
-
-            // 刷新列表显示新脚本
-            await Promise.all([loadTenantList(), loadTrainingHistory()]);
-            loadTenantStatus();
-            loadTenantScripts(tenantId);
-        }
-    } catch (e) {
-        addLog('error', `调整失败: ${e.message}`);
-        alert('调整失败: ' + e.message);
-    } finally {
-        submitBtn.disabled = false;
-        submitBtn.textContent = '开始修正';
-    }
+    msgDiv.appendChild(label);
+    msgDiv.appendChild(contentDiv);
+    container.appendChild(msgDiv);
 }
-
-// ==================== 文件列表显示 ====================
-
-function updateFileList(inputId, listId) {
-    const input = document.getElementById(inputId);
-    const list = document.getElementById(listId);
-
-    console.log('updateFileList called:', inputId, 'files:', input?.files?.length);
-
-    if (!input || !list) {
-        console.error('Element not found:', inputId, listId);
-        return;
-    }
-
-    if (!input.files || input.files.length === 0) {
-        list.innerHTML = '';
-        return;
-    }
-
-    let html = '<div style="margin-top: 8px; font-size: 13px; color: #666;">';
-    Array.from(input.files).forEach(file => {
-        html += `<div style="padding: 4px 0;">📄 ${file.name}</div>`;
-    });
-    html += '</div>';
-    list.innerHTML = html;
-    console.log('File list updated:', list.innerHTML);
-}
-
-// ==================== 规则整理功能 ====================
 
 /**
- * 将文本内容作为文件下载
+ * 合并消息 + 迭代记录，构建完整的对话时间线
+ * 迭代记录包含代码生成详情，补充消息中缺失的信息
  */
-function _downloadAsTextFile(content, filename, mimeType) {
-    const blob = new Blob([content], { type: mimeType || 'text/plain; charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+function _renderFullHistory(messages, iterations) {
+    // 构建迭代按 iteration_num 索引
+    const iterMap = {};
+    iterations.forEach(it => { iterMap[it.iteration_num] = it; });
+
+    // 记录哪些迭代已经通过消息 metadata 提及（避免重复）
+    const mentionedIters = new Set();
+    messages.forEach(msg => {
+        if (msg.metadata && msg.metadata.iteration) {
+            mentionedIters.add(msg.metadata.iteration);
+        }
+    });
+
+    // 按时间线渲染消息，在合适位置插入迭代详情
+    let lastRenderedIter = 0;
+
+    messages.forEach(msg => {
+        // 在此消息之前，检查是否有未展示的迭代信息需要插入
+        const msgIter = msg.metadata && msg.metadata.iteration;
+
+        // 渲染原始消息
+        if (msg.role === 'user') {
+            _addMessage('user', msg.content);
+        } else if (msg.role === 'assistant') {
+            _addMessage('assistant', msg.content);
+        } else if (msg.role === 'system') {
+            _addSystemMessage(msg.content, msg.msg_type, msg.metadata);
+        }
+
+        // 如果这条消息是迭代结果消息，在其后追加代码摘要
+        if (msgIter && iterMap[msgIter]) {
+            const it = iterMap[msgIter];
+            if (it.generated_code) {
+                _renderIterationCodeSummary(it);
+            }
+            lastRenderedIter = msgIter;
+        }
+    });
+
+    // 如果有迭代没有对应的消息（例如首轮训练后没保存足够消息），补充渲染
+    iterations.forEach(it => {
+        if (!mentionedIters.has(it.iteration_num)) {
+            _renderOrphanIteration(it);
+        }
+    });
+}
+
+/**
+ * 渲染迭代代码摘要（折叠式，可展开查看代码）
+ */
+function _renderIterationCodeSummary(iteration) {
+    const container = document.getElementById('chat-messages');
+    const msgDiv = document.createElement('div');
+    msgDiv.className = 'message system';
+
+    const label = document.createElement('div');
+    label.className = 'message-label';
+    label.textContent = `第 ${iteration.iteration_num} 轮代码`;
+
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'message-content iteration-code-summary';
+
+    const codeLines = iteration.generated_code.split('\n');
+    const lineCount = codeLines.length;
+    const preview = codeLines.slice(0, 6).join('\n');
+
+    const toggleId = `code-toggle-${iteration.iteration_num}`;
+    contentDiv.innerHTML = `
+        <div class="code-summary-header" onclick="document.getElementById('${toggleId}').classList.toggle('expanded')">
+            <span>生成代码（${lineCount} 行）</span>
+            <span class="code-toggle-icon">▶ 展开/收起</span>
+        </div>
+        <div id="${toggleId}" class="code-collapse">
+            <pre><code>${_escapeHtml(iteration.generated_code)}</code></pre>
+        </div>
+    `;
+
+    msgDiv.appendChild(label);
+    msgDiv.appendChild(contentDiv);
+    container.appendChild(msgDiv);
+}
+
+/**
+ * 渲染没有对应消息的孤立迭代记录
+ */
+function _renderOrphanIteration(iteration) {
+    const container = document.getElementById('chat-messages');
+
+    // 显示迭代结果
+    const acc = iteration.accuracy;
+    let resultText = `第 ${iteration.iteration_num} 轮`;
+    if (acc != null) {
+        resultText += ` — 准确率 ${(acc * 100).toFixed(1)}%`;
+    }
+    if (iteration.status === 'failed') {
+        resultText += '（执行失败）';
+    }
+
+    const metadata = {
+        iteration: iteration.iteration_num,
+        accuracy: acc
+    };
+    _addSystemMessage(resultText, acc != null ? 'status' : 'status', metadata);
+
+    // 如果有代码，显示折叠摘要
+    if (iteration.generated_code) {
+        _renderIterationCodeSummary(iteration);
+    }
+}
+
+function _escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+function _showHistoryDownloadBar(sessionId, latestFiles, hasRules) {
+    const container = document.getElementById('chat-messages');
+    const bar = document.createElement('div');
+    bar.className = 'message system download-bar';
+
+    const label = document.createElement('div');
+    label.className = 'message-label';
+    label.textContent = '下载';
+
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'message-content download-buttons';
+
+    const items = [
+        { type: 'script', label: '脚本 (.py)', icon: '\uD83D\uDCC4', has: latestFiles.script_file },
+        { type: 'output', label: '生成结果 (.xlsx)', icon: '\uD83D\uDCCA', has: latestFiles.output_file },
+        { type: 'diff', label: '差异对比 (.xlsx)', icon: '\uD83D\uDCCB', has: latestFiles.diff_file },
+    ];
+
+    items.forEach(item => {
+        if (!item.has) return;
+        const btn = document.createElement('button');
+        btn.className = 'download-btn';
+        btn.textContent = `${item.icon} ${item.label}`;
+        btn.onclick = () => _downloadFile(sessionId, item.type);
+        contentDiv.appendChild(btn);
+    });
+
+    // 提示词下载
+    const promptBtn = document.createElement('button');
+    promptBtn.className = 'download-btn prompt-btn';
+    promptBtn.textContent = '\uD83D\uDCDD 提示词/上下文';
+    promptBtn.onclick = () => _downloadOriginalFile(sessionId, 'prompt');
+    contentDiv.appendChild(promptBtn);
+
+    // 规则下载
+    if (hasRules) {
+        const rulesBtn = document.createElement('button');
+        rulesBtn.className = 'download-btn';
+        rulesBtn.textContent = '\uD83D\uDCD6 规则文件';
+        rulesBtn.onclick = () => _downloadOriginalFile(sessionId, 'rules');
+        contentDiv.appendChild(rulesBtn);
+    }
+
+    if (contentDiv.children.length === 0) return;
+
+    bar.appendChild(label);
+    bar.appendChild(contentDiv);
+    container.appendChild(bar);
+    container.scrollTop = container.scrollHeight;
+}
+
+async function _downloadOriginalFile(sessionId, category, filename) {
+    try {
+        let url = `/api/training/chat/sessions/${sessionId}/original-files/${category}`;
+        if (filename) url += `?filename=${encodeURIComponent(filename)}`;
+        const resp = await AUTH.authFetch(url);
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            alert('下载失败: ' + (err.detail || `HTTP ${resp.status}`));
+            return;
+        }
+        const blob = await resp.blob();
+        const disposition = resp.headers.get('content-disposition') || '';
+        const fnMatch = disposition.match(/filename[*]?=(?:UTF-8'')?["']?([^"';\n]+)/i);
+        const dlName = fnMatch ? decodeURIComponent(fnMatch[1]) : (filename || `${category}_${sessionId}`);
+
+        const objUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = objUrl;
+        a.download = dlName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(objUrl);
+    } catch (e) {
+        alert('下载失败: ' + e.message);
+    }
+}
+
+// ==================== UI 状态 ====================
+function _setUIStreaming(streaming) {
+    _isStreaming = streaming;
+    const sendBtn = document.getElementById('send-btn');
+    const genBtn = document.getElementById('generate-btn');
+    sendBtn.disabled = streaming;
+    if (genBtn) genBtn.disabled = streaming;
+    if (streaming) {
+        sendBtn.textContent = '处理中...';
+    } else {
+        sendBtn.textContent = '发送';
+        // 对话流式状态也要重置
+        _chatStreamEl = null;
+        _chatStreamBuf = '';
+    }
+}
+
+// ==================== 动作按钮 ====================
+async function setBestCode() {
+    if (!_currentSessionId) return;
+    if (!confirm('确定将当前最佳代码设为正式脚本？')) return;
+
+    try {
+        const resp = await AUTH.authFetch(`/api/training/chat/sessions/${_currentSessionId}/set-best`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({}),
+        });
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            throw new Error(err.detail || `HTTP ${resp.status}`);
+        }
+        const data = await resp.json();
+        _addSystemMessage(
+            `已设为最佳脚本 (v${data.version}，准确率 ${(data.accuracy * 100).toFixed(1)}%)`,
+            'status', { accuracy: data.accuracy }
+        );
+        _updateChatStatus('completed');
+        document.getElementById('btn-set-best').disabled = true;
+        document.getElementById('btn-set-best').textContent = '已设置';
+        loadSessions();
+    } catch (e) {
+        alert('设为最佳失败: ' + e.message);
+    }
+}
+
+function showUploadCode() {
+    document.getElementById('upload-code-input').click();
+}
+
+async function handleUploadCode(event) {
+    const file = event.target.files[0];
+    if (!file || !_currentSessionId) return;
+
+    const formData = new FormData();
+    formData.append('code_file', file);
+
+    try {
+        _setUIStreaming(true);
+        _addSystemMessage(`正在上传并验证代码文件: ${file.name}`, 'status');
+
+        const resp = await AUTH.authFetch(`/api/training/chat/sessions/${_currentSessionId}/upload-code`, {
+            method: 'POST',
+            body: formData,
+        });
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            throw new Error(err.detail || `HTTP ${resp.status}`);
+        }
+        const data = await resp.json();
+
+        if (data.success) {
+            const accPct = (data.accuracy * 100).toFixed(1);
+            _currentAccuracy = data.accuracy;
+            _currentCode = 'uploaded';  // 标记有代码，使按钮可见
+            let msg = `代码上传成功，准确率 ${accPct}%`;
+            if (data.accuracy < 1.0 && data.diff_details) {
+                msg += '\n\n' + _formatDiffDetails(data.diff_details);
+            }
+            _addSystemMessage(msg, data.accuracy < 1.0 ? 'diff' : 'status', { accuracy: data.accuracy });
+        } else {
+            _addSystemMessage(`代码上传执行失败: ${data.error || '未知错误'}`, 'status', { error: data.error });
+        }
+        _updateActionButtons({ status: 'running', has_script: false });
+        loadSessions();
+    } catch (e) {
+        _addSystemMessage('上传代码失败: ' + e.message, 'status', { error: true });
+    } finally {
+        _setUIStreaming(false);
+        event.target.value = '';
+    }
+}
+
+async function downloadCode() {
+    if (!_currentSessionId) return;
+    try {
+        const resp = await AUTH.authFetch(`/api/training/chat/sessions/${_currentSessionId}/code`);
+        if (!resp.ok) {
+            alert('获取代码失败');
+            return;
+        }
+        const data = await resp.json();
+        if (!data.code) {
+            alert('暂无可下载的代码');
+            return;
+        }
+        const blob = new Blob([data.code], { type: 'text/x-python; charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `script_${_currentTenantId || 'unknown'}.py`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    } catch (e) {
+        alert('下载失败: ' + e.message);
+    }
+}
+
+// ==================== 输入处理 ====================
+function handleInputKeydown(event) {
+    if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        if (event.ctrlKey || event.metaKey) {
+            // Ctrl+Enter → 执行修正
+            sendMessage('generate');
+        } else {
+            // Enter → 对话
+            sendMessage();
+        }
+    }
+}
+
+function clearChat() {
+    createNewSession();
 }

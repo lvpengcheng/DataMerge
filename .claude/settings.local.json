@@ -102,7 +102,8 @@
       "Bash(cp -r fonts releases/datamerge-1.0.0/)",
       "Bash(cp .env.example build_docker.sh releases/datamerge-1.0.0/)",
       "Read(//c/Users/Administrator/Desktop/asposetest/**)",
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "Bash(awk 'NR>=2266 && NR<=2431' backend/ai_engine/formula_code_generator.py)"
     ],
     "additionalDirectories": [
       "E:\\project\\DataMerge20260224\\DataMerge\\backend\\test_data\\data_cleaning_test",

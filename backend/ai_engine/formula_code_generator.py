@@ -2268,6 +2268,12 @@ def main():
 【任务说明】
 只需要修正fill_result_sheets函数，其他代码（数据加载、保存等）由固定模板处理。
 
+⚠️ **最重要的修正原则：**
+1. **只修改差异中指出的列，其他列的代码不要动**
+2. **必须保留原始代码中所有变量定义（如 sn_xxx = "表名" 等 sheet name 变量），不得删除或遗漏任何变量**
+3. **输出完整的fill_result_sheets函数，包含所有原有的变量定义、所有列的处理逻辑**
+4. **如果用户要求只改某列，则只修改该列的公式，其余全部原样保留**
+
 ## 原始fill_result_sheets函数
 ```python
 {original_fill_function}
@@ -2338,7 +2344,7 @@ def main():
   - ✅ 正确示例：
     - `f'=TEXT(A1,"YYYY-MM-DD")'` ← 公式中有双引号，外层用单引号
     - `f'=DATEDIF(N{{r}},DATE(参数!$B$2,参数!$B$3+1,0),"Y")'` ← 公式中有双引号，外层用单引号
-    - `f"=VLOOKUP(K{{r}},'{sn_bank}'!$A:$J,{col_num},FALSE)"` ← 公式中只有单引号，外层用双引号
+    - `f"=VLOOKUP(K{{r}},'{{sn_bank}}'!$A:$J,{{col_num}},FALSE)"` ← 公式中只有单引号，外层用双引号
   - ❌ 错误示例：
     - `f"=TEXT(A1,\"YYYY-MM-DD\")"` ← 错误！双引号冲突
     - `f"=DATEDIF(N{{r}},DATE(参数!$B$2,参数!$B$3+1,0),""Y"")"` ← 错误！双引号冲突
@@ -2365,7 +2371,7 @@ def main():
 from openpyxl.formatting.rule import CellIsRule
 red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
 # 出勤天数>20标红（E列）
-cell_range = f"E2:E{n_rows+1}"
+cell_range = f"E2:E{{n_rows+1}}"
 ws.conditional_formatting.add(cell_range, CellIsRule(operator="greaterThan", formula=["20"], fill=red_fill))
 ```
 - 支持的operator：greaterThan, lessThan, equal, notEqual, greaterThanOrEqual, lessThanOrEqual, between
@@ -2378,7 +2384,7 @@ ws.conditional_formatting.add(cell_range, CellIsRule(operator="greaterThan", for
 from openpyxl.formatting.rule import FormulaRule
 yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
 # 基本工资>20000标黄警告（D列）
-cell_range = f"D2:D{n_rows+1}"
+cell_range = f"D2:D{{n_rows+1}}"
 ws.conditional_formatting.add(cell_range, FormulaRule(formula=["D2>20000"], fill=yellow_fill))
 ```
 
@@ -2435,9 +2441,10 @@ ws.conditional_formatting.add(cell_range, FormulaRule(formula=["D2>20000"], fill
             def chunk_handler(chunk):
                 nonlocal raw_response
                 raw_response += chunk
-                import sys
-                sys.stdout.write(chunk)
-                sys.stdout.flush()
+                # 转发到 stream_callback（带 [CODE] 前缀供前端识别）
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                stream_callback(f"[{timestamp}] [CODE] {chunk}")
 
             extracted = self.ai_provider.generate_code_with_stream(prompt, chunk_callback=chunk_handler)
             ai_response = raw_response if raw_response else extracted

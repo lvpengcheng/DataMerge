@@ -172,6 +172,13 @@ class TrainingSession(Base):
     source_asset_ids = Column(JSON, nullable=True)                  # 关联的源文件 asset id 列表
     expected_asset_id = Column(Integer, ForeignKey("data_assets.id"), nullable=True)
     final_script_id = Column(Integer, ForeignKey("scripts.id"), nullable=True)
+    ai_provider = Column(String(50), nullable=True)              # deepseek / claude / openai
+    salary_year = Column(Integer, nullable=True)
+    salary_month = Column(Integer, nullable=True)
+    manual_headers = Column(JSON, nullable=True)                 # {"文件.xlsx": {"Sheet1": [3,3]}}
+    rules_content = Column(Text, nullable=True)                  # 规则文本
+    source_structure = Column(JSON, nullable=True)               # 源文件结构描述
+    expected_structure = Column(JSON, nullable=True)             # 目标文件结构
     total_iterations = Column(Integer, default=0)
     best_accuracy = Column(Float, nullable=True)
     error_message = Column(Text, nullable=True)
@@ -182,6 +189,23 @@ class TrainingSession(Base):
     expected_asset = relationship("DataAsset", foreign_keys=[expected_asset_id])
     final_script = relationship("Script", foreign_keys=[final_script_id])
     iterations = relationship("TrainingIteration", back_populates="session", order_by="TrainingIteration.iteration_num")
+    messages = relationship("TrainingMessage", back_populates="session", order_by="TrainingMessage.created_at")
+
+
+# ==================== 训练对话消息 ====================
+
+class TrainingMessage(Base):
+    __tablename__ = "training_messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(Integer, ForeignKey("training_sessions.id"), nullable=False, index=True)
+    role = Column(String(20), nullable=False)           # user / assistant / system
+    content = Column(Text, nullable=False, default="")
+    msg_type = Column(String(20), default="chat")       # chat / diff / code / status
+    metadata_ = Column("metadata", JSON, nullable=True) # iteration_num, accuracy, diff details, etc.
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    session = relationship("TrainingSession", back_populates="messages")
 
 
 # ==================== 训练迭代 ====================
@@ -218,6 +242,10 @@ class Script(Base):
     code = Column(Text, nullable=False)                             # Python 代码
     mode = Column(String(20), default="formula")                    # formula / modular
     config = Column(JSON, nullable=True)                            # 脚本配置（列映射等）
+    manual_headers = Column(JSON, nullable=True)                   # 手动表头
+    source_structure = Column(JSON, nullable=True)                 # 源文件结构
+    rules_content = Column(Text, nullable=True)                    # 规则文本
+    expected_structure = Column(JSON, nullable=True)               # 目标文件结构
     source_session_id = Column(Integer, ForeignKey("training_sessions.id"), nullable=True)
     accuracy = Column(Float, nullable=True)                         # 训练时的最佳准确率
     version = Column(Integer, default=1)

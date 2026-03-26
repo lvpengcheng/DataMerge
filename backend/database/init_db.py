@@ -89,7 +89,7 @@ from backend.database.connection import engine, SessionLocal, Base
 from backend.database.models import (
     Role, Organization, User, TenantAuthorization,
     ReferenceCategory, DataAsset,
-    TrainingSession, TrainingIteration, Script,
+    TrainingSession, TrainingIteration, TrainingMessage, Script,
     ComputeTask, ComputeTaskInput, RuleSession,
 )
 from passlib.context import CryptContext
@@ -116,6 +116,18 @@ def _migrate_add_columns():
         ("compute_tasks", "salary_year", "INTEGER"),
         ("compute_tasks", "salary_month", "INTEGER"),
         ("templates", "show_empty_period", "BOOLEAN DEFAULT TRUE"),
+        # 训练信息统一入库
+        ("training_sessions", "ai_provider", "VARCHAR(50)"),
+        ("training_sessions", "salary_year", "INTEGER"),
+        ("training_sessions", "salary_month", "INTEGER"),
+        ("training_sessions", "manual_headers", "TEXT"),
+        ("training_sessions", "rules_content", "TEXT"),
+        ("training_sessions", "source_structure", "TEXT"),
+        ("training_sessions", "expected_structure", "TEXT"),
+        ("scripts", "manual_headers", "TEXT"),
+        ("scripts", "source_structure", "TEXT"),
+        ("scripts", "rules_content", "TEXT"),
+        ("scripts", "expected_structure", "TEXT"),
     ]
 
     with engine.connect() as conn:

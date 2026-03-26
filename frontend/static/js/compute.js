@@ -548,7 +548,8 @@ function showResult(data) {
     resultDownloads.innerHTML = `
         <div class="download-row">
             <button class="btn btn-download" onclick="downloadResult('${data.output_file}')">下载计算结果</button>
-            <button class="btn btn-secondary" onclick="resetCompute()">重新计算</button>
+            <button class="btn btn-primary" onclick="resetCompute(); startCompute();">重新计算</button>
+            <button class="btn btn-secondary" onclick="fullReset()">更换文件</button>
         </div>
     `;
 }
@@ -582,7 +583,16 @@ function resetCompute() {
     clearResult();
     updateStatus('等待计算');
     updateProgress(0);
+    // 保留已选文件和租户/脚本选择，用户可直接重新计算
+    checkCanCompute();
+}
+
+function fullReset() {
+    clearResult();
+    updateStatus('等待计算');
+    updateProgress(0);
     document.getElementById('source-files').value = '';
+    _filePasswordsMap = null;
     updateFileList();
     checkCanCompute();
 }

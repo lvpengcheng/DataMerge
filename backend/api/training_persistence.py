@@ -4,7 +4,7 @@
 
 import logging
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 
 from sqlalchemy.orm import Session
 
@@ -135,6 +135,10 @@ class TrainingPersistence:
         source_session_id: Optional[int] = None,
         accuracy: Optional[float] = None,
         created_by: Optional[int] = None,
+        manual_headers: Optional[Dict] = None,
+        source_structure: Optional[Any] = None,
+        rules_content: Optional[str] = None,
+        expected_structure: Optional[Any] = None,
     ) -> Script:
         """保存训练产出的脚本"""
         # 查找同名脚本，自增版本号
@@ -158,6 +162,10 @@ class TrainingPersistence:
             accuracy=accuracy,
             version=version,
             created_by=created_by,
+            manual_headers=manual_headers,
+            source_structure=source_structure,
+            rules_content=rules_content,
+            expected_structure=expected_structure,
         )
         self.db.add(script)
         self.db.commit()

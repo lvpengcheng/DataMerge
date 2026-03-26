@@ -34,9 +34,11 @@ from ..api.training import router as training_api_router
 from ..api.compute import router as compute_api_router
 from ..api.rules import router as rules_api_router
 from ..api.dashboard import router as dashboard_api_router
+from ..api.training_chat import router as training_chat_router
 from ..database.connection import engine, get_db, SessionLocal
 from ..database import models as db_models
 from ..auth.dependencies import get_current_user, get_accessible_tenants
+from sqlalchemy.orm import Session
 
 # 配置日志
 logging.basicConfig(
@@ -69,6 +71,7 @@ app.include_router(training_api_router)
 app.include_router(compute_api_router)
 app.include_router(rules_api_router)
 app.include_router(dashboard_api_router)
+app.include_router(training_chat_router)
 
 
 # ==================== 文件加密检测 API ====================
@@ -1273,29 +1276,25 @@ async def calculate_data(
         script_info = active_script["script_info"]
         manual_headers = script_info.get("manual_headers")
 
+        # 优先从 DB 读取元数据（第一入口：非流式计算）
+        try:
+            _db = SessionLocal()
+            try:
+                _db_script = _db.query(db_models.Script).filter(
+                    db_models.Script.tenant_id == tenant_id,
+                    db_models.Script.is_active == True,
+                ).order_by(db_models.Script.created_at.desc()).first()
+                if _db_script:
+                    if _db_script.manual_headers:
+                        manual_headers = _db_script.manual_headers
+                    if _db_script.source_structure:
+                        script_info["source_structure"] = _db_script.source_structure
+            finally:
+                _db.close()
+        except Exception as _e:
+            logger.warning(f"DB 读取脚本元数据失败: {_e}")
+
         # 获取源文件结构
-        if "source_structure" not in script_info:
-            raise HTTPException(
-                status_code=500,
-                detail="脚本信息中缺少源文件结构信息"
-            )
-
-        source_structure = script_info["source_structure"]
-
-        # ========== 快速表头匹配 ==========
-        from backend.utils.fast_header_matcher import FastHeaderMatcher
-
-        logger.info(f"使用FastHeaderMatcher进行快速表头匹配")
-        logger.info(f"上传文件列表: {[os.path.basename(f) for f in saved_files['input_files']]}")
-
-        fast_matcher = FastHeaderMatcher()
-
-        # 完整读取上传文件 → 提取表头 → 和source_structure对比
-        match_success, match_error, smart_mapping = fast_matcher.match_and_prepare(
-            source_structure=source_structure,
-            input_files=saved_files["input_files"],
-            manual_headers=manual_headers
-        )
 
         if not match_success:
             logger.error(f"FastHeaderMatcher匹配失败: {match_error}")
@@ -2204,6 +2203,24 @@ async def calculate_data_split(
         # 验证文档格式 - 使用源文件结构进行验证
         script_info = active_script["script_info"]
         manual_headers = script_info.get("manual_headers")
+
+        # 优先从 DB 读取元数据（第二入口：报表生成）
+        try:
+            _db = SessionLocal()
+            try:
+                _db_script = _db.query(db_models.Script).filter(
+                    db_models.Script.tenant_id == tenant_id,
+                    db_models.Script.is_active == True,
+                ).order_by(db_models.Script.created_at.desc()).first()
+                if _db_script:
+                    if _db_script.manual_headers:
+                        manual_headers = _db_script.manual_headers
+                    if _db_script.source_structure:
+                        script_info["source_structure"] = _db_script.source_structure
+            finally:
+                _db.close()
+        except Exception as _e:
+            logger.warning(f"DB 读取脚本元数据失败(报表): {_e}")
 
         # 获取源文件结构
         if "source_structure" not in script_info:
@@ -3907,140 +3924,165 @@ async def compute_with_script_stream(
                     # ========== 【关键修复】根据列头映射表名/sheet名/列名 ==========
                     pre_loaded_source_data = None
                     try:
-                        active_script = storage_manager.get_active_script(tenant_id)
-                        if active_script and "script_info" in active_script:
-                            script_info = active_script["script_info"]
-                            source_structure = script_info.get("source_structure")
-                            manual_headers = script_info.get("manual_headers")
-
-                            if source_structure:
-                                from backend.utils.fast_header_matcher import FastHeaderMatcher
-
-                                fast_matcher = FastHeaderMatcher()
-                                input_files = [
-                                    str(f) for f in source_dir.glob("*.xlsx")
-                                    if not f.name.startswith("~")
-                                ] + [
-                                    str(f) for f in source_dir.glob("*.xls")
-                                    if not f.name.startswith("~")
-                                ]
-
-                                if input_files:
-                                    log_msg = {
-                                        "type": "log",
-                                        "timestamp": datetime.now().strftime("%H:%M:%S"),
-                                        "level": "info",
-                                        "message": f"开始表头匹配映射（{len(input_files)}个文件）..."
+                        # 优先从 DB scripts 表读取元数据
+                        _script_info = None
+                        try:
+                            if db_session:
+                                _db_script = db_session.query(db_models.Script).filter(
+                                    db_models.Script.tenant_id == tenant_id,
+                                    db_models.Script.is_active == True,
+                                ).order_by(db_models.Script.created_at.desc()).first()
+                                if _db_script and (_db_script.manual_headers or _db_script.source_structure):
+                                    _script_info = {
+                                        "manual_headers": _db_script.manual_headers,
+                                        "source_structure": _db_script.source_structure,
                                     }
-                                    await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+                        except Exception as _e:
+                            logger.warning(f"DB 读取 script 元数据失败: {_e}")
 
-                                    match_success, match_error, smart_mapping = fast_matcher.match_and_prepare(
-                                        source_structure=source_structure,
-                                        input_files=input_files,
-                                        manual_headers=manual_headers
-                                    )
+                        # 回退：从文件系统读取
+                        if not _script_info:
+                            try:
+                                _info_file = storage_manager.get_tenant_dir(tenant_id) / "scripts" / f"{script_id}_info.json"
+                                if _info_file.exists():
+                                    _script_info = json.loads(_info_file.read_text(encoding="utf-8"))
+                            except Exception:
+                                pass
+                        if not _script_info:
+                            _active = storage_manager.get_active_script(tenant_id)
+                            _script_info = _active.get("script_info", {}) if _active else {}
 
-                                    if match_success and smart_mapping and smart_mapping.get("file_mapping"):
-                                        file_mapping = smart_mapping["file_mapping"]
+                        source_structure = _script_info.get("source_structure")
+                        manual_headers = _script_info.get("manual_headers")
 
-                                        # 根据映射结果重写/重命名文件
-                                        for input_file_name, mapping_info in file_mapping.items():
-                                            needs_rewrite = mapping_info.get("needs_rewrite", False)
-                                            expected_file = mapping_info.get("expected_file")
+                        if source_structure:
+                            from backend.utils.fast_header_matcher import FastHeaderMatcher
 
-                                            if needs_rewrite:
+                            fast_matcher = FastHeaderMatcher()
+                            input_files = [
+                                str(f) for f in source_dir.glob("*.xlsx")
+                                if not f.name.startswith("~")
+                            ] + [
+                                str(f) for f in source_dir.glob("*.xls")
+                                if not f.name.startswith("~")
+                            ]
+
+                            if input_files:
+                                log_msg = {
+                                    "type": "log",
+                                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                    "level": "info",
+                                    "message": f"开始表头匹配映射（{len(input_files)}个文件）..."
+                                }
+                                await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+
+                                match_success, match_error, smart_mapping = fast_matcher.match_and_prepare(
+                                    source_structure=source_structure,
+                                    input_files=input_files,
+                                    manual_headers=manual_headers
+                                )
+
+                                if match_success and smart_mapping and smart_mapping.get("file_mapping"):
+                                    file_mapping = smart_mapping["file_mapping"]
+
+                                    # 根据映射结果重写/重命名文件
+                                    for input_file_name, mapping_info in file_mapping.items():
+                                        needs_rewrite = mapping_info.get("needs_rewrite", False)
+                                        expected_file = mapping_info.get("expected_file")
+
+                                        if needs_rewrite:
+                                            old_path = os.path.join(str(source_dir), input_file_name)
+                                            if os.path.exists(old_path):
+                                                os.remove(old_path)
+                                            FastHeaderMatcher.rewrite_excel(mapping_info, str(source_dir))
+                                            logger.info(f"[compute/stream] 生成映射文件: {input_file_name} → {expected_file}")
+                                            log_msg = {
+                                                "type": "log",
+                                                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                                "level": "info",
+                                                "message": f"生成映射文件: {input_file_name} → {expected_file}"
+                                            }
+                                            await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+                                        else:
+                                            if input_file_name != expected_file:
                                                 old_path = os.path.join(str(source_dir), input_file_name)
-                                                if os.path.exists(old_path):
-                                                    os.remove(old_path)
-                                                FastHeaderMatcher.rewrite_excel(mapping_info, str(source_dir))
-                                                logger.info(f"[compute/stream] 生成映射文件: {input_file_name} → {expected_file}")
+                                                new_path = os.path.join(str(source_dir), expected_file)
+                                                if os.path.exists(new_path):
+                                                    os.remove(new_path)
+                                                shutil.move(old_path, new_path)
+                                                logger.info(f"[compute/stream] 文件重命名: {input_file_name} → {expected_file}")
                                                 log_msg = {
                                                     "type": "log",
                                                     "timestamp": datetime.now().strftime("%H:%M:%S"),
                                                     "level": "info",
-                                                    "message": f"生成映射文件: {input_file_name} → {expected_file}"
+                                                    "message": f"文件重命名: {input_file_name} → {expected_file}"
                                                 }
                                                 await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
-                                            else:
-                                                if input_file_name != expected_file:
-                                                    old_path = os.path.join(str(source_dir), input_file_name)
-                                                    new_path = os.path.join(str(source_dir), expected_file)
-                                                    if os.path.exists(new_path):
-                                                        os.remove(new_path)
-                                                    shutil.move(old_path, new_path)
-                                                    logger.info(f"[compute/stream] 文件重命名: {input_file_name} → {expected_file}")
+
+                                    # 构建预加载源数据
+                                    try:
+                                        pre_loaded_source_data = _build_pre_loaded_source_data(file_mapping)
+                                        if pre_loaded_source_data:
+                                            logger.info(f"[compute/stream] 预加载源数据: {len(pre_loaded_source_data)}个sheet")
+                                            log_msg = {
+                                                "type": "log",
+                                                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                                "level": "info",
+                                                "message": f"预加载源数据: {len(pre_loaded_source_data)}个sheet"
+                                            }
+                                            await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+
+                                            # 发送每个sheet的详细信息
+                                            for sheet_name, sheet_info in pre_loaded_source_data.items():
+                                                df = sheet_info.get("df")
+                                                if df is not None:
                                                     log_msg = {
                                                         "type": "log",
                                                         "timestamp": datetime.now().strftime("%H:%M:%S"),
                                                         "level": "info",
-                                                        "message": f"文件重命名: {input_file_name} → {expected_file}"
+                                                        "message": f"  └─ {sheet_name}: {len(df)}行 × {len(df.columns)}列"
                                                     }
                                                     await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
 
-                                        # 构建预加载源数据
-                                        try:
-                                            pre_loaded_source_data = _build_pre_loaded_source_data(file_mapping)
-                                            if pre_loaded_source_data:
-                                                logger.info(f"[compute/stream] 预加载源数据: {len(pre_loaded_source_data)}个sheet")
-                                                log_msg = {
-                                                    "type": "log",
-                                                    "timestamp": datetime.now().strftime("%H:%M:%S"),
-                                                    "level": "info",
-                                                    "message": f"预加载源数据: {len(pre_loaded_source_data)}个sheet"
-                                                }
-                                                await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+                                            # 验证预加载数据是否包含训练时的所有 sheet
+                                            expected_keys = set()
+                                            for train_file, file_data in source_structure.get("files", {}).items():
+                                                if "error" in file_data:
+                                                    continue
+                                                file_base = train_file.replace('.xlsx', '').replace('.xls', '')
+                                                for sn in file_data.get("sheets", {}).keys():
+                                                    key = f"{file_base}_{sn}"
+                                                    if len(key) > 31:
+                                                        key = key[:31]
+                                                    expected_keys.add(key)
 
-                                                # 发送每个sheet的详细信息
-                                                for sheet_name, sheet_info in pre_loaded_source_data.items():
-                                                    df = sheet_info.get("df")
-                                                    if df is not None:
-                                                        log_msg = {
-                                                            "type": "log",
-                                                            "timestamp": datetime.now().strftime("%H:%M:%S"),
-                                                            "level": "info",
-                                                            "message": f"  └─ {sheet_name}: {len(df)}行 × {len(df.columns)}列"
-                                                        }
-                                                        await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+                                            missing_keys = expected_keys - set(pre_loaded_source_data.keys())
+                                            if missing_keys:
+                                                logger.warning(f"[compute/stream] 预加载数据缺少: {missing_keys}，将由脚本自行解析")
+                                                pre_loaded_source_data = None
+                                    except Exception as e:
+                                        logger.warning(f"[compute/stream] 构建预加载数据失败: {e}")
+                                        pre_loaded_source_data = None
 
-                                                # 验证预加载数据是否包含训练时的所有 sheet
-                                                expected_keys = set()
-                                                for train_file, file_data in source_structure.get("files", {}).items():
-                                                    if "error" in file_data:
-                                                        continue
-                                                    file_base = train_file.replace('.xlsx', '').replace('.xls', '')
-                                                    for sn in file_data.get("sheets", {}).keys():
-                                                        key = f"{file_base}_{sn}"
-                                                        if len(key) > 31:
-                                                            key = key[:31]
-                                                        expected_keys.add(key)
+                                    # 释放 parsed_data 内存
+                                    for mapping_info in file_mapping.values():
+                                        mapping_info.pop("parsed_data", None)
 
-                                                missing_keys = expected_keys - set(pre_loaded_source_data.keys())
-                                                if missing_keys:
-                                                    logger.warning(f"[compute/stream] 预加载数据缺少: {missing_keys}，将由脚本自行解析")
-                                                    pre_loaded_source_data = None
-                                        except Exception as e:
-                                            logger.warning(f"[compute/stream] 构建预加载数据失败: {e}")
-                                            pre_loaded_source_data = None
-
-                                        # 释放 parsed_data 内存
-                                        for mapping_info in file_mapping.values():
-                                            mapping_info.pop("parsed_data", None)
-
-                                        log_msg = {
-                                            "type": "log",
-                                            "timestamp": datetime.now().strftime("%H:%M:%S"),
-                                            "level": "info",
-                                            "message": f"表头匹配映射完成"
-                                        }
-                                        await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
-                                    elif not match_success:
-                                        log_msg = {
-                                            "type": "log",
-                                            "timestamp": datetime.now().strftime("%H:%M:%S"),
-                                            "level": "warning",
-                                            "message": f"表头匹配失败: {match_error}，将使用原始文件名"
-                                        }
-                                        await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+                                    log_msg = {
+                                        "type": "log",
+                                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                        "level": "info",
+                                        "message": f"表头匹配映射完成"
+                                    }
+                                    await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+                                elif not match_success:
+                                    log_msg = {
+                                        "type": "log",
+                                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                        "level": "warning",
+                                        "message": f"表头匹配失败: {match_error}，将使用原始文件名"
+                                    }
+                                    await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
                     except Exception as e:
                         logger.warning(f"[compute/stream] 表头映射过程出错: {e}，将使用原始文件名", exc_info=True)
 
@@ -4801,7 +4843,7 @@ async def get_training_logs(tenant_id: str, limit: int = 50):
 
 
 @app.get("/api/tenant-scripts/{tenant_id}")
-async def get_tenant_scripts(tenant_id: str):
+async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
     """获取租户的所有训练脚本列表"""
     try:
         tenant_dir = storage_manager.get_tenant_dir(tenant_id)
@@ -4810,11 +4852,14 @@ async def get_tenant_scripts(tenant_id: str):
         active_script_id = active_script.get("script_id") if active_script else None
 
         scripts = []
+        fs_script_ids = set()
+
         if training_dir.exists():
             for script_dir in sorted(training_dir.iterdir(), key=lambda d: d.stat().st_mtime, reverse=True):
                 if not script_dir.is_dir():
                     continue
                 script_id = script_dir.name
+                fs_script_ids.add(script_id)
                 result_file = script_dir / "training_result.json"
                 score = None
                 created = None
@@ -4831,6 +4876,24 @@ async def get_tenant_scripts(tenant_id: str):
                     "is_active": script_id == active_script_id,
                     "created": created or datetime.fromtimestamp(script_dir.stat().st_mtime).isoformat()
                 })
+
+        # 合并 DB 中的脚本（文件系统没有的）
+        try:
+            db_scripts = db.query(db_models.Script).filter(
+                db_models.Script.tenant_id == tenant_id,
+                db_models.Script.is_active == True,
+            ).order_by(db_models.Script.created_at.desc()).all()
+            for ds in db_scripts:
+                if ds.name not in fs_script_ids:
+                    scripts.append({
+                        "script_id": ds.name,
+                        "score": ds.accuracy,
+                        "is_active": ds.name == active_script_id,
+                        "created": ds.created_at.isoformat() if ds.created_at else None,
+                        "db_id": ds.id,
+                    })
+        except Exception as e:
+            logger.warning(f"DB 查询脚本失败: {e}")
 
         return {
             "tenant_id": tenant_id,
@@ -5066,6 +5129,26 @@ async def list_tenants():
         tenants_dir = storage_manager.base_dir
         tenants = []
 
+        # 从数据库获取每个租户的最佳训练会话准确率
+        db_best = {}
+        try:
+            from sqlalchemy import func
+            db = SessionLocal()
+            rows = (
+                db.query(
+                    db_models.TrainingSession.tenant_id,
+                    func.max(db_models.TrainingSession.best_accuracy).label("best_acc")
+                )
+                .filter(db_models.TrainingSession.best_accuracy.isnot(None))
+                .group_by(db_models.TrainingSession.tenant_id)
+                .all()
+            )
+            for row in rows:
+                db_best[row.tenant_id] = row.best_acc
+            db.close()
+        except Exception as e:
+            logger.warning(f"查询训练会话失败: {e}")
+
         if tenants_dir.exists():
             for tenant_dir in sorted(tenants_dir.iterdir()):
                 if not tenant_dir.is_dir():
@@ -5100,7 +5183,26 @@ async def list_tenants():
                     except Exception:
                         pass
 
+                # 合并数据库中的智训准确率（如果比文件系统的更高）
+                db_acc = db_best.get(tenant_id)
+                if db_acc is not None:
+                    tenant_info["has_training"] = True
+                    if tenant_info["best_score"] is None or db_acc > tenant_info["best_score"]:
+                        tenant_info["best_score"] = db_acc
+
                 tenants.append(tenant_info)
+
+        # 补充只存在于数据库中的智训租户（没有文件系统目录）
+        fs_tenant_ids = {t["tenant_id"] for t in tenants}
+        for tid, acc in db_best.items():
+            if tid not in fs_tenant_ids:
+                tenants.append({
+                    "tenant_id": tid,
+                    "has_training": True,
+                    "best_score": acc,
+                    "script_id": None,
+                    "last_training": None,
+                })
 
         return {"tenants": tenants}
     except Exception as e:
@@ -5230,6 +5332,47 @@ async def get_all_training_history():
                             result[tenant_id]["field_diff_samples"] = fds
                     except Exception:
                         pass
+
+        # 补充数据库中智训租户（chat training 存在 DB，不一定有 training_logs）
+        try:
+            from sqlalchemy import func as _func
+            _db = SessionLocal()
+            db_rows = (
+                _db.query(
+                    db_models.TrainingSession.tenant_id,
+                    _func.max(db_models.TrainingSession.best_accuracy).label("best_acc"),
+                    _func.max(db_models.TrainingSession.id).label("latest_id"),
+                )
+                .filter(db_models.TrainingSession.best_accuracy.isnot(None))
+                .group_by(db_models.TrainingSession.tenant_id)
+                .all()
+            )
+            for row in db_rows:
+                tid = row.tenant_id
+                if tid not in result:
+                    # 查找该租户是否有通过 save_script 保存的脚本
+                    _active = storage_manager.get_active_script(tid)
+                    _script_id = _active.get("script_id") if _active else None
+                    _score = _active.get("script_info", {}).get("score") if _active else None
+                    result[tid] = {
+                        "best_score": _score if _score is not None else row.best_acc,
+                        "script_id": _script_id,
+                        "last_training": None,
+                        "success": True,
+                        "total_iterations": None,
+                        "elapsed_seconds": None,
+                        "sessions": [],
+                        "iteration_results": [],
+                        "field_diff_samples": {},
+                    }
+                else:
+                    # 已有文件系统记录，合并更高的准确率
+                    if row.best_acc and (result[tid]["best_score"] is None
+                                         or row.best_acc > result[tid]["best_score"]):
+                        result[tid]["best_score"] = row.best_acc
+            _db.close()
+        except Exception as e:
+            logger.warning(f"补充智训租户失败: {e}")
 
         return {"history": result}
     except Exception as e:
