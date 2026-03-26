@@ -380,6 +380,8 @@ def _run_single_iteration(
             execution_env["salary_month"] = salary_month
         if monthly_standard_hours is not None:
             execution_env["monthly_standard_hours"] = monthly_standard_hours
+        # 注入 tenant_id，让沙箱能创建 HistoricalDataProvider
+        execution_env["tenant_id"] = tenant_id
 
         # 注入预加载源数据（后台全量解析完成后的缓存，避免脚本内重复解析）
         if pre_loaded_source_data is not None:

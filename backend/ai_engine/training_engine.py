@@ -351,6 +351,7 @@ class TrainingEngine:
                 - True: 清除所有历史训练数据和最佳代码，从头开始全新训练
         """
         # 保存薪资参数供后续使用
+        self.tenant_id = tenant_id
         self.salary_year = salary_year
         self.salary_month = salary_month
         self.monthly_standard_hours = monthly_standard_hours
@@ -852,6 +853,9 @@ class TrainingEngine:
                 if hasattr(self, 'monthly_standard_hours') and self.monthly_standard_hours is not None:
                     execution_env["monthly_standard_hours"] = self.monthly_standard_hours
                     self.training_logger.log_info(f"薪资参数 - 年: {self.salary_year}, 月: {self.salary_month}, 标准工时: {self.monthly_standard_hours}")
+                # 注入 tenant_id，让沙箱能创建 HistoricalDataProvider
+                if hasattr(self, 'tenant_id') and self.tenant_id:
+                    execution_env["tenant_id"] = self.tenant_id
 
                 execution_result = self.sandbox.execute_script(code, execution_env)
                 execution_time = time.time() - start_time
@@ -1604,6 +1608,8 @@ class TrainingEngine:
                 execution_env["salary_month"] = self.salary_month
             if hasattr(self, 'monthly_standard_hours') and self.monthly_standard_hours is not None:
                 execution_env["monthly_standard_hours"] = self.monthly_standard_hours
+            if hasattr(self, 'tenant_id') and self.tenant_id:
+                execution_env["tenant_id"] = self.tenant_id
 
             # 在沙箱中执行代码
             start_time = time.time()

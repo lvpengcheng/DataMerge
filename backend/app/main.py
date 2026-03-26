@@ -2781,7 +2781,8 @@ async def revalidate_script(
             "input_folder": str(input_dir),
             "output_folder": str(output_dir),
             "manual_headers": active_script.get("script_info", {}).get("manual_headers") or {},
-            "source_files": [sf.name for sf in source_files]
+            "source_files": [sf.name for sf in source_files],
+            "tenant_id": tenant_id
         }
         if salary_year is not None:
             execution_env["salary_year"] = salary_year
@@ -3081,7 +3082,8 @@ async def _execute_email_calculation(
             "source_files": [f.name for f in input_files],
             "salary_year": salary_year,
             "salary_month": salary_month,
-            "monthly_standard_hours": monthly_standard_hours
+            "monthly_standard_hours": monthly_standard_hours,
+            "tenant_id": tenant_id
         }
 
         # 执行脚本
@@ -3424,7 +3426,8 @@ async def adjust_code(
             "input_folder": str(input_dir),
             "output_folder": str(output_dir),
             "manual_headers": script_info.get("manual_headers") or {},
-            "source_files": [sf.name for sf in source_files]
+            "source_files": [sf.name for sf in source_files],
+            "tenant_id": tenant_id
         }
         # 薪资参数：前端传入优先，否则使用当前年月作为默认值（避免脚本因None报错）
         from datetime import datetime as _dt
@@ -3956,6 +3959,30 @@ async def compute_with_script_stream(
                         source_structure = _script_info.get("source_structure")
                         manual_headers = _script_info.get("manual_headers")
 
+                        # ========== 自动补全缺失源文件（从基础资料） ==========
+                        if source_structure and db_session:
+                            try:
+                                from backend.utils.source_auto_filler import auto_fill_missing_sources
+                                _filled, _still_missing = auto_fill_missing_sources(
+                                    source_dir=str(source_dir),
+                                    source_structure=source_structure,
+                                    tenant_id=tenant_id,
+                                    db_session=db_session,
+                                )
+                                if _filled:
+                                    _filled_names = [f["file_name"] for f in _filled]
+                                    _filled_detail = ", ".join(
+                                        f'{f["file_name"]}(来自{f["source"]}基础资料)' for f in _filled
+                                    )
+                                    yield f"data: {json.dumps({'type': 'info', 'message': f'自动补全源文件: {_filled_detail}'}, ensure_ascii=False)}\n\n"
+                                    logger.info(f"[Compute] 自动补全源文件: {_filled_names}")
+                                if _still_missing:
+                                    yield f"data: {json.dumps({'type': 'error', 'message': f'以下源文件缺失，请上传或添加到基础资料: {_still_missing}'}, ensure_ascii=False)}\n\n"
+                                    yield "data: [DONE]\n\n"
+                                    return
+                            except Exception as _af_err:
+                                logger.warning(f"[Compute] 自动补全源文件异常（不阻塞计算）: {_af_err}")
+
                         if source_structure:
                             from backend.utils.fast_header_matcher import FastHeaderMatcher
 
@@ -4129,6 +4156,13 @@ async def compute_with_script_stream(
                                 module.salary_month = salary_month
                             if standard_hours is not None:
                                 module.monthly_standard_hours = standard_hours
+
+                            # 注入历史数据提供者（供公式代码模板的 write_history_sheet 使用）
+                            try:
+                                from backend.utils.historical_data import HistoricalDataProvider
+                                module.history_provider = HistoricalDataProvider(tenant_id)
+                            except Exception as _hp_err:
+                                logger.warning(f"历史数据提供者注入失败: {_hp_err}")
 
                             # 【关键】注入预加载源数据，避免因文件名/sheet名不同导致KeyError
                             if pre_loaded_source_data:
@@ -4480,6 +4514,13 @@ async def compute_with_script(
                 module.salary_month = salary_month
             if standard_hours is not None:
                 module.monthly_standard_hours = standard_hours
+
+            # 注入历史数据提供者
+            try:
+                from backend.utils.historical_data import HistoricalDataProvider
+                module.history_provider = HistoricalDataProvider(tenant_id)
+            except Exception as _hp_err:
+                logger.warning(f"历史数据提供者注入失败: {_hp_err}")
 
             spec.loader.exec_module(module)
 
@@ -5042,7 +5083,8 @@ async def get_training_detail(
                             "input_folder": str(input_dir),
                             "output_folder": str(output_dir),
                             "manual_headers": script_info.get("manual_headers") or {},
-                            "source_files": [sf.name for sf in source_files]
+                            "source_files": [sf.name for sf in source_files],
+                            "tenant_id": tenant_id
                         }
 
                         # 添加薪资参数（避免脚本因salary_month为None导致NoneType+int错误）
