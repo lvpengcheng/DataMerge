@@ -29,7 +29,7 @@ def normalize_emp_code(emp_code) -> str:
     return code_str
 
 
-def calculate_excel_formulas(file_path: str) -> str:
+def calculate_excel_formulas(file_path: str) -> bool:
     """计算Excel文件中的所有公式并保存
 
     优先使用 Aspose.Cells 内存计算（无需 Excel 软件），失败则回退 win32com。
@@ -38,19 +38,19 @@ def calculate_excel_formulas(file_path: str) -> str:
         file_path: Excel文件路径
 
     Returns:
-        计算后的文件路径（原文件会被覆盖）
+        True 表示公式计算成功，False 表示计算失败（文件中的公式值可能不正确）
     """
     # ---- 方案1: Aspose.Cells（推荐，无进程开销） ----
     try:
-        import aspose_init  # noqa: F401
-        from Aspose.Cells import Workbook as AsposeWorkbook, LoadOptions as AsposeLoadOptions
+        import aspose_init  # noqa: F401 — 确保 Aspose 已初始化
+        from Aspose.Cells import Workbook as AsposeWorkbook
 
         logger.info(f"[Aspose] 开始计算公式: {file_path}")
         wb = AsposeWorkbook(str(file_path))
         wb.CalculateFormula()
         wb.Save(str(file_path))
         logger.info(f"[Aspose] 公式计算完成: {file_path}")
-        return file_path
+        return True
     except ImportError:
         logger.info("Aspose.Cells 不可用，尝试 win32com")
     except Exception as e:
@@ -59,7 +59,7 @@ def calculate_excel_formulas(file_path: str) -> str:
     # ---- 方案2: win32com 回退 ----
     if platform.system() != 'Windows':
         logger.warning("非Windows系统且Aspose不可用，跳过公式计算")
-        return file_path
+        return False
 
     try:
         import pythoncom
@@ -108,7 +108,7 @@ def calculate_excel_formulas(file_path: str) -> str:
                     pass
 
             logger.info(f"[win32com] 公式计算完成: {file_path}")
-            return file_path
+            return True
 
         finally:
             try:
@@ -119,10 +119,10 @@ def calculate_excel_formulas(file_path: str) -> str:
 
     except ImportError:
         logger.warning("未安装pywin32，跳过Excel公式计算")
-        return file_path
+        return False
     except Exception as e:
         logger.warning(f"[win32com] 公式计算失败: {e}")
-        return file_path
+        return False
 
 
 def _select_best_sheet(wb_data, wb_formula):
@@ -591,8 +591,12 @@ def compare_excel_files(
     # 用Excel计算公式（两个文件都可能包含公式）
     # 生成的结果文件包含AI生成的公式
     # 预期文件也可能包含VLOOKUP等公式（不一定是纯值）
-    calculate_excel_formulas(result_file)
-    calculate_excel_formulas(expected_file)
+    result_calc_ok = calculate_excel_formulas(result_file)
+    expected_calc_ok = calculate_excel_formulas(expected_file)
+    if not result_calc_ok:
+        logger.error(f"[对比] 结果文件公式计算失败，对比结果可能不准确: {result_file}")
+    if not expected_calc_ok:
+        logger.error(f"[对比] 预期文件公式计算失败，对比结果可能不准确: {expected_file}")
 
     # 读取结果文件的公式（用于差异分析时展示）
     result_formulas = {}  # {列名: 公式字符串}

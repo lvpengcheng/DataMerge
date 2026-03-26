@@ -1691,7 +1691,9 @@ def load_source_data(input_folder, manual_headers):
                 file_path,
                 manual_headers=manual_headers,
                 active_sheet_only=True,
-                best_region_only=True  # 只取有效区域（与merge_source_to_target逻辑一致）
+                best_region_only=True,  # 只取有效区域（与merge_source_to_target逻辑一致）
+                # 不限制 max_data_rows → 执行时加载全量数据
+                # （训练时通过 _pre_loaded_source_data 注入预解析的全量数据，通常不会走到这里）
             )
 
             if not results:

@@ -85,7 +85,8 @@ class ExcelFormulaBuilder:
                     file_path,
                     manual_headers=manual_headers,
                     active_sheet_only=True,
-                    best_region_only=True  # 只取有效区域
+                    best_region_only=True,  # 只取有效区域
+                    max_data_rows=30,  # 训练时只需结构和样本，不读全量数据
                 )
 
                 for sheet_data in results:

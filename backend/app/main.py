@@ -592,6 +592,7 @@ async def train_model(
                     saved_files["expected"],
                     manual_headers=manual_headers_dict,
                     active_sheet_only=True,  # 只加载激活的sheet
+                    max_data_rows=10,  # 提取模版只需结构和少量样本
                     password=_fps.get(os.path.basename(saved_files["expected"]))
                 )
                 template_schema = document_validator.extract_document_schema(parsed_data)
@@ -1040,6 +1041,7 @@ async def train_model_stream(
                             saved_files["expected"],
                             manual_headers=manual_headers_dict,
                             active_sheet_only=True,  # 只加载激活的sheet
+                            max_data_rows=10,  # 提取模版只需结构和少量样本
                             password=_fps.get(os.path.basename(saved_files["expected"]))
                         )
                         template_schema = document_validator.extract_document_schema(parsed_data)
@@ -3694,7 +3696,6 @@ def _persist_result_file(db, task_id, tenant_id, saved_file_path, original_name)
         sheet_summary = None
         try:
             import dataclasses as _dc
-            import aspose_init  # noqa: F401
             from Aspose.Cells import Workbook as _RWb
             from excel_parser import IntelligentExcelParser
 

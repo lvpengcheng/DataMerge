@@ -97,6 +97,77 @@ def _analyze_expected_structure(expected_file: str) -> Dict[str, Any]:
 
     return structure
 
+# ==================== 后台全量数据加载 ====================
+
+
+def _load_full_source_data(source_dir: str, manual_headers: Dict = None) -> Dict:
+    """全量加载源文件数据（无 max_data_rows 限制），供脚本执行时使用。
+    该函数设计为在后台线程中运行，与 AI 代码生成并行执行。
+
+    返回格式与模板代码中 load_source_data() 一致：
+    {"文件名_sheet名": {"df": DataFrame, "columns": [列名]}}
+    """
+    import pandas as pd
+    from excel_parser import IntelligentExcelParser
+
+    source_data = {}
+    parser = IntelligentExcelParser()
+
+    for filename in sorted(os.listdir(source_dir)):
+        if not filename.endswith(('.xlsx', '.xls')) or filename.startswith('~'):
+            continue
+        file_path = os.path.join(source_dir, filename)
+        file_base = filename.replace('.xlsx', '').replace('.xls', '')
+
+        try:
+            results = parser.parse_excel_file(
+                file_path,
+                manual_headers=manual_headers,
+                active_sheet_only=True,
+                best_region_only=True,
+                # 不传 max_data_rows → 加载全量数据
+            )
+            if not results:
+                continue
+
+            for sheet_data in results:
+                dfs = []
+                columns = None
+                for region in sheet_data.regions:
+                    # 将 ExcelRegion 转换为 DataFrame（与模板代码逻辑一致）
+                    col_letter_to_name = {v: k for k, v in region.head_data.items()}
+                    cols = list(region.head_data.keys())
+                    if not region.data:
+                        df = pd.DataFrame(columns=cols)
+                    else:
+                        converted = []
+                        for row in region.data:
+                            new_row = {col_letter_to_name.get(cl, cl): val for cl, val in row.items()}
+                            converted.append(new_row)
+                        df = pd.DataFrame(converted, columns=cols)
+
+                    if df.empty and len(df.columns) == 0:
+                        continue
+                    if columns is None:
+                        columns = list(df.columns)
+                    dfs.append(df)
+
+                if not dfs:
+                    continue
+
+                merged_df = dfs[0] if len(dfs) == 1 else pd.concat(dfs, ignore_index=True)
+                sheet_name = f"{file_base}_{sheet_data.sheet_name}"
+                if len(sheet_name) > 31:
+                    sheet_name = sheet_name[:31]
+                source_data[sheet_name] = {"df": merged_df, "columns": columns}
+                logger.info(f"[后台全量加载] {sheet_name}: {len(merged_df)} 行")
+
+        except Exception as e:
+            logger.warning(f"[后台全量加载] 解析 {filename} 失败: {e}")
+
+    return source_data
+
+
 # ==================== 辅助函数 ====================
 
 
@@ -271,6 +342,7 @@ def _run_single_iteration(
     monthly_standard_hours: float = None,
     manual_headers: Dict = None,
     file_passwords: Dict = None,
+    pre_loaded_source_data: Dict = None,
 ) -> Dict[str, Any]:
     """执行单轮训练：运行代码 → 对比 → 返回结果（与 TrainingEngine._execute_and_validate 一致）"""
     from ..sandbox.code_sandbox import CodeSandbox
@@ -308,6 +380,10 @@ def _run_single_iteration(
             execution_env["salary_month"] = salary_month
         if monthly_standard_hours is not None:
             execution_env["monthly_standard_hours"] = monthly_standard_hours
+
+        # 注入预加载源数据（后台全量解析完成后的缓存，避免脚本内重复解析）
+        if pre_loaded_source_data is not None:
+            execution_env["_pre_loaded_source_data"] = pre_loaded_source_data
 
         # 执行代码
         start_time = time.time()
@@ -890,6 +966,12 @@ def main(source_dir, output_dir, **kwargs):
             rules = config.get("rules_content", "")
             src_dir = config.get("source_dir", source_dir)
 
+            # 【后台全量加载】在 AI 代码生成期间并行加载全量源数据
+            # 这样 AI 生成代码时（耗时最长），全量数据同时解析
+            _full_data_future = _executor.submit(
+                _load_full_source_data, src_dir, config.get("manual_headers")
+            )
+
             # 使用 FormulaCodeGenerator.generate_code()（与原训练引擎一致）
             _emit({"type": "status", "message": "AI 正在生成代码（使用公式模式）..."})
 
@@ -927,6 +1009,16 @@ def main(source_dir, output_dir, **kwargs):
 
             _emit({"type": "status", "message": "代码生成完成，正在执行验证..."})
 
+            # 【后台全量加载】等待全量数据就绪（通常 AI 生成代码耗时更长，此时已完成）
+            _full_source_data = None
+            try:
+                _full_source_data = _full_data_future.result(timeout=300)
+                if _full_source_data:
+                    logger.info(f"[后台全量加载] 完成，共 {len(_full_source_data)} 个sheet")
+                    _emit({"type": "log", "message": f"全量源数据加载完成（{len(_full_source_data)} 个sheet）"})
+            except Exception as e:
+                logger.warning(f"[后台全量加载] 失败，脚本将自行解析: {e}")
+
             # 执行并验证
             iteration_num = (ts.total_iterations or 0) + 1
             run_result = _run_single_iteration(
@@ -936,6 +1028,7 @@ def main(source_dir, output_dir, **kwargs):
                 iteration_num,
                 salary_year=salary_year,
                 salary_month=salary_month,
+                pre_loaded_source_data=_full_source_data,
             )
 
             # 记录迭代
@@ -1223,6 +1316,12 @@ async def send_message(
 
             generator, provider = _create_formula_generator(ai_provider_name, stream_callback=stream_cb)
 
+            # 【后台全量加载】修正轮次也需要全量数据
+            src_dir = config.get("source_dir", "")
+            _full_data_future = _executor.submit(
+                _load_full_source_data, src_dir, config.get("manual_headers")
+            ) if src_dir and os.path.isdir(src_dir) else None
+
             _emit({"type": "status", "message": "AI 正在修正代码..."})
 
             # 使用 FormulaCodeGenerator.generate_correction_code()（与原训练引擎修正逻辑一致）
@@ -1248,7 +1347,7 @@ async def send_message(
             _emit({"type": "status", "message": "代码已修正，正在执行验证..."})
 
             # 检查训练文件是否存在（临时文件可能已被清理）
-            src_dir = config.get("source_dir", "")
+            # 注意：src_dir 已在上方定义（后台全量加载时使用）
             exp_file = config.get("expected_file", "")
             if not src_dir or not os.path.isdir(src_dir):
                 _emit({"type": "error", "message": "训练源文件已丢失，请创建新会话并重新上传文件后再训练"})
@@ -1259,6 +1358,14 @@ async def send_message(
                 _add_message(db, session_id, "system", "预期结果文件已丢失，无法继续训练。请新建会话并重新上传文件。", "status", {"error": "files_missing"})
                 return
 
+            # 【后台全量加载】等待全量数据就绪
+            _full_source_data = None
+            if _full_data_future:
+                try:
+                    _full_source_data = _full_data_future.result(timeout=300)
+                except Exception as e:
+                    logger.warning(f"[后台全量加载] 修正轮次失败: {e}")
+
             # 执行并验证
             iteration_num = (session.total_iterations or 0) + 1
             run_result = _run_single_iteration(
@@ -1268,6 +1375,7 @@ async def send_message(
                 iteration_num,
                 salary_year=config.get("salary_year"),
                 salary_month=config.get("salary_month"),
+                pre_loaded_source_data=_full_source_data,
             )
 
             # 保存详细差异文本到 config

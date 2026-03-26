@@ -75,7 +75,7 @@ def _parse_sheet_summary(file_path: str) -> list:
     try:
         from excel_parser import IntelligentExcelParser
         parser = IntelligentExcelParser()
-        results = parser.parse_excel_file(file_path)
+        results = parser.parse_excel_file(file_path, max_data_rows=5)
         summary = []
         for sheet_data in results:
             regions = sheet_data.regions

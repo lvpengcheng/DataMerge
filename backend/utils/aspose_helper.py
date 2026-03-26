@@ -724,11 +724,6 @@ def generate_from_template(
       fill/block → output_path (xlsx)
       zip        → output_path (zip)
     """
-    import aspose_init
-    if not aspose_init.is_licensed():
-        logger.warning("[SmartMarker] Aspose 许可证未生效，尝试重新加载")
-        aspose_init._apply_license()
-
     if mode == "block":
         return _generate_block(
             output_path, template_path, data,

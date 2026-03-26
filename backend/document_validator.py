@@ -227,7 +227,7 @@ class DocumentValidator:
     ) -> Tuple[bool, List[str]]:
         """验证文件格式"""
         try:
-            parsed_data = self.excel_parser.parse_excel_file(file_path, manual_headers=manual_headers, active_sheet_only=True)
+            parsed_data = self.excel_parser.parse_excel_file(file_path, manual_headers=manual_headers, active_sheet_only=True, max_data_rows=5)
             return self.validate_document(parsed_data, template_schema)
         except Exception as e:
             return False, [f"解析文件失败: {str(e)}"]
