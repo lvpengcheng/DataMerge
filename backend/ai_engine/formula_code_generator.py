@@ -1434,7 +1434,7 @@ class FormulaCodeGenerator:
                 # 收集到括号闭合为止的所有行
                 combined = stripped
                 j = i + 1
-                while j < len(lines) and combined.count('(') > combined.count(')'):
+                while j < len(lines) and self._count_unbalanced_parens(combined) > 0:
                     combined += ' ' + lines[j].strip()
                     j += 1
 
@@ -1467,11 +1467,13 @@ class FormulaCodeGenerator:
                 continue
 
             # 检测未闭合括号的非f-string行
-            if stripped.count('(') > stripped.count(')'):
+            # 使用 _count_unbalanced_parens 排除字符串内的括号，
+            # 避免中文全角括号（如 df['含税级距）']）被误判导致大量代码被合并到一行
+            if self._count_unbalanced_parens(stripped) > 0:
                 # 收集到括号闭合
                 combined = stripped
                 j = i + 1
-                while j < len(lines) and combined.count('(') > combined.count(')'):
+                while j < len(lines) and self._count_unbalanced_parens(combined) > 0:
                     combined += ' ' + lines[j].strip()
                     j += 1
                 try:
@@ -1490,6 +1492,41 @@ class FormulaCodeGenerator:
             logger.info(f"f-string/括号修复: 修复了 {fix_count} 处问题")
 
         return '\n'.join(fixed_lines)
+
+    @staticmethod
+    def _count_unbalanced_parens(code: str) -> int:
+        """计算代码中未闭合的圆括号数量，忽略字符串内的括号
+
+        遍历代码字符，跟踪是否在字符串内部（单引号、双引号），
+        只统计字符串外的 ( 和 )。返回 open - close 的差值，
+        正数表示有未闭合的左括号。
+
+        这样可以避免中文列名里的全角/半角括号（如 '含税级距）'）
+        被误判为代码级别的未闭合括号。
+        """
+        depth = 0
+        in_str = None  # None, "'", '"'
+        escape = False
+        for ch in code:
+            if escape:
+                escape = False
+                continue
+            if ch == '\\':
+                escape = True
+                continue
+            if in_str is None:
+                if ch == '#':
+                    break  # 行注释，后面都忽略
+                if ch in ("'", '"'):
+                    in_str = ch
+                elif ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+            else:
+                if ch == in_str:
+                    in_str = None
+        return depth
 
     def _replace_fstring_double_quotes(self, code: str) -> str:
         """预处理：将f-string中的双引号问题替换为EMPTY常量和TXT_常量变量
@@ -2050,12 +2087,15 @@ def write_source_sheets(wb, source_data):
     for sheet_name, data_info in source_data.items():
         df = data_info["df"]
 
-        # 清理列名：去除首尾空格、合并内部多余空格
+        # 清理列名：只去除换行符和首尾空格，保留列名内的正常空格
+        # （不能用 \s+ 去除所有空格，否则 'Employee ID' 变成 'EmployeeID'，
+        #   导致 fill_result_sheets 中用原始列名取值时匹配不上）
         import re as _re_clean
         cleaned_cols = {}
         for col in df.columns:
             if isinstance(col, str):
-                clean = _re_clean.sub(r'\s+', '', col).strip()  # 去除所有空格
+                # 只去除换行符、制表符等非空格空白字符，然后trim首尾空格
+                clean = _re_clean.sub(r'[\\t\\n\\r\\x0b\\x0c]+', '', col).strip()
                 if clean != col:
                     cleaned_cols[col] = clean
         if cleaned_cols:
@@ -2373,7 +2413,7 @@ def main():
             wb.move_sheet(ws, offset=-len(wb.worksheets)+1)
             break
 
-    # 保存文件
+    # 保存文件（公式由 compare_excel_files 在沙箱外用 Aspose 计算，避免占用沙箱执行时间）
     output_path = os.path.join(globals().get('output_folder', ''), "薪资汇总表.xlsx")
     wb.save(output_path)
     print(f"保存成功: {output_path}")
@@ -2396,6 +2436,19 @@ def main():
         if 'def fill_result_sheets' not in complete_code and 'def fill_result_sheet' not in complete_code:
             logger.error("拼接后的代码中没有fill_result_sheets函数定义")
             return None
+
+        # 兼容处理：AI可能生成单数形式 fill_result_sheet，但 main() 固定调用复数形式
+        # 如果只有单数形式，添加别名让复数调用也能工作
+        if 'def fill_result_sheets' not in complete_code and 'def fill_result_sheet' in complete_code:
+            alias_code = "\n\n# 兼容别名：确保 fill_result_sheets（复数）可用\nfill_result_sheets = fill_result_sheet\n"
+            # 插入到 main_template 之前（即 fill_function_code 之后）
+            main_marker = "\n# ============================================================\n# 主函数"
+            if main_marker in complete_code:
+                complete_code = complete_code.replace(main_marker, alias_code + main_marker)
+            else:
+                # 兜底：直接在 main() 定义前插入
+                complete_code = complete_code.replace("\ndef main():", alias_code + "\ndef main():")
+            logger.info("已添加 fill_result_sheets = fill_result_sheet 别名")
 
         return complete_code
 

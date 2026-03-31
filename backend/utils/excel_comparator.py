@@ -127,40 +127,62 @@ def calculate_excel_formulas(file_path: str) -> bool:
         return False
 
 
-def _select_best_sheet(wb_data, wb_formula):
+def _select_best_sheet(wb_data, wb_formula, preferred_name: str = None):
     """智能选择最佳对比sheet
 
     优先级：
-    1. 名称包含"结果"/"报表"/"汇总"/"output"/"result"的sheet
+    0. 如果指定了preferred_name且存在，直接用它
+    1. 名称包含"结果"/"报表"/"汇总"/"output"/"result"的sheet（排除源数据sheet后）
     2. 如果只有1个sheet，直接用它
     3. 如果有多个sheet，排除明显的源数据/参数sheet，选列数最多的
-    4. 回退到active sheet
+    4. 回退到第一个sheet
     """
+    import re as _re_sel
     sheet_names = wb_data.sheetnames
+
+    # 优先级0: 指定了目标sheet名，精确匹配或模糊匹配
+    if preferred_name:
+        # 精确匹配
+        if preferred_name in sheet_names:
+            logger.info(f"通过指定名称匹配到sheet: '{preferred_name}'")
+            return wb_data[preferred_name], wb_formula[preferred_name]
+        # 模糊匹配：sheet名包含preferred_name或反过来
+        pn_lower = preferred_name.strip().lower()
+        for name in sheet_names:
+            if pn_lower in name.strip().lower() or name.strip().lower() in pn_lower:
+                logger.info(f"通过模糊匹配到sheet: '{name}' (目标: '{preferred_name}')")
+                return wb_data[name], wb_formula[name]
 
     if len(sheet_names) == 1:
         return wb_data[sheet_names[0]], wb_formula[sheet_names[0]]
 
-    # 优先匹配结果sheet的关键词
+    # 判断是否为源数据sheet（数字前缀如 "01_xxx"、"05_xxx"，由 write_source_sheets 生成）
+    def _is_source_data_sheet(name: str) -> bool:
+        return bool(_re_sel.match(r'^\d{1,3}_', name))
+
+    # 排除明显的源数据/参数sheet
+    skip_keywords = ["参数", "历史数据", "source", "param", "config"]
+    def _should_skip(name: str) -> bool:
+        if _is_source_data_sheet(name):
+            return True
+        name_lower = name.lower()
+        return any(kw in name_lower for kw in skip_keywords)
+
+    # 优先匹配结果sheet的关键词（但要排除源数据sheet）
     result_keywords = ["结果", "报表", "汇总", "output", "result", "summary"]
     for name in sheet_names:
+        if _is_source_data_sheet(name):
+            continue  # 源数据sheet如"05_Previous IIT汇总"含"汇总"但不是结果sheet
         name_lower = name.lower()
         if any(kw in name_lower for kw in result_keywords):
             logger.info(f"通过关键词匹配到结果sheet: '{name}'")
             return wb_data[name], wb_formula[name]
 
-    # 排除明显的源数据/参数sheet
-    skip_keywords = ["参数", "历史数据", "source", "param", "config"]
-    candidates = []
-    for name in sheet_names:
-        name_lower = name.lower()
-        if not any(kw in name_lower for kw in skip_keywords):
-            candidates.append(name)
-
+    # 从剩余sheet中选列数最多的
+    candidates = [name for name in sheet_names if not _should_skip(name)]
     if not candidates:
         candidates = sheet_names
 
-    # 选列数最多的sheet（结果sheet通常列数最多）
     best_name = candidates[0]
     best_col_count = 0
     for name in candidates:
@@ -174,7 +196,7 @@ def _select_best_sheet(wb_data, wb_formula):
     return wb_data[best_name], wb_formula[best_name]
 
 
-def read_excel_with_formulas_calculated(file_path: str) -> pd.DataFrame:
+def read_excel_with_formulas_calculated(file_path: str, preferred_sheet: str = None) -> pd.DataFrame:
     """读取Excel文件，获取公式计算后的值
 
     对于包含公式的Excel文件，尝试获取公式计算后的值：
@@ -184,6 +206,7 @@ def read_excel_with_formulas_calculated(file_path: str) -> pd.DataFrame:
 
     Args:
         file_path: Excel文件路径
+        preferred_sheet: 优先选择的sheet名称（如预期文件的sheet名）
 
     Returns:
         包含计算值的DataFrame
@@ -196,7 +219,7 @@ def read_excel_with_formulas_calculated(file_path: str) -> pd.DataFrame:
         wb_formula = openpyxl.load_workbook(file_path, data_only=False)
 
         # 智能选择sheet：优先选择"结果"相关的sheet，而非源数据sheet
-        ws_data, ws_formula = _select_best_sheet(wb_data, wb_formula)
+        ws_data, ws_formula = _select_best_sheet(wb_data, wb_formula, preferred_name=preferred_sheet)
         logger.info(f"对比使用sheet: '{ws_data.title}' (共 {len(wb_data.sheetnames)} 个sheet: {wb_data.sheetnames})")
 
         # 获取表头（第一行）
@@ -685,26 +708,40 @@ def compare_excel_files(
     if not expected_calc_ok:
         logger.error(f"[对比] 预期文件公式计算失败，对比结果可能不准确: {expected_file}")
 
+    # 先读取预期文件，确定目标sheet名称
+    expected_df = read_excel_with_formulas_calculated(expected_file)
+    # 获取预期文件的sheet名，作为结果文件选择sheet的提示
+    expected_sheet_name = None
+    try:
+        import openpyxl as _opx_hint
+        _wb_hint = _opx_hint.load_workbook(expected_file, read_only=True, data_only=True)
+        if _wb_hint.sheetnames:
+            # 预期文件通常只有一个sheet，取第一个即可
+            expected_sheet_name = _wb_hint.sheetnames[0]
+        _wb_hint.close()
+        logger.info(f"预期文件sheet名: '{expected_sheet_name}'，将作为结果文件sheet选择提示")
+    except Exception:
+        pass
+
     # 读取结果文件的公式（用于差异分析时展示）
     result_formulas = {}
     try:
         import openpyxl
         wb_formulas = openpyxl.load_workbook(result_file, data_only=False)
-        ws_formulas = wb_formulas.active
-        header_row = {ws_formulas.cell(row=1, column=col).value: col for col in range(1, ws_formulas.max_column + 1)}
-        if ws_formulas.max_row >= 2:
+        ws_formulas_sheet = _select_best_sheet(wb_formulas, wb_formulas, preferred_name=expected_sheet_name)[0]
+        header_row = {ws_formulas_sheet.cell(row=1, column=col).value: col for col in range(1, ws_formulas_sheet.max_column + 1)}
+        if ws_formulas_sheet.max_row >= 2:
             for col_name, col_idx in header_row.items():
                 if col_name:
-                    cell_value = ws_formulas.cell(row=2, column=col_idx).value
+                    cell_value = ws_formulas_sheet.cell(row=2, column=col_idx).value
                     if cell_value and isinstance(cell_value, str) and cell_value.startswith('='):
                         result_formulas[col_name] = cell_value
         wb_formulas.close()
     except Exception as e:
         logger.warning(f"读取公式失败: {e}")
 
-    # 读取两个Excel文件
-    result_df = read_excel_with_formulas_calculated(result_file)
-    expected_df = read_excel_with_formulas_calculated(expected_file)
+    # 读取结果文件（使用预期文件的sheet名作为提示）
+    result_df = read_excel_with_formulas_calculated(result_file, preferred_sheet=expected_sheet_name)
 
     # 标准化列名
     result_df.columns = [_standardize_column_name(col) for col in result_df.columns]
@@ -753,6 +790,15 @@ def _compare_dataframes_core(
     for key_col in primary_keys:
         expected_df[f"标准化_{key_col}"] = expected_df[key_col].apply(_standardize_key_value)
         result_df[f"标准化_{key_col}"] = result_df[key_col].apply(_standardize_key_value)
+        # 诊断日志：检查主键列空值比例，帮助排查匹配失败
+        exp_empty = (expected_df[f"标准化_{key_col}"] == "").sum()
+        res_empty = (result_df[f"标准化_{key_col}"] == "").sum()
+        if res_empty > 0:
+            logger.warning(f"[主键诊断] 生成结果中 '{key_col}' 有 {res_empty}/{len(result_df)} 个空值 "
+                           f"(预期有 {exp_empty}/{len(expected_df)} 个空值)")
+        exp_sample = expected_df[f"标准化_{key_col}"].head(3).tolist()
+        res_sample = result_df[f"标准化_{key_col}"].head(3).tolist()
+        logger.info(f"[主键诊断] '{key_col}' 前3值: 预期={exp_sample}, 生成={res_sample}")
 
     # 创建差异报告
     wb = openpyxl.Workbook()

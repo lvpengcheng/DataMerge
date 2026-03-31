@@ -18,7 +18,7 @@ import openpyxl
 class CodeSandbox:
     """代码沙箱执行环境"""
 
-    def __init__(self, timeout: int = 300, max_memory_mb: int = 1024):
+    def __init__(self, timeout: int = 360, max_memory_mb: int = 1024):
         self.timeout = timeout
         self.max_memory_mb = max_memory_mb
         import logging
