@@ -11,6 +11,7 @@ Aspose.Cells for .NET 全局初始化模块
 
 import os
 import sys
+import time
 import logging
 import threading
 
@@ -20,7 +21,10 @@ logger = logging.getLogger(__name__)
 _initialized = False
 _license_applied = False
 _license_obj = None          # 持有 License 对象引用，防止 GC 回收导致许可证失效
+_license_bytes = None        # 许可证文件内容缓存（避免并发读文件冲突）
 _lock = threading.Lock()     # 线程安全锁
+_last_license_time = 0       # 上次成功注册许可证的时间戳
+_LICENSE_COOLDOWN = 30       # 冷却时间（秒），此间隔内不重复 SetLicense
 
 # 路径配置
 _project_root = os.path.dirname(os.path.abspath(__file__))
@@ -98,36 +102,38 @@ def init_aspose():
 def _apply_license(lic_path: str = None):
     """注册 Aspose 许可证
 
-    将 License 对象保存到模块级变量 _license_obj，
-    防止 Python GC 回收 .NET 对象导致许可证失效。
+    首次从文件读取字节缓存到内存，后续使用 MemoryStream 设置，
+    避免并发 FileStream 读取导致 "license file is corrupted" 错误。
     """
-    global _license_applied, _license_obj
+    global _license_applied, _license_obj, _license_bytes, _last_license_time
 
     path = lic_path or _lic_path
-    if not os.path.exists(path):
-        logger.warning(f"[Aspose] 许可证文件不存在: {path}")
-        return False
 
     try:
+        # 首次：读取许可证文件到内存缓存
+        if _license_bytes is None:
+            if not os.path.exists(path):
+                logger.warning(f"[Aspose] 许可证文件不存在: {path}")
+                return False
+            with open(path, 'rb') as f:
+                _license_bytes = f.read()
+            logger.info(f"[Aspose] 许可证文件已缓存到内存 ({len(_license_bytes)} bytes)")
+
+        # 用 MemoryStream 设置许可证（线程安全，无文件 IO）
         from Aspose.Cells import License
+        from System.IO import MemoryStream
+        import System
+
         lic = License()
+        byte_array = System.Array[System.Byte](list(_license_bytes))
+        ms = MemoryStream(byte_array)
+        lic.SetLicense(ms)
+        ms.Close()
 
-        # 优先使用 Stream 方式（pythonnet 下更可靠）
-        try:
-            from System.IO import FileStream, FileMode, FileAccess, FileShare
-            stream = FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read)
-            lic.SetLicense(stream)
-            stream.Close()
-            logger.info(f"[Aspose] 许可证已生效（Stream 方式）: {os.path.basename(path)}")
-        except Exception as stream_err:
-            logger.warning(f"[Aspose] Stream 方式失败: {stream_err}, 尝试路径方式")
-            lic = License()
-            lic.SetLicense(path)
-            logger.info(f"[Aspose] 许可证已生效（路径方式）: {os.path.basename(path)}")
-
-        # 关键：保持 License 对象的模块级引用，防止 GC 回收
         _license_obj = lic
         _license_applied = True
+        _last_license_time = time.time()
+        logger.info(f"[Aspose] 许可证已生效（MemoryStream 方式）")
         return True
     except Exception as e:
         logger.error(f"[Aspose] 许可证设置失败: {e}")
@@ -148,32 +154,22 @@ def is_licensed() -> bool:
 def ensure_license():
     """确保 Aspose 许可证已注册
 
-    轻量级检查：由于 _license_obj 持有 License 对象引用防止 GC，
-    正常情况下许可证不会丢失，这里只做 Python 标志检查。
-    仅在未初始化或标志异常时才重新注册。
+    冷却机制：30秒内不重复 SetLicense，避免高频调用。
+    加锁：防止多线程同时 SetLicense 冲突。
     """
-    global _license_applied
-
     if not _initialized:
         init_aspose()
         return
 
-    # 快速路径：License 对象存活 + 标志已设置 → 直接返回
-    if _license_applied and _license_obj is not None:
+    # 冷却期内跳过（无锁快速路径）
+    if _license_applied and (time.time() - _last_license_time) < _LICENSE_COOLDOWN:
         return
 
-    # 异常路径（加锁）：标志丢失，需要重新注册
     with _lock:
-        if _license_applied and _license_obj is not None:
+        # 双重检查：拿到锁后再确认
+        if _license_applied and (time.time() - _last_license_time) < _LICENSE_COOLDOWN:
             return
-
-        logger.warning("[Aspose] 许可证标志异常，重新注册")
-        _license_applied = False
         _apply_license()
-        if _license_applied:
-            logger.info("[Aspose] 许可证重新注册成功")
-        else:
-            logger.error("[Aspose] 许可证重新注册失败！将以评估模式运行")
 
 
 # ==================== 模块加载时自动初始化 ====================

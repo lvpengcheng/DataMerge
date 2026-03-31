@@ -33,6 +33,37 @@ router = APIRouter(prefix="/api/training/chat", tags=["对话式训练"])
 
 _executor = ThreadPoolExecutor(max_workers=4)
 
+# SSE 心跳间隔（秒），防止大文件解析时连接超时
+_SSE_HEARTBEAT_INTERVAL = 15
+
+
+def _create_sse_stream(loop):
+    """创建带心跳的 SSE 事件流
+
+    Returns:
+        (queue, emit, event_generator):
+            queue - asyncio.Queue
+            emit  - 线程安全的推送函数，_emit(event_dict) 或 _emit(None) 结束流
+            event_generator - 传给 StreamingResponse 的异步生成器
+    """
+    queue = asyncio.Queue()
+
+    def _emit(event):
+        loop.call_soon_threadsafe(queue.put_nowait, event)
+
+    async def event_generator():
+        while True:
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=_SSE_HEARTBEAT_INTERVAL)
+                if event is None:
+                    break
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            except asyncio.TimeoutError:
+                # 超时未收到业务事件 → 发送心跳保活
+                yield f": heartbeat\n\n"
+
+    return queue, _emit, event_generator()
+
 
 def _create_formula_generator(ai_provider_name: str, stream_callback=None):
     """创建 FormulaCodeGenerator 实例（复用原有智训管线）"""
@@ -713,19 +744,8 @@ async def start_training(
         except Exception:
             logger.warning(f"手动表头 JSON 解析失败: {manual_headers}")
 
-    queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
-
-    async def event_generator():
-        while True:
-            event = await queue.get()
-            if event is None:
-                break
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-
-    def _emit(event):
-        """线程安全地往 queue 推事件"""
-        loop.call_soon_threadsafe(queue.put_nowait, event)
+    queue, _emit, sse_generator = _create_sse_stream(loop)
 
     def _run_first_iteration():
         """在线程中执行首轮训练（使用 FormulaCodeGenerator）"""
@@ -1152,7 +1172,7 @@ def main(source_dir, output_dir, **kwargs):
 
     loop.run_in_executor(_executor, _run_first_iteration)
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(sse_generator, media_type="text/event-stream")
 
 
 # ==================== 对话发消息 ====================
@@ -1188,19 +1208,8 @@ async def send_message(
                 except Exception:
                     pass
 
-    queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
-
-    async def event_generator():
-        while True:
-            event = await queue.get()
-            if event is None:
-                break
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-
-    def _emit(event):
-        """线程安全地往 queue 推事件"""
-        loop.call_soon_threadsafe(queue.put_nowait, event)
+    queue, _emit, sse_generator = _create_sse_stream(loop)
 
     def _run_chat_conversation():
         """纯对话模式：AI 分析/讨论，不触发代码生成"""
@@ -1587,7 +1596,7 @@ async def send_message(
     else:
         loop.run_in_executor(_executor, _run_chat_conversation)
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(sse_generator, media_type="text/event-stream")
 
 
 # ==================== 设为最佳 / 上传代码 ====================

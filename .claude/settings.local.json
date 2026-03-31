@@ -106,7 +106,8 @@
       "Bash(awk 'NR>=2266 && NR<=2431' backend/ai_engine/formula_code_generator.py)",
       "Bash(node -e \"const fs=require\\(''fs''\\); const code=fs.readFileSync\\(''frontend/static/js/admin.js'',''utf8''\\); try{new Function\\(code\\);console.log\\(''JS syntax OK''\\)}catch\\(e\\){console.error\\(e.message\\)}\")",
       "Bash(node -e \"const fs=require\\(''fs''\\); const code=fs.readFileSync\\(''frontend/static/js/admin.js'',''utf8''\\); try{new Function\\(code\\);console.log\\(''OK''\\)}catch\\(e\\){console.error\\(e.message\\)}\")",
-      "Bash(sort -t/ -k9 -n)"
+      "Bash(sort -t/ -k9 -n)",
+      "Read(//c/Users/Administrator/Desktop/**)"
     ],
     "additionalDirectories": [
       "E:\\project\\DataMerge20260224\\DataMerge\\backend\\test_data\\data_cleaning_test",

@@ -43,6 +43,12 @@ def set_license(lic_path: str = None) -> bool:
     return aspose_init.is_licensed()
 
 
+def _licensed_workbook(*args, **kwargs):
+    """创建 Workbook 前自动确保许可证有效，防止 .NET GC 回收许可证"""
+    aspose_init.ensure_license()
+    return _licensed_workbook(*args, **kwargs)
+
+
 # ==================== Aspose.Cells 适配器层 ====================
 # 将 Aspose Worksheet 包装为兼容原有业务逻辑的接口（1-indexed row/col）
 
@@ -1299,14 +1305,14 @@ class IntelligentExcelParser:
                 try:
                     load_opts = _AsposeLoadOptions()
                     load_opts.Password = password
-                    aspose_wb = _AsposeWorkbook(str(file_path), load_opts)
+                    aspose_wb = _licensed_workbook(str(file_path), load_opts)
                 except Exception as _pwd_err:
                     if 'Invalid password' in str(_pwd_err):
-                        aspose_wb = _AsposeWorkbook(str(file_path))
+                        aspose_wb = _licensed_workbook(str(file_path))
                     else:
                         raise
             else:
-                aspose_wb = _AsposeWorkbook(str(file_path))
+                aspose_wb = _licensed_workbook(str(file_path))
 
             # 提取当前文件的 manual_headers 配置
             file_manual_headers = self._extract_file_manual_headers(file_path, manual_headers)
@@ -3419,7 +3425,7 @@ class IntelligentExcelParser:
 
             try:
                 # 只打开一次，后续 Range.Copy 复用同一个 workbook 对象
-                aspose_wb = _AsposeWorkbook(str(file_path))
+                aspose_wb = _licensed_workbook(str(file_path))
 
                 active_idx = aspose_wb.Worksheets.ActiveSheetIndex
 
@@ -3453,7 +3459,7 @@ class IntelligentExcelParser:
         self.logger.info(f"从source文件夹解析到 {len(source_results)} 个有效区域")
 
         # ---- 2. 解析预期文件，找到有效区域（同样只打开一次） ----
-        expected_wb = _AsposeWorkbook(str(expected_file))
+        expected_wb = _licensed_workbook(str(expected_file))
 
         exp_active_idx = expected_wb.Worksheets.ActiveSheetIndex
         exp_active_name = expected_wb.Worksheets[exp_active_idx].Name
@@ -3487,7 +3493,7 @@ class IntelligentExcelParser:
                         best_col_count = len(region.head_data)
 
         # ---- 3. 创建target工作簿 ----
-        target_wb = _AsposeWorkbook()
+        target_wb = _licensed_workbook()
 
         # ---- 4. 第一个sheet：完全复制预期文件的表头及表头以上的行 ----
         first_ws = target_wb.Worksheets[0]

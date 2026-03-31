@@ -66,6 +66,12 @@ from Aspose.Cells.Rendering.PdfSecurity import PdfSecurityOptions  # type: ignor
 logger = logging.getLogger(__name__)
 
 
+def _licensed_workbook(*args, **kwargs):
+    """创建 Workbook 前自动确保许可证有效，防止 .NET GC 回收许可证"""
+    aspose_init.ensure_license()
+    return Workbook(*args, **kwargs)
+
+
 # ═══════════════════════════════════════════════════════
 # 内部工具
 # ═══════════════════════════════════════════════════════
@@ -160,9 +166,9 @@ def read_excel(
         if password:
             opts = LoadOptions()
             opts.Password = password
-            wb = Workbook(path, opts)
+            wb = _licensed_workbook(path, opts)
         else:
-            wb = Workbook(path)
+            wb = _licensed_workbook(path)
 
         ws = wb.Worksheets[sheet]
         return _sheet_to_dataframe(ws, header_row, lowercase_cols)
@@ -190,9 +196,9 @@ def read_all_sheets(
     if password:
         opts = LoadOptions()
         opts.Password = password
-        wb = Workbook(path, opts)
+        wb = _licensed_workbook(path, opts)
     else:
-        wb = Workbook(path)
+        wb = _licensed_workbook(path)
 
     result: Dict[str, pd.DataFrame] = {}
     for i in range(wb.Worksheets.Count):
@@ -224,9 +230,9 @@ def read_all_sheets_calculated(
     if password:
         opts = LoadOptions()
         opts.Password = password
-        wb = Workbook(path, opts)
+        wb = _licensed_workbook(path, opts)
     else:
-        wb = Workbook(path)
+        wb = _licensed_workbook(path)
 
     wb.CalculateFormula()
 
@@ -262,7 +268,7 @@ def dataframe_to_excel(
     Returns:
         实际保存路径
     """
-    wb = Workbook()
+    wb = _licensed_workbook()
     ws = wb.Worksheets[0]
     ws.Name = sheet_name
 
@@ -302,7 +308,7 @@ def save_as(wb_or_path, output_path: str) -> str:
     Returns:
         output_path
     """
-    wb = wb_or_path if isinstance(wb_or_path, Workbook) else Workbook(str(wb_or_path))
+    wb = wb_or_path if isinstance(wb_or_path, Workbook) else _licensed_workbook(str(wb_or_path))
     fmt = _ext_save_format(output_path)
 
     if fmt is None:  # HTML 特殊处理
@@ -343,7 +349,7 @@ def sheet_to_image(
     from Aspose.Cells.Rendering import ImageOrPrintOptions, SheetRender
 
     if isinstance(ws_or_path, str):
-        wb = Workbook(ws_or_path)
+        wb = _licensed_workbook(ws_or_path)
         ws = wb.Worksheets[sheet_index]
     else:
         ws = ws_or_path
@@ -372,7 +378,7 @@ def convert_to_pdf(input_path: str, output_path: str = None, active_sheet_only: 
     if not output_path:
         output_path = tempfile.mktemp(suffix=".pdf")
 
-    wb = Workbook(input_path)
+    wb = _licensed_workbook(input_path)
 
     if active_sheet_only:
         active_index = wb.Worksheets.ActiveSheetIndex
@@ -399,7 +405,7 @@ def convert_to_encrypted_pdf(
     if not output_path:
         output_path = tempfile.mktemp(suffix=".pdf")
 
-    wb = Workbook(input_path)
+    wb = _licensed_workbook(input_path)
 
     if active_sheet_only:
         active_index = wb.Worksheets.ActiveSheetIndex
@@ -445,7 +451,7 @@ def convert_format(
     if not output_path:
         output_path = tempfile.mktemp(suffix=ext)
 
-    wb = Workbook(input_path)
+    wb = _licensed_workbook(input_path)
     wb.Save(output_path, save_fmt)
 
     logger.info(f"格式转换完成: {input_path} -> {output_path} ({fmt})")
@@ -655,7 +661,7 @@ def _dataframe_to_datatable(df: pd.DataFrame, table_name: str):
     使用独立临时 Workbook（不影响模板），
     将 DataFrame 写入 → ExportDataTable() 导出原生 .NET DataTable。
     """
-    temp_wb = Workbook()
+    temp_wb = _licensed_workbook()
     cells = temp_wb.Worksheets[0].Cells
 
     n_rows = len(df)
@@ -751,7 +757,7 @@ def _smartmarker_fill(template_path: str, data: Dict) -> Workbook:
     """
     from Aspose.Cells import WorkbookDesigner
 
-    wb = Workbook(template_path)
+    wb = _licensed_workbook(template_path)
     _fix_smart_marker_spacing(wb)
 
     designer = WorkbookDesigner()
@@ -1112,7 +1118,7 @@ def encrypt_excel(
     if not output_path:
         output_path = tempfile.mktemp(suffix=".xlsx")
 
-    wb = Workbook(input_path)
+    wb = _licensed_workbook(input_path)
     wb.SetEncryptionOptions(EncryptionType.StrongCryptographicProvider, 128)
     wb.Settings.Password = password
     wb.Save(output_path)
@@ -1137,13 +1143,13 @@ def decrypt_excel(
     try:
         load_opts = LoadOptions()
         load_opts.Password = password
-        wb = Workbook(input_path, load_opts)
+        wb = _licensed_workbook(input_path, load_opts)
     except Exception as e:
         err_str = str(e)
         if 'Invalid password' in err_str:
             logger.warning(f"[decrypt_excel] 密码无效, 尝试无密码打开: {input_path}")
             try:
-                wb = Workbook(input_path)
+                wb = _licensed_workbook(input_path)
             except Exception as e2:
                 logger.error(f"[decrypt_excel] 无密码打开也失败: {e2}")
                 raise ValueError(
@@ -1167,7 +1173,7 @@ def write_protect_excel(
     if not output_path:
         output_path = tempfile.mktemp(suffix=".xlsx")
 
-    wb = Workbook(input_path)
+    wb = _licensed_workbook(input_path)
     wb.Settings.WriteProtection.Password = password
     wb.Settings.WriteProtection.RecommendReadOnly = True
     wb.Save(output_path)

@@ -44,6 +44,7 @@ def calculate_excel_formulas(file_path: str) -> bool:
     # ---- 方案1: Aspose.Cells（推荐，无进程开销） ----
     try:
         import aspose_init  # noqa: F401 — 确保 Aspose 已初始化
+        aspose_init.ensure_license()
         from Aspose.Cells import Workbook as AsposeWorkbook
 
         logger.info(f"[Aspose] 开始计算公式: {file_path}")
