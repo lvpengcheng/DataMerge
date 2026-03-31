@@ -272,7 +272,7 @@ def _build_chat_system_prompt(context: Dict, config: Dict, rules: str) -> str:
 
     # 规则
     if rules:
-        parts.append(f"\n计算规则（参考）:\n{rules[:5000]}")
+        parts.append(f"\n计算规则（参考）:\n{rules[:70000]}")
 
     # 源数据结构
     src_desc = config.get("source_structure_desc", "")
@@ -343,10 +343,11 @@ def _run_single_iteration(
     manual_headers: Dict = None,
     file_passwords: Dict = None,
     pre_loaded_source_data: Dict = None,
+    rules_content: str = None,
 ) -> Dict[str, Any]:
     """执行单轮训练：运行代码 → 对比 → 返回结果（与 TrainingEngine._execute_and_validate 一致）"""
     from ..sandbox.code_sandbox import CodeSandbox
-    from ..utils.excel_comparator import compare_excel_files
+    from ..utils.excel_comparator import compare_excel_files, extract_primary_keys_from_rules
 
     sandbox = CodeSandbox()
 
@@ -419,9 +420,11 @@ def _run_single_iteration(
             }
         result_file = str(output_files[0])
 
-        # 对比
+        # 对比 — 从规则中提取主键以精确匹配行
         diff_output = str(output_dir / "_diff.xlsx")
-        comparison = compare_excel_files(result_file, expected_file, diff_output)
+        comparison_primary_keys = extract_primary_keys_from_rules(rules_content) if rules_content else None
+        logger.info(f"[对比] rules_content长度={len(rules_content) if rules_content else 0}, 提取到主键={comparison_primary_keys}")
+        comparison = compare_excel_files(result_file, expected_file, diff_output, primary_keys=comparison_primary_keys)
 
         total = comparison.get("total_cells", 1)
         matched = comparison.get("matched_cells", 0)
@@ -763,7 +766,7 @@ async def start_training(
                     "source_dir": source_dir,
                     "expected_file": expected_file,
                     "work_dir": work_dir,
-                    "rules_content": rules_content[:10000],
+                    "rules_content": rules_content[:70000],
                     "expected_structure": expected_struct_dict,
                     "ai_provider": ai_provider,
                     "salary_year": salary_year,
@@ -783,7 +786,7 @@ async def start_training(
                 ts.salary_year = salary_year
                 ts.salary_month = salary_month
                 ts.manual_headers = manual_headers_dict
-                ts.rules_content = rules_content[:10000] if rules_content else None
+                ts.rules_content = rules_content[:70000] if rules_content else None
                 ts.expected_structure = expected_struct_dict or None
                 db.commit()
 
@@ -1003,10 +1006,10 @@ def main(source_dir, output_dir, **kwargs):
             source_structure_desc = ""
             try:
                 source_structure_desc = generator.formula_builder.get_source_structure_for_prompt()
-                config["source_structure_desc"] = source_structure_desc[:5000]
+                config["source_structure_desc"] = source_structure_desc[:70000]
                 ts.config = config
                 # 写入正式列
-                ts.source_structure = {"desc": source_structure_desc[:5000]}
+                ts.source_structure = {"desc": source_structure_desc[:70000]}
                 db.commit()
             except Exception as e:
                 logger.warning(f"获取源数据结构描述失败: {e}")
@@ -1034,6 +1037,7 @@ def main(source_dir, output_dir, **kwargs):
                 salary_month=salary_month,
                 monthly_standard_hours=monthly_standard_hours,
                 pre_loaded_source_data=_full_source_data,
+                rules_content=config.get("rules_content", ""),
             )
 
             # 记录迭代
@@ -1041,8 +1045,8 @@ def main(source_dir, output_dir, **kwargs):
             persistence.record_iteration(
                 session_id=sid,
                 iteration_num=iteration_num,
-                prompt_text="[FormulaCodeGenerator.generate_code]",
-                ai_response=(ai_response or "")[:10000],
+                prompt_text=(getattr(generator, 'last_prompt', None) or "[FormulaCodeGenerator.generate_code]")[:70000],
+                ai_response=(ai_response or "")[:70000],
                 generated_code=code,
                 accuracy=accuracy,
                 execution_result={"success": run_result.get("success"),
@@ -1054,7 +1058,7 @@ def main(source_dir, output_dir, **kwargs):
 
             # 保存详细差异文本到 config（供后续修正使用）
             if run_result.get("detailed_diff"):
-                config["latest_detailed_diff"] = run_result["detailed_diff"][:5000]
+                config["latest_detailed_diff"] = run_result["detailed_diff"][:70000]
                 ts.config = config
                 db.commit()
 
@@ -1071,7 +1075,10 @@ def main(source_dir, output_dir, **kwargs):
                      "best_score": accuracy,
                      "total_iterations": iteration_num,
                      "best_code": code, "mode": mode,
-                     "manual_headers": config.get("manual_headers")},
+                     "manual_headers": config.get("manual_headers"),
+                     "source_structure": ts.source_structure or {},
+                     "rules_content": config.get("rules_content", ""),
+                     "expected_structure": config.get("expected_structure", {})},
                     {}
                 )
             except Exception as e:
@@ -1218,7 +1225,7 @@ async def send_message(
             rules = config.get("rules_content", "")
             if new_rules:
                 rules = new_rules + "\n" + rules
-                config["rules_content"] = rules[:10000]
+                config["rules_content"] = rules[:70000]
                 session.config = config
                 db.commit()
 
@@ -1284,7 +1291,7 @@ async def send_message(
             rules = config.get("rules_content", "")
             if new_rules:
                 rules = new_rules + "\n" + rules
-                config["rules_content"] = rules[:10000]
+                config["rules_content"] = rules[:70000]
                 session.config = config
                 db.commit()
 
@@ -1296,19 +1303,36 @@ async def send_message(
                 _emit({"type": "error", "message": "没有可修正的代码，请先运行首轮训练"})
                 return
 
-            # 获取差异文本（优先从最新迭代获取，再回退到 config 缓存）
-            comparison_result = ""
-            diff = context.get("latest_diff")
-            if diff:
-                if isinstance(diff, dict):
-                    comparison_result = json.dumps(diff, ensure_ascii=False, indent=2)
-                else:
-                    comparison_result = str(diff)
-            if not comparison_result:
-                comparison_result = config.get("latest_detailed_diff", "")
+            # 获取结构化差异（dict格式）和文本差异
+            diff_dict = context.get("latest_diff")  # {"列名": {"count": N, ...}}
+            detailed_diff_text = config.get("latest_detailed_diff", "")
 
-            # 将用户消息追加到差异说明中（用户的修正指导）
-            comparison_result += f"\n\n用户反馈:\n{message}"
+            # 【关键】分析用户消息中提到了哪些列名，只修正这些列
+            user_mentioned_columns = {}
+            # 1. 从diff中匹配用户提到的列名
+            if diff_dict and isinstance(diff_dict, dict):
+                for col_name, col_info in diff_dict.items():
+                    if col_name in message:
+                        user_mentioned_columns[col_name] = col_info
+
+            # 2. 如果用户提到的列不在diff中（可能是已正确但要改逻辑的列），
+            #    也从代码的列注释中提取列名进行匹配
+            if not user_mentioned_columns and original_code:
+                import re as _re
+                code_columns = _re.findall(
+                    r'# [A-Z]{1,3}列\(\d+\):\s*(.+?)(?:\s*[-—]|\s*$)',
+                    original_code
+                )
+                for col_name in code_columns:
+                    col_name = col_name.strip()
+                    if col_name and col_name in message:
+                        user_mentioned_columns[col_name] = {"count": 0, "sample": "用户要求修改逻辑"}
+
+            # 3. 如果用户未提到具体列名，自动使用差异列作为修正目标
+            #    （避免全量重新生成，只针对有差异的列做精准修正）
+            if not user_mentioned_columns and diff_dict and isinstance(diff_dict, dict):
+                user_mentioned_columns = dict(diff_dict)
+                logger.info(f"[chat修正] 用户未指定列名，自动使用差异列: {list(user_mentioned_columns.keys())}")
 
             # 获取源数据结构描述
             source_structure_desc = config.get("source_structure_desc", "")
@@ -1327,16 +1351,53 @@ async def send_message(
                 _load_full_source_data, src_dir, config.get("manual_headers")
             ) if src_dir and os.path.isdir(src_dir) else None
 
-            _emit({"type": "status", "message": "AI 正在修正代码..."})
+            code = None
 
-            # 使用 FormulaCodeGenerator.generate_correction_code()（与原训练引擎修正逻辑一致）
-            code = generator.generate_correction_code(
-                original_code=original_code,
-                comparison_result=comparison_result,
-                rules_content=rules,
-                source_structure=source_structure_desc,
-                stream_callback=stream_cb,
-            )
+            # 策略：用户提到具体列名时，使用列级精准修正；否则全量修正
+            if user_mentioned_columns:
+                _emit({"type": "status",
+                       "message": f"AI 正在精准修正 {len(user_mentioned_columns)} 列: {', '.join(user_mentioned_columns.keys())}..."})
+                logger.info(f"[chat修正] 用户指定列级修正: {list(user_mentioned_columns.keys())}")
+                try:
+                    code, _ = generator.generate_column_level_correction(
+                        full_code=original_code,
+                        field_diff_samples=user_mentioned_columns,
+                        rules_content=rules,
+                        source_structure=source_structure_desc,
+                        expected_structure=config.get("expected_structure", {}),
+                        stream_callback=stream_cb,
+                        user_feedback=message,
+                    )
+                except Exception as col_err:
+                    logger.warning(f"[chat修正] 列级修正失败: {col_err}, 降级为全量修正")
+                    code = None
+
+            if not code:
+                # 全量修正（用户未提到具体列名，或列级修正失败）
+                _emit({"type": "status", "message": "AI 正在修正代码..."})
+
+                # 构建差异文本
+                comparison_result = ""
+                if diff_dict:
+                    if isinstance(diff_dict, dict):
+                        # 如果用户提到了列名但列级修正失败，仍然只传用户提到的列的差异
+                        filtered = user_mentioned_columns if user_mentioned_columns else diff_dict
+                        comparison_result = json.dumps(filtered, ensure_ascii=False, indent=2)
+                    else:
+                        comparison_result = str(diff_dict)
+                if not comparison_result:
+                    comparison_result = detailed_diff_text
+
+                # 用户反馈单独传递，不混入差异文本
+                comparison_result += f"\n\n## 用户修正指示（最高优先级，只修改用户提到的列）:\n{message}"
+
+                code = generator.generate_correction_code(
+                    original_code=original_code,
+                    comparison_result=comparison_result,
+                    rules_content=rules,
+                    source_structure=source_structure_desc,
+                    stream_callback=stream_cb,
+                )
 
             if not code:
                 ai_msg = "抱歉，我未能生成有效的修正代码。请提供更具体的指导。"
@@ -1382,11 +1443,12 @@ async def send_message(
                 salary_month=config.get("salary_month"),
                 monthly_standard_hours=config.get("monthly_standard_hours"),
                 pre_loaded_source_data=_full_source_data,
+                rules_content=config.get("rules_content", ""),
             )
 
             # 保存详细差异文本到 config
             if run_result.get("detailed_diff"):
-                config["latest_detailed_diff"] = run_result["detailed_diff"][:5000]
+                config["latest_detailed_diff"] = run_result["detailed_diff"][:70000]
                 session.config = config
                 db.commit()
 
@@ -1449,7 +1511,10 @@ async def send_message(
                          "best_score": accuracy,
                          "total_iterations": iteration_num,
                          "best_code": code, "mode": session.mode or "formula",
-                         "manual_headers": config.get("manual_headers")},
+                         "manual_headers": config.get("manual_headers"),
+                         "source_structure": session.source_structure or {},
+                         "rules_content": config.get("rules_content", ""),
+                         "expected_structure": config.get("expected_structure", {})},
                         {}
                     )
                 except Exception as e:
@@ -1572,6 +1637,28 @@ def set_as_best(
         created_by=current_user.id,
     )
 
+    # 同步保存到磁盘（使老版智算路径也能读到）
+    config = session.config or {}
+    try:
+        from ..storage.storage_manager import StorageManager
+        _sm = StorageManager()
+        _sm.save_script(
+            session.tenant_id, iteration.generated_code,
+            {"success": True,
+             "best_score": iteration.accuracy or 0,
+             "total_iterations": iteration.iteration_num,
+             "best_code": iteration.generated_code,
+             "mode": session.mode or "formula",
+             "manual_headers": config.get("manual_headers"),
+             "source_structure": session.source_structure or {},
+             "rules_content": config.get("rules_content", ""),
+             "expected_structure": config.get("expected_structure", {})},
+            {}
+        )
+        logger.info(f"[set-best] 脚本已同步到磁盘: tenant={session.tenant_id}")
+    except Exception as e:
+        logger.warning(f"[set-best] 保存脚本到磁盘失败: {e}")
+
     # 更新 session
     session.final_script_id = script.id
     session.status = "completed"
@@ -1623,6 +1710,7 @@ async def upload_code(
         salary_year=config.get("salary_year"),
         salary_month=config.get("salary_month"),
         monthly_standard_hours=config.get("monthly_standard_hours"),
+        rules_content=config.get("rules_content", ""),
     )
 
     from ..api.training_persistence import TrainingPersistence
@@ -1640,6 +1728,58 @@ async def upload_code(
         status="completed" if run_result.get("success") else "failed",
     )
     persistence.update_session_best(session_id, accuracy, iteration_num)
+
+    # 持久化迭代产物（脚本、生成Excel、差异Excel）到磁盘，更新下载路径
+    iter_files = _persist_iteration_files(
+        session.tenant_id, session_id, iteration_num,
+        code_content, run_result
+    )
+    if iter_files:
+        config["latest_files"] = iter_files
+        session.config = dict(config)  # 触发 SQLAlchemy 变更检测
+        db.commit()
+
+    # 同步保存到磁盘和DB（使智算页面可用）
+    mode = session.mode or "formula"
+    try:
+        from ..storage.storage_manager import StorageManager
+        _sm = StorageManager()
+        _sm.save_script(
+            session.tenant_id, code_content,
+            {"success": run_result.get("success", False),
+             "best_score": accuracy,
+             "total_iterations": iteration_num,
+             "best_code": code_content, "mode": mode,
+             "manual_headers": config.get("manual_headers"),
+             "source_structure": session.source_structure or {},
+             "rules_content": config.get("rules_content", ""),
+             "expected_structure": config.get("expected_structure", {})},
+            {}
+        )
+        logger.info(f"[upload-code] 脚本已同步到磁盘: tenant={session.tenant_id}")
+    except Exception as e:
+        logger.warning(f"[upload-code] 保存脚本到磁盘失败: {e}")
+
+    try:
+        persistence.save_script(
+            tenant_id=session.tenant_id,
+            name=f"script_{session.tenant_id}",
+            code=code_content,
+            mode=mode,
+            source_session_id=session_id,
+            accuracy=accuracy,
+            created_by=current_user.id,
+            config={"manual_headers": config.get("manual_headers"),
+                    "source_structure": config.get("source_structure_desc", ""),
+                    "rules_content": config.get("rules_content", "")},
+            manual_headers=config.get("manual_headers"),
+            source_structure=session.source_structure,
+            rules_content=config.get("rules_content", ""),
+            expected_structure=config.get("expected_structure"),
+        )
+        logger.info(f"[upload-code] 脚本已同步到DB: tenant={session.tenant_id}")
+    except Exception as e:
+        logger.warning(f"[upload-code] 保存脚本到DB失败: {e}")
 
     # 消息
     if run_result.get("success"):
@@ -1660,7 +1800,11 @@ async def upload_code(
         "iteration": iteration_num,
         "accuracy": accuracy,
         "success": run_result.get("success", False),
-        "diff_details": run_result.get("diff_details"),
+        "diff_details": {
+            "field_diff_samples": run_result.get("diff_details"),
+            "total_cells": run_result.get("total_cells"),
+            "matched_cells": run_result.get("matched_cells"),
+        } if run_result.get("diff_details") else None,
         "error": run_result.get("error"),
     }
 

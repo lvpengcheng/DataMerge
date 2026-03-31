@@ -113,10 +113,19 @@ def _migrate_add_columns():
     insp = inspect(engine)
 
     migrations = [
+        # ---------- compute_tasks ----------
         ("compute_tasks", "salary_year", "INTEGER"),
         ("compute_tasks", "salary_month", "INTEGER"),
+        # ---------- templates ----------
+        ("templates", "file_name_rule", "VARCHAR(500) DEFAULT ''"),
+        ("templates", "encrypt_type", "VARCHAR(20) DEFAULT 'none'"),
+        ("templates", "encrypt_password", "VARCHAR(100) DEFAULT ''"),
+        ("templates", "report_mode", "VARCHAR(20) DEFAULT 'fill'"),
+        ("templates", "group_by", "VARCHAR(100) DEFAULT ''"),
+        ("templates", "skip_rows", "INTEGER DEFAULT 1"),
+        ("templates", "name_field", "VARCHAR(100) DEFAULT ''"),
         ("templates", "show_empty_period", "BOOLEAN DEFAULT TRUE"),
-        # 训练信息统一入库
+        # ---------- training_sessions ----------
         ("training_sessions", "ai_provider", "VARCHAR(50)"),
         ("training_sessions", "salary_year", "INTEGER"),
         ("training_sessions", "salary_month", "INTEGER"),
@@ -124,6 +133,7 @@ def _migrate_add_columns():
         ("training_sessions", "rules_content", "TEXT"),
         ("training_sessions", "source_structure", "TEXT"),
         ("training_sessions", "expected_structure", "TEXT"),
+        # ---------- scripts ----------
         ("scripts", "manual_headers", "TEXT"),
         ("scripts", "source_structure", "TEXT"),
         ("scripts", "rules_content", "TEXT"),

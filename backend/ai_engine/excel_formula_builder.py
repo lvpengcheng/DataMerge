@@ -359,17 +359,49 @@ class ExcelFormulaBuilder:
 
         return unique_keys[:5]  # 最多返回5个可能的主键列
 
-    def get_source_structure_for_prompt(self) -> str:
-        """生成用于AI提示词的源数据结构描述，包含主键识别信息"""
+    def get_source_structure_for_prompt(self, main_table_name: str = None) -> str:
+        """生成用于AI提示词的源数据结构描述，包含主键识别信息
+
+        Args:
+            main_table_name: 规则中指定的主表名称。如果提供，直接确认该表为主表；
+                           如果为None，则标注候选让AI根据规则决定。
+        """
         lines = ["## 源数据Sheet结构\n"]
 
         # 收集所有表的主键信息，用于后面的汇总
         all_key_info = {}
 
+        # 确定主表：优先使用规则指定的主表名，模糊匹配source_sheets的key
+        confirmed_main = None
+        if main_table_name:
+            for k in self.source_sheets:
+                if main_table_name == k or main_table_name in k or k in main_table_name:
+                    confirmed_main = k
+                    break
+
+        # 如果规则没指定或匹配不到，则走候选逻辑
+        main_candidate_names = []
+        if not confirmed_main:
+            aux_keywords = ['原稿', '原始', '疑问点', '说明']
+            candidate_sheets = {k: v for k, v in self.source_sheets.items()
+                               if not any(aux in k for aux in aux_keywords)}
+            if not candidate_sheets:
+                candidate_sheets = self.source_sheets
+
+            main_candidates = []
+            for k in candidate_sheets:
+                key_cols = self._identify_key_columns(candidate_sheets[k]['df'])
+                if key_cols:
+                    main_candidates.append((k, len(candidate_sheets[k]['df']), key_cols))
+            main_candidates.sort(key=lambda x: x[1], reverse=True)
+            main_candidate_names = [c[0] for c in main_candidates]
+
         for sheet_name, sheet_info in self.source_sheets.items():
             columns = sheet_info["columns"]
             row_count = len(sheet_info["df"])
             df = sheet_info["df"]
+            is_main = (sheet_name == confirmed_main)
+            is_candidate = (not confirmed_main and sheet_name in main_candidate_names)
 
             # 识别可能的主键列
             key_columns = self._identify_key_columns(df)
@@ -378,6 +410,11 @@ class ExcelFormulaBuilder:
             lines.append(f"### {sheet_name}")
             lines.append(f"- 来源文件: {sheet_info['source_file']}")
             lines.append(f"- 行数: {row_count}")
+
+            if is_main:
+                lines.append(f"- **⭐ 确认主表（规则指定），所有列属于L1同源层，用 main_df.iloc[i].get('列名','') 直接复制，禁止VLOOKUP/INDEX+MATCH**")
+            elif is_candidate:
+                lines.append(f"- **⭐ 主表候选（包含主键列，行数{row_count}），如规则中「列处理分层」标注此表为主键来源表，则其所有列属于L1同源层，用 main_df.iloc[i].get('列名','') 直接复制**")
 
             # 显示可能的主键列
             if key_columns:
@@ -391,7 +428,8 @@ class ExcelFormulaBuilder:
                 col_letter = get_column_letter(col_idx)
                 # 标记主键列
                 key_marker = " 🔑" if col_name in key_columns else ""
-                lines.append(f"  - {col_letter}列: {col_name}{key_marker}")
+                copy_marker = " → 直接复制" if (is_main or is_candidate) and col_name not in key_columns else ""
+                lines.append(f"  - {col_letter}列: {col_name}{key_marker}{copy_marker}")
 
             lines.append("")
 
@@ -404,6 +442,23 @@ class ExcelFormulaBuilder:
 
         for sheet_name, key_cols in all_key_info.items():
             columns = self.source_sheets[sheet_name]["columns"]
+
+            # 已确认主表：完全跳过VLOOKUP指南
+            if sheet_name == confirmed_main:
+                lines.append(f"### {sheet_name}（⭐ 确认主表 — 不使用VLOOKUP）")
+                lines.append(f"- **主表所有列通过 main_df.iloc[i].get('列名','') 直接复制**")
+                lines.append(f"- ❌ 禁止对主表列使用VLOOKUP/INDEX+MATCH/XLOOKUP")
+                lines.append(f"- ❌ 禁止对主表列调用get_vlookup_col_num()")
+                lines.append("")
+                continue
+
+            # 未确认的主表候选：保留提示
+            if not confirmed_main and sheet_name in main_candidate_names:
+                lines.append(f"### {sheet_name}（⭐ 主表候选 — 若规则确认为主表则不使用VLOOKUP，用main_df.iloc[i].get()直接复制）")
+                lines.append(f"- 如果规则「列处理分层」标注此表为主键来源表：**禁止对此表列使用VLOOKUP/INDEX+MATCH**")
+                lines.append(f"- 如果此表不是主表，则按以下VLOOKUP指南取数：")
+                lines.append("")
+
             if not key_cols:
                 lines.append(f"### {sheet_name}")
                 lines.append(f"- 主键列: (未识别到常见主键列，需根据数据内容判断)")
@@ -452,6 +507,7 @@ class ExcelFormulaBuilder:
             lines.append("")
 
         lines.append("**【重要】VLOOKUP主键选择策略：**")
+        lines.append("0. **主表（规则中「列处理分层」标注的主键来源表）的列不需要VLOOKUP，用find_source_sheet定位后用main_df.iloc[i].get()直接复制！禁止用max(len(df))选主表！**")
         lines.append("1. 优先使用工号/员工编号/身份证号作为查找键，这里面是最可靠的唯一标识，能最大程度避免重复和错误匹配")
         lines.append("2. 其次使用姓名")
         lines.append("3. VLOOKUP范围必须从主键列开始，不能从$A列开始（除非主键就在A列）")

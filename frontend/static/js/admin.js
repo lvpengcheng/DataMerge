@@ -8,6 +8,15 @@ let _orgs = [];
 let _orgsFlatMap = {};  // id -> org
 let _modalCallback = null;
 
+/** 安全解析错误响应，防止非 JSON 响应（如 nginx 502/504 纯文本）导致二次报错 */
+async function _alertErr(resp, fallback) {
+    let msg = fallback;
+    try { const j = await resp.json(); msg = j.detail || j.message || fallback; } catch (_) {
+        try { msg = await resp.text(); } catch (__) {}
+    }
+    alert(msg);
+}
+
 const Admin = {
     // ==================== 初始化 ====================
     async init() {
@@ -102,7 +111,7 @@ const Admin = {
                 }),
             });
             if (resp.ok) { this.closeModal(); this.loadUsers(); }
-            else { const e = await resp.json(); alert(e.detail || '创建失败'); }
+            else { await _alertErr(resp, '创建失败'); }
         });
     },
 
@@ -136,7 +145,7 @@ const Admin = {
                 }),
             });
             if (resp.ok) { this.closeModal(); this.loadUsers(); }
-            else { const e = await resp.json(); alert(e.detail || '更新失败'); }
+            else { await _alertErr(resp, '更新失败'); }
         });
     },
 
@@ -200,7 +209,7 @@ const Admin = {
                 }),
             });
             if (resp.ok) { this.closeModal(); await this.loadRoles(); this.renderRoles(); }
-            else { const e = await resp.json(); alert(e.detail || '创建失败'); }
+            else { await _alertErr(resp, '创建失败'); }
         });
     },
 
@@ -225,7 +234,7 @@ const Admin = {
                 }),
             });
             if (resp.ok) { this.closeModal(); await this.loadRoles(); this.renderRoles(); }
-            else { const e = await resp.json(); alert(e.detail || '更新失败'); }
+            else { await _alertErr(resp, '更新失败'); }
         });
     },
 
@@ -233,7 +242,7 @@ const Admin = {
         if (!confirm(`确定删除角色 ${name}？`)) return;
         const resp = await AUTH.authFetch(`/api/admin/roles/${id}`, { method: 'DELETE' });
         if (resp.ok) { await this.loadRoles(); this.renderRoles(); }
-        else { const e = await resp.json(); alert(e.detail || '删除失败'); }
+        else { await _alertErr(resp, '删除失败'); }
     },
 
     // ==================== 组织管理 ====================
@@ -291,7 +300,7 @@ const Admin = {
                 }),
             });
             if (resp.ok) { this.closeModal(); await this.loadOrgs(); this.renderOrgs(); }
-            else { const e = await resp.json(); alert(e.detail || '创建失败'); }
+            else { await _alertErr(resp, '创建失败'); }
         });
     },
 
@@ -314,7 +323,7 @@ const Admin = {
                 }),
             });
             if (resp.ok) { this.closeModal(); await this.loadOrgs(); this.renderOrgs(); }
-            else { const e = await resp.json(); alert(e.detail || '更新失败'); }
+            else { await _alertErr(resp, '更新失败'); }
         });
     },
 
@@ -322,7 +331,7 @@ const Admin = {
         if (!confirm(`确定删除组织 ${name}？`)) return;
         const resp = await AUTH.authFetch(`/api/admin/organizations/${id}`, { method: 'DELETE' });
         if (resp.ok) { await this.loadOrgs(); this.renderOrgs(); }
-        else { const e = await resp.json(); alert(e.detail || '删除失败'); }
+        else { await _alertErr(resp, '删除失败'); }
     },
 
     // ==================== 租户授权 ====================
@@ -377,7 +386,7 @@ const Admin = {
                 }),
             });
             if (resp.ok) { this.closeModal(); this.loadTenantAuth(); }
-            else { const e = await resp.json(); alert(e.detail || '授权失败'); }
+            else { await _alertErr(resp, '授权失败'); }
         });
     },
 
@@ -402,7 +411,11 @@ const Admin = {
     },
 
     confirmModal() {
-        if (_modalCallback) _modalCallback();
+        if (_modalCallback) {
+            const cb = _modalCallback;
+            _modalCallback = null;  // 立即清空，防止重复触发
+            cb();
+        }
     },
 
     // ==================== 选项生成 ====================
@@ -721,7 +734,7 @@ const Admin = {
             fd.append('show_empty_period', document.getElementById('m-tpl-show-empty')?.checked ? 'true' : 'false');
             const resp = await AUTH.authFetch('/api/admin/templates', { method: 'POST', body: fd });
             if (resp.ok) { this.closeModal(); this.loadTemplates(); }
-            else { const e = await resp.json(); alert(e.detail || '创建失败'); }
+            else { await _alertErr(resp, '创建失败'); }
         });
     },
 
@@ -798,7 +811,7 @@ const Admin = {
             fd.append('show_empty_period', document.getElementById('m-tpl-show-empty')?.checked ? 'true' : 'false');
             const resp = await AUTH.authFetch(`/api/admin/templates/${id}`, { method: 'PUT', body: fd });
             if (resp.ok) { this.closeModal(); this.loadTemplates(); }
-            else { const e = await resp.json(); alert(e.detail || '更新失败'); }
+            else { await _alertErr(resp, '更新失败'); }
         });
     },
 
@@ -838,6 +851,11 @@ const Admin = {
             let name = fileName || 'download.xlsx';
             if (format === 'pdf') name = name.replace(/\.(xlsx?|csv)$/i, '') + '.pdf';
             else if (format === 'encrypted') name = name.replace(/\.(xlsx?)$/i, '') + '_加密.xlsx';
+            // 检查content-type，如果是zip则确保文件名以.zip结尾
+            const contentType = resp.headers.get('content-type') || '';
+            if (contentType.includes('zip') && !name.endsWith('.zip')) {
+                name = name.replace(/\.(xlsx?)$/i, '') + '.zip';
+            }
             a.download = name;
             document.body.appendChild(a);
             a.click();
@@ -1030,6 +1048,7 @@ const Admin = {
             </div>
         `, async () => {
             const tplId = document.getElementById('m-rpt-tpl').value;
+            const selectedTpl = templates.find(t => String(t.id) === String(tplId));
             const useHistory = document.getElementById('m-rpt-history').checked;
             const periodFrom = document.getElementById('m-rpt-from').value;
             const periodTo = document.getElementById('m-rpt-to').value;
@@ -1038,11 +1057,12 @@ const Admin = {
                 return alert('启用历史时请选择薪资周期范围');
             }
 
-            // 显示加载状态
-            const confirmBtn = document.getElementById('modal-confirm');
-            const origText = confirmBtn.textContent;
-            confirmBtn.textContent = '生成中...';
-            confirmBtn.disabled = true;
+            // 关闭弹窗，显示全局 loading
+            this.closeModal();
+            const loadingEl = document.getElementById('loading-overlay');
+            const loadingText = document.getElementById('loading-text');
+            loadingEl.style.display = 'flex';
+            loadingText.textContent = '报表生成中，请稍候...';
 
             try {
                 const fd = new FormData();
@@ -1057,15 +1077,23 @@ const Admin = {
                     method: 'POST', body: fd
                 });
                 if (!resp.ok) {
-                    const err = await resp.json();
-                    alert(err.detail || '报表生成失败');
+                    let msg = '报表生成失败';
+                    try { const err = await resp.json(); msg = err.detail || msg; } catch (_) {}
+                    alert(msg);
                     return;
                 }
 
                 // 下载生成的文件
                 const blob = await resp.blob();
+                if (!blob || blob.size === 0) {
+                    alert('报表生成异常：文件为空（0 字节），请检查模版配置');
+                    return;
+                }
+
+                // 从 content-disposition 解析文件名，取不到则根据模版的 report_mode 决定扩展名
                 const cd = resp.headers.get('content-disposition') || '';
-                let fileName = '报表.xlsx';
+                const tplMode = (selectedTpl && selectedTpl.report_mode) || 'fill';
+                let fileName = tplMode === 'zip' ? '报表.zip' : '报表.xlsx';
                 const fnMatch = cd.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i);
                 if (fnMatch) fileName = decodeURIComponent(fnMatch[1].replace(/"/g, ''));
 
@@ -1077,13 +1105,10 @@ const Admin = {
                 a.click();
                 document.body.removeChild(a);
                 URL.revokeObjectURL(blobUrl);
-
-                this.closeModal();
             } catch (e) {
                 alert('报表生成失败: ' + e.message);
             } finally {
-                confirmBtn.textContent = origText;
-                confirmBtn.disabled = false;
+                loadingEl.style.display = 'none';
             }
         });
     },

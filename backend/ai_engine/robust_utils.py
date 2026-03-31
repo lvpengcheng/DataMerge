@@ -171,6 +171,58 @@ def mark_missing_cells_in_excel(file_path: str, missing_data_info: Dict[str, Lis
         logger.error(f"标记缺失数据单元格失败: {e}")
 
 
+def safe_to_numeric(series: pd.Series, default_value: Any = 0,
+                    log_warning: bool = True) -> pd.Series:
+    """
+    安全地将Series转换为数值类型，无法转换的值用默认值填充
+
+    Args:
+        series: pandas Series
+        default_value: 无法转换时的默认值
+        log_warning: 是否记录警告日志
+
+    Returns:
+        转换后的数值Series
+    """
+    try:
+        result = pd.to_numeric(series, errors='coerce')
+        na_count = result.isna().sum() - series.isna().sum()  # 新增的NaN数量
+        if na_count > 0 and log_warning:
+            logger.warning(f"列 '{series.name}' 有 {na_count} 个值无法转换为数值，使用默认值 {default_value} 填充")
+        result = result.fillna(default_value)
+        return result
+    except Exception as e:
+        if log_warning:
+            logger.error(f"转换列 '{series.name}' 为数值时出错: {e}")
+        return pd.Series([default_value] * len(series), index=series.index, name=series.name)
+
+
+def is_numeric_column(series: pd.Series) -> bool:
+    """
+    判断一个Series是否为数值列（排除含字母的编号列如工号'YN00002'）
+
+    Args:
+        series: pandas Series
+
+    Returns:
+        是否为数值列
+    """
+    try:
+        # 如果已经是数值类型，直接返回True
+        if pd.api.types.is_numeric_dtype(series):
+            return True
+        # 尝试转换，检查是否大部分能转为数值
+        converted = pd.to_numeric(series.dropna(), errors='coerce')
+        if len(converted) == 0:
+            return False
+        # 如果超过50%的值可以转为数值，且不含字母，认为是数值列
+        numeric_ratio = converted.notna().sum() / len(converted)
+        has_alpha = series.dropna().astype(str).str.contains('[a-zA-Z]').any()
+        return numeric_ratio > 0.5 and not has_alpha
+    except Exception:
+        return False
+
+
 def get_dataframe_info(df: pd.DataFrame, name: str = "") -> Dict[str, Any]:
     """
     获取DataFrame的详细信息，用于调试
@@ -197,6 +249,8 @@ def get_dataframe_info(df: pd.DataFrame, name: str = "") -> Dict[str, Any]:
 __all__ = [
     'safe_get_column',
     'safe_calculate',
+    'safe_to_numeric',
+    'is_numeric_column',
     'validate_required_columns',
     'create_missing_columns',
     'mark_missing_cells_in_excel',

@@ -53,6 +53,16 @@ class FastHeaderMatcher:
         4. 直接从缓存取已解析数据（不再重复读取）
         """
         try:
+            # 防御性处理：source_structure 可能是 JSON 字符串（从DB或文件读取时未反序列化）
+            if isinstance(source_structure, str):
+                import json
+                try:
+                    source_structure = json.loads(source_structure)
+                except (json.JSONDecodeError, TypeError):
+                    return False, "source_structure 格式异常（非有效JSON字符串）", None
+            if not isinstance(source_structure, dict):
+                return False, f"source_structure 类型异常: {type(source_structure).__name__}", None
+
             # 步骤1: 从source_structure提取训练基准
             logger.info("[匹配] ===== 步骤1: 提取训练基准 =====")
             train_sheets = self._build_training_sheets(source_structure)

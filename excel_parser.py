@@ -2603,8 +2603,8 @@ class IntelligentExcelParser:
         for char in special_chars:
             cleaned = cleaned.replace(char, '')
 
-        # 将制表符、换行符、回车符替换为空格
-        cleaned = cleaned.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ')
+        # 将换行符、回车符直接去除（不替换为空格），制表符替换为空格
+        cleaned = cleaned.replace('\r', '').replace('\n', '').replace('\t', ' ')
         
         # 再次去除前后空格（因为去除特殊字符后可能产生新的空格）
         cleaned = cleaned.strip()

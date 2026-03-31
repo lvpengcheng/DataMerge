@@ -2126,7 +2126,7 @@ async def adjust_code(
 ```
 
 ## 原始计算规则
-{rules_content[:10000]}
+{rules_content[:70000]}
 
 ## 用户的调整要求
 {adjustment_request}

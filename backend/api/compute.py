@@ -6,6 +6,7 @@ import os
 import shutil
 import tempfile
 import logging
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
@@ -25,6 +26,44 @@ router = APIRouter(prefix="/api/compute2", tags=["计算任务"])
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def _load_script_code(script: Script) -> str:
+    """加载脚本代码：优先读取磁盘文件（支持手动编辑），回退到DB。
+
+    训练时脚本同时保存到 DB(Script.code) 和磁盘(tenants/{id}/scripts/script_{hash}.py)。
+    用户可能手动编辑磁盘文件，此函数优先使用磁盘版本。
+    """
+    try:
+        # 通过DB代码的hash推算磁盘文件名
+        code_hash = hashlib.md5(script.code.encode('utf-8')).hexdigest()[:12]
+        disk_script_id = f"script_{code_hash}"
+        disk_path = PROJECT_ROOT / "tenants" / script.tenant_id / "scripts" / f"{disk_script_id}.py"
+
+        if disk_path.exists():
+            disk_code = disk_path.read_text(encoding='utf-8')
+            if disk_code != script.code:
+                logger.info(f"[脚本同步] 检测到磁盘文件已手动修改，使用磁盘版本: {disk_path.name}")
+                # 同步回DB，保持一致
+                script.code = disk_code
+                try:
+                    from ..database.connection import SessionLocal
+                    with SessionLocal() as db_sync:
+                        db_sync.query(Script).filter_by(id=script.id).update({"code": disk_code})
+                        db_sync.commit()
+                    logger.info(f"[脚本同步] 磁盘修改已同步回DB: Script.id={script.id}")
+                except Exception as e:
+                    logger.warning(f"[脚本同步] 回写DB失败（不影响本次执行）: {e}")
+                return disk_code
+            else:
+                logger.debug(f"[脚本同步] 磁盘文件与DB一致: {disk_path.name}")
+                return script.code
+        else:
+            logger.debug(f"[脚本同步] 磁盘文件不存在: {disk_path}, 使用DB版本")
+            return script.code
+    except Exception as e:
+        logger.warning(f"[脚本同步] 读取磁盘脚本失败，使用DB版本: {e}")
+        return script.code
 
 
 # ==================== Pydantic 模型 ====================
@@ -217,9 +256,10 @@ async def execute_compute(
             else:
                 source_files.append(str(dest))
 
-        # 写入脚本
+        # 写入脚本（优先磁盘文件，支持手动编辑）
+        script_code = _load_script_code(script)
         script_path = temp_dir / "compute_script.py"
-        script_path.write_text(script.code, encoding="utf-8")
+        script_path.write_text(script_code, encoding="utf-8")
 
         # 执行脚本
         from ..sandbox.code_sandbox import CodeSandbox

@@ -73,11 +73,467 @@ for sheet_data in results:
    ```
    这样可以避免计算时因文件名不同导致KeyError。"""
 
+    # ============ 公式模式规则（集中定义，只维护一处）============
+    FORMULA_RULES = {
+        "char_encoding": {
+            "compact": "【规则1】字符规范：必须英文半角()[]\"'，禁止中文全角",
+            "detailed": "【规则1】字符规范\n- ✅ 必须：英文半角 ()[]\"'\n- ❌ 禁止：中文全角 （）【】\u201c\u201d\u2018\u2019\n- 最优先检查，每次输出前检查",
+        },
+        "cross_table_lookup": {
+            "compact": "【规则2】跨表取数：L1同源列直接复制（不查列号），L2跨表列才用VLOOKUP/INDEX+MATCH/SUMPRODUCT",
+            "detailed": (
+                "【规则2】跨表取数（按层级处理）\n"
+                "- **L1同源列**（与主键在同一源表）：用main_df.iloc[i].get('列名','')直接复制\n"
+                "  ❌ 禁止对同源列使用VLOOKUP\n"
+                "  ❌ 禁止对同源列定义col_xxx或调用get_vlookup_col_num()\n"
+                "- **L2跨表列**（其他源表的数据）：必须使用Excel公式跨表取数：\n"
+                "  - VLOOKUP：单条件精确匹配（默认首选），列号用get_vlookup_col_num()计算\n"
+                "    格式：=IFERROR(VLOOKUP(查找值,'表'!$主键列:$末列,列号,FALSE),默认值)\n"
+                "  - XLOOKUP：反向查找、自定义默认值\n"
+                "    格式：=XLOOKUP(查找值,'表'!查找列,'表'!返回列,默认值,0)\n"
+                "  - INDEX+MATCH：多条件匹配、左向查找\n"
+                "    格式：=IFERROR(INDEX('表'!返回列,MATCH(查找值,'表'!查找列,0)),默认值)\n"
+                "  - FILTER：一对多匹配+聚合\n"
+                "    格式：=SUM(FILTER('表'!金额列,'表'!工号列=A2))\n"
+                "  - SUMPRODUCT：多条件求和/计数\n"
+                "    格式：=SUMPRODUCT(('表'!$A:$A=A2)*('表'!$B:$B=\"条件\")*('表'!$D:$D))\n"
+                "- 参考规则文档中「列处理分层」章节判断每列属于L1还是L2\n"
+                "- 所有跨表公式必须用IFERROR包裹"
+            ),
+        },
+        "date_conversion": {
+            "compact": "【规则3】日期必转换 - DATEVALUE()，AND()/OR()不短路需IFERROR包裹",
+            "detailed": (
+                "【规则3】日期必转换\n"
+                "- 日期参与计算前用 `IFERROR(DATEVALUE(x),x)` 确保是数值\n"
+                "- 检查清单：日期比较、日期相减、日期筛选\n"
+                "- ⚠️ AND()/OR()不短路：空单元格调MONTH()/YEAR()会报#VALUE!，用IFERROR包裹"
+            ),
+        },
+        "fstring_rules": {
+            "compact": "【规则4】f-string规则：公式含双引号时外层用单引号，文本比较用TXT_xxx常量，空字符串一律用{EMPTY}",
+            "detailed": (
+                "【规则4】f-string引号规则\n"
+                "- 外层双引号时，sheet名单引号直接写\n"
+                "- 公式含双引号（如TEXT格式）时，外层用单引号：f'=TEXT(A{r},\"YYYY-MM\")'\n"
+                "- Excel空字符串 → 一律用{EMPTY}代替，禁止直接写\"\"。包括：\n"
+                "  - 等于空字符串：={EMPTY}  （不要写=\"\"）\n"
+                "  - 不等于空字符串：<>{EMPTY}  （不要写<>\"\"）\n"
+                "  - 逗号后空字符串：,{EMPTY})  （不要写,\"\")）\n"
+                "- Excel文本比较 → 用excel_text()预定义TXT_xxx常量\n"
+                "- 禁止在f-string内部调用函数（常量必须在循环外预定义）"
+            ),
+        },
+        "no_import": {
+            "compact": "【规则5】禁止在函数内部import模块",
+            "detailed": "【规则5】禁止在函数内部导入模块\n- 所有需要的模块已在文件顶部导入\n- 禁止在fill_result_sheets或clean_source_data内部写import语句",
+        },
+        "employee_id": {
+            "compact": "【规则6】工号一般是数字格式，不需要TEXT转换",
+            "detailed": "【规则6】工号类型\n- 一般为数字格式，不需要TEXT转换\n- 仅当工号包含字母或特殊字符时才用TEXT转换",
+        },
+        "comment_format": {
+            "compact": "【规则7】注释规范：每列一行 `# X列(N): 简要说明`",
+            "detailed": "【规则7】注释规范\n- 每列仅一行注释：# X列(N): 列名 - 说明\n- 无分隔线，列之间不加空行",
+        },
+        "conditional_format": {
+            "compact": "【规则8】条件格式：规则要求标红/高亮时用CellIsRule/FormulaRule实现",
+            "detailed": (
+                "【规则8】条件格式\n"
+                "- 规则要求标红/高亮/颜色标记时，必须用CellIsRule/FormulaRule实现\n"
+                "- 放在公式填充（for循环）之后\n"
+                "- CellIsRule(operator=\"greaterThan\", formula=[\"20\"], fill=red_fill)\n"
+                "- FormulaRule(formula=['条件公式'], fill=fill)"
+            ),
+        },
+    }
+
+    # 修正专用额外规则
+    CORRECTION_EXTRA_RULES = {
+        "type_safety": (
+            "【额外规则】clean_source_data类型安全\n"
+            "- groupby聚合时，必须用agg字典分别指定数值列sum、文本列first，"
+            "禁止对整个DataFrame统一sum（含字母的工号列如'YN00002'会报错）\n"
+            "- 编号补位（zfill）时，直接用str(x).strip().zfill(N)，禁止先转float/int再转str"
+        ),
+    }
+
+    # 修正专用执行清单
+    CORRECTION_CHECKLIST = (
+        "## 执行前检查清单\n"
+        "1. ✅ L1同源列（主表列）是否都用main_df.iloc[i].get()直接赋值？（禁止用VLOOKUP/INDEX+MATCH）\n"
+        "2. ✅ 所有字符是否为英文半角？\n"
+        "3. ✅ L2跨表列的VLOOKUP列号是否用get_vlookup_col_num()计算？\n"
+        "4. ✅ 日期是否用DATEVALUE()转换？（仅L2跨表日期需要，L1主表日期直接赋值）\n"
+        "5. ✅ f-string引号是否正确？\n"
+        "6. ✅ 每行代码是否完整闭合？\n"
+        "7. ✅ 条件格式是否用CellIsRule/FormulaRule实现？\n"
+        "8. ✅ 是否所有括号都正确匹配？"
+    )
+
+    # 修正专用快速参考表
+    CORRECTION_QUICK_REF = (
+        "## 公式速查表\n"
+        "| 场景 | 公式模板 |\n"
+        "|------|----------|\n"
+        "| L1主表列（直接复制） | ws.cell(row=r, column=N, value=main_df.iloc[i].get('列名','')) |\n"
+        "| L2单条件查找 | =IFERROR(VLOOKUP(A{r},'表'!$A:$Z,列号,FALSE),0) |\n"
+        "| L2左向查找 | =IFERROR(INDEX('表'!$返回列,MATCH(A{r},'表'!$查找列,0)),0) |\n"
+        "| 多条件求和 | =SUMPRODUCT(('表'!$A$2:$A$N=A{r})*('表'!$D$2:$D$N)) |\n"
+        "| 多条件计数 | =SUMPRODUCT(('表'!$A$2:$A$N=A{r})*1) |\n"
+        "| 文本日期转换 | =IFERROR(DATEVALUE(x),x) |\n"
+        "| 历史累计 | =IFERROR(SUMIFS(历史数据!$E:$E,历史数据!$A:$A,\"<\"&月份,历史数据!$B:$B,A{r}),0) |\n"
+        "| 条件判断 | =IF(条件,真值,假值) |\n"
+        "| 文本比较 | 用TXT_xxx常量，如=IF(A{r}={TXT_YES},1,0) |"
+    )
+
+    # 修正专用禁止操作
+    CORRECTION_FORBIDDEN = (
+        "## 禁止操作\n"
+        "1. 禁止简化任何计算列为0或空字符串\n"
+        "2. 禁止删除或注释掉已有的列代码\n"
+        "3. 禁止修改未在差异列表中的列\n"
+        "4. 禁止在结果报表内使用SUMIF等汇总函数替代源数据的逐行公式"
+    )
+
+    # 黄金样例（不含f-string转义，直接使用{r}）
+    GOLDEN_EXAMPLE = r"""# ==================== 黄金样例（必须严格参照此模式编写）====================
+以下是一个完整的fill_result_sheets代码示例，展示了8种常见列类型的正确写法。
+你的代码必须完全遵循此模式，包括变量定义位置、缩进层级、注释格式、f-string写法。
+
+```python
+def fill_result_sheets(wb, source_sheets, salary_year=None,
+                       salary_month=None, monthly_standard_hours=174):
+    # === 1. 主表选择（根据规则中「列处理分层」指定的主表定位）===
+    # ⚠️ 禁止用 max(len(df)) 选主表！行数最多的表不一定是主表
+    # 优先级：规则中「列处理分层→主表」指定的表 > find_source_sheet按主键列+特征列定位
+    main_key = find_source_sheet(source_sheets, target_columns=["工号", "姓名"], sheet_name_hint="工资")
+    main_df = source_sheets[main_key]['df']
+    n_rows = len(main_df)
+
+    # === 2. 动态查找源表（禁止硬编码key，必须用find_source_sheet）===
+    key_attend = find_source_sheet(source_sheets, target_columns=["出勤天数", "加班时数"], sheet_name_hint="考勤")
+    key_roster = find_source_sheet(source_sheets, target_columns=["用工类型", "入职日期"], sheet_name_hint="花名册")
+    sn_main = source_sheets[main_key]['ws'].title
+    sn_attend = source_sheets[key_attend]['ws'].title
+    sn_roster = source_sheets[key_roster]['ws'].title
+
+    # === 3. 预计算VLOOKUP列号（在for循环外，用get_vlookup_col_num）===
+    col_hire_date = get_vlookup_col_num("F", "A")      # 入职日期在F列，查找范围从A列开始
+    col_attend_days = get_vlookup_col_num("E", "D")    # 出勤天数在E列，查找范围从D列(工号)开始
+
+    # === 4. 预定义文本常量（Excel文本比较用，避免f-string引号冲突）===
+    TXT_FULLTIME = excel_text('全职')
+
+    # === 5. 创建结果sheet并写表头 ===
+    ws = wb.create_sheet("结果")
+    headers = ["工号", "姓名", "部门", "入职日期", "出勤天数",
+               "应发工资", "岗位津贴", "累计工资", "加班费", "用工类型"]
+    for c, h in enumerate(headers, 1):
+        ws.cell(row=1, column=c, value=h)
+
+    # === 6. 逐行填充（每列平级排列，缩进统一8空格）===
+    for i in range(n_rows):
+        r = i + 2
+
+        # A列(1): 工号 - [L0主键] 主表直接复制
+        write_cell(ws, r, 1, main_df.iloc[i].get('工号', ''))
+
+        # B列(2): 姓名 - [L1同源] 主表直接复制
+        write_cell(ws, r, 2, main_df.iloc[i].get('姓名', ''))
+
+        # C列(3): 部门 - [L1同源] 主表直接复制（主表内已有的列全部直接复制，不用VLOOKUP）
+        write_cell(ws, r, 3, main_df.iloc[i].get('部门', ''))
+
+        # ⚠️ 以上A/B/C列以及主表中的其他所有列（包括日期列、金额列）
+        #    都用 write_cell(ws, r, 列号, main_df.iloc[i].get('源列名', '')) 写入。
+        #    write_cell 会自动处理空值和日期格式（datetime自动设置yyyy/mm/dd）。
+        #    只有下面来自非主表（花名册、考勤等）的列才用VLOOKUP/INDEX+MATCH。
+
+        # D列(4): 入职日期 - [L2跨表] VLOOKUP（花名册，非主表）+ 日期格式转换
+        ws.cell(row=r, column=4).value = f"=IFERROR(IFERROR(DATEVALUE(VLOOKUP(A{r},'{sn_roster}'!$A:$J,{col_hire_date},FALSE)),VLOOKUP(A{r},'{sn_roster}'!$A:$J,{col_hire_date},FALSE)),{EMPTY})"
+        ws.cell(row=r, column=4).number_format = 'yyyy/mm/dd'
+
+        # E列(5): 出勤天数 - [L2跨表] VLOOKUP（考勤表，非主表，主键非A列，范围起始为D列）
+        ws.cell(row=r, column=5).value = f"=IFERROR(VLOOKUP(A{r},'{sn_attend}'!$D:$M,{col_attend_days},FALSE),0)"
+
+        # F列(6): 应发工资 - [L3计算] 公式计算（引用参数sheet + 本表E列）
+        ws.cell(row=r, column=6).value = f"=IFERROR(E{r}*参数!$B$4,0)"
+
+        # G列(7): 岗位津贴 - [L3计算] 文本条件判断（用TXT_xxx常量 + 引用中间项J列）
+        ws.cell(row=r, column=7).value = f"=IF(J{r}={TXT_FULLTIME},1000,500)"
+
+        # H列(8): 累计工资 - [L3计算] SUMIFS历史累计（引用历史数据sheet）
+        ws.cell(row=r, column=8).value = f"=IFERROR(SUMIFS(历史数据!$F:$F,历史数据!$A:$A,\"<\"&参数!$B$3,历史数据!$B:$B,A{r})+F{r},F{r})"
+
+        # I列(9): 加班费 - [L3计算] SUMPRODUCT多条件加权计算（匹配工号，对加班时数×时薪求和）
+        ws.cell(row=r, column=9).value = f"=IFERROR(SUMPRODUCT(('{sn_attend}'!$A$2:$A$1000=A{r})*('{sn_attend}'!$H$2:$H$1000)*('{sn_attend}'!$I$2:$I$1000)),0)"
+
+        # J列(10): 用工类型（中间项，淡蓝色背景#DCE6F1）- [L2跨表] INDEX+MATCH左查找（花名册D列查工号，返回左侧B列）
+        ws.cell(row=r, column=10).value = f"=IFERROR(INDEX('{sn_roster}'!$B:$B,MATCH(A{r},'{sn_roster}'!$D:$D,0)),{EMPTY})"
+
+    # === 7. 中间项标记淡蓝色背景 ===
+    if n_rows > 0:
+        light_blue = PatternFill(start_color="DCE6F1", end_color="DCE6F1", fill_type="solid")
+        for row in range(2, n_rows + 2):
+            ws.cell(row=row, column=10).fill = light_blue
+
+    # === 8. 条件格式（如规则要求标红/高亮等）===
+    if n_rows > 0:
+        red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+        ws.conditional_formatting.add(f"E2:E{n_rows+1}", CellIsRule(operator="greaterThan", formula=["20"], fill=red_fill))
+
+    # 共处理了 10 列（预期 10 列）
+```
+
+### 从黄金样例中提取的关键模式
+1. **动态查找源表**：必须用find_source_sheet()查找，禁止硬编码source_sheets的key
+2. **变量定义位置**：sn_xxx、col_xxx、TXT_xxx 全部在for循环外定义
+3. **注释格式**：每列仅一行 `# X列(N): 说明`，无分隔线
+4. **列平级排列**：每列代码缩进统一8空格，互不嵌套
+5. **f-string规则**：
+   - 外层双引号时，sheet名单引号直接写（参照D、E列）
+   - 公式含双引号（如TEXT格式）时，外层用单引号：`f'=TEXT(A{r},"YYYY-MM")'`
+   - Excel空字符串 → 一律用{EMPTY}代替（包括 ={EMPTY}、<>{EMPTY}、,{EMPTY})）
+   - Excel文本比较 → 用excel_text('xxx')预定义TXT_xxx常量（参照G列）
+   - 禁止在f-string内部调用函数（常量必须在循环外预定义）
+6. **VLOOKUP列号**：用get_vlookup_col_num()计算，禁止硬编码数字
+7. **INDEX+MATCH左查找**：当目标列在主键列左侧时使用（参照J列），VLOOKUP无法实现左查找
+8. **SUMPRODUCT多条件计算**：多条件用乘法连接 `(条件1)*(条件2)*值列`，注意用有界范围$A$2:$A$1000而非整列（参照I列）
+9. **主表数据必须用write_cell写入（L1同源）**：主表（由规则「列处理分层→主表」指定，用find_source_sheet定位，禁止用max(len(df))——行数最多的不一定是主表）中的所有列——无论是文本、日期还是金额——全部用write_cell(ws, r, 列号, main_df.iloc[i].get('源列名',''))写入。write_cell会自动处理空值和日期格式（datetime类型自动设置yyyy/mm/dd）。只有来自其他源表的列才用VLOOKUP/INDEX+MATCH（参照A、B、C列 vs D、E列的区别）
+   - ⚠️ 判断标准：参考规则文档中「列处理分层」的L1（同源直接复制）和L2（跨表查找）
+   - ⚠️ L1同源列不需要定义col_xxx变量，不需要调用get_vlookup_col_num()
+   - ⚠️ 即使源列名与目标列名不同（如源"入职日期（卡中心）"→目标"聘用日期"），只要在主表中就直接复制
+10. **中间项处理**：追加在最后一列之后，用PatternFill填充淡蓝色背景#DCE6F1（参照J列）
+11. **条件格式**：规则要求标红/高亮时，在for循环结束后用CellIsRule/FormulaRule实现，不能只留注释
+12. **日期格式转换**：VLOOKUP取回的日期可能是文本或数字，用 `IFERROR(DATEVALUE(x),x)` 转为真实日期值，再用 `number_format = 'yyyy/mm/dd'` 格式化显示（参照D列）。注意：AND()/OR()不短路，空单元格使用MONTH()/YEAR()时需IFERROR包裹"""
+
+    # 补充规则（历史数据、工号、日期、完整性）—— __TOTAL_COLUMNS__ 在使用时替换
+    SUPPLEMENTARY_RULES = (
+        "# ==================== 补充规则 ====================\n\n"
+        "## 主表列直接赋值（L1同源列，最高优先级）\n"
+        "- 主表由规则「列处理分层→主表」指定，用find_source_sheet定位（禁止max(len(df))，行数最多的不一定是主表）\n"
+        "- 如果规则未指定主表，则根据主键列名和特征列用find_source_sheet推断\n"
+        "- 主表的所有列，用 main_df.iloc[i].get('源列名', '') 直接赋值\n"
+        "- 包括日期列、金额列、文本列——只要在主表中，一律直接赋值\n"
+        "- 主表日期列：赋值后加 ws.cell(row=r, column=N).number_format = 'yyyy/mm/dd'\n"
+        "- ❌ 禁止对主表列使用VLOOKUP/INDEX+MATCH/XLOOKUP\n"
+        "- ❌ 禁止对主表列定义col_xxx或调用get_vlookup_col_num()\n"
+        "- 源列名与目标列名不同时，get()中写源列名\n\n"
+        "## 历史数据引用（仅规则涉及'累计''历史'时使用）\n"
+        "- 系统自动创建\"历史数据\"sheet，第1列为薪资月份，其余列与结果sheet列名一致\n"
+        "- 累计示例：`=SUMIFS(历史数据!$E:$E, 历史数据!$A:$A, \"<\"&salary_month, 历史数据!$B:$B, B{r})`\n"
+        "- 需用IFERROR包裹（第1个月历史数据可能为空）\n"
+        "- 规则中未涉及历史数据时不要引用此sheet\n\n"
+        "## 工号类型\n"
+        "- 一般为数字格式，不需要TEXT转换\n"
+        "- 仅当工号包含字母或特殊字符时才用TEXT转换\n\n"
+        "## 日期格式转换\n"
+        "- **L1主表日期列**：直接用main_df.iloc[i].get()赋值，然后加number_format='yyyy/mm/dd'即可，不需要DATEVALUE\n"
+        "- **L2跨表日期列**：VLOOKUP/INDEX取回的日期往往是文本或数字序列号，必须转为真实日期值：\n"
+        "  - 公式模式：`=IFERROR(DATEVALUE(VLOOKUP结果), VLOOKUP结果)` — 保留真实日期值（非文本）\n"
+        "  - DATEVALUE将文本日期转为Excel日期数字，若已是数字则IFERROR兜底\n"
+        "  - 格式化显示：公式赋值后紧跟 `ws.cell(row=r, column=N).number_format = 'yyyy/mm/dd'`\n"
+        "- 日期参与减法运算前，也需要先用 `IFERROR(DATEVALUE(x),x)` 确保是数值\n"
+        "- 禁止用TEXT()将日期转为文本，否则日期无法参与运算\n"
+        "- ⚠️ AND()/OR()不短路：空单元格调MONTH()/YEAR()仍报#VALUE!，需用IFERROR包裹：`IFERROR(MONTH(A2),0)`\n\n"
+        "## 完整性要求\n"
+        "- 必须为全部 __TOTAL_COLUMNS__ 列生成处理逻辑\n"
+        "- 在代码最后添加注释：# 共处理了 X 列（预期 __TOTAL_COLUMNS__ 列）\n"
+        "- 每行代码必须完整闭合，不允许跨行写赋值语句\n"
+        "- 禁止\"暂时跳过\"、\"简化为0\"、提前结束\n"
+        "- 禁止在函数内部import已导入的模块\n"
+        "- 全部使用英文半角字符 ()[]\"'，禁止中文全角"
+    )
+
+    # 函数签名模板 —— __TOTAL_COLUMNS__ 在使用时替换
+    FUNCTION_SIGNATURES = r"""# ==================== 函数签名 ====================
+
+## 1. 数据清洗函数（如果有清洗规则）
+def clean_source_data(source_data):
+    \"\"\"应用数据清洗规则：过滤无效数据 + 按主键汇总多行为单行
+
+    代码结构要求（必须严格遵守）：
+    - 必须用 for key, val in source_data.items(): 遍历所有表
+    - 在循环内用 if/elif 判断不同的 key 做对应清洗
+    - 不需要清洗的表也必须原样拷贝到 cleaned 中
+    - return cleaned 必须在函数最外层（与for同级），禁止嵌套在if内部
+
+    重要汇总规则（单人多行→单人单行）：
+    - groupby的key只能是清洗规则中指定的汇总主键（如工号），除主键外的其他字段都不能作为groupby key
+    - 数值型列（包括用文本表示的数值，但不包括日期）用sum聚合
+    - 文本列、日期列用first取值
+    - **禁止使用pivot_table**，不允许改变原表的列结构（表头必须和清洗前完全一致）
+    - 汇总后必须更新columns：cleaned[key]["columns"] = list(df.columns)
+    - ⚠️ groupby聚合时，必须用agg字典分别指定数值列sum、文本列first，禁止对整个DataFrame统一sum（含字母的工号列如'YN00002'会报错）
+    - ⚠️ 编号补位（zfill）时，禁止先转float/int再转str，直接用str(x).strip().zfill(N)
+    \"\"\"
+    cleaned = {}
+    for key, val in source_data.items():
+        df = val["df"].copy()
+        columns = val["columns"]
+        # 根据key判断做对应清洗...
+        cleaned[key] = {"df": df, "columns": list(df.columns)}
+    return cleaned  # 必须在for循环之后、函数最外层返回
+
+## 2. 结果填充函数
+def fill_result_sheets(wb, source_sheets, salary_year=None,
+                       salary_month=None, monthly_standard_hours=174):
+    \"\"\"创建结果sheet并填充数据和公式\"\"\"
+    pass
+
+请严格参照黄金样例的代码模式，生成完整代码：
+1. 如果有数据清洗规则，先生成clean_source_data函数
+2. 然后生成fill_result_sheets函数，覆盖全部 __TOTAL_COLUMNS__ 列"""
+
+    # 验证检查清单（multi-step step4专用）
+    VERIFICATION_CHECKLIST = """## 检查清单
+### 1. 语法检查
+- [ ] 所有括号是否正确闭合（圆括号、方括号、花括号）
+- [ ] f-string引号是否正确（统一 f"..." + \\' + \\"）
+- [ ] f-string中是否有裸""（必须用{EMPTY}代替，包括<>""、=""、,"" 等所有场景）
+- [ ] 每行代码是否完整，没有截断，没有跨行赋值
+- [ ] 缩进是否一致（for循环内8空格，列之间平级，无级联嵌套）
+
+### 2. VLOOKUP验证
+- [ ] 每个VLOOKUP取的字段是否正确（字段名和源表对应）
+- [ ] range_start是否等于该表主键所在列（不是固定$A）
+- [ ] col_index = 目标列绝对位置 - 主键列绝对位置 + 1，计算是否正确
+- [ ] range_end是否覆盖到目标列
+
+### 3. 列完整性
+- [ ] 是否覆盖了全部 __TOTAL_COLUMNS__ 列
+- [ ] 基础列是否直接赋值，计算列是否有公式
+
+### 4. 注释规范
+- [ ] 每列注释是否只有一行：`# 列名(列号): 简要说明`
+- [ ] 是否有多余的分隔线（# ------、# ===等）→ 必须删除
+
+### 5. 其他
+- [ ] sheet名是否用sn_变量，无硬编码
+- [ ] 无中文全角字符（括号、引号）
+- [ ] 无函数内import"""
+
     def __init__(self):
         self.templates = self._load_templates()
         self.max_structure_length = 20000000
         self.logger = logging.getLogger(__name__)
         self.rule_extractor = RuleExtractor()
+
+    # ============ 集中规则辅助方法 ============
+
+    def _build_formula_rules(self, detail: str = "compact", include_extra: bool = False) -> str:
+        """组装公式模式规则段落
+
+        Args:
+            detail: "compact"（1行摘要）或 "detailed"（完整含示例）
+            include_extra: 是否包含修正专用额外规则
+        """
+        lines = ["# ==================== 核心规则（违反=失败）===================="]
+        for rule in self.FORMULA_RULES.values():
+            lines.append(rule[detail])
+        if include_extra:
+            for rule in self.CORRECTION_EXTRA_RULES.values():
+                lines.append(rule)
+        return "\n\n".join(lines)
+
+    def _build_golden_and_rules(self, total_columns: int, escape_braces: bool = False) -> str:
+        """构建黄金样例 + 补充规则 + 函数签名
+
+        Args:
+            total_columns: 总列数，替换 __TOTAL_COLUMNS__
+            escape_braces: 是否将{/}转义为{{/}}（用于f-string上下文）
+        """
+        parts = [
+            self.GOLDEN_EXAMPLE,
+            self.SUPPLEMENTARY_RULES.replace("__TOTAL_COLUMNS__", str(total_columns)),
+            self.FUNCTION_SIGNATURES.replace("__TOTAL_COLUMNS__", str(total_columns)),
+        ]
+        result = "\n\n".join(parts)
+        if escape_braces:
+            # 将 {xxx} 转为 {{xxx}}，但保留已转义的 {{xxx}}
+            # 先保护已有的 {{ }}
+            result = result.replace("{{", "\x00\x00").replace("}}", "\x01\x01")
+            result = result.replace("{", "{{").replace("}", "}}")
+            result = result.replace("\x00\x00", "{{").replace("\x01\x01", "}}")
+        return result
+
+    def _extract_cleaning_and_format_rules(self, rules_content: str) -> dict:
+        """统一提取数据清洗/警告/条件格式/精度规则（消除4处重复逻辑）
+
+        Returns:
+            {"data_cleaning": str, "warning": str, "conditional_format": str, "precision": str}
+        """
+        extracted = self.rule_extractor.extract_rules(rules_content)
+        result = {"data_cleaning": "", "warning": "", "conditional_format": "", "precision": ""}
+
+        if extracted["data_cleaning_rules"]:
+            text = "\n## 数据清洗规则（在clean_source_data中应用）\n"
+            text += "⚠️ 在将源数据写入Excel之前，必须先应用以下清洗规则过滤数据：\n\n"
+            for i, rule in enumerate(extracted["data_cleaning_rules"], 1):
+                if rule['original_text'] and not rule['original_text'].startswith('--'):
+                    text += f"{i}. {rule['original_text']}\n"
+            text += (
+                "\n**实现方式**：生成clean_source_data函数，对每个DataFrame应用清洗逻辑后返回清洗后的数据。\n"
+                "**汇总规则**：如果某个表存在单人多行数据需要汇总，groupby的key只能是清洗规则中指定的汇总主键，"
+                "除主键外的其他字段都不能作为groupby key。数值型列（包括用文本表示的数值，但不包括日期）用sum聚合，"
+                "文本列和日期列用first取值。禁止使用pivot_table，不允许改变原表的列结构（表头必须和清洗前完全一致）。\n"
+            )
+            result["data_cleaning"] = text
+
+        if extracted.get("warning_rules"):
+            text = "\n## 警告信息规则\n"
+            for i, rule in enumerate(extracted["warning_rules"], 1):
+                text += f"{i}. {rule['original_text']}\n"
+            result["warning"] = text
+
+        if extracted.get("conditional_format_rules"):
+            text = "\n## 条件格式规则\n"
+            text += "在填充公式后，需要对以下情况应用条件格式（使用CellIsRule/FormulaRule）：\n\n"
+            for i, rule in enumerate(extracted["conditional_format_rules"], 1):
+                text += f"{i}. {rule['original_text']}\n"
+            result["conditional_format"] = text
+
+        if extracted.get("precision_rules"):
+            text = "\n## 数值精度规则\n"
+            text += "在生成公式时，必须按以下精度要求使用ROUND函数：\n\n"
+            for i, rule in enumerate(extracted["precision_rules"], 1):
+                text += f"{i}. {rule['original_text']}\n"
+            result["precision"] = text
+
+        return result
+
+    def _build_expected_sheets_info(self, expected_structure: dict, rules_content: str) -> tuple:
+        """构建预期输出Sheet信息和总列数（消除3处重复逻辑）
+
+        Returns:
+            (expected_sheets_info: str, total_columns: int)
+        """
+        total_columns = 0
+        expected_sheets_info = ""
+
+        if isinstance(expected_structure, dict) and "sheets" in expected_structure:
+            sheets = expected_structure.get("sheets", {})
+            if sheets:
+                expected_sheets_info = "\n## 预期输出Sheet列表\n"
+                for sheet_name, sheet_info in sheets.items():
+                    headers = sheet_info.get("headers", {})
+                    col_count = len(headers)
+                    total_columns += col_count
+                    expected_sheets_info += f"- **{sheet_name}** ({col_count}列): {list(headers.keys())}\n"
+
+        # 从规则中提取中间计算项
+        intermediate_items = self._extract_intermediate_items_from_rules(rules_content)
+        if intermediate_items:
+            total_columns += len(intermediate_items)
+            intermediate_names = [item.split(':')[1] if ':' in item else item for item in intermediate_items]
+            expected_sheets_info += f"\n## 中间计算项（追加在最后一列之后，淡蓝色背景 #DCE6F1）\n"
+            expected_sheets_info += f"- 共 {len(intermediate_items)} 个中间项: {intermediate_names}\n"
+            for item in intermediate_items:
+                expected_sheets_info += f"  - {item}\n"
+            expected_sheets_info += f"\n⚠️ 中间项必须作为新增列追加在结果sheet最后，使用淡蓝色背景(#DCE6F1)标识\n"
+
+        return expected_sheets_info, total_columns
 
     def _extract_intermediate_items_from_rules(self, rules_content: str) -> List[str]:
         """从规则文本中提取中间计算项的列名
@@ -85,32 +541,120 @@ for sheet_data in results:
         匹配规则中定义的中间项，如:
         ### DS列: 当月标准工时（不含法定）（中间项，淡蓝色背景 #DCE6F1）
         ### DU列: 加班工时（中间项，淡蓝色背景 #DCE6F1）
+        也匹配:
+        - 类型: 中间计算项
         """
         intermediate_items = []
         if not rules_content:
             return intermediate_items
 
-        # 匹配 "### XX列: 名称（中间项" 或 "类型: 中间计算项" 模式
-        for line in rules_content.split('\n'):
+        seen = set()
+        lines = rules_content.split('\n')
+
+        for idx, line in enumerate(lines):
             stripped = line.strip()
             # 模式1: ### XX列: 名称（中间项...）
             match = re.match(r'^#{1,4}\s+([A-Z]{1,3})列[:：]\s*(.+?)(?:（中间项|（中间计算项)', stripped)
             if match:
                 col_letter = match.group(1)
                 col_name = match.group(2).strip()
-                intermediate_items.append(f"{col_letter}列:{col_name}")
+                key = f"{col_letter}列:{col_name}"
+                if key not in seen:
+                    intermediate_items.append(key)
+                    seen.add(key)
                 continue
-            # 模式2: ### XX列: 名称  后面跟着 "- 类型: 中间计算项"
+            # 模式2: ### XX列: 名称  同行或后续几行包含 "中间" 关键词
             match = re.match(r'^#{1,4}\s+([A-Z]{1,3})列[:：]\s*(.+)', stripped)
-            if match and '中间项' in stripped:
+            if match:
                 col_letter = match.group(1)
                 col_name = match.group(2).strip()
-                # 清理括号内的标注
-                col_name = re.sub(r'[（(]中间项.*?[）)]', '', col_name).strip()
-                col_name = re.sub(r'[（(]淡蓝色.*?[）)]', '', col_name).strip()
-                intermediate_items.append(f"{col_letter}列:{col_name}")
+                # 检查同行或后续3行是否有"中间项"/"中间计算项"标注
+                nearby = stripped
+                for j in range(1, min(4, len(lines) - idx)):
+                    nearby += " " + lines[idx + j].strip()
+                if '中间项' in nearby or '中间计算项' in nearby:
+                    col_name = re.sub(r'[（(]中间项.*?[）)]', '', col_name).strip()
+                    col_name = re.sub(r'[（(]淡蓝色.*?[）)]', '', col_name).strip()
+                    key = f"{col_letter}列:{col_name}"
+                    if key not in seen:
+                        intermediate_items.append(key)
+                        seen.add(key)
 
         return intermediate_items
+
+    def _parse_layer_info_from_rules(self, rules_content: str) -> dict:
+        """从规则文本中解析「列处理分层」信息
+
+        解析规则文档中的 ## 列处理分层 章节，提取主键、各层级列名。
+        如果规则中没有该章节（旧规则），返回空dict，调用方回退到默认行为。
+
+        Returns:
+            {
+                "primary_key": "工号",
+                "primary_source": "考勤表",
+                "L1": ["姓名", "部门", ...],
+                "L2": ["社保个人", ...],
+                "L3": ["应发合计", ...],
+                "L4": ["实发工资", ...],
+                "column_layer": {"工号": "L0", "姓名": "L1", ...}
+            }
+            或空dict（无分层信息时）
+        """
+        if not rules_content or "## 列处理分层" not in rules_content:
+            return {}
+
+        result = {
+            "primary_key": "",
+            "primary_source": "",
+            "main_table": "",
+            "L1": [], "L2": [], "L3": [], "L4": [],
+            "column_layer": {},
+        }
+
+        # 截取 ## 列处理分层 到下一个 ## 之间的内容
+        start = rules_content.index("## 列处理分层")
+        rest = rules_content[start + len("## 列处理分层"):]
+        # 找下一个 ## 标题
+        next_section = re.search(r'\n## [^#]', rest)
+        section_text = rest[:next_section.start()] if next_section else rest
+
+        # 解析主键
+        pk_match = re.search(r'###\s*主键[:：]\s*(.+)', section_text)
+        if pk_match:
+            result["primary_key"] = pk_match.group(1).strip()
+            result["column_layer"][result["primary_key"]] = "L0"
+
+        # 解析主键来源表
+        src_match = re.search(r'###\s*主键来源表[:：]\s*(.+)', section_text)
+        if src_match:
+            result["primary_source"] = src_match.group(1).strip()
+
+        # 解析主表（如果规则指定了，优先使用；否则回退到主键来源表）
+        main_match = re.search(r'###\s*主表[:：]\s*(.+?)(?:\n|（|$)', section_text)
+        if main_match:
+            result["main_table"] = main_match.group(1).strip()
+        elif result["primary_source"]:
+            result["main_table"] = result["primary_source"]
+
+        # 解析各层级
+        for layer in ["L1", "L2", "L3", "L4"]:
+            # 匹配 ### L1-xxx 或 ### L2-xxx 等标题后的列表
+            pattern = rf'###\s*{layer}[-\s].*?\n((?:[-\s]*.*\n)*?)(?=###|\Z)'
+            layer_match = re.search(pattern, section_text)
+            if layer_match:
+                block = layer_match.group(1)
+                for line in block.split('\n'):
+                    line = line.strip()
+                    if line.startswith('-'):
+                        # 提取列名（取括号前的部分）
+                        col_text = line.lstrip('- ').strip()
+                        # "姓名（考勤表.姓名）" → "姓名"
+                        col_name = re.split(r'[（(]', col_text)[0].strip()
+                        if col_name:
+                            result[layer].append(col_name)
+                            result["column_layer"][col_name] = layer
+
+        return result
 
     def _load_templates(self) -> Dict[str, str]:
         """加载提示词模板"""
@@ -682,7 +1226,7 @@ for sheet_data in results:
 {compressed_expected}
 
 ## 计算规则
-{rules_content[:10000]}
+{rules_content[:70000]}
 
 ## 手动表头映射
 {manual_headers_str}
@@ -1086,56 +1630,10 @@ input_folder, output_folder, manual_headers: {manual_headers_json}
         rules = self._compress_rules(rules_content, max_length=80000)
         _ = manual_headers
 
-        # 提取数据清洗规则、警告规则和条件格式规则
-        extracted_rules = self.rule_extractor.extract_rules(rules_content)
-        data_cleaning_rules_text = ""
-
-        if extracted_rules["data_cleaning_rules"]:
-            data_cleaning_rules_text = "\n## 数据清洗规则（在write_source_sheets中应用）\n"
-            data_cleaning_rules_text += "⚠️ 在将源数据写入Excel之前，必须先应用以下清洗规则过滤数据：\n\n"
-            for i, rule in enumerate(extracted_rules["data_cleaning_rules"], 1):
-                if rule['original_text'] and not rule['original_text'].startswith('--'):
-                    data_cleaning_rules_text += f"{i}. {rule['original_text']}\n"
-            data_cleaning_rules_text += "\n**实现方式**：在write_source_sheets函数中，对每个DataFrame应用清洗逻辑后再写入Excel。\n"
-            data_cleaning_rules_text += '**汇总规则**：如果某个表存在单人多行数据需要汇总，groupby的key只能是清洗规则中指定的汇总主键，除主键外的其他字段都不能作为groupby key。数值型列（包括用文本表示的数值，但不包括日期）用sum聚合，文本列和日期列用first取值。禁止使用pivot_table，不允许改变原表的列结构（表头必须和清洗前完全一致）。\n'
-
-        conditional_format_text = ""
-        if extracted_rules["conditional_format_rules"]:
-            conditional_format_text = "\n## 条件格式规则\n"
-            conditional_format_text += "在填充公式后，需要对以下情况应用条件格式（使用CellIsRule/FormulaRule）：\n\n"
-            for i, rule in enumerate(extracted_rules["conditional_format_rules"], 1):
-                conditional_format_text += f"{i}. {rule['original_text']}\n"
-
-        precision_rules_text = ""
-        if extracted_rules["precision_rules"]:
-            precision_rules_text = "\n## 数值精度规则\n"
-            precision_rules_text += "在生成公式时，必须按以下精度要求使用ROUND函数：\n\n"
-            for i, rule in enumerate(extracted_rules["precision_rules"], 1):
-                precision_rules_text += f"{i}. {rule['original_text']}\n"
-
-        # 统计总列数
-        total_columns = 0
-        expected_sheets_info = ""
-        if isinstance(expected_structure, dict) and "sheets" in expected_structure:
-            sheets = expected_structure.get("sheets", {})
-            if sheets:
-                expected_sheets_info = "\n## 预期输出Sheet列表\n"
-                for sheet_name, sheet_info in sheets.items():
-                    headers = sheet_info.get("headers", {})
-                    col_count = len(headers)
-                    total_columns += col_count
-                    expected_sheets_info += f"- **{sheet_name}** ({col_count}列): {list(headers.keys())}\n"
-
-        # 从规则中提取中间计算项，追加到预期输出列表
-        intermediate_items = self._extract_intermediate_items_from_rules(rules_content)
-        if intermediate_items:
-            total_columns += len(intermediate_items)
-            intermediate_names = [item.split(':')[1] if ':' in item else item for item in intermediate_items]
-            expected_sheets_info += f"\n## 中间计算项（追加在最后一列之后，淡蓝色背景 #DCE6F1）\n"
-            expected_sheets_info += f"- 共 {len(intermediate_items)} 个中间项: {intermediate_names}\n"
-            for item in intermediate_items:
-                expected_sheets_info += f"  - {item}\n"
-            expected_sheets_info += f"\n⚠️ 中间项必须作为新增列追加在结果sheet最后，使用淡蓝色背景(#DCE6F1)标识\n"
+        # 使用集中式辅助方法提取规则和统计列数
+        rules_info = self._extract_cleaning_and_format_rules(rules_content)
+        expected_sheets_info, total_columns = self._build_expected_sheets_info(expected_structure, rules_content)
+        golden_and_rules = self._build_golden_and_rules(total_columns)
 
         template = """你是专业Python程序员，擅长人力资源行业的薪资计算、税务处理、考勤管理，同时你也是一个EXCEL公式大师。
 
@@ -1164,6 +1662,9 @@ input_folder, output_folder, manual_headers: {manual_headers_json}
 __SOURCE_STRUCTURE__
 __EXPECTED_SHEETS_INFO__
 
+⚠️ 如果规则文档中包含「列处理分层」信息，请严格按照层级处理：L1同源列用main_df.iloc[i].get()直接复制（不查列号），L2跨表列才使用VLOOKUP查找。
+⚠️ 主表选择：优先使用规则中「列处理分层→主表」指定的表，用find_source_sheet()定位。禁止用max(len(df))——行数最多的不一定是主表！如果规则未指定主表，根据主键列名和特征列推断。
+
 ## 预期输出结构
 __COMPRESSED_EXPECTED__
 
@@ -1176,197 +1677,19 @@ __PRECISION_RULES__
 ## 计算规则
 __RULES__
 
-# ==================== 黄金样例（必须严格参照此模式编写）====================
-以下是一个完整的fill_result_sheets代码示例，展示了8种常见列类型的正确写法。
-你的代码必须完全遵循此模式，包括变量定义位置、缩进层级、注释格式、f-string写法。
+"""
 
-```python
-def fill_result_sheets(wb, source_sheets, salary_year=None,
-                       salary_month=None, monthly_standard_hours=174):
-    # === 1. 主表选择（员工数最多的表）===
-    main_key = max(source_sheets.keys(), key=lambda k: len(source_sheets[k]['df']))
-    main_df = source_sheets[main_key]['df']
-    n_rows = len(main_df)
-
-    # === 2. 动态查找源表（禁止硬编码key，必须用find_source_sheet）===
-    key_attend = find_source_sheet(source_sheets, target_columns=["出勤天数", "加班时数"], sheet_name_hint="考勤")
-    key_roster = find_source_sheet(source_sheets, target_columns=["用工类型", "入职日期"], sheet_name_hint="花名册")
-    sn_main = source_sheets[main_key]['ws'].title
-    sn_attend = source_sheets[key_attend]['ws'].title
-    sn_roster = source_sheets[key_roster]['ws'].title
-
-    # === 3. 预计算VLOOKUP列号（在for循环外，用get_vlookup_col_num）===
-    col_hire_date = get_vlookup_col_num("F", "A")      # 入职日期在F列，查找范围从A列开始
-    col_attend_days = get_vlookup_col_num("E", "D")    # 出勤天数在E列，查找范围从D列(工号)开始
-
-    # === 4. 预定义文本常量（Excel文本比较用，避免f-string引号冲突）===
-    TXT_FULLTIME = excel_text('全职')
-
-    # === 5. 创建结果sheet并写表头 ===
-    ws = wb.create_sheet("结果")
-    headers = ["工号", "姓名", "部门", "入职日期", "出勤天数",
-               "应发工资", "岗位津贴", "累计工资", "加班费", "用工类型"]
-    for c, h in enumerate(headers, 1):
-        ws.cell(row=1, column=c, value=h)
-
-    # === 6. 逐行填充（每列平级排列，缩进统一8空格）===
-    for i in range(n_rows):
-        r = i + 2
-
-        # A列(1): 工号 - 主表直接复制
-        ws.cell(row=r, column=1, value=main_df.iloc[i].get('工号', ''))
-
-        # B列(2): 姓名 - 主表直接复制
-        ws.cell(row=r, column=2, value=main_df.iloc[i].get('姓名', ''))
-
-        # C列(3): 部门 - 主表直接复制（主表内已有的列全部直接复制，不用VLOOKUP）
-        ws.cell(row=r, column=3, value=main_df.iloc[i].get('部门', ''))
-
-        # D列(4): 入职日期 - VLOOKUP跨表取数 + 日期格式转换（转为真实日期值，用number_format显示）
-        ws.cell(row=r, column=4).value = f"=IFERROR(IFERROR(DATEVALUE(VLOOKUP(A{r},'{sn_roster}'!$A:$J,{col_hire_date},FALSE)),VLOOKUP(A{r},'{sn_roster}'!$A:$J,{col_hire_date},FALSE)),{EMPTY})"
-        ws.cell(row=r, column=4).number_format = 'yyyy/mm/dd'
-
-        # E列(5): 出勤天数 - VLOOKUP跨表取数（主键非A列，范围起始为D列）
-        ws.cell(row=r, column=5).value = f"=IFERROR(VLOOKUP(A{r},'{sn_attend}'!$D:$M,{col_attend_days},FALSE),0)"
-
-        # F列(6): 应发工资 - 公式计算（引用参数sheet + 本表E列）
-        ws.cell(row=r, column=6).value = f"=IFERROR(E{r}*参数!$B$4,0)"
-
-        # G列(7): 岗位津贴 - 文本条件判断（用TXT_xxx常量 + 引用中间项J列）
-        ws.cell(row=r, column=7).value = f"=IF(J{r}={TXT_FULLTIME},1000,500)"
-
-        # H列(8): 累计工资 - SUMIFS历史累计（引用历史数据sheet）
-        ws.cell(row=r, column=8).value = f"=IFERROR(SUMIFS(历史数据!$F:$F,历史数据!$A:$A,\\"<\\"&参数!$B$3,历史数据!$B:$B,A{r})+F{r},F{r})"
-
-        # I列(9): 加班费 - SUMPRODUCT多条件加权计算（匹配工号，对加班时数×时薪求和）
-        ws.cell(row=r, column=9).value = f"=IFERROR(SUMPRODUCT(('{sn_attend}'!$A$2:$A$1000=A{r})*('{sn_attend}'!$H$2:$H$1000)*('{sn_attend}'!$I$2:$I$1000)),0)"
-
-        # J列(10): 用工类型（中间项，淡蓝色背景#DCE6F1）- INDEX+MATCH左查找（在D列查工号，返回左侧B列）
-        ws.cell(row=r, column=10).value = f"=IFERROR(INDEX('{sn_roster}'!$B:$B,MATCH(A{r},'{sn_roster}'!$D:$D,0)),{EMPTY})"
-
-    # === 7. 中间项标记淡蓝色背景 ===
-    if n_rows > 0:
-        light_blue = PatternFill(start_color="DCE6F1", end_color="DCE6F1", fill_type="solid")
-        for row in range(2, n_rows + 2):
-            ws.cell(row=row, column=10).fill = light_blue
-
-    # === 8. 条件格式（如规则要求标红/高亮等）===
-    if n_rows > 0:
-        red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
-        ws.conditional_formatting.add(f"E2:E{n_rows+1}", CellIsRule(operator="greaterThan", formula=["20"], fill=red_fill))
-
-    # 共处理了 10 列（预期 10 列）
-```
-
-### 从黄金样例中提取的关键模式
-1. **动态查找源表**：必须用find_source_sheet()查找，禁止硬编码source_sheets的key
-2. **变量定义位置**：sn_xxx、col_xxx、TXT_xxx 全部在for循环外定义
-3. **注释格式**：每列仅一行 `# X列(N): 说明`，无分隔线
-4. **列平级排列**：每列代码缩进统一8空格，互不嵌套
-5. **f-string规则**：
-   - 外层双引号时，sheet名单引号直接写（参照D、E列）
-   - 公式含双引号（如TEXT格式）时，外层用单引号：`f'=TEXT(A{r},"YYYY-MM")'`
-   - Excel空字符串 → 用{EMPTY}代替
-   - Excel文本比较 → 用excel_text('xxx')预定义TXT_xxx常量（参照G列）
-   - 禁止在f-string内部调用函数（常量必须在循环外预定义）
-6. **VLOOKUP列号**：用get_vlookup_col_num()计算，禁止硬编码数字
-7. **INDEX+MATCH左查找**：当目标列在主键列左侧时使用（参照J列），VLOOKUP无法实现左查找
-8. **SUMPRODUCT多条件计算**：多条件用乘法连接 `(条件1)*(条件2)*值列`，注意用有界范围$A$2:$A$1000而非整列（参照I列）
-9. **主表数据优先直接复制**：主表内已有的列（如工号、姓名、部门等）全部用main_df.iloc[i].get()直接复制，只有其他源表的数据才用VLOOKUP/INDEX+MATCH查找（参照A、B、C列）
-10. **中间项处理**：追加在最后一列之后，用PatternFill填充淡蓝色背景#DCE6F1（参照J列）
-11. **条件格式**：规则要求标红/高亮时，在for循环结束后用CellIsRule/FormulaRule实现，不能只留注释
-12. **日期格式转换**：VLOOKUP取回的日期可能是文本或数字，用 `IFERROR(DATEVALUE(x),x)` 转为真实日期值，再用 `number_format = 'yyyy/mm/dd'` 格式化显示（参照D列）
-
-# ==================== 补充规则 ====================
-
-## 历史数据引用（仅规则涉及"累计""历史"时使用）
-- 系统自动创建"历史数据"sheet，第1列为薪资月份，其余列与结果sheet列名一致
-- 累计示例：`=SUMIFS(历史数据!$E:$E, 历史数据!$A:$A, "<"&salary_month, 历史数据!$B:$B, B{r})`
-- 需用IFERROR包裹（第1个月历史数据可能为空）
-- 规则中未涉及历史数据时不要引用此sheet
-
-## 工号类型
-- 一般为数字格式，不需要TEXT转换
-- 仅当工号包含字母或特殊字符时才用TEXT转换
-
-## 日期格式转换
-- VLOOKUP/INDEX取回的日期往往是文本格式或Excel数字序列号，必须转为真实日期值并格式化显示
-- 公式模式：`=IFERROR(DATEVALUE(VLOOKUP结果), VLOOKUP结果)` — 保留真实日期值（非文本）
-  - DATEVALUE将文本日期转为Excel日期数字，若已是数字则IFERROR兜底
-- 格式化显示：公式赋值后紧跟 `ws.cell(row=r, column=N).number_format = 'yyyy/mm/dd'`
-- 日期参与减法运算前，也需要先用 `IFERROR(DATEVALUE(x),x)` 确保是数值
-- 禁止用TEXT()将日期转为文本，否则日期无法参与运算
-
-## 完整性要求
-- 必须为全部 __TOTAL_COLUMNS__ 列生成处理逻辑
-- 在代码最后添加注释：# 共处理了 X 列（预期 __TOTAL_COLUMNS__ 列）
-- 每行代码必须完整闭合，不允许跨行写赋值语句
-- 禁止"暂时跳过"、"简化为0"、提前结束
-- 禁止在函数内部import已导入的模块
-- 全部使用英文半角字符 ()[]"'，禁止中文全角
-
-# ==================== 函数签名 ====================
-
-## 1. 数据清洗函数（如果有清洗规则）
-def clean_source_data(source_data):
-    \"\"\"应用数据清洗规则：过滤无效数据 + 按主键汇总多行为单行
-
-    Args:
-        source_data: {"文件名_sheet名": {"df": DataFrame, "columns": [列名]}}
-
-    Returns:
-        清洗后的source_data（相同格式）
-
-    代码结构要求（必须严格遵守）：
-    - 必须用 for key, val in source_data.items(): 遍历所有表
-    - 在循环内用 if/elif 判断不同的 key 做对应清洗
-    - 不需要清洗的表也必须原样拷贝到 cleaned 中
-    - return cleaned 必须在函数最外层（与for同级），禁止嵌套在if内部
-
-    重要汇总规则（单人多行→单人单行）：
-    - groupby的key只能是清洗规则中指定的汇总主键（如工号），除主键外的其他字段都不能作为groupby key
-    - 数值型列（包括用文本表示的数值，但不包括日期）用sum聚合
-    - 文本列、日期列用first取值
-    - **禁止使用pivot_table**，不允许改变原表的列结构（表头必须和清洗前完全一致）
-    - 汇总后必须更新columns：cleaned[key]["columns"] = list(df.columns)
-    \"\"\"
-    cleaned = {{}}
-    for key, val in source_data.items():
-        df = val["df"].copy()
-        columns = val["columns"]
-        # 根据key判断做对应清洗...
-        # if key == "xxx": ...
-        # elif key == "yyy": ...
-        cleaned[key] = {{"df": df, "columns": list(df.columns)}}
-    return cleaned  # 必须在for循环之后、函数最外层返回
-
-## 2. 结果填充函数
-def fill_result_sheets(wb, source_sheets, salary_year=None,
-                       salary_month=None, monthly_standard_hours=174):
-    \"\"\"创建结果sheet并填充数据和公式
-
-    Args:
-        wb: openpyxl Workbook
-        source_sheets: {"文件名_sheet名": {"df": DataFrame, "ws": worksheet}}
-        salary_year: 薪资年份
-        salary_month: 薪资月份
-        monthly_standard_hours: 月标准工时
-    \"\"\"
-    pass
-
-请严格参照黄金样例的代码模式，生成完整代码：
-1. 如果有数据清洗规则，先生成clean_source_data函数
-2. 然后生成fill_result_sheets函数，覆盖全部 __TOTAL_COLUMNS__ 列"""
 
         return (template
                 .replace('__TOTAL_COLUMNS__', str(total_columns))
                 .replace('__SOURCE_STRUCTURE__', source_structure)
                 .replace('__EXPECTED_SHEETS_INFO__', expected_sheets_info)
                 .replace('__COMPRESSED_EXPECTED__', compressed_expected)
-                .replace('__DATA_CLEANING_RULES__', data_cleaning_rules_text)
-                .replace('__CONDITIONAL_FORMAT_RULES__', conditional_format_text)
-                .replace('__PRECISION_RULES__', precision_rules_text)
-                .replace('__RULES__', rules))
+                .replace('__DATA_CLEANING_RULES__', rules_info["data_cleaning"])
+                .replace('__CONDITIONAL_FORMAT_RULES__', rules_info["conditional_format"])
+                .replace('__PRECISION_RULES__', rules_info["precision"])
+                .replace('__RULES__', rules)
+                + "\n" + golden_and_rules)
 
     def generate_formula_batch_prompt(
         self,
@@ -1412,6 +1735,9 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
                 calls.append(f"        fill_columns_batch_{i + 1}(ws, r, source_sheets)")
             batch_calls = "\n".join(calls)
 
+        formula_rules_detailed = self._build_formula_rules("detailed")
+        formula_rules_compact = self._build_formula_rules("compact")
+
         if batch_index == 0:
             return f"""你是专业Python程序员，擅长人力资源行业的薪资计算、税务处理、考勤管理，同时你也是一个EXCEL公式大师。
 
@@ -1445,27 +1771,9 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
 ## 本批次相关的计算规则
 {rules_content}
 
-# ==================== 核心规则（违反=失败）====================
-## 【规则1】字符规范
-- ✅ 必须：英文半角 ()[]"'
-- ❌ 禁止：中文全角 （）【】""''
+⚠️ 如果规则中包含「列处理分层」，L1同源列直接用main_df.iloc[i].get()复制（不查列号），L2跨表列才用VLOOKUP。
 
-## 【规则2】跨表取数方式（按优先级，禁止直接引用DataFrame）
-- 主表数据：直接复制,不能用VLOOKUP
-- 非主表数据：必须使用Excel公式跨表取数，根据场景选择：
-  - VLOOKUP：单条件精确匹配（默认首选），列号 = 目标列位置 - 范围起始列位置 + 1
-  - XLOOKUP：反向查找、自定义默认值，格式：`=XLOOKUP(查找值,'表'!查找列,'表'!返回列,默认值,0)`
-  - INDEX+MATCH：多条件匹配、左向查找，格式：`=IFERROR(INDEX('表'!返回列,MATCH(查找值,'表'!查找列,0)),0)`
-  - FILTER：一对多匹配+聚合，格式：`=SUM(FILTER('表'!金额列,'表'!工号列=A2))`
-  - SUMPRODUCT：多条件求和/计数，格式：`=SUMPRODUCT(('表'!$A:$A=A2)*('表'!$B:$B="正常")*('表'!$D:$D))`
-- 所有跨表公式必须用IFERROR包裹
-
-## 【规则3】日期必转换 - DATEVALUE()
-## 【规则4】f-string规则：公式含双引号时，外层用单引号
-## 【规则5】❌ 禁止在函数内部导入模块
-## 【规则6】工号一般是数字格式，不需要TEXT转换
-## 【规则7】注释规范：每列一行 `# 列名(列号): 简要说明`
-## 【规则8】条件格式：规则要求标红/高亮/颜色标记时，必须用CellIsRule/FormulaRule实现，放在公式填充之后
+{formula_rules_detailed}
 
 # ==================== 代码结构要求 ====================
 请生成以下结构的代码：
@@ -1473,7 +1781,7 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
 ```python
 def fill_result_sheets(wb, source_sheets, salary_year=None,
                        salary_month=None, monthly_standard_hours=174):
-    # 1. 主表选择
+    # 1. 主表选择（用find_source_sheet定位，禁止max(len(df))）
     # 2. 源表sheet标题映射（所有源表的key和ws_title变量）
     # 3. 创建结果sheet
     # 4. 写【全部列】的表头（不只是本批次，是所有列的表头）
@@ -1520,13 +1828,9 @@ def fill_columns_batch_{batch_index + 1}(ws, r, source_sheets):
 ## 源数据结构
 {source_structure}
 
-# ==================== 核心规则 ====================
-- 跨表取数：优先VLOOKUP，也可用XLOOKUP/INDEX+MATCH/FILTER/SUMPRODUCT（按场景选择），列号 = 目标列位置 - 范围起始列 + 1
-- 英文半角括号引号，禁止中文全角
-- f-string含双引号时外层用单引号
-- 日期参与计算前用DATEVALUE()
-- 注释规范：每列一行 `# 列名(列号): 简要说明`
-- 条件格式：规则要求标红/高亮时用CellIsRule/FormulaRule实现（已导入）
+⚠️ 如果规则中包含「列处理分层」，L1同源列直接用main_df.iloc[i].get()复制（不查列号），L2跨表列才用VLOOKUP。
+
+{formula_rules_compact}
 
 ## 要求
 1. 生成完整的 fill_columns_batch_{batch_index + 1} 函数定义
@@ -1637,56 +1941,14 @@ def fill_columns_batch_{batch_index + 1}(ws, r, source_sheets):
         compressed_expected = self._compress_structure(expected_structure, max_length=30000)
         rules = self._compress_rules(rules_content, max_length=80000)
 
-        # 提取数据清洗规则、警告规则和条件格式规则
-        extracted_rules = self.rule_extractor.extract_rules(rules_content)
-        data_cleaning_rules_text = ""
+        # 统一提取规则
+        extracted = self._extract_cleaning_and_format_rules(rules_content)
 
-        if extracted_rules["data_cleaning_rules"]:
-            data_cleaning_rules_text = "\n## 数据清洗规则（在clean_source_data中应用）\n"
-            data_cleaning_rules_text += "⚠️ 在将源数据写入Excel之前，必须先应用以下清洗规则过滤数据：\n\n"
-            for i, rule in enumerate(extracted_rules["data_cleaning_rules"], 1):
-                if rule['original_text'] and not rule['original_text'].startswith('--'):
-                    data_cleaning_rules_text += f"{i}. {rule['original_text']}\n"
-            data_cleaning_rules_text += "\n**实现方式**：生成clean_source_data函数，对每个DataFrame应用清洗逻辑后返回清洗后的数据。\n"
-            data_cleaning_rules_text += '**汇总规则**：如果某个表存在单人多行数据需要汇总，groupby的key只能是清洗规则中指定的汇总主键，除主键外的其他字段都不能作为groupby key。数值型列（包括用文本表示的数值，但不包括日期）用sum聚合，文本列和日期列用first取值。禁止使用pivot_table，不允许改变原表的列结构（表头必须和清洗前完全一致）。\n'
+        # 统一构建预期Sheet信息
+        expected_sheets_info, total_columns = self._build_expected_sheets_info(expected_structure, rules_content)
 
-        conditional_format_text = ""
-        if extracted_rules["conditional_format_rules"]:
-            conditional_format_text = "\n## 条件格式规则\n"
-            conditional_format_text += "在填充公式后，需要对以下情况应用条件格式（使用CellIsRule/FormulaRule）：\n\n"
-            for i, rule in enumerate(extracted_rules["conditional_format_rules"], 1):
-                conditional_format_text += f"{i}. {rule['original_text']}\n"
-
-        precision_rules_text = ""
-        if extracted_rules["precision_rules"]:
-            precision_rules_text = "\n## 数值精度规则\n"
-            precision_rules_text += "在生成公式时，必须按以下精度要求使用ROUND函数：\n\n"
-            for i, rule in enumerate(extracted_rules["precision_rules"], 1):
-                precision_rules_text += f"{i}. {rule['original_text']}\n"
-
-        # 统计总列数和sheet信息
-        total_columns = 0
-        expected_sheets_info = ""
-        if isinstance(expected_structure, dict) and "sheets" in expected_structure:
-            sheets = expected_structure.get("sheets", {})
-            if sheets:
-                expected_sheets_info = "\n## 预期输出Sheet列表\n"
-                for sheet_name, sheet_info in sheets.items():
-                    headers = sheet_info.get("headers", {})
-                    col_count = len(headers)
-                    total_columns += col_count
-                    expected_sheets_info += f"- **{sheet_name}** ({col_count}列): {list(headers.keys())}\n"
-
-        # 从规则中提取中间计算项，追加到预期输出列表
-        intermediate_items = self._extract_intermediate_items_from_rules(rules_content)
-        if intermediate_items:
-            total_columns += len(intermediate_items)
-            intermediate_names = [item.split(':')[1] if ':' in item else item for item in intermediate_items]
-            expected_sheets_info += f"\n## 中间计算项（追加在最后一列之后，淡蓝色背景 #DCE6F1）\n"
-            expected_sheets_info += f"- 共 {len(intermediate_items)} 个中间项: {intermediate_names}\n"
-            for item in intermediate_items:
-                expected_sheets_info += f"  - {item}\n"
-            expected_sheets_info += f"\n⚠️ 中间项必须作为新增列追加在结果sheet最后，使用淡蓝色背景(#DCE6F1)标识\n"
+        # 黄金样例 + 补充规则 + 函数签名（在f-string中需要转义花括号）
+        golden_and_rules = self._build_golden_and_rules(total_columns, escape_braces=True)
 
         system_prompt = (
             "你是一个专业的Python程序员，擅长处理各种Excel数据处理任务，"
@@ -1694,7 +1956,7 @@ def fill_columns_batch_{batch_index + 1}(ws, r, source_sheets):
             "你同时也是一个EXCEL公式大师，熟悉VLOOKUP、IF、SUMIF等公式的使用。"
         )
 
-        # Step 3: 生成代码（包含完整上下文，不再依赖前置分析步骤）
+        # Step 3: 生成代码（包含完整上下文）
         step3 = f"""你是专业Python程序员，擅长人力资源行业的薪资计算、税务处理、考勤管理，同时你也是一个EXCEL公式大师。
 
 ## 任务概览
@@ -1724,180 +1986,17 @@ def fill_columns_batch_{batch_index + 1}(ws, r, source_sheets):
 
 ## 预期输出结构
 {compressed_expected}
-{data_cleaning_rules_text}
-{conditional_format_text}
-{precision_rules_text}
+{extracted['data_cleaning']}
+{extracted['conditional_format']}
+{extracted['precision']}
 
 ## 计算规则
 {rules}
 
-# ==================== 黄金样例（必须严格参照此模式编写）====================
-以下是一个完整的fill_result_sheets代码示例，展示了8种常见列类型的正确写法。
-你的代码必须完全遵循此模式，包括变量定义位置、缩进层级、注释格式、f-string写法。
-
-```python
-def fill_result_sheets(wb, source_sheets, salary_year=None,
-                       salary_month=None, monthly_standard_hours=174):
-    # === 1. 主表选择（员工数最多的表）===
-    main_key = max(source_sheets.keys(), key=lambda k: len(source_sheets[k]['df']))
-    main_df = source_sheets[main_key]['df']
-    n_rows = len(main_df)
-
-    # === 2. 动态查找源表（禁止硬编码key，必须用find_source_sheet）===
-    key_attend = find_source_sheet(source_sheets, target_columns=["出勤天数", "加班时数"], sheet_name_hint="考勤")
-    key_roster = find_source_sheet(source_sheets, target_columns=["用工类型", "入职日期"], sheet_name_hint="花名册")
-    sn_main = source_sheets[main_key]['ws'].title
-    sn_attend = source_sheets[key_attend]['ws'].title
-    sn_roster = source_sheets[key_roster]['ws'].title
-
-    # === 3. 预计算VLOOKUP列号（在for循环外，用get_vlookup_col_num）===
-    col_hire_date = get_vlookup_col_num("F", "A")      # 入职日期在F列，查找范围从A列开始
-    col_attend_days = get_vlookup_col_num("E", "D")    # 出勤天数在E列，查找范围从D列(工号)开始
-
-    # === 4. 预定义文本常量（Excel文本比较用，避免f-string引号冲突）===
-    TXT_FULLTIME = excel_text('全职')
-
-    # === 5. 创建结果sheet并写表头 ===
-    ws = wb.create_sheet("结果")
-    headers = ["工号", "姓名", "部门", "入职日期", "出勤天数",
-               "应发工资", "岗位津贴", "累计工资", "加班费", "用工类型"]
-    for c, h in enumerate(headers, 1):
-        ws.cell(row=1, column=c, value=h)
-
-    # === 6. 逐行填充（每列平级排列，缩进统一8空格）===
-    for i in range(n_rows):
-        r = i + 2
-
-        # A列(1): 工号 - 主表直接复制
-        ws.cell(row=r, column=1, value=main_df.iloc[i].get('工号', ''))
-
-        # B列(2): 姓名 - 主表直接复制
-        ws.cell(row=r, column=2, value=main_df.iloc[i].get('姓名', ''))
-
-        # C列(3): 部门 - 主表直接复制（主表内已有的列全部直接复制，不用VLOOKUP）
-        ws.cell(row=r, column=3, value=main_df.iloc[i].get('部门', ''))
-
-        # D列(4): 入职日期 - VLOOKUP跨表取数 + 日期格式转换（转为真实日期值，用number_format显示）
-        ws.cell(row=r, column=4).value = f"=IFERROR(IFERROR(DATEVALUE(VLOOKUP(A{{r}},'{{sn_roster}}'!$A:$J,{{col_hire_date}},FALSE)),VLOOKUP(A{{r}},'{{sn_roster}}'!$A:$J,{{col_hire_date}},FALSE)),{{EMPTY}})"
-        ws.cell(row=r, column=4).number_format = 'yyyy/mm/dd'
-
-        # E列(5): 出勤天数 - VLOOKUP跨表取数（主键非A列，范围起始为D列）
-        ws.cell(row=r, column=5).value = f"=IFERROR(VLOOKUP(A{{r}},'{{sn_attend}}'!$D:$M,{{col_attend_days}},FALSE),0)"
-
-        # F列(6): 应发工资 - 公式计算（引用参数sheet + 本表E列）
-        ws.cell(row=r, column=6).value = f"=IFERROR(E{{r}}*参数!$B$4,0)"
-
-        # G列(7): 岗位津贴 - 文本条件判断（用TXT_xxx常量 + 引用中间项J列）
-        ws.cell(row=r, column=7).value = f"=IF(J{{r}}={{TXT_FULLTIME}},1000,500)"
-
-        # H列(8): 累计工资 - SUMIFS历史累计（引用历史数据sheet）
-        ws.cell(row=r, column=8).value = f"=IFERROR(SUMIFS(历史数据!$F:$F,历史数据!$A:$A,\\"<\\"&参数!$B$3,历史数据!$B:$B,A{{r}})+F{{r}},F{{r}})"
-
-        # I列(9): 加班费 - SUMPRODUCT多条件加权计算（匹配工号，对加班时数×时薪求和）
-        ws.cell(row=r, column=9).value = f"=IFERROR(SUMPRODUCT(('{{sn_attend}}'!$A$2:$A$1000=A{{r}})*('{{sn_attend}}'!$H$2:$H$1000)*('{{sn_attend}}'!$I$2:$I$1000)),0)"
-
-        # J列(10): 用工类型（中间项，淡蓝色背景#DCE6F1）- INDEX+MATCH左查找（在D列查工号，返回左侧B列）
-        ws.cell(row=r, column=10).value = f"=IFERROR(INDEX('{{sn_roster}}'!$B:$B,MATCH(A{{r}},'{{sn_roster}}'!$D:$D,0)),{{EMPTY}})"
-
-    # === 7. 中间项标记淡蓝色背景 ===
-    if n_rows > 0:
-        light_blue = PatternFill(start_color="DCE6F1", end_color="DCE6F1", fill_type="solid")
-        for row in range(2, n_rows + 2):
-            ws.cell(row=row, column=10).fill = light_blue
-
-    # === 8. 条件格式（如规则要求标红/高亮等）===
-    if n_rows > 0:
-        red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
-        ws.conditional_formatting.add(f"E2:E{{n_rows+1}}", CellIsRule(operator="greaterThan", formula=["20"], fill=red_fill))
-
-    # 共处理了 10 列（预期 10 列）
-```
-
-### 从黄金样例中提取的关键模式
-1. **动态查找源表**：必须用find_source_sheet()查找，禁止硬编码source_sheets的key
-2. **变量定义位置**：sn_xxx、col_xxx、TXT_xxx 全部在for循环外定义
-3. **注释格式**：每列仅一行 `# X列(N): 说明`，无分隔线
-4. **列平级排列**：每列代码缩进统一8空格，互不嵌套
-5. **f-string规则**：
-   - 外层双引号时，sheet名单引号直接写（参照D、E列）
-   - 公式含双引号（如TEXT格式）时，外层用单引号：`f'=TEXT(A{{r}},"YYYY-MM")'`
-   - Excel空字符串 → 用{{EMPTY}}代替
-   - Excel文本比较 → 用excel_text('xxx')预定义TXT_xxx常量（参照G列）
-   - 禁止在f-string内部调用函数（常量必须在循环外预定义）
-6. **VLOOKUP列号**：用get_vlookup_col_num()计算，禁止硬编码数字
-7. **INDEX+MATCH左查找**：当目标列在主键列左侧时使用（参照J列），VLOOKUP无法实现左查找
-8. **SUMPRODUCT多条件计算**：多条件用乘法连接 `(条件1)*(条件2)*值列`，注意用有界范围$A$2:$A$1000而非整列（参照I列）
-9. **主表数据优先直接复制**：主表内已有的列（如工号、姓名、部门等）全部用main_df.iloc[i].get()直接复制，只有其他源表的数据才用VLOOKUP/INDEX+MATCH查找（参照A、B、C列）
-10. **中间项处理**：追加在最后一列之后，用PatternFill填充淡蓝色背景#DCE6F1（参照J列）
-11. **条件格式**：规则要求标红/高亮时，在for循环结束后用CellIsRule/FormulaRule实现，不能只留注释
-12. **日期格式转换**：VLOOKUP取回的日期可能是文本或数字，用 `IFERROR(DATEVALUE(x),x)` 转为真实日期值，再用 `number_format = 'yyyy/mm/dd'` 格式化显示（参照D列）
-
-# ==================== 补充规则 ====================
-
-## 历史数据引用（仅规则涉及"累计""历史"时使用）
-- 系统自动创建"历史数据"sheet，第1列为薪资月份，其余列与结果sheet列名一致
-- 累计示例：`=SUMIFS(历史数据!$E:$E, 历史数据!$A:$A, "<"&salary_month, 历史数据!$B:$B, B{{r}})`
-- 需用IFERROR包裹（第1个月历史数据可能为空）
-- 规则中未涉及历史数据时不要引用此sheet
-
-## 工号类型
-- 一般为数字格式，不需要TEXT转换
-- 仅当工号包含字母或特殊字符时才用TEXT转换
-
-## 日期格式转换
-- VLOOKUP/INDEX取回的日期往往是文本格式或Excel数字序列号，必须转为真实日期值并格式化显示
-- 公式模式：`=IFERROR(DATEVALUE(VLOOKUP结果), VLOOKUP结果)` — 保留真实日期值（非文本）
-  - DATEVALUE将文本日期转为Excel日期数字，若已是数字则IFERROR兜底
-- 格式化显示：公式赋值后紧跟 `ws.cell(row=r, column=N).number_format = 'yyyy/mm/dd'`
-- 日期参与减法运算前，也需要先用 `IFERROR(DATEVALUE(x),x)` 确保是数值
-- 禁止用TEXT()将日期转为文本，否则日期无法参与运算
-
-## 完整性要求
-- 必须为全部 {total_columns} 列生成处理逻辑
-- 在代码最后添加注释：# 共处理了 X 列（预期 {total_columns} 列）
-- 每行代码必须完整闭合，不允许跨行写赋值语句
-- 禁止"暂时跳过"、"简化为0"、提前结束
-- 禁止在函数内部import已导入的模块
-- 全部使用英文半角字符 ()[]"'，禁止中文全角
-
-# ==================== 函数签名 ====================
-
-## 1. 数据清洗函数（如果有清洗规则）
-def clean_source_data(source_data):
-    \"\"\"应用数据清洗规则：过滤无效数据 + 按主键汇总多行为单行
-
-    代码结构要求（必须严格遵守）：
-    - 必须用 for key, val in source_data.items(): 遍历所有表
-    - 在循环内用 if/elif 判断不同的 key 做对应清洗
-    - 不需要清洗的表也必须原样拷贝到 cleaned 中
-    - return cleaned 必须在函数最外层（与for同级），禁止嵌套在if内部
-
-    重要汇总规则（单人多行→单人单行）：
-    - groupby的key只能是清洗规则中指定的汇总主键（如工号），除主键外的其他字段都不能作为groupby key
-    - 数值型列（包括用文本表示的数值，但不包括日期）用sum聚合
-    - 文本列、日期列用first取值
-    - **禁止使用pivot_table**，不允许改变原表的列结构（表头必须和清洗前完全一致）
-    - 汇总后必须更新columns：cleaned[key]["columns"] = list(df.columns)
-    \"\"\"
-    cleaned = {{}}
-    for key, val in source_data.items():
-        df = val["df"].copy()
-        columns = val["columns"]
-        # 根据key判断做对应清洗...
-        cleaned[key] = {{"df": df, "columns": list(df.columns)}}
-    return cleaned  # 必须在for循环之后、函数最外层返回
-
-## 2. 结果填充函数
-def fill_result_sheets(wb, source_sheets, salary_year=None,
-                       salary_month=None, monthly_standard_hours=174):
-    \"\"\"创建结果sheet并填充数据和公式\"\"\"
-    pass
-
-请严格参照黄金样例的代码模式，生成完整代码：
-1. 如果有数据清洗规则，先生成clean_source_data函数
-2. 然后生成fill_result_sheets函数，覆盖全部 {total_columns} 列"""
+{golden_and_rules}"""
 
         # Step 4: 验证修正（占位符__GENERATED_CODE__在使用时替换）
+        verification = self.VERIFICATION_CHECKLIST.replace("__TOTAL_COLUMNS__", str(total_columns))
         step4 = f"""## 任务：验证并修正生成的代码
 
 请逐项检查以下代码，找出问题并输出修正后的完整代码。
@@ -1907,31 +2006,7 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
 __GENERATED_CODE__
 ```
 
-## 检查清单
-### 1. 语法检查
-- [ ] 所有括号是否正确闭合（圆括号、方括号、花括号）
-- [ ] f-string引号是否正确（统一 f"..." + \\' + \\"）
-- [ ] 每行代码是否完整，没有截断，没有跨行赋值
-- [ ] 缩进是否一致（for循环内8空格，列之间平级，无级联嵌套）
-
-### 2. VLOOKUP验证
-- [ ] 每个VLOOKUP取的字段是否正确（字段名和源表对应）
-- [ ] range_start是否等于该表主键所在列（不是固定$A）
-- [ ] col_index = 目标列绝对位置 - 主键列绝对位置 + 1，计算是否正确
-- [ ] range_end是否覆盖到目标列
-
-### 3. 列完整性
-- [ ] 是否覆盖了全部 {total_columns} 列
-- [ ] 基础列是否直接赋值，计算列是否有公式
-
-### 4. 注释规范
-- [ ] 每列注释是否只有一行：`# 列名(列号): 简要说明`
-- [ ] 是否有多余的分隔线（# ------、# ===等）→ 必须删除
-
-### 5. 其他
-- [ ] sheet名是否用sn_变量，无硬编码
-- [ ] 无中文全角字符（括号、引号）
-- [ ] 无函数内import
+{verification}
 
 ## 输出要求
 1. 先输出发现的问题列表

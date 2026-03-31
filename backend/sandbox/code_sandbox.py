@@ -8,6 +8,7 @@ import traceback
 import contextlib
 import tempfile
 import os
+import threading
 from pathlib import Path
 from typing import Dict, Any, Optional
 import pandas as pd
@@ -132,159 +133,124 @@ class CodeSandbox:
                 exec_globals = {}
                 exec_globals.update(safe_env)
 
-                try:
-                    # 初始化monkey-patch标记（必须在exec之前，否则exec失败时finally无法访问）
-                    _iep_patched = False
-                    _iep_orig_parse = None
+                # monkey-patch状态（线程和主线程共享）
+                _patch_state = {"iep_patched": False, "iep_orig_parse": None}
 
-                    # 编译并执行代码
-                    output_buffer.write(f"开始编译和执行代码...\n")
-                    code_obj = compile(script_content, '<sandbox>', 'exec')
-                    exec(code_obj, exec_globals)
-                    output_buffer.write(f"代码编译和执行完成\n")
+                def _execute_in_thread():
+                    """在线程中执行脚本，支持超时控制"""
+                    try:
 
-                    # 【加密支持】如果有 file_passwords，monkey-patch IntelligentExcelParser
-                    # 使其在 parse_excel_file 时自动注入对应文件的密码
-                    # 注意：文件通常已在上游解密，仅对仍加密的文件注入密码
-                    _file_passwords = execution_env.get('file_passwords') or {}
-                    if _file_passwords:
-                        try:
-                            from excel_parser import IntelligentExcelParser as _IEP
+                        # 编译并执行代码
+                        output_buffer.write(f"开始编译和执行代码...\n")
+                        code_obj = compile(script_content, '<sandbox>', 'exec')
+                        exec(code_obj, exec_globals)
+                        output_buffer.write(f"代码编译和执行完成\n")
+
+                        # 【加密支持】如果有 file_passwords，monkey-patch IntelligentExcelParser
+                        # 使其在 parse_excel_file 时自动注入对应文件的密码
+                        # 注意：文件通常已在上游解密，仅对仍加密的文件注入密码
+                        _file_passwords = execution_env.get('file_passwords') or {}
+                        if _file_passwords:
                             try:
-                                from backend.utils.aspose_helper import is_encrypted as _chk_enc
-                            except ImportError:
-                                _chk_enc = None
-                            _iep_orig_parse = _IEP.parse_excel_file
-                            _fp_map = _file_passwords  # 闭包捕获
+                                from excel_parser import IntelligentExcelParser as _IEP
+                                try:
+                                    from backend.utils.aspose_helper import is_encrypted as _chk_enc
+                                except ImportError:
+                                    _chk_enc = None
+                                _patch_state["iep_orig_parse"] = _IEP.parse_excel_file
+                                _fp_map = _file_passwords  # 闭包捕获
 
-                            def _auto_pwd_parse(self_parser, file_path, *args, **kwargs):
-                                if 'password' not in kwargs or kwargs.get('password') is None:
-                                    fname = os.path.basename(str(file_path))
-                                    pwd = _fp_map.get(fname)
-                                    if pwd:
-                                        # 先检查文件是否仍然加密
-                                        still_enc = True
-                                        if _chk_enc is not None:
-                                            try:
-                                                still_enc = _chk_enc(str(file_path))
-                                            except Exception:
-                                                still_enc = True
-                                        if still_enc:
-                                            kwargs['password'] = pwd
-                                            output_buffer.write(f"[加密支持] 为 {fname} 自动注入密码\n")
-                                        else:
-                                            output_buffer.write(f"[加密支持] {fname} 已解密，跳过密码注入\n")
-                                return _iep_orig_parse(self_parser, file_path, *args, **kwargs)
+                                def _auto_pwd_parse(self_parser, file_path, *args, **kwargs):
+                                    if 'password' not in kwargs or kwargs.get('password') is None:
+                                        fname = os.path.basename(str(file_path))
+                                        pwd = _fp_map.get(fname)
+                                        if pwd:
+                                            # 先检查文件是否仍然加密
+                                            still_enc = True
+                                            if _chk_enc is not None:
+                                                try:
+                                                    still_enc = _chk_enc(str(file_path))
+                                                except Exception:
+                                                    still_enc = True
+                                            if still_enc:
+                                                kwargs['password'] = pwd
+                                                output_buffer.write(f"[加密支持] 为 {fname} 自动注入密码\n")
+                                            else:
+                                                output_buffer.write(f"[加密支持] {fname} 已解密，跳过密码注入\n")
+                                    return _patch_state["iep_orig_parse"](self_parser, file_path, *args, **kwargs)
 
-                            _IEP.parse_excel_file = _auto_pwd_parse
-                            _iep_patched = True
-                            output_buffer.write(f"[加密支持] 已注入密码映射（{len(_file_passwords)}个文件）\n")
-                        except Exception as _e:
-                            output_buffer.write(f"[加密支持] 注入失败: {_e}\n")
+                                _IEP.parse_excel_file = _auto_pwd_parse
+                                _patch_state["iep_patched"] = True
+                                output_buffer.write(f"[加密支持] 已注入密码映射（{len(_file_passwords)}个文件）\n")
+                            except Exception as _e:
+                                output_buffer.write(f"[加密支持] 注入失败: {_e}\n")
 
-                    # 【性能优化】如果有预加载的源数据，替换 load_source_data 避免重复解析
-                    _pre_loaded = exec_globals.get('_pre_loaded_source_data')
-                    if _pre_loaded and 'load_source_data' in exec_globals:
-                        _original_load = exec_globals['load_source_data']
-                        def _cached_load_source_data(input_folder, manual_headers, _data=_pre_loaded):
-                            output_buffer.write(f"[性能优化] 使用预加载源数据（{len(_data)}个sheet，跳过Excel解析）\n")
-                            return _data
-                        exec_globals['load_source_data'] = _cached_load_source_data
-                        output_buffer.write(f"[性能优化] 已注入预加载源数据缓存\n")
+                        # 【性能优化】如果有预加载的源数据，替换 load_source_data 避免重复解析
+                        _pre_loaded = exec_globals.get('_pre_loaded_source_data')
+                        if _pre_loaded and 'load_source_data' in exec_globals:
+                            _original_load = exec_globals['load_source_data']
+                            def _cached_load_source_data(input_folder, manual_headers, _data=_pre_loaded):
+                                output_buffer.write(f"[性能优化] 使用预加载源数据（{len(_data)}个sheet，跳过Excel解析）\n")
+                                return _data
+                            exec_globals['load_source_data'] = _cached_load_source_data
+                            output_buffer.write(f"[性能优化] 已注入预加载源数据缓存\n")
 
-                    # 尝试调用主函数
-                    if 'main' in exec_globals and callable(exec_globals['main']):
-                        main_func = exec_globals['main']
-                        # 检查main函数的签名，智能传递参数
-                        import inspect
-                        sig = inspect.signature(main_func)
-                        params = list(sig.parameters.keys())
-
-                        if len(params) == 0:
-                            # main() 不带参数
-                            output_buffer.write(f"调用 main() 函数\n")
-                            exec_globals['main']()
-                        else:
-                            # main() 带参数，尝试传递执行环境
-                            input_folder = execution_env.get('input_folder', '')
-                            output_folder = execution_env.get('output_folder', '')
-                            output_buffer.write(f"调用 main('{input_folder}', '{output_folder}') 函数\n")
-                            # 尝试匹配参数名
-                            kwargs = {}
-                            if 'input_folder' in params:
-                                kwargs['input_folder'] = input_folder
-                            if 'input_path' in params:
-                                kwargs['input_path'] = input_folder
-                            if 'output_folder' in params:
-                                kwargs['output_folder'] = output_folder
-                            if 'output_path' in params:
-                                kwargs['output_path'] = output_folder
-                            if 'output_file' in params:
-                                # 兼容 output_file 参数名
-                                import os as _os
-                                kwargs['output_file'] = _os.path.join(output_folder, 'output.xlsx')
-
-                            # 按位置参数调用
-                            if len(params) >= 2 and not kwargs:
-                                exec_globals['main'](input_folder, output_folder)
-                            else:
-                                exec_globals['main'](**kwargs)
-
-                        output_buffer.write(f"main() 函数执行完成\n")
-                    elif 'process_excel_files' in exec_globals and callable(exec_globals['process_excel_files']):
-                        # 传递执行环境参数
-                        input_folder = execution_env.get('input_folder', '')
-                        output_folder = execution_env.get('output_folder', '')
-
-                        # 检查函数签名，支持薪资年月参数
-                        import inspect
-                        sig = inspect.signature(exec_globals['process_excel_files'])
-                        params = list(sig.parameters.keys())
-
-                        # 构建参数字典
-                        call_kwargs = {
-                            'input_folder': input_folder,
-                            'output_folder': output_folder
-                        }
-
-                        # 如果函数支持薪资年月参数，传入
-                        if 'salary_year' in params and 'salary_year' in execution_env:
-                            call_kwargs['salary_year'] = execution_env.get('salary_year')
-                        if 'salary_month' in params and 'salary_month' in execution_env:
-                            call_kwargs['salary_month'] = execution_env.get('salary_month')
-                        if 'monthly_standard_hours' in params and 'monthly_standard_hours' in execution_env:
-                            call_kwargs['monthly_standard_hours'] = execution_env.get('monthly_standard_hours')
-
-                        output_buffer.write(f"调用 process_excel_files({call_kwargs})\n")
-                        return_value = exec_globals['process_excel_files'](**call_kwargs)
-                        output_buffer.write(f"process_excel_files 执行完成，返回值: {return_value}\n")
-                        result["return_value"] = return_value
-                    else:
-                        # 查找其他可能的入口函数 (process_salary_data, process_data 等)
-                        entry_func = None
-                        entry_func_name = None
-                        for func_name in ['process_salary_data', 'process_data', 'run', 'execute']:
-                            if func_name in exec_globals and callable(exec_globals[func_name]):
-                                entry_func = exec_globals[func_name]
-                                entry_func_name = func_name
-                                break
-
-                        if entry_func:
-                            # 调用找到的入口函数
-                            input_folder = execution_env.get('input_folder', '')
-                            output_folder = execution_env.get('output_folder', '')
-
+                        # 尝试调用主函数
+                        if 'main' in exec_globals and callable(exec_globals['main']):
+                            main_func = exec_globals['main']
+                            # 检查main函数的签名，智能传递参数
                             import inspect
-                            sig = inspect.signature(entry_func)
+                            sig = inspect.signature(main_func)
                             params = list(sig.parameters.keys())
 
-                            call_kwargs = {}
-                            if 'input_folder' in params:
-                                call_kwargs['input_folder'] = input_folder
-                            if 'output_folder' in params:
-                                call_kwargs['output_folder'] = output_folder
-                            if 'rules_content' in params:
-                                call_kwargs['rules_content'] = execution_env.get('rules_content', '')
+                            if len(params) == 0:
+                                # main() 不带参数
+                                output_buffer.write(f"调用 main() 函数\n")
+                                exec_globals['main']()
+                            else:
+                                # main() 带参数，尝试传递执行环境
+                                input_folder = execution_env.get('input_folder', '')
+                                output_folder = execution_env.get('output_folder', '')
+                                output_buffer.write(f"调用 main('{input_folder}', '{output_folder}') 函数\n")
+                                # 尝试匹配参数名
+                                kwargs = {}
+                                if 'input_folder' in params:
+                                    kwargs['input_folder'] = input_folder
+                                if 'input_path' in params:
+                                    kwargs['input_path'] = input_folder
+                                if 'output_folder' in params:
+                                    kwargs['output_folder'] = output_folder
+                                if 'output_path' in params:
+                                    kwargs['output_path'] = output_folder
+                                if 'output_file' in params:
+                                    # 兼容 output_file 参数名
+                                    import os as _os
+                                    kwargs['output_file'] = _os.path.join(output_folder, 'output.xlsx')
+
+                                # 按位置参数调用
+                                if len(params) >= 2 and not kwargs:
+                                    exec_globals['main'](input_folder, output_folder)
+                                else:
+                                    exec_globals['main'](**kwargs)
+
+                            output_buffer.write(f"main() 函数执行完成\n")
+                        elif 'process_excel_files' in exec_globals and callable(exec_globals['process_excel_files']):
+                            # 传递执行环境参数
+                            input_folder = execution_env.get('input_folder', '')
+                            output_folder = execution_env.get('output_folder', '')
+
+                            # 检查函数签名，支持薪资年月参数
+                            import inspect
+                            sig = inspect.signature(exec_globals['process_excel_files'])
+                            params = list(sig.parameters.keys())
+
+                            # 构建参数字典
+                            call_kwargs = {
+                                'input_folder': input_folder,
+                                'output_folder': output_folder
+                            }
+
+                            # 如果函数支持薪资年月参数，传入
                             if 'salary_year' in params and 'salary_year' in execution_env:
                                 call_kwargs['salary_year'] = execution_env.get('salary_year')
                             if 'salary_month' in params and 'salary_month' in execution_env:
@@ -292,33 +258,80 @@ class CodeSandbox:
                             if 'monthly_standard_hours' in params and 'monthly_standard_hours' in execution_env:
                                 call_kwargs['monthly_standard_hours'] = execution_env.get('monthly_standard_hours')
 
-                            output_buffer.write(f"调用 {entry_func_name}({call_kwargs})\n")
-                            return_value = entry_func(**call_kwargs)
-                            output_buffer.write(f"{entry_func_name} 执行完成，返回值: {return_value}\n")
+                            output_buffer.write(f"调用 process_excel_files({call_kwargs})\n")
+                            return_value = exec_globals['process_excel_files'](**call_kwargs)
+                            output_buffer.write(f"process_excel_files 执行完成，返回值: {return_value}\n")
                             result["return_value"] = return_value
                         else:
-                            output_buffer.write(f"未找到可调用的主函数 (main, process_excel_files, process_salary_data 等)\n")
-                            output_buffer.write(f"全局变量: {list(exec_globals.keys())}\n")
+                            # 查找其他可能的入口函数 (process_salary_data, process_data 等)
+                            entry_func = None
+                            entry_func_name = None
+                            for func_name in ['process_salary_data', 'process_data', 'run', 'execute']:
+                                if func_name in exec_globals and callable(exec_globals[func_name]):
+                                    entry_func = exec_globals[func_name]
+                                    entry_func_name = func_name
+                                    break
 
-                    result["success"] = True
-                    if result["return_value"] is None:
-                        result["return_value"] = exec_globals.get('__result__', None)
+                            if entry_func:
+                                # 调用找到的入口函数
+                                input_folder = execution_env.get('input_folder', '')
+                                output_folder = execution_env.get('output_folder', '')
 
-                except SystemExit as e:
-                    # 捕获SystemExit异常，防止沙箱代码退出主进程
-                    error_msg = f"代码尝试退出进程 (SystemExit): {str(e)}\n{traceback.format_exc()}"
-                    error_buffer.write(error_msg)
-                except Exception as e:
-                    error_msg = f"执行错误: {str(e)}\n{traceback.format_exc()}"
-                    error_buffer.write(error_msg)
-                finally:
-                    # 恢复 IntelligentExcelParser.parse_excel_file 原始方法
-                    if _iep_patched and _iep_orig_parse is not None:
-                        try:
-                            from excel_parser import IntelligentExcelParser as _IEP
-                            _IEP.parse_excel_file = _iep_orig_parse
-                        except Exception:
-                            pass
+                                import inspect
+                                sig = inspect.signature(entry_func)
+                                params = list(sig.parameters.keys())
+
+                                call_kwargs = {}
+                                if 'input_folder' in params:
+                                    call_kwargs['input_folder'] = input_folder
+                                if 'output_folder' in params:
+                                    call_kwargs['output_folder'] = output_folder
+                                if 'rules_content' in params:
+                                    call_kwargs['rules_content'] = execution_env.get('rules_content', '')
+                                if 'salary_year' in params and 'salary_year' in execution_env:
+                                    call_kwargs['salary_year'] = execution_env.get('salary_year')
+                                if 'salary_month' in params and 'salary_month' in execution_env:
+                                    call_kwargs['salary_month'] = execution_env.get('salary_month')
+                                if 'monthly_standard_hours' in params and 'monthly_standard_hours' in execution_env:
+                                    call_kwargs['monthly_standard_hours'] = execution_env.get('monthly_standard_hours')
+
+                                output_buffer.write(f"调用 {entry_func_name}({call_kwargs})\n")
+                                return_value = entry_func(**call_kwargs)
+                                output_buffer.write(f"{entry_func_name} 执行完成，返回值: {return_value}\n")
+                                result["return_value"] = return_value
+                            else:
+                                output_buffer.write(f"未找到可调用的主函数 (main, process_excel_files, process_salary_data 等)\n")
+                                output_buffer.write(f"全局变量: {list(exec_globals.keys())}\n")
+
+                        result["success"] = True
+                        if result["return_value"] is None:
+                            result["return_value"] = exec_globals.get('__result__', None)
+
+                    except SystemExit as e:
+                        # 捕获SystemExit异常，防止沙箱代码退出主进程
+                        error_msg = f"代码尝试退出进程 (SystemExit): {str(e)}\n{traceback.format_exc()}"
+                        error_buffer.write(error_msg)
+                    except Exception as e:
+                        error_msg = f"执行错误: {str(e)}\n{traceback.format_exc()}"
+                        error_buffer.write(error_msg)
+
+                # 使用线程执行，实现超时控制
+                exec_thread = threading.Thread(target=_execute_in_thread, daemon=True)
+                exec_thread.start()
+                exec_thread.join(timeout=self.timeout)
+
+                if exec_thread.is_alive():
+                    self.logger.error(f"脚本执行超时（{self.timeout}秒）")
+                    result["success"] = False
+                    result["error"] = f"执行超时: 脚本运行超过{self.timeout}秒，可能存在死循环或数据量过大"
+
+                # 恢复monkey-patch（无论是否超时都需要恢复）
+                if _patch_state["iep_patched"] and _patch_state["iep_orig_parse"] is not None:
+                    try:
+                        from excel_parser import IntelligentExcelParser as _IEP
+                        _IEP.parse_excel_file = _patch_state["iep_orig_parse"]
+                    except Exception:
+                        pass
 
             # 收集输出
             full_output = output_buffer.getvalue()
@@ -500,6 +513,26 @@ class CodeSandbox:
         safe_env['EMPTY'] = '""'
         safe_env['ZERO'] = '0'
         safe_env['excel_text'] = lambda text: f'"{text}"'
+
+        # 注入 write_cell 辅助函数（兜底：模板代码中也有定义）
+        def _write_cell(ws, row, column, value, number_format=None):
+            """写入单元格值，自动处理日期和空值"""
+            import datetime
+            import pandas as _pd
+            if _pd.isna(value) if not isinstance(value, str) else (value == ''):
+                cell = ws.cell(row=row, column=column, value=None)
+            else:
+                if hasattr(value, 'to_pydatetime'):
+                    try:
+                        value = value.to_pydatetime()
+                    except Exception:
+                        pass
+                cell = ws.cell(row=row, column=column, value=value)
+            if isinstance(value, (datetime.datetime, datetime.date)):
+                cell.number_format = number_format or 'yyyy/mm/dd'
+            elif number_format:
+                cell.number_format = number_format
+        safe_env['write_cell'] = _write_cell
 
         # 安全包装 CellIsRule —— 防止 AI 生成错误的 operator 值
         # 1. operator={'greaterThan'} (set) → 'greaterThan' (str)
@@ -761,6 +794,7 @@ class CodeSandbox:
                     ',"' in line or      # ,""  逗号后跟引号
                     '=""' in line or     # ="" 等于空字符串
                     '="")' in line or    # ="")
+                    '<>""' in line or    # <>"" 不等于空字符串
                     '","' in line or     # "," 引号内有逗号
                     '")' in line         # ") 可能的引号结束
                 )
@@ -899,7 +933,8 @@ class CodeSandbox:
             # 导入robust_utils模块
             from backend.ai_engine.robust_utils import (
                 safe_get_column, safe_calculate, validate_required_columns,
-                create_missing_columns, mark_missing_cells_in_excel, get_dataframe_info
+                create_missing_columns, mark_missing_cells_in_excel, get_dataframe_info,
+                safe_to_numeric, is_numeric_column
             )
 
             # 创建一个包含所有导出函数的模块对象
@@ -909,6 +944,8 @@ class CodeSandbox:
             module = RobustUtilsModule()
             module.safe_get_column = safe_get_column
             module.safe_calculate = safe_calculate
+            module.safe_to_numeric = safe_to_numeric
+            module.is_numeric_column = is_numeric_column
             module.validate_required_columns = validate_required_columns
             module.create_missing_columns = create_missing_columns
             module.mark_missing_cells_in_excel = mark_missing_cells_in_excel

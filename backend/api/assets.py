@@ -359,10 +359,19 @@ def download_asset(
 
     # 原始下载
     if not format:
+        # 根据实际文件扩展名决定 MIME 类型
+        ext = Path(asset.file_path).suffix.lower()
+        mime_map = {
+            ".zip": "application/zip",
+            ".pdf": "application/pdf",
+            ".csv": "text/csv",
+            ".xls": "application/vnd.ms-excel",
+        }
+        media_type = mime_map.get(ext, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         return FileResponse(
             path=asset.file_path,
             filename=asset.file_name,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            media_type=media_type,
         )
 
     from ..utils.aspose_helper import convert_to_pdf, encrypt_excel

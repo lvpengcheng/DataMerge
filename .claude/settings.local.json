@@ -103,7 +103,10 @@
       "Bash(cp .env.example build_docker.sh releases/datamerge-1.0.0/)",
       "Read(//c/Users/Administrator/Desktop/asposetest/**)",
       "Bash(python -c \":*)",
-      "Bash(awk 'NR>=2266 && NR<=2431' backend/ai_engine/formula_code_generator.py)"
+      "Bash(awk 'NR>=2266 && NR<=2431' backend/ai_engine/formula_code_generator.py)",
+      "Bash(node -e \"const fs=require\\(''fs''\\); const code=fs.readFileSync\\(''frontend/static/js/admin.js'',''utf8''\\); try{new Function\\(code\\);console.log\\(''JS syntax OK''\\)}catch\\(e\\){console.error\\(e.message\\)}\")",
+      "Bash(node -e \"const fs=require\\(''fs''\\); const code=fs.readFileSync\\(''frontend/static/js/admin.js'',''utf8''\\); try{new Function\\(code\\);console.log\\(''OK''\\)}catch\\(e\\){console.error\\(e.message\\)}\")",
+      "Bash(sort -t/ -k9 -n)"
     ],
     "additionalDirectories": [
       "E:\\project\\DataMerge20260224\\DataMerge\\backend\\test_data\\data_cleaning_test",

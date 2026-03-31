@@ -794,6 +794,15 @@ def _finalize_workbook(
     return save_as(wb, output_path)
 
 
+def _fuzzy_match_column(target: str, columns) -> Optional[str]:
+    """模糊匹配列名：去空格、忽略大小写"""
+    target_clean = target.strip().lower()
+    for col in columns:
+        if str(col).strip().lower() == target_clean:
+            return col
+    return None
+
+
 # ── fill 模式 ──────────────────────────────────────────
 
 def _generate_fill(
@@ -817,6 +826,13 @@ def _generate_block(
     """按 group_by 分组，每组用 SmartMarker 填充模板，合并到一个文件。"""
     # 找到主数据源（非 $ 开头的第一个 DataFrame）
     ds_name, full_df, vars_data = _extract_datasource(data)
+
+    # 模糊匹配 group_by 列名
+    if group_by and group_by not in full_df.columns:
+        matched = _fuzzy_match_column(group_by, full_df.columns)
+        if matched:
+            logger.info(f"[block] group_by 模糊匹配: '{group_by}' -> '{matched}'")
+            group_by = matched
 
     if not group_by or group_by not in full_df.columns:
         logger.warning(f"[block] group_by='{group_by}' 不在列 {list(full_df.columns)} 中，回退到 fill 模式")
@@ -875,9 +891,18 @@ def _generate_zip(
     """按 group_by 分组，每组生成独立 xlsx，打包为 zip。"""
     ds_name, full_df, vars_data = _extract_datasource(data)
 
+    # 模糊匹配 group_by 列名（去空格、忽略大小写）
+    if group_by and group_by not in full_df.columns:
+        matched = _fuzzy_match_column(group_by, full_df.columns)
+        if matched:
+            logger.info(f"[zip] group_by 模糊匹配: '{group_by}' -> '{matched}'")
+            group_by = matched
+
     if not group_by or group_by not in full_df.columns:
-        logger.warning(f"[zip] group_by='{group_by}' 不在列中，回退到 fill 模式")
-        return _generate_fill(output_path, template_path, data, password, watermark_text)
+        logger.warning(f"[zip] group_by='{group_by}' 不在列 {list(full_df.columns)} 中，回退到 fill 模式")
+        # 回退到 fill 模式时，输出路径改为 .xlsx（否则 Aspose 保存到 .zip 扩展名会产生无效文件）
+        fill_path = os.path.splitext(output_path)[0] + ".xlsx"
+        return _generate_fill(fill_path, template_path, data, password, watermark_text)
 
     # 确保输出路径是 .zip
     if not output_path.endswith(".zip"):

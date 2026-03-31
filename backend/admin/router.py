@@ -907,6 +907,31 @@ async def generate_report(
     name_field_val = getattr(tpl, "name_field", "") or ""
     show_empty = getattr(tpl, "show_empty_period", True)
 
+    # zip/block 模式前置校验：group_by 不能为空，且必须在数据列中
+    if report_mode in ("zip", "block"):
+        if not group_by_field:
+            raise HTTPException(
+                status_code=400,
+                detail=f"报表模式为 {report_mode}，但模版未配置分组字段(group_by)，请在模版设置中指定分组列名",
+            )
+        available_cols = list(dataset.columns)
+        # 模糊匹配：去空格、忽略大小写
+        matched_col = None
+        target = group_by_field.strip().lower()
+        for col in available_cols:
+            if str(col).strip().lower() == target:
+                matched_col = col
+                break
+        if not matched_col:
+            raise HTTPException(
+                status_code=400,
+                detail=f"分组字段 '{group_by_field}' 不在数据列中，可用列: {available_cols[:30]}",
+            )
+        # 如果匹配到的列名与配置不完全一致，使用实际列名
+        if matched_col != group_by_field:
+            logger.info(f"group_by 模糊匹配: '{group_by_field}' -> '{matched_col}'")
+            group_by_field = matched_col
+
     # zip 模式输出 .zip，其余输出原始扩展名
     if report_mode == "zip":
         output_ext = ".zip"
@@ -922,7 +947,7 @@ async def generate_report(
     logger.info(f"报表模式: {report_mode}, group_by={group_by_field}, skip_rows={skip_rows_val}")
 
     try:
-        aspose_helper.generate_from_template(
+        actual_output_path = aspose_helper.generate_from_template(
             output_path=output_path,
             template_path=tpl.file_path,
             data=template_data,
@@ -933,18 +958,21 @@ async def generate_report(
             name_field=name_field_val,
             show_empty_period=show_empty,
         )
+        # 实际输出路径可能和请求路径不同（如 zip 回退到 fill 时扩展名变为 .xlsx）
+        output_path = actual_output_path
     except Exception as e:
         logger.error(f"报表生成失败: {e}")
         raise HTTPException(status_code=500, detail=f"报表生成失败: {str(e)}")
 
     # 10. 留痕 — 保存为 DataAsset
+    actual_filename = os.path.basename(output_path)
     try:
         report_asset = DataAsset(
             tenant_id=tenant_id,
             asset_type="report",
             name=f"报表_{tpl.name}_{now.strftime('%Y%m%d')}",
             file_path=output_path,
-            file_name=output_name_final,
+            file_name=actual_filename,
             file_size=os.path.getsize(output_path),
             source_task_id=task_id,
             uploaded_by=admin.id,
@@ -965,10 +993,11 @@ async def generate_report(
         except Exception:
             pass
 
-    # 11. 返回文件下载
-    media = "application/zip" if report_mode == "zip" else "application/octet-stream"
+    # 11. 返回文件下载（根据实际文件扩展名决定 MIME 类型）
+    is_zip = output_path.lower().endswith(".zip")
+    media = "application/zip" if is_zip else "application/octet-stream"
     return FileResponse(
         path=output_path,
-        filename=output_name_final,
+        filename=actual_filename,
         media_type=media,
     )

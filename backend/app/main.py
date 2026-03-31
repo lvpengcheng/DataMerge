@@ -40,11 +40,24 @@ from ..database import models as db_models
 from ..auth.dependencies import get_current_user, get_accessible_tenants
 from sqlalchemy.orm import Session
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+# 配置日志（控制台 + 文件）
+_LOG_DIR = Path(__file__).resolve().parent.parent.parent / "logs"
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+_log_fmt = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# 控制台
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(_log_fmt)
+
+# 文件（按天轮转，保留 30 天）
+from logging.handlers import TimedRotatingFileHandler
+_file_handler = TimedRotatingFileHandler(
+    str(_LOG_DIR / "app.log"), when="midnight", backupCount=30, encoding="utf-8"
 )
+_file_handler.setFormatter(_log_fmt)
+
+logging.basicConfig(level=logging.INFO, handlers=[_console_handler, _file_handler])
 logger = logging.getLogger(__name__)
 
 # 创建FastAPI应用
@@ -1288,15 +1301,39 @@ async def calculate_data(
                 ).order_by(db_models.Script.created_at.desc()).first()
                 if _db_script:
                     if _db_script.manual_headers:
-                        manual_headers = _db_script.manual_headers
+                        _mh = _db_script.manual_headers
+                        manual_headers = json.loads(_mh) if isinstance(_mh, str) else _mh
                     if _db_script.source_structure:
-                        script_info["source_structure"] = _db_script.source_structure
+                        _ss = _db_script.source_structure
+                        script_info["source_structure"] = json.loads(_ss) if isinstance(_ss, str) else _ss
             finally:
                 _db.close()
         except Exception as _e:
             logger.warning(f"DB 读取脚本元数据失败: {_e}")
 
         # 获取源文件结构
+        source_structure = script_info.get("source_structure", {})
+        match_success = True
+        match_error = None
+        smart_mapping = None
+
+        if source_structure:
+            try:
+                from backend.utils.fast_header_matcher import FastHeaderMatcher
+                fast_matcher = FastHeaderMatcher()
+                current_input_files = [
+                    f for f in saved_files["input_files"]
+                    if f.endswith(('.xlsx', '.xls')) and not os.path.basename(f).startswith('~')
+                ]
+                if current_input_files:
+                    match_success, match_error, smart_mapping = fast_matcher.match_and_prepare(
+                        source_structure=source_structure,
+                        input_files=current_input_files,
+                        manual_headers=manual_headers
+                    )
+            except Exception as _match_err:
+                logger.warning(f"FastHeaderMatcher匹配出错: {_match_err}")
+                match_success = True  # 出错时不阻塞，让脚本自行解析
 
         if not match_success:
             logger.error(f"FastHeaderMatcher匹配失败: {match_error}")
@@ -2216,9 +2253,11 @@ async def calculate_data_split(
                 ).order_by(db_models.Script.created_at.desc()).first()
                 if _db_script:
                     if _db_script.manual_headers:
-                        manual_headers = _db_script.manual_headers
+                        _mh = _db_script.manual_headers
+                        manual_headers = json.loads(_mh) if isinstance(_mh, str) else _mh
                     if _db_script.source_structure:
-                        script_info["source_structure"] = _db_script.source_structure
+                        _ss = _db_script.source_structure
+                        script_info["source_structure"] = json.loads(_ss) if isinstance(_ss, str) else _ss
             finally:
                 _db.close()
         except Exception as _e:
@@ -3243,7 +3282,7 @@ async def adjust_code(
 ```
 
 ## 原始计算规则
-{rules_content[:10000]}
+{rules_content[:70000]}
 
 ## 用户的调整要求
 {adjustment_request}
@@ -3959,6 +3998,18 @@ async def compute_with_script_stream(
                         source_structure = _script_info.get("source_structure")
                         manual_headers = _script_info.get("manual_headers")
 
+                        # 确保从DB读出的JSON列是dict（SQLite可能返回字符串）
+                        if isinstance(source_structure, str):
+                            try:
+                                source_structure = json.loads(source_structure)
+                            except (json.JSONDecodeError, TypeError):
+                                source_structure = None
+                        if isinstance(manual_headers, str):
+                            try:
+                                manual_headers = json.loads(manual_headers)
+                            except (json.JSONDecodeError, TypeError):
+                                manual_headers = None
+
                         # ========== 自动补全缺失源文件（从基础资料） ==========
                         if source_structure and db_session:
                             try:
@@ -3974,12 +4025,10 @@ async def compute_with_script_stream(
                                     _filled_detail = ", ".join(
                                         f'{f["file_name"]}(来自{f["source"]}基础资料)' for f in _filled
                                     )
-                                    yield f"data: {json.dumps({'type': 'info', 'message': f'自动补全源文件: {_filled_detail}'}, ensure_ascii=False)}\n\n"
+                                    await logs_queue.put(json.dumps({'type': 'info', 'message': f'自动补全源文件: {_filled_detail}'}, ensure_ascii=False))
                                     logger.info(f"[Compute] 自动补全源文件: {_filled_names}")
                                 if _still_missing:
-                                    yield f"data: {json.dumps({'type': 'error', 'message': f'以下源文件缺失，请上传或添加到基础资料: {_still_missing}'}, ensure_ascii=False)}\n\n"
-                                    yield "data: [DONE]\n\n"
-                                    return
+                                    raise ValueError(f"以下源文件缺失，请上传或添加到基础资料: {', '.join(_still_missing)}")
                             except Exception as _af_err:
                                 logger.warning(f"[Compute] 自动补全源文件异常（不阻塞计算）: {_af_err}")
 
@@ -4274,6 +4323,25 @@ async def compute_with_script_stream(
                         "message": f"生成输出文件: {output_file.name}"
                     }
                     await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+
+                    # 【关键修复】计算公式（公式模式下输出文件包含未计算的公式）
+                    # 训练时 compare_excel_files 会自动计算公式，但计算端之前缺失此步骤
+                    try:
+                        from backend.utils.excel_comparator import calculate_excel_formulas
+                        for ef in output_files:
+                            calc_ok = calculate_excel_formulas(str(ef))
+                            if calc_ok:
+                                log_calc = {
+                                    "type": "log",
+                                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                    "level": "info",
+                                    "message": f"公式计算完成: {ef.name}"
+                                }
+                                await logs_queue.put(json.dumps(log_calc, ensure_ascii=False))
+                            else:
+                                logger.warning(f"[compute/stream] 公式计算未成功: {ef.name}")
+                    except Exception as calc_err:
+                        logger.warning(f"[compute/stream] 公式计算失败（不影响输出）: {calc_err}")
 
                     # 保存到租户目录
                     tenant_dir = storage_manager.get_tenant_dir(tenant_id)
@@ -4602,6 +4670,15 @@ async def compute_with_script(
                 raise HTTPException(status_code=500, detail="未生成输出文件")
 
             output_file = output_files[0]
+
+            # 【关键修复】计算公式（公式模式下输出文件包含未计算的公式）
+            try:
+                from backend.utils.excel_comparator import calculate_excel_formulas
+                for ef in output_files:
+                    calculate_excel_formulas(str(ef))
+                    logger.info(f"[compute] 公式计算完成: {ef.name}")
+            except Exception as calc_err:
+                logger.warning(f"[compute] 公式计算失败（不影响输出）: {calc_err}")
 
             # 保存到租户目录
             tenant_dir = storage_manager.get_tenant_dir(tenant_id)

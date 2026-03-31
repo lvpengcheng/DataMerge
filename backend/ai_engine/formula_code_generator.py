@@ -83,14 +83,25 @@ class FormulaCodeGenerator:
                 stream_callback(msg)
 
         log("=== 公式模式：开始生成代码 ===")
+        self.last_prompt = None  # 记录实际提示词，供调用方获取
 
         # 1. 加载源数据获取结构信息
         log("步骤1: 分析源数据结构...")
         source_info = self.formula_builder.load_source_data(input_folder, manual_headers)
         log(f"发现 {len(source_info['sheets'])} 个源数据sheet")
 
-        # 2. 生成源数据结构描述
-        source_structure = self.formula_builder.get_source_structure_for_prompt()
+        # 2. 从规则中解析主表名称，传给源数据结构描述
+        main_table_name = None
+        if rules_content:
+            import re as _re
+            main_match = _re.search(r'###\s*主表[:：]\s*(.+?)(?:\n|（|$)', rules_content)
+            if not main_match:
+                main_match = _re.search(r'###\s*主键来源表[:：]\s*(.+?)(?:\n|（|$)', rules_content)
+            if main_match:
+                main_table_name = main_match.group(1).strip()
+                log(f"步骤2: 规则指定主表: {main_table_name}")
+
+        source_structure = self.formula_builder.get_source_structure_for_prompt(main_table_name=main_table_name)
         log("步骤2: 生成源数据结构描述完成")
 
         # 3. 统计预期列数，收集列名
@@ -126,6 +137,7 @@ class FormulaCodeGenerator:
                 manual_headers=manual_headers
             )
             log(f"提示词长度: {len(prompt)} 字符")
+            self.last_prompt = prompt  # 存储实际提示词
 
             if self.training_logger:
                 self.training_logger.log_full_prompt(prompt, "generate")
@@ -175,6 +187,10 @@ class FormulaCodeGenerator:
                 stream_callback=stream_callback,
                 log=log
             )
+
+        # 5.5 修复for循环体缩进脱离
+        if fill_function_code:
+            fill_function_code = self._fix_for_loop_body_indentation(fill_function_code)
 
         # 5.6 修复列代码的级联缩进问题
         if fill_function_code:
@@ -380,34 +396,31 @@ class FormulaCodeGenerator:
             tail_lines = accumulated_code.strip().split('\n')[-15:]
             tail_snippet = '\n'.join(tail_lines)
 
-            # 提取已定义的变量（sn_变量、其他关键变量），供续写时参考
-            defined_vars = []
-            for code_line in accumulated_code.split('\n'):
-                stripped_line = code_line.strip()
-                # 匹配 sn_xxx = ... 或 xxx_name = ... 等变量定义
-                if re.match(r'^(sn_\w+|[\w_]*name[\w_]*|[\w_]*title[\w_]*)\s*=', stripped_line):
-                    defined_vars.append(stripped_line)
-            vars_info = ""
-            if defined_vars:
-                vars_info = (
-                    f"\n已定义的变量（必须复用，不要重新定义或使用未定义的变量）：\n"
-                    + '\n'.join(f"  {v}" for v in defined_vars)
-                    + '\n'
-                )
+            # 提取已定义的变量（sn_/col_/TXT_/key_变量），供续写时参考
+            vars_info = self._extract_defined_variables_with_context(accumulated_code)
+
+            # 构建已完成列清单
+            completed_cols = [col for col in expected_col_names if col in accumulated_code]
+            completed_info = f"\n## 已完成的列 ({len(completed_cols)}/{total_columns})\n"
+            completed_info += ', '.join(completed_cols[:30])
+            if len(completed_cols) > 30:
+                completed_info += '...'
 
             continuation_msg = (
                 f"我正在生成fill_result_sheets函数，但代码还没有完成。\n"
                 f"目前只覆盖了 {covered}/{total_columns} 列（已完成到第{last_col_num}列）。\n"
                 f"最后一个完整列是: {last_col_info}\n"
-                f"还缺少以下列（共{len(missing)}列）：{', '.join(missing_preview)}"
+                f"{completed_info}\n"
+                f"\n## 剩余需要生成的列（共{len(missing)}列）\n"
+                f"{', '.join(missing_preview)}"
                 f"{'...' if len(missing) > 20 else ''}\n"
                 f"{vars_info}\n"
-                f"当前代码末尾（已完成部分的最后几行）：\n```python\n{tail_snippet}\n```\n\n"
+                f"## 代码上下文（最后15行）\n```python\n{tail_snippet}\n```\n\n"
                 f"请紧接着上面的代码继续生成，从第{next_col_num}列{' [' + missing[0] + ']' if missing else ''} 开始。要求：\n"
                 f"1. 绝对不要重复第1~{last_col_num}列的代码，直接从第{next_col_num}列开始\n"
                 f"2. 保持相同的缩进级别（8空格，在for循环内）\n"
                 f"3. 只输出Python代码块，不要解释\n"
-                f"4. 每列格式：ws.cell(r, N).value = ... （N是列号）\n"
+                f"4. 【格式要求】每列代码必须独立一行，列与列之间用空行分隔，每列前必须有注释行。绝对不要把多列代码写在同一行\n"
                 f"5. 尽可能多生成列，一次性生成全部{len(missing)}个缺失列，不要只生成几列就停止\n"
                 f"6. 只使用上面列出的已定义变量，不要引用未定义的变量\n"
                 f"7. 预计还需要生成约{len(missing)}列的代码，请一次性全部输出，直到所有列都完成"
@@ -485,6 +498,113 @@ class FormulaCodeGenerator:
             log(f"⚠️ VLOOKUP后处理: 未检测到sn_变量定义，所有VLOOKUP可能使用了硬编码sheet名")
 
         return code
+
+    def _fix_for_loop_body_indentation(self, code: str) -> str:
+        """修复AI生成代码中for循环体缩进脱离的问题
+
+        AI常见错误：for i in range(n_rows): 后面的列赋值代码
+        缩进从8空格降回4空格，导致代码跑到循环外面，只有最后一行的值被写入。
+
+        检测模式：
+            for i in range(n_rows):     # 4空格
+                r = i + 2               # 8空格（正确）
+            # XX列(N): ...              # 4空格（错误！应该8空格）
+            val = main_df.iloc[i]...    # 4空格（错误！引用了循环变量i）
+        """
+        lines = code.split('\n')
+
+        # 1. 找到 for i in range(n_rows):
+        for_line_idx = None
+        for_indent = None
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if re.match(r'for\s+i\s+in\s+range\s*\(\s*n_rows\s*\)', stripped):
+                for_line_idx = idx
+                for_indent = len(line) - len(line.lstrip())
+                break
+
+        if for_line_idx is None:
+            return code
+
+        expected_body_indent = for_indent + 4
+        col_marker_pattern = re.compile(r'#\s*\S*列\s*\(\s*\d+\s*\)')
+
+        # 2. 找到for之后第一个非空行，判断缩进情况
+        first_code_after_for = None
+        for idx in range(for_line_idx + 1, len(lines)):
+            if lines[idx].strip():
+                first_code_after_for = idx
+                break
+
+        if first_code_after_for is None:
+            return code
+
+        first_indent = len(lines[first_code_after_for]) - len(lines[first_code_after_for].lstrip())
+
+        drop_start = None
+        if first_indent == expected_body_indent:
+            # Case A: 循环开头缩进正确（r = i + 2 在8空格），后面掉回去了
+            for idx in range(first_code_after_for + 1, len(lines)):
+                stripped = lines[idx].strip()
+                if not stripped:
+                    continue
+                current_indent = len(lines[idx]) - len(lines[idx].lstrip())
+                if current_indent == for_indent and (
+                    col_marker_pattern.search(stripped) or
+                    'main_df.iloc[i]' in stripped or
+                    'ws.cell(row=r' in stripped or
+                    '.iloc[i]' in stripped
+                ):
+                    drop_start = idx
+                    break
+        elif first_indent == for_indent:
+            # Case B: 整个循环体都在for_indent级别
+            stripped = lines[first_code_after_for].strip()
+            if any(var in stripped for var in ['= i +', 'iloc[i]', 'row=r', '列(']):
+                drop_start = first_code_after_for
+        else:
+            return code
+
+        if drop_start is None:
+            return code
+
+        # 3. 找到循环体的结束位置
+        loop_end = len(lines)
+        for idx in range(drop_start, len(lines)):
+            stripped = lines[idx].strip()
+            if not stripped:
+                continue
+            current_indent = len(lines[idx]) - len(lines[idx].lstrip())
+            # 新的函数定义
+            if stripped.startswith('def ') and current_indent <= for_indent:
+                loop_end = idx
+                break
+            # return语句在函数级别
+            if stripped.startswith('return ') and current_indent == for_indent:
+                loop_end = idx
+                break
+            # 模块级别的section标记（0缩进的 # === 注释）
+            if current_indent == 0 and stripped.startswith('#') and '===' in stripped:
+                loop_end = idx
+                break
+
+        # 4. 修复：给drop_start到loop_end之间的所有行加4空格
+        indent_add = ' ' * 4
+        fixed_lines = lines[:drop_start]
+        for idx in range(drop_start, loop_end):
+            line = lines[idx]
+            if not line.strip():
+                fixed_lines.append('')
+            else:
+                fixed_lines.append(indent_add + line)
+        fixed_lines.extend(lines[loop_end:])
+
+        logger.info(
+            f"修复for循环体缩进：第{drop_start + 1}-{loop_end}行，"
+            f"共{loop_end - drop_start}行从{for_indent}空格修正为{expected_body_indent}空格"
+        )
+
+        return '\n'.join(fixed_lines)
 
     def _fix_cascading_indentation(self, code: str) -> str:
         """修复AI生成代码中的级联缩进问题
@@ -1087,9 +1207,35 @@ class FormulaCodeGenerator:
 
         result = '\n'.join(relevant_lines).strip()
         # 限制长度
-        if len(result) > 10000:
-            result = result[:10000] + "\n... (规则过长已截断)"
-        return result if result else rules_content[:5000]
+        if len(result) > 70000:
+            result = result[:70000] + "\n... (规则过长已截断)"
+        return result if result else rules_content[:70000]
+
+    @staticmethod
+    def _extract_defined_variables_with_context(code: str) -> str:
+        """提取代码中已定义的关键变量（续写上下文增强）
+
+        提取 sn_xxx, col_xxx, TXT_xxx, key_xxx 等变量定义，
+        帮助AI在续写时知道哪些变量可以直接使用。
+
+        Args:
+            code: 已生成的代码文本
+
+        Returns:
+            格式化的变量列表文本，无变量时返回空字符串
+        """
+        lines = []
+        for line in code.split('\n'):
+            stripped = line.strip()
+            # 匹配各类关键变量
+            if re.match(r'(sn_|col_|TXT_|key_|[\w_]*title[\w_]*|[\w_]*name[\w_]*)\w*\s*=', stripped):
+                lines.append(f"  {stripped}")
+        if not lines:
+            return ""
+        return (
+            "\n## 已定义的变量（必须复用，不要重新定义或使用未定义的变量）\n"
+            + '\n'.join(lines) + '\n'
+        )
 
     def _merge_completion_into_function(self, function_code: str, completion_code: str) -> str:
         """将补全代码合并到函数末尾（return语句之前）
@@ -1223,9 +1369,36 @@ class FormulaCodeGenerator:
         3. 修复跨行的f-string赋值语句
         """
         import ast
+        import re as _re
 
         # 预处理：替换f-string中的双引号问题为常量/函数调用
         code = self._replace_fstring_double_quotes(code)
+
+        # 预处理：修复变量名跨行断裂（AI输出被token截断导致）
+        # 模式：裸标识符行 + 下一行以 _xxx = ... 开头 → 合并为一行
+        # 例：col_sp_12\n_13 = get_vlookup_col_num(...) → col_sp_12_13 = get_vlookup_col_num(...)
+        pre_lines = code.split('\n')
+        merged_lines = []
+        skip_next = False
+        for idx in range(len(pre_lines)):
+            if skip_next:
+                skip_next = False
+                continue
+            line = pre_lines[idx]
+            stripped = line.strip()
+            # 检测：当前行是裸标识符（无赋值、无调用），下一行以 _xxx = 或 _xxx( 开头
+            if (stripped and _re.match(r'^[a-zA-Z_]\w*$', stripped)
+                    and idx + 1 < len(pre_lines)):
+                next_stripped = pre_lines[idx + 1].strip()
+                if _re.match(r'^_\w+\s*=', next_stripped):
+                    indent = line[:len(line) - len(line.lstrip())]
+                    merged = indent + stripped + next_stripped
+                    merged_lines.append(merged)
+                    skip_next = True
+                    logger.info(f"[语法修复] 合并断裂变量名: {stripped} + {next_stripped[:30]}...")
+                    continue
+            merged_lines.append(line)
+        code = '\n'.join(merged_lines)
 
         lines = code.split('\n')
         fixed_lines = []
@@ -1370,13 +1543,13 @@ class FormulaCodeGenerator:
             # 模式2: ,\"\") → ,{EMPTY}) — 已转义的Excel空字符串
             line = re.sub(r',\s*\\"\\"[\s)]*\)', ',{EMPTY})', line)
 
-            # 模式3: =\\"xxx\\" → ={TXT_xxx} — 文本比较
+            # 模式3: =\\"xxx\\" → ={TXT_xxx} — 文本比较（只匹配简短文本值，排除公式片段）
             def replace_text_compare(m):
                 text = m.group(1)
                 var_name = self._text_to_var_name(text)
                 text_constants[var_name] = text
                 return f"={{{var_name}}}"
-            line = re.sub(r'=\\"([^"\\]+)\\"', replace_text_compare, line)
+            line = re.sub(r'=\\"([^"\\\'{} ]+)\\"', replace_text_compare, line)
 
             # 模式4: excel_text('xxx') → TXT_xxx变量
             def replace_excel_text_call(m):
@@ -1389,6 +1562,16 @@ class FormulaCodeGenerator:
 
             # 模式5: 独立的 \"\\" 在行尾附近 → {EMPTY}
             line = re.sub(r'\\"\\"(?=\s*[)\"])', '{EMPTY}', line)
+
+            # 模式6（通用兜底）: 公式f-string中任何残留的裸 "" 都替换为 {EMPTY}
+            # 在Excel公式中 "" 只有一个含义：空字符串。上面的具体模式可能遗漏某些运算符
+            # 组合（如 <>"", >""等），这里做最终兜底。
+            # 只处理公式行（含 f"= 或 f'= 的行），避免误伤非公式代码。
+            if ("f\"=" in stripped or "f'=" in stripped) and '""' in line:
+                # 替换所有不在 {...} 内部的裸 ""
+                # 简单策略：直接替换所有 "" 为 {EMPTY}，因为在公式f-string中
+                # 不会有Python层面的 "" 空字符串需要保留
+                line = line.replace('""', '{EMPTY}')
 
             if line != original:
                 fix_count += 1
@@ -1452,6 +1635,10 @@ class FormulaCodeGenerator:
         indent = lines[insert_pos][:len(lines[insert_pos]) - len(lines[insert_pos].lstrip())]
         const_lines = [f"{indent}# Excel文本常量（避免f-string引号冲突）"]
         for var_name, text_value in new_constants.items():
+            # 安全检查：TXT常量值不应含单引号、大括号等（属公式片段，非文本常量）
+            if "'" in text_value or '{' in text_value or '}' in text_value:
+                logger.warning(f"[TXT常量] 跳过含特殊字符的值: {var_name} = {text_value[:50]}")
+                continue
             const_lines.append(f"{indent}{var_name} = '\"" + text_value + "\"'")
         const_lines.append("")
 
@@ -1635,6 +1822,34 @@ def add_header_comment(cell, source_desc: str):
         print(f"添加备注失败: {e}")
 
 
+def write_cell(ws, row, column, value, number_format=None):
+    """写入单元格值，自动处理日期和空值
+
+    Args:
+        ws: openpyxl worksheet
+        row: 行号
+        column: 列号
+        value: 要写入的值
+        number_format: 可选的数字格式（如 'yyyy/mm/dd'）
+    """
+    import datetime
+    if pd.isna(value) if not isinstance(value, str) else (value == ''):
+        cell = ws.cell(row=row, column=column, value=None)
+    else:
+        # 如果是 pandas Timestamp 或 NaT，转成 python datetime
+        if hasattr(value, 'to_pydatetime'):
+            try:
+                value = value.to_pydatetime()
+            except Exception:
+                pass
+        cell = ws.cell(row=row, column=column, value=value)
+    # 自动为 datetime 类型设置日期格式
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        cell.number_format = number_format or 'yyyy/mm/dd'
+    elif number_format:
+        cell.number_format = number_format
+
+
 def convert_region_to_dataframe(region) -> pd.DataFrame:
     """将ExcelRegion转换为DataFrame
 
@@ -1744,13 +1959,100 @@ def load_source_data(input_folder, manual_headers):
     return source_data
 
 
+def _is_date_column(col_name, df=None):
+    \"\"\"判断是否为日期列：先按列名关键词匹配，再按数据内容探测\"\"\"
+    name = str(col_name).lower().strip()
+
+    # 排除误匹配（如"工作日数"、"节日"等）
+    exclude_keywords = ['日数', '日常', '日志', '日报', '日均', '节日', '假日', '工日', 'update', 'today']
+    for exc in exclude_keywords:
+        if exc in name:
+            return False
+
+    # 列名关键词匹配
+    date_keywords = ['日期', 'date', '入职日', '离职日', '生效日', '截止日', '转正日', '生日']
+    for kw in date_keywords:
+        if kw in name:
+            return True
+
+    # 数据内容探测（采样前10个非空值，70%以上能解析为日期即认定）
+    if df is not None and col_name in df.columns:
+        # 跳过已经是数值类型的列（如工资金额）
+        if pd.api.types.is_numeric_dtype(df[col_name]):
+            return False
+        sample = df[col_name].dropna().head(10)
+        if len(sample) >= 3:
+            success = 0
+            for v in sample:
+                try:
+                    parsed = pd.to_datetime(v)
+                    # 确保不是纯数字被误判（如员工编号 20060112）
+                    if isinstance(v, str) and any(c in str(v) for c in ['-', '/', '年', '月']):
+                        success += 1
+                    elif not isinstance(v, (int, float)):
+                        success += 1
+                except Exception:
+                    pass
+            if success / len(sample) >= 0.7:
+                return True
+
+    return False
+
+
+def _to_native_datetime(x):
+    \"\"\"将任意日期值统一转为 Python 原生 datetime.datetime（避免 pd.Timestamp 比较问题）\"\"\"
+    if pd.isna(x) if not isinstance(x, str) else (x == ''):
+        return None
+    try:
+        ts = pd.to_datetime(x)
+        return ts.to_pydatetime()
+    except Exception:
+        return x
+
+
+def _normalize_date_columns(source_data):
+    \"\"\"预处理所有源数据的日期列，统一转为 datetime.datetime
+    必须在 clean_source_data 之前调用，否则清洗代码中的日期比较会触发 TypeError\"\"\"
+    for sheet_name, data_info in source_data.items():
+        df = data_info["df"]
+        date_cols = set()
+        for col_name in df.columns:
+            if _is_date_column(col_name, df):
+                date_cols.add(col_name)
+        if date_cols:
+            print(f"  [日期预处理] {sheet_name}: 识别到日期列 {list(date_cols)}")
+            for dc in date_cols:
+                df[dc] = df[dc].apply(_to_native_datetime)
+            data_info["df"] = df
+
+
 def write_source_sheets(wb, source_data):
     source_sheets = {}
     header_fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
 
     for sheet_name, data_info in source_data.items():
         df = data_info["df"]
+
+        # 清理列名：去除首尾空格、合并内部多余空格
+        import re as _re_clean
+        cleaned_cols = {}
+        for col in df.columns:
+            if isinstance(col, str):
+                clean = _re_clean.sub(r'\s+', '', col).strip()  # 去除所有空格
+                if clean != col:
+                    cleaned_cols[col] = clean
+        if cleaned_cols:
+            df = df.rename(columns=cleaned_cols)
+            data_info["df"] = df
+            print(f"  [列名清理] {sheet_name}: {list(cleaned_cols.items())}")
+
         ws = wb.create_sheet(title=sheet_name)
+
+        # 预判哪些列是日期列（每个sheet只判断一次）
+        date_cols = set()
+        for col_name in df.columns:
+            if _is_date_column(col_name, df):
+                date_cols.add(col_name)
 
         # 写入表头
         for col_idx, col_name in enumerate(df.columns, 1):
@@ -1762,19 +2064,23 @@ def write_source_sheets(wb, source_data):
         for row_idx, row in enumerate(df.itertuples(index=False), 2):
             for col_idx, value in enumerate(row, 1):
                 col_name = df.columns[col_idx - 1]
-                # 如果列名包含“日期”，尝试将文本转换为日期对象
-                if '日期' in col_name and pd.notna(value):
-                    try:
-                        # 强制转换为 datetime（可处理多种格式，如 2006-01-12、2006/01/12 等）
-                        value = pd.to_datetime(value).to_pydatetime()
-                    except:
-                        pass  # 转换失败则保留原值（可能是无效日期）
+                # 日期列安全网：如果仍有未转换的值，在写入时兜底转换
+                if col_name in date_cols and pd.notna(value):
+                    if hasattr(value, 'to_pydatetime'):
+                        try:
+                            value = value.to_pydatetime()
+                        except Exception:
+                            pass
+                    elif isinstance(value, str) and value.strip():
+                        try:
+                            value = pd.to_datetime(value).to_pydatetime()
+                        except Exception:
+                            pass
                 cell = ws.cell(row=row_idx, column=col_idx, value=value if pd.notna(value) else "")
                 # 源数据sheet只存值，防止公式字符串被Excel当公式执行（产生外部链接）
-                # 检查=、+、-开头的字符串（Excel会将这些前缀解释为公式）
                 if isinstance(value, str) and len(value) > 1 and value[0] in ('=', '+', '-'):
                     cell.data_type = 's'
-                if '日期' in col_name:
+                if col_name in date_cols:
                     cell.number_format = 'yyyy/mm/dd'  # 设置显示格式
 
         source_sheets[sheet_name] = {"df": df, "ws": ws}
@@ -1984,6 +2290,12 @@ def main():
     )
     print(f"加载完成，共 {len(source_data)} 个源数据sheet")
 
+    # 步骤1.1: 预处理日期列（统一转为 Python 原生 datetime.datetime）
+    # 必须在 clean_source_data 之前，否则清洗代码中的日期比较会报 TypeError:
+    # Cannot compare Timestamp with datetime.date
+    print("步骤1.1: 预处理日期列...")
+    _normalize_date_columns(source_data)
+
     # 步骤1.5: 应用数据清洗规则（如果定义了clean_source_data函数）
     if 'clean_source_data' in globals():
         print("步骤1.5: 应用数据清洗规则...")
@@ -2046,6 +2358,8 @@ def main():
         # 拼接完整代码前，清理fill_function_code中函数定义之前的垃圾代码
         if fill_function_code:
             fill_function_code = self._clean_before_function_def(fill_function_code)
+            # 同时清理函数体结束后的游离模块级代码（如 n_rows = len(main_df)）
+            fill_function_code = self._clean_after_function_body(fill_function_code)
 
         complete_code = template + fill_function_code + main_template
 
@@ -2130,6 +2444,96 @@ def main():
             i += 1
 
         return '\n'.join(clean_prefix + lines[func_start:])
+
+    def _clean_after_function_body(self, code: str) -> str:
+        """清理函数体结束后的模块级游离代码
+
+        AI生成的代码有时在fill_result_sheets函数体之后包含
+        游离的变量赋值或代码片段（如 n_rows = len(main_df)），
+        这些在模块级别执行会导致NameError。
+        """
+        lines = code.split('\n')
+
+        # 找到最后一个顶级函数定义（indent=0 的 def 行）
+        last_func_start = -1
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith('def ') and (not line[0].isspace()):
+                last_func_start = i
+
+        if last_func_start == -1:
+            return code  # 没有函数定义
+
+        # 从最后一个函数定义向后，找函数体结束的位置
+        func_body_end = last_func_start + 1
+        for i in range(last_func_start + 1, len(lines)):
+            stripped = lines[i].strip()
+            if not stripped:
+                # 空行——可能在函数体内也可能在函数外，先标记继续
+                func_body_end = i + 1
+                continue
+            # 有缩进 → 还在函数体内
+            if lines[i][0].isspace():
+                func_body_end = i + 1
+            else:
+                # 缩进归零 → 函数体结束
+                break
+
+        # func_body_end 之后没有代码，不需要处理
+        if func_body_end >= len(lines):
+            return code
+
+        # 过滤尾部代码：只保留合法的模块级内容
+        clean_suffix = []
+        removed_count = 0
+        i = func_body_end
+        while i < len(lines):
+            stripped = lines[i].strip()
+
+            # 保留：空行、注释
+            if not stripped or stripped.startswith('#'):
+                clean_suffix.append(lines[i])
+                i += 1
+                continue
+
+            # 保留：import
+            if stripped.startswith('import ') or stripped.startswith('from '):
+                clean_suffix.append(lines[i])
+                i += 1
+                continue
+
+            # 保留：常量赋值（大写变量名）
+            if (re.match(r'^[A-Z_][A-Z_0-9]*\s*=', stripped)
+                    or re.match(r'^TXT_\w+\s*=', stripped)):
+                clean_suffix.append(lines[i])
+                i += 1
+                continue
+
+            # 保留：函数或类定义（包含整个函数体）
+            if stripped.startswith('def ') or stripped.startswith('class '):
+                clean_suffix.append(lines[i])
+                i += 1
+                while i < len(lines):
+                    if not lines[i].strip():
+                        clean_suffix.append(lines[i])
+                        i += 1
+                        continue
+                    if lines[i][0].isspace():
+                        clean_suffix.append(lines[i])
+                        i += 1
+                        continue
+                    break
+                continue
+
+            # 跳过游离代码
+            logger.info(f"清理函数体后的游离代码: 行{i+1}: {stripped[:80]}")
+            removed_count += 1
+            i += 1
+
+        if removed_count > 0:
+            logger.warning(f"共清理了 {removed_count} 行函数体后的游离模块级代码")
+
+        return '\n'.join(lines[:func_body_end] + clean_suffix)
 
     def _extract_python_code(self, response: str) -> str:
         """从AI响应中提取Python代码，确保清理所有markdown标记"""
@@ -2265,172 +2669,48 @@ def main():
             log("警告: 无法从原始代码中提取fill_result_sheets函数")
             return None
 
+        # 使用集中式规则（消除150行内联重复）
+        correction_rules = self.prompt_generator._build_formula_rules("detailed", include_extra=True)
+        correction_checklist = PromptGenerator.CORRECTION_CHECKLIST
+        correction_quick_ref = PromptGenerator.CORRECTION_QUICK_REF
+        correction_forbidden = PromptGenerator.CORRECTION_FORBIDDEN
+
         prompt = f"""你是专业Python程序员，擅长人力资源行业的薪资计算、税务处理、考勤管理，了解HR行业的各种术语,同时你也是一个EXCEL公式大师，熟悉每个公式的使用方法和使用场景。请修正fill_result_sheets函数。
 
 【任务说明】
 只需要修正fill_result_sheets函数，其他代码（数据加载、保存等）由固定模板处理。
 
-⚠️ **最重要的修正原则：**
-1. **只修改差异中指出的列，其他列的代码不要动**
-2. **必须保留原始代码中所有变量定义（如 sn_xxx = "表名" 等 sheet name 变量），不得删除或遗漏任何变量**
-3. **输出完整的fill_result_sheets函数，包含所有原有的变量定义、所有列的处理逻辑**
-4. **如果用户要求只改某列，则只修改该列的公式，其余全部原样保留**
+⚠️⚠️⚠️ **最重要的修正原则（违反即为失败）：**
+1. **严禁修改用户未提到的列** — 如果用户反馈只提到了"工资基数"和"试用期内金额"，则只能修改这两列的代码，其余所有列的代码必须原封不动地保留，一个字符都不能改
+2. **必须保留原始代码中所有变量定义**（如 sn_xxx = "表名" 等 sheet name 变量），不得删除或遗漏任何变量
+3. **输出完整的fill_result_sheets函数**，包含所有原有的变量定义、所有列的处理逻辑
+4. **对于未提到的列，直接复制粘贴原始代码** — 不要"优化"、"改进"、"简化"任何未被用户指出的列
 
 ## 原始fill_result_sheets函数
 ```python
 {original_fill_function}
 ```
 
-## 与预期结果的差异
+## 与预期结果的差异（仅作参考，以用户反馈为准）
 {comparison_result}
 
 ## 计算规则（参考）
-{rules_content[:10000]}
+{rules_content[:70000]}
 
 {source_structure}
 
-# ==================== 核心规则（违反=失败）====================
-## 【规则1】字符规范 - 最优先检查
-- ✅ 必须：英文半角 ()[]"'
-- ❌ 禁止：中文全角 （）【】""''
-- 🔍 每次输出前检查：括号、引号是否全部半角
+{correction_rules}
 
-## 【规则2】跨表取数方式（按优先级排序，禁止直接引用DataFrame）
-- 主表数据：直接复制，特别是工号等主键列，直接复制值，不要用公式
-- 非主表数据：必须使用Excel公式跨表取数，根据场景选择最合适的方式：
+{correction_checklist}
 
-### 方式A：VLOOKUP（默认首选，适用于单条件精确匹配）
-- 列号的计算非常重要，必须正确计算：列号 = 目标列位置 - 范围起始列位置 + 1
-- 格式：`=IFERROR(VLOOKUP(主键,'xxx'!$A:$Z,列号,FALSE),0)`
-- 文本主键加TEXT：`=IFERROR(VLOOKUP(TEXT(A2,"@"),'xxx'!$A:$Z,列号,FALSE),0)`
+{correction_quick_ref}
 
-### 方式B：XLOOKUP（适用于需要反向查找、自定义默认值、近似匹配）
-- 格式：`=XLOOKUP(查找值,'xxx'!查找列,'xxx'!返回列,默认值,0)`
-- 优势：无需计算列号，支持从右向左查找，默认值更灵活
-- 示例：`=XLOOKUP(A2,'xxx'!$C:$C,'xxx'!$A:$A,"未找到",0)`
-
-### 方式C：INDEX+MATCH（适用于双向查找、多条件匹配）
-- 格式：`=IFERROR(INDEX('xxx'!返回列,MATCH(查找值,'xxx'!查找列,0)),0)`
-- 多条件：`=IFERROR(INDEX('xxx'!返回列,MATCH(1,(条件1)*(条件2),0)),0)` （需Ctrl+Shift+Enter数组公式）
-- 适用场景：需要左向查找、多列联合匹配
-
-### 方式D：FILTER（适用于一对多匹配、条件筛选取值）
-- 格式：`=IFERROR(FILTER('xxx'!返回列,'xxx'!条件列=查找值),0)`
-- 适用场景：一个员工可能有多条记录需要汇总
-- 常与SUM/AVERAGE等聚合函数配合：`=SUM(FILTER('xxx'!金额列,'xxx'!工号列=A2))`
-
-### 方式E：SUMPRODUCT（适用于多条件汇总计算，兼容性最好）
-- 格式：`=SUMPRODUCT(('xxx'!条件列1=查找值1)*('xxx'!条件列2=查找值2)*('xxx'!数值列))`
-- 适用场景：多条件求和、条件计数、加权计算等
-- 条件求和：`=SUMPRODUCT(('xxx'!$A:$A=A2)*('xxx'!$B:$B="正常")*('xxx'!$D:$D))`
-- 条件计数：`=SUMPRODUCT(('xxx'!$A:$A=A2)*('xxx'!$B:$B="出勤")*1)`
-- 优势：无需Ctrl+Shift+Enter，兼容所有Excel版本，天然支持多条件
-
-### 选择原则
-- 单条件精确匹配 → 优先VLOOKUP
-- 需要反向查找或自定义未找到返回值 → XLOOKUP
-- 多条件匹配或左向查找 → INDEX+MATCH
-- 一对多匹配需要聚合 → FILTER+聚合函数
-- 多条件求和/计数/加权计算 → SUMPRODUCT
-- 所有跨表公式必须用IFERROR包裹
-
-## 【规则3】日期必转换
-- 所有日期参与计算前必须用 `DATEVALUE()`
-- 检查清单：日期比较、日期相减、日期筛选
-
-## 【规则4】代码完整性和f-string引号规则
-- 每行代码必须完整闭合，不允许截断
-- ⚠️ **f-string引号选择规则（最关键！）**：
-  - **如果Excel公式中包含双引号（如TEXT函数、DATEDIF的"Y"参数等），必须使用单引号f-string：f'...'**
-  - **如果Excel公式中只包含单引号（如sheet名），使用双引号f-string：f"..."**
-  - ✅ 正确示例：
-    - `f'=TEXT(A1,"YYYY-MM-DD")'` ← 公式中有双引号，外层用单引号
-    - `f'=DATEDIF(N{{r}},DATE(参数!$B$2,参数!$B$3+1,0),"Y")'` ← 公式中有双引号，外层用单引号
-    - `f"=VLOOKUP(K{{r}},'{{sn_bank}}'!$A:$J,{{col_num}},FALSE)"` ← 公式中只有单引号，外层用双引号
-  - ❌ 错误示例：
-    - `f"=TEXT(A1,\"YYYY-MM-DD\")"` ← 错误！双引号冲突
-    - `f"=DATEDIF(N{{r}},DATE(参数!$B$2,参数!$B$3+1,0),""Y"")"` ← 错误！双引号冲突
-
-## 【规则5】模块导入规则（严格执行，违反=立即失败）
-- ❌ 禁止在函数内部导入已在顶层导入的模块（会导致UnboundLocalError）
-- ❌ 禁止：在fill_result_sheets函数内写 `import pandas as pd`
-- ✅ 正确：直接使用顶层已导入的 `pd`（pandas已在文件开头导入）
-
-## 【规则6】工号类型
-- 一般情况下，工号都是数字格式，不需要TEXT转换
-- 只有当工号包含字母或特殊字符时，才需要用TEXT转换
-
-## 【规则7】条件格式规则（标红、高亮、颜色标记等样式）
-- 如果规则文档中要求对某些单元格进行颜色标记、标红、高亮等，必须用openpyxl的条件格式实现，不能跳过或只留注释
-- 需要额外导入：`from openpyxl.formatting.rule import CellIsRule, FormulaRule`
-- 条件格式代码放在**所有公式填充完成之后**
-- **关键：CellIsRule/FormulaRule 调用必须和 f-string 分开写，不能在同一行！先用变量保存范围字符串**
-
-### 数值条件格式（CellIsRule）
-- 适用于：大于/小于/等于某个数值
-- **正确写法（范围和CellIsRule分两行）**：
-```python
-from openpyxl.formatting.rule import CellIsRule
-red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
-# 出勤天数>20标红（E列）
-cell_range = f"E2:E{{n_rows+1}}"
-ws.conditional_formatting.add(cell_range, CellIsRule(operator="greaterThan", formula=["20"], fill=red_fill))
-```
-- 支持的operator：greaterThan, lessThan, equal, notEqual, greaterThanOrEqual, lessThanOrEqual, between
-- **注意：operator参数必须是字符串**，如 `operator="greaterThan"`
-
-### 公式条件格式（FormulaRule）
-- 适用于：复杂条件、跨列判断、文本匹配
-- **正确写法（范围和FormulaRule分两行）**：
-```python
-from openpyxl.formatting.rule import FormulaRule
-yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-# 基本工资>20000标黄警告（D列）
-cell_range = f"D2:D{{n_rows+1}}"
-ws.conditional_formatting.add(cell_range, FormulaRule(formula=["D2>20000"], fill=yellow_fill))
-```
-
-### 常用颜色
-- 红色：FF0000（标红/警告）
-- 黄色：FFFF00（标黄/提醒）
-- 绿色：00FF00（标绿/正常）
-- 橙色：FFA500（标橙/注意）
-
-# ==================== 执行检查清单 ====================
-每生成一列公式前，按顺序检查：
-1. [ ] 是否跨表取数？→ 是 → 根据场景选择VLOOKUP/XLOOKUP/INDEX+MATCH/FILTER/SUMPRODUCT
-2. [ ] 是否涉及日期？→ 是 → 加DATEVALUE
-3. [ ] 是否有文本比较？→ 是 → 值加双引号（如"是"）
-4. [ ] 是否有中文标点？→ 是 → 全部改为英文
-5. [ ] f-string内有双引号？→ 是 → 外层用单引号
-6. [ ] 规则是否要求条件格式（标红/高亮等）？→ 是 → 在公式填充后用循环遍历+直接设置fill实现
-
-# ==================== 快速参考 ====================
-## VLOOKUP列号计算
-列号 = 目标列位置 - 范围起始列 + 1
-例：$C:$CD中取CD列 → 82-3+1=80
-
-## 常用模板
-| 场景 | 公式模板 |
-|------|---------|
-| 跨表取数(VLOOKUP) | `=IFERROR(VLOOKUP(A2,'表名'!$A:$Z,列号,FALSE),0)` |
-| 跨表取数(XLOOKUP) | `=XLOOKUP(A2,'表名'!$A:$A,'表名'!$E:$E,"",0)` |
-| 跨表取数(INDEX+MATCH) | `=IFERROR(INDEX('表名'!$E:$E,MATCH(A2,'表名'!$A:$A,0)),0)` |
-| 跨表一对多汇总(FILTER) | `=SUM(FILTER('表名'!$D:$D,'表名'!$A:$A=A2))` |
-| 跨表多条件汇总(SUMPRODUCT) | `=SUMPRODUCT(('表名'!$A:$A=A2)*('表名'!$B:$B="正常")*('表名'!$D:$D))` |
-| 日期比较 | `=IF(DATEVALUE(A2)>参数!$B$5,"是","否")` |
-| 表内汇总 | `=SUMIF('表名'!$A:$A,A2,'表名'!$C:$C)` |
-| 参数引用 | `参数!$B$4` (绝对引用) |
-
-## 禁止行为（立即停止）
-- ❌ "暂时跳过" / "简化为0" → 必须完整实现
-- ❌ 直接引用DataFrame值 → 必须改用Excel跨表公式（VLOOKUP/XLOOKUP/INDEX+MATCH/FILTER/SUMPRODUCT）
-- ❌ 跨行不闭合引号 → 每行必须独立完整
-- ❌ 禁止在结果报表内使用sumif等汇总函数 → 汇总必须在源数据sheet完成
+{correction_forbidden}
 
 
 【输出要求】
-只输出修正后的fill_result_sheets函数代码，不需要其他代码。"""
+只输出修正后的fill_result_sheets函数代码，不需要其他代码。
+⚠️ 再次强调：未在用户反馈中提到的列，其代码必须与原始代码完全一致。"""
 
         if self.training_logger:
             self.training_logger.log_full_prompt(prompt, "correct")
@@ -2463,7 +2743,9 @@ ws.conditional_formatting.add(cell_range, FormulaRule(formula=["D2>20000"], fill
         if corrected_fill_function:
             corrected_fill_function = self.ai_provider.validate_and_fix_code_format(corrected_fill_function)
 
-        # 修复级联缩进和f-string引号冲突（与generate_code主流程一致）
+        # 修复for循环体缩进、级联缩进和f-string引号冲突（与generate_code主流程一致）
+        if corrected_fill_function:
+            corrected_fill_function = self._fix_for_loop_body_indentation(corrected_fill_function)
         if corrected_fill_function:
             corrected_fill_function = self._fix_cascading_indentation(corrected_fill_function)
         if corrected_fill_function:
@@ -2502,6 +2784,151 @@ ws.conditional_formatting.add(cell_range, FormulaRule(formula=["D2>20000"], fill
             complete_code = original_code
 
         return complete_code
+
+    def generate_column_level_correction(
+        self,
+        full_code: str,
+        field_diff_samples: dict,
+        rules_content: str,
+        source_structure: str,
+        expected_structure: dict,
+        stream_callback: callable = None,
+        user_feedback: str = None
+    ) -> tuple:
+        """精准列级修正：只修改有差异的列，保留正确列不变
+
+        相比 generate_correction_code（全量修正），此方法只让AI修改出错的列，
+        避免破坏已正确的列。适用于匹配率>=50%且错误列<=8个的场景。
+
+        Args:
+            full_code: 当前完整代码
+            field_diff_samples: {"列名": {"formula": "=...", "count": N}}
+            rules_content: 规则内容
+            source_structure: 源数据结构描述
+            expected_structure: 预期输出结构
+            stream_callback: 流式回调
+            user_feedback: 用户的修正指示（优先于自动差异描述）
+
+        Returns:
+            (complete_code, ai_response) 或 (None, ai_response) 如果列级修正失败
+        """
+        def log(msg):
+            logger.info(msg)
+            if stream_callback:
+                stream_callback(msg)
+
+        # 1. 提取目标列和构建修正请求
+        target_columns = list(field_diff_samples.keys())
+        # 如果有用户反馈，以用户反馈为主；否则从差异样本自动构建
+        if user_feedback:
+            adjustment_request = f"【用户修正指示】\n{user_feedback}"
+            auto_diff = self._build_adjustment_request_from_diff(field_diff_samples)
+            if auto_diff:
+                adjustment_request += f"\n\n【参考差异（仅供辅助）】\n{auto_diff}"
+        else:
+            adjustment_request = self._build_adjustment_request_from_diff(field_diff_samples)
+
+        log(f"列级修正: {len(target_columns)}个差异列 - {', '.join(target_columns[:5])}{'...' if len(target_columns) > 5 else ''}")
+
+        # 2. 提取 fill_result_sheets 函数
+        fill_function = self._extract_fill_result_sheets_function(full_code)
+        if not fill_function:
+            log("警告: 无法提取fill_result_sheets函数，降级为全量修正")
+            return None, ""
+
+        # 3. 生成列级修正提示词
+        prompt = self.prompt_generator.generate_column_adjustment_prompt(
+            fill_function=fill_function,
+            target_columns=target_columns,
+            adjustment_request=adjustment_request,
+            source_structure=source_structure,
+            expected_structure=expected_structure,
+            rules_content=rules_content
+        )
+
+        if self.training_logger:
+            self.training_logger.log_full_prompt(prompt, "column_correct")
+
+        # 4. 调用AI获取响应
+        ai_response = ""
+        if hasattr(self.ai_provider, 'generate_code_with_stream') and stream_callback:
+            raw_response = ""
+
+            def chunk_handler(chunk):
+                nonlocal raw_response
+                raw_response += chunk
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                stream_callback(f"[{timestamp}] [CODE] {chunk}")
+
+            extracted = self.ai_provider.generate_code_with_stream(prompt, chunk_callback=chunk_handler)
+            ai_response = raw_response if raw_response else extracted
+        else:
+            ai_response = self.ai_provider.generate_code(prompt)
+
+        if self.training_logger:
+            self.training_logger.log_full_ai_response(ai_response, "column_correct")
+
+        # 5. 解析结构化响应
+        parsed = PromptGenerator.parse_column_adjustment_response(ai_response)
+
+        if not parsed["column_blocks"]:
+            log(f"列级修正解析失败（未提取到列代码块），降级为全量修正")
+            return None, ai_response
+
+        log(f"列级修正解析成功: 修改{len(parsed['column_blocks'])}列 - {list(parsed['column_blocks'].keys())}")
+
+        # 6. 替换列代码块
+        patched_function = fill_function
+        patched_function = self.replace_column_blocks(patched_function, parsed["column_blocks"])
+        if parsed["pre_loop_code"]:
+            patched_function = self.inject_pre_loop_code(patched_function, parsed["pre_loop_code"])
+
+        # 7. 后处理
+        patched_function = self._fix_for_loop_body_indentation(patched_function)
+        patched_function = self._fix_cascading_indentation(patched_function)
+        patched_function = self._fix_fstring_and_brackets(patched_function)
+
+        # 8. 拼接完整代码
+        complete_code = self._build_complete_code(patched_function)
+        if complete_code:
+            complete_code = self.ai_provider._fix_fstring_quotes(complete_code)
+
+        if complete_code:
+            log(f"列级修正完成，长度: {len(complete_code)} 字符")
+            if self.training_logger:
+                self.training_logger.log_generated_code(complete_code, "formula")
+        else:
+            log("警告: 列级修正代码拼接失败")
+            return None, ai_response
+
+        return complete_code, ai_response
+
+    @staticmethod
+    def _build_adjustment_request_from_diff(field_diff_samples: dict) -> str:
+        """从差异样本自动生成修正请求文本
+
+        Args:
+            field_diff_samples: {"列名": {"formula": "=...", "count": N, "samples": [...]}}
+
+        Returns:
+            修正请求描述
+        """
+        lines = ["以下列的计算结果与预期不符，请修正："]
+        for col_name, info in field_diff_samples.items():
+            formula = info.get("formula", "")
+            count = info.get("count", 0)
+            samples = info.get("samples", [])
+            if formula:
+                line = f"- **{col_name}**：{count}处差异，当前公式：`{formula}`"
+            else:
+                line = f"- **{col_name}**：{count}处差异（非公式列/直接赋值）"
+            # 附加样本值（如果有）
+            if samples:
+                sample = samples[0]
+                line += f"（实际: {sample.get('actual', '?')}, 预期: {sample.get('expected', '?')}）"
+            lines.append(line)
+        return "\n".join(lines)
 
     def _extract_fill_result_sheets_function(self, code: str) -> str:
         """从完整代码中提取clean_source_data和fill_result_sheets函数
@@ -2707,6 +3134,7 @@ ws.conditional_formatting.add(cell_range, FormulaRule(formula=["D2>20000"], fill
         )
 
         system_prompt = prompts["system"]
+        self.last_prompt = prompts.get("step3", system_prompt)  # 存储实际提示词
         full_response = ""
 
         # 构建初始messages
@@ -2800,32 +3228,29 @@ ws.conditional_formatting.add(cell_range, FormulaRule(formula=["D2>20000"], fill
                 tail_lines = accumulated_code.strip().split('\n')[-15:]
                 tail_snippet = '\n'.join(tail_lines)
 
-                # 提取已定义变量
-                defined_vars = []
-                for code_line in accumulated_code.split('\n'):
-                    stripped_line = code_line.strip()
-                    if re.match(r'^(sn_\w+|[\w_]*name[\w_]*|[\w_]*title[\w_]*)\s*=', stripped_line):
-                        defined_vars.append(stripped_line)
-                vars_info = ""
-                if defined_vars:
-                    vars_info = (
-                        f"\n已定义的变量（必须复用）：\n"
-                        + '\n'.join(f"  {v}" for v in defined_vars) + '\n'
-                    )
+                # 提取已定义变量（增强版：sn_/col_/TXT_/key_变量）
+                vars_info = self._extract_defined_variables_with_context(accumulated_code)
+
+                # 构建已完成列清单
+                completed_cols = [col for col in expected_col_names if col in accumulated_code]
 
                 continuation_msg = (
                     f"代码还没完成，目前覆盖了 {covered}/{total_columns} 列（已完成到第{last_col_num}列）。\n"
                     f"最后完整列: {last_col_info}\n"
-                    f"缺少以下列（共{len(missing)}列）：{', '.join(missing_preview)}"
+                    f"\n## 已完成的列 ({len(completed_cols)}/{total_columns})\n"
+                    f"{', '.join(completed_cols[:30])}{'...' if len(completed_cols) > 30 else ''}\n"
+                    f"\n## 剩余需要生成的列（共{len(missing)}列）\n"
+                    f"{', '.join(missing_preview)}"
                     f"{'...' if len(missing) > 20 else ''}\n"
                     f"{vars_info}\n"
-                    f"当前代码末尾：\n```python\n{tail_snippet}\n```\n\n"
+                    f"## 代码上下文（最后15行）\n```python\n{tail_snippet}\n```\n\n"
                     f"请紧接着继续生成，从第{next_col_num}列 [{missing[0]}] 开始。\n"
                     f"要求：\n"
                     f"1. 绝对不要重复第1~{last_col_num}列的代码，直接从第{next_col_num}列开始\n"
                     f"2. 保持8空格缩进，只输出Python代码块\n"
-                    f"3. 一次性生成全部{len(missing)}个缺失列，不要只生成几列就停止\n"
-                    f"4. 只使用上面列出的已定义变量，不要引用未定义的变量"
+                    f"3. 【格式要求】每列代码必须独立一行，列与列之间用空行分隔，每列前必须有注释行。绝对不要把多列代码写在同一行\n"
+                    f"4. 一次性生成全部{len(missing)}个缺失列，不要只生成几列就停止\n"
+                    f"5. 只使用上面列出的已定义变量，不要引用未定义的变量"
                 )
 
                 # 构建assistant预填充
@@ -2880,6 +3305,7 @@ ws.conditional_formatting.add(cell_range, FormulaRule(formula=["D2>20000"], fill
 
         # 后处理
         if accumulated_code:
+            accumulated_code = self._fix_for_loop_body_indentation(accumulated_code)
             accumulated_code = self._fix_cascading_indentation(accumulated_code)
             accumulated_code = self._fix_fstring_and_brackets(accumulated_code)
             accumulated_code = self.ai_provider.validate_and_fix_code_format(accumulated_code)

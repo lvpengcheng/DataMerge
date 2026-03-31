@@ -307,11 +307,23 @@ class TrainingEngine:
         for field_name, sample in sorted_fields:
             formula = sample.get("formula", "")
             count = sample.get("count", 1)
+            samples = sample.get("samples", [])
 
             if formula:
-                lines.append(f"- **{field_name}** ({count}处差异): `{formula}`")
+                line = f"- **{field_name}** ({count}处差异): `{formula}`"
             else:
-                lines.append(f"- **{field_name}** ({count}处差异): [非公式列/直接赋值]")
+                line = f"- **{field_name}** ({count}处差异): [非公式列/直接赋值]"
+            # 附加样本值帮助AI理解偏差
+            if samples:
+                s = samples[0]
+                line += f"  (实际: {s.get('actual', '?')}, 预期: {s.get('expected', '?')})"
+            lines.append(line)
+
+        # 根因分类（帮助AI快速定位问题方向）
+        categorized = self._categorize_diffs(field_diff_samples)
+        if categorized:
+            lines.append("")
+            lines.append(categorized)
 
         lines.append("")
         lines.append("## 修正要求")
@@ -321,6 +333,65 @@ class TrainingEngine:
         lines.append("3. 条件判断逻辑符合规则要求")
         lines.append("4. 主键类型和数据类型是否一致，不一致vlookup需要转换")
         return "\n".join(lines)
+
+    def _categorize_diffs(self, field_diff_samples: Dict[str, Any]) -> str:
+        """将差异按根因分类，给AI更精准的修正方向
+
+        根据样本值的特征自动推断可能的错误原因。
+
+        Args:
+            field_diff_samples: {"列名": {"formula": ..., "count": ..., "samples": [...]}}
+
+        Returns:
+            分类描述文本，无分类时返回空字符串
+        """
+        categories = {
+            "全列为0/空（VLOOKUP可能sheet名或列号错误）": [],
+            "日期显示为数字（缺DATEVALUE或number_format）": [],
+            "#VALUE!/#REF!错误（公式语法问题）": [],
+            "数值偏差（计算逻辑错误）": [],
+            "整列缺失（列未实现或列号错位）": [],
+        }
+
+        for col, info in field_diff_samples.items():
+            samples = info.get("samples", [])
+            if not samples:
+                continue
+
+            actuals = [s.get("actual", "") for s in samples]
+
+            # 判断特征
+            all_zero = all(
+                (isinstance(a, (int, float)) and a == 0) or str(a).strip() in ("0", "0.0", "")
+                for a in actuals
+            )
+            has_error = any(
+                isinstance(a, str) and a.startswith("#") for a in actuals
+            )
+            has_date_number = any(
+                isinstance(a, (int, float)) and 40000 < a < 50000 for a in actuals
+            )
+
+            if has_error:
+                categories["#VALUE!/#REF!错误（公式语法问题）"].append(col)
+            elif all_zero:
+                categories["全列为0/空（VLOOKUP可能sheet名或列号错误）"].append(col)
+            elif has_date_number:
+                categories["日期显示为数字（缺DATEVALUE或number_format）"].append(col)
+            else:
+                categories["数值偏差（计算逻辑错误）"].append(col)
+
+        # 构建输出
+        result_lines = []
+        for category, cols in categories.items():
+            if cols:
+                result_lines.append(f"### {category}")
+                for col in cols:
+                    result_lines.append(f"- {col}")
+
+        if not result_lines:
+            return ""
+        return "## 差异根因分类\n" + "\n".join(result_lines)
 
     def train(
         self,
@@ -518,6 +589,10 @@ class TrainingEngine:
         best_score = 0.0
         iteration_results = []
 
+        # 从规则内容中提取主键列，用于差异对比
+        from backend.utils.excel_comparator import extract_primary_keys_from_rules
+        simple_comparison_primary_keys = extract_primary_keys_from_rules(rules_content)
+
         for iteration in range(self.max_iterations):
             iteration_num = iteration + 1
             iteration_type = "training" if iteration == 0 else "correction"
@@ -592,7 +667,8 @@ class TrainingEngine:
                 self.training_logger.log_execution_start()
                 execution_result = self._execute_and_validate(
                     code, source_files, expected_file, manual_headers,
-                    tenant_id=tenant_id, iteration_num=iteration_num
+                    tenant_id=tenant_id, iteration_num=iteration_num,
+                    comparison_primary_keys=simple_comparison_primary_keys
                 )
 
                 # 记录执行结果
@@ -763,6 +839,14 @@ class TrainingEngine:
         iteration_results = []
         source_structure_desc = ""  # 用于修正时传递
 
+        # 从规则内容中提取主键列，用于差异对比时精确匹配行
+        from backend.utils.excel_comparator import extract_primary_keys_from_rules
+        comparison_primary_keys = extract_primary_keys_from_rules(rules_content)
+        if comparison_primary_keys:
+            self.training_logger.log_info(f"从规则中提取到对比主键: {comparison_primary_keys}")
+        else:
+            self.training_logger.log_info("规则中未找到明确主键声明，对比时将使用自动检测")
+
         for iteration in range(self.max_iterations):
             iteration_num = iteration + 1
             self.training_logger.start_iteration(iteration_num, "formula")
@@ -788,6 +872,19 @@ class TrainingEngine:
                         last_result = iteration_results[-1]
                         comparison_result = last_result.get("detailed_diff", "") or last_result.get("comparison", "")
 
+                        # 如果上一轮是执行错误（没有comparison信息），将错误信息作为反馈传给AI
+                        if not comparison_result and last_result.get("error"):
+                            error_msg = last_result["error"]
+                            comparison_result = f"""## 上一轮执行错误（代码未能成功运行）
+
+错误信息：
+{error_msg[:2000]}
+
+请根据以上错误信息修正代码。常见问题：
+- "could not convert string to float" → 对文本列（如工号'YN00002'）误用了数值转换，需要在groupby/agg前区分数值列和文本列
+- TypeError: 数据类型不匹配 → 检查是否对混合类型列做了不当操作
+- KeyError: 列名不存在 → 检查列名拼写和大小写"""
+
                     # 确定用于修正的原始代码：优先使用best_code，否则使用上一次迭代的代码
                     original_code_for_correction = best_code
                     if original_code_for_correction is None and iteration_results:
@@ -805,13 +902,44 @@ class TrainingEngine:
                             stream_callback=self.stream_callback
                         )
                     else:
-                        code = formula_generator.generate_correction_code(
-                            original_code=original_code_for_correction,
-                            comparison_result=comparison_result,
-                            rules_content=rules_content,
-                            source_structure=source_structure_desc,
-                            stream_callback=self.stream_callback
+                        # 决策：列级修正 vs 全量修正
+                        field_diff_samples = last_result.get("field_diff_samples", {}) if iteration_results else {}
+                        diff_col_count = len(field_diff_samples)
+                        last_score = last_result.get("score", 0) if iteration_results else 0
+                        has_execution_error = bool(last_result.get("error")) if iteration_results else False
+
+                        use_column_correction = (
+                            diff_col_count > 0
+                            and diff_col_count <= 8
+                            and last_score >= 0.5
+                            and not has_execution_error
                         )
+
+                        if use_column_correction:
+                            self.training_logger.log_info(
+                                f"使用精准列级修正（{diff_col_count}列有差异，匹配率{last_score:.1%}）"
+                            )
+                            code, ai_response = formula_generator.generate_column_level_correction(
+                                full_code=original_code_for_correction,
+                                field_diff_samples=field_diff_samples,
+                                rules_content=rules_content,
+                                source_structure=source_structure_desc,
+                                expected_structure=expected_structure,
+                                stream_callback=self.stream_callback
+                            )
+                            # 列级修正失败时自动降级到全量修正
+                            if code is None:
+                                self.training_logger.log_info("列级修正失败，降级为全量修正")
+                                use_column_correction = False
+
+                        if not use_column_correction:
+                            code = formula_generator.generate_correction_code(
+                                original_code=original_code_for_correction,
+                                comparison_result=comparison_result,
+                                rules_content=rules_content,
+                                source_structure=source_structure_desc,
+                                stream_callback=self.stream_callback
+                            )
 
                 if not code:
                     self.training_logger.log_warning("代码生成失败，跳过此迭代")
@@ -925,7 +1053,8 @@ class TrainingEngine:
                 comparison_result = compare_excel_files(
                     result_file=output_path,
                     expected_file=expected_file,
-                    output_file=comparison_output_file
+                    output_file=comparison_output_file,
+                    primary_keys=comparison_primary_keys
                 )
 
                 # 计算匹配分数（基于单元格匹配数量）
@@ -1088,6 +1217,10 @@ class TrainingEngine:
         best_score = 0.0
         iteration_results = []
 
+        # 从规则内容中提取主键列，用于差异对比
+        from backend.utils.excel_comparator import extract_primary_keys_from_rules
+        modular_comparison_primary_keys = extract_primary_keys_from_rules(rules_content)
+
         for iteration in range(self.max_iterations):
             iteration_num = iteration + 1
             iteration_type = "modular_training" if iteration == 0 else "modular_correction"
@@ -1139,7 +1272,8 @@ class TrainingEngine:
                 self.training_logger.log_execution_start()
                 execution_result = self._execute_and_validate(
                     code, source_files, expected_file, manual_headers,
-                    tenant_id=tenant_id, iteration_num=iteration_num
+                    tenant_id=tenant_id, iteration_num=iteration_num,
+                    comparison_primary_keys=modular_comparison_primary_keys
                 )
 
                 # 记录执行结果
@@ -1276,7 +1410,7 @@ class TrainingEngine:
 {error_description[:3000]}
 
 ## 上次对比结果（前10行差异）
-{comparison_result[:5000]}
+{comparison_result[:70000]}
 
 ## 【修正要求】
 1. 参考下方的"代码骨架"结构，修正上述代码中的错误
@@ -1563,7 +1697,8 @@ class TrainingEngine:
         expected_file: str,
         manual_headers: Optional[Dict[str, Any]] = None,
         tenant_id: str = "default",
-        iteration_num: int = 0
+        iteration_num: int = 0,
+        comparison_primary_keys: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """执行代码并验证结果"""
         result = {
@@ -1659,7 +1794,8 @@ class TrainingEngine:
                     comparison_result = compare_excel_files(
                         result_file=str(output_file),
                         expected_file=expected_file,
-                        output_file=comparison_output_file
+                        output_file=comparison_output_file,
+                        primary_keys=comparison_primary_keys
                     )
 
                     # 保存差异对比Excel到training_logs，然后删除临时文件
