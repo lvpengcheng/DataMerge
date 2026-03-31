@@ -1956,6 +1956,18 @@ def load_source_data(input_folder, manual_headers):
             traceback.print_exc()
 
 
+    if not source_data:
+        # 列出输入目录里的文件，帮助定位问题
+        try:
+            all_files = [f for f in os.listdir(input_folder)
+                         if f.endswith(('.xlsx', '.xls')) and not f.startswith('~')]
+        except Exception:
+            all_files = []
+        raise ValueError(
+            f"load_source_data: 所有源文件解析失败，source_data 为空。"
+            f"输入目录: {input_folder}, 文件列表: {all_files}"
+        )
+
     return source_data
 
 
@@ -2027,6 +2039,11 @@ def _normalize_date_columns(source_data):
 
 
 def write_source_sheets(wb, source_data):
+    if not source_data:
+        raise ValueError(
+            "write_source_sheets: source_data 为空，未加载到任何源数据。"
+            "请检查：1) 输入文件是否存在 2) 文件格式是否正确 3) Aspose许可证是否有效"
+        )
     source_sheets = {}
     header_fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
 
@@ -2099,7 +2116,9 @@ def find_source_sheet(source_sheets, target_columns=None, sheet_name_hint=None):
         sheet_name_hint: sheet名称提示（比如"薪资"、"考勤"等关键词）
 
     Returns:
-        匹配的sheet key，如果找不到返回None
+        匹配的sheet key
+    Raises:
+        KeyError: 找不到匹配的sheet时，抛出包含可用sheet列表的异常
     """
     # 策略1: 如果只有一个sheet，直接返回
     if len(source_sheets) == 1:
@@ -2127,7 +2146,17 @@ def find_source_sheet(source_sheets, target_columns=None, sheet_name_hint=None):
                 return sheet_key
 
     # 策略4: 返回第一个sheet
-    return list(source_sheets.keys())[0] if source_sheets else None
+    if source_sheets:
+        return list(source_sheets.keys())[0]
+
+    # 无可用sheet → 抛出明确异常（避免返回 None 导致下游 KeyError: None）
+    hint_info = f", sheet_name_hint='{sheet_name_hint}'" if sheet_name_hint else ""
+    col_info = f", target_columns={target_columns}" if target_columns else ""
+    available = list(source_sheets.keys()) if source_sheets else []
+    raise KeyError(
+        f"find_source_sheet: 未找到匹配的源数据sheet"
+        f"{col_info}{hint_info}。可用sheets: {available}"
+    )
 
 
 def write_params_sheet(wb, salary_year, salary_month, monthly_standard_hours):

@@ -11,7 +11,6 @@ Aspose.Cells for .NET 全局初始化模块
 
 import os
 import sys
-import time
 import logging
 import threading
 
@@ -23,8 +22,6 @@ _license_applied = False
 _license_obj = None          # 持有 License 对象引用，防止 GC 回收导致许可证失效
 _license_bytes = None        # 许可证文件内容缓存（避免并发读文件冲突）
 _lock = threading.Lock()     # 线程安全锁
-_last_license_time = 0       # 上次成功注册许可证的时间戳
-_LICENSE_COOLDOWN = 30       # 冷却时间（秒），此间隔内不重复 SetLicense
 
 # 路径配置
 _project_root = os.path.dirname(os.path.abspath(__file__))
@@ -105,7 +102,7 @@ def _apply_license(lic_path: str = None):
     首次从文件读取字节缓存到内存，后续使用 MemoryStream 设置，
     避免并发 FileStream 读取导致 "license file is corrupted" 错误。
     """
-    global _license_applied, _license_obj, _license_bytes, _last_license_time
+    global _license_applied, _license_obj, _license_bytes
 
     path = lic_path or _lic_path
 
@@ -132,8 +129,6 @@ def _apply_license(lic_path: str = None):
 
         _license_obj = lic
         _license_applied = True
-        _last_license_time = time.time()
-        logger.info(f"[Aspose] 许可证已生效（MemoryStream 方式）")
         return True
     except Exception as e:
         logger.error(f"[Aspose] 许可证设置失败: {e}")
@@ -154,21 +149,15 @@ def is_licensed() -> bool:
 def ensure_license():
     """确保 Aspose 许可证已注册
 
-    冷却机制：30秒内不重复 SetLicense，避免高频调用。
-    加锁：防止多线程同时 SetLicense 冲突。
+    每次调用都通过 MemoryStream 重新 SetLicense。
+    MemoryStream 无文件 IO，不会有并发 "corrupted" 问题，无需冷却。
+    加锁防止多线程同时调用 SetLicense。
     """
     if not _initialized:
         init_aspose()
         return
 
-    # 冷却期内跳过（无锁快速路径）
-    if _license_applied and (time.time() - _last_license_time) < _LICENSE_COOLDOWN:
-        return
-
     with _lock:
-        # 双重检查：拿到锁后再确认
-        if _license_applied and (time.time() - _last_license_time) < _LICENSE_COOLDOWN:
-            return
         _apply_license()
 
 

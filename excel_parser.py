@@ -46,7 +46,7 @@ def set_license(lic_path: str = None) -> bool:
 def _licensed_workbook(*args, **kwargs):
     """创建 Workbook 前自动确保许可证有效，防止 .NET GC 回收许可证"""
     aspose_init.ensure_license()
-    return _licensed_workbook(*args, **kwargs)
+    return _AsposeWorkbook(*args, **kwargs)
 
 
 # ==================== Aspose.Cells 适配器层 ====================
