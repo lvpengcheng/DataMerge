@@ -108,7 +108,10 @@
       "Bash(node -e \"const fs=require\\(''fs''\\); const code=fs.readFileSync\\(''frontend/static/js/admin.js'',''utf8''\\); try{new Function\\(code\\);console.log\\(''OK''\\)}catch\\(e\\){console.error\\(e.message\\)}\")",
       "Bash(sort -t/ -k9 -n)",
       "Read(//c/Users/Administrator/Desktop/**)",
-      "Read(//e/FSG/星巴克个税预估_data/星巴克个税预估_data/rules/**)"
+      "Read(//e/FSG/星巴克个税预估_data/星巴克个税预估_data/rules/**)",
+      "Bash(xxd \"e:/project/DataMerge20260224/DataMerge/libs/Aspose.Total.NET.lic\")",
+      "Bash(xxd)",
+      "Bash(powershell -Command \"\\(Get-Item ''libs/Aspose.Cells.dll''\\).VersionInfo.FileVersion\")"
     ],
     "additionalDirectories": [
       "E:\\project\\DataMerge20260224\\DataMerge\\backend\\test_data\\data_cleaning_test",

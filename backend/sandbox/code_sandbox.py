@@ -18,76 +18,88 @@ import openpyxl
 class CodeSandbox:
     """代码沙箱执行环境"""
 
+    # 类级别缓存，大幅提升沙箱初始化速度
+    _cached_safe_modules = None
+    _modules_lock = threading.Lock()
+
     def __init__(self, timeout: int = 360, max_memory_mb: int = 1024):
         self.timeout = timeout
         self.max_memory_mb = max_memory_mb
         import logging
         self.logger = logging.getLogger(__name__)
-        self.safe_modules = {
-            'pandas': pd,
-            'openpyxl': openpyxl,
-            'os': os,
-            'sys': sys,
-            'pathlib': Path,
-            'json': __import__('json'),
-            're': __import__('re'),
-            'datetime': __import__('datetime'),
-            'math': __import__('math'),
-            'typing': __import__('typing'),
-            'collections': __import__('collections'),
-            'itertools': __import__('itertools'),
-            'functools': __import__('functools'),
-            'statistics': __import__('statistics'),
-            'decimal': __import__('decimal'),
-            'fractions': __import__('fractions'),
-            'random': __import__('random'),
-            'string': __import__('string'),
-            'hashlib': __import__('hashlib'),
-            # 健壮性工具函数
-            'robust_utils': self._import_robust_utils(),
-            # 沙箱辅助函数（公共方法）
-            'sandbox_helpers': self._import_sandbox_helpers(),
-            'base64': __import__('base64'),
-            'csv': __import__('csv'),
-            'io': io,
-            'tempfile': tempfile,
-            # 'shutil': __import__('shutil'),  # 移除shutil，因为它包含rmtree等危险操作
-            'copy': __import__('copy'),
-            'pprint': __import__('pprint'),
-            'textwrap': __import__('textwrap'),
-            'unicodedata': __import__('unicodedata'),
-            'numbers': __import__('numbers'),
-            'operator': __import__('operator'),
-            'bisect': __import__('bisect'),
-            'heapq': __import__('heapq'),
-            'array': __import__('array'),
-            'struct': __import__('struct'),
-            'pickle': __import__('pickle'),
-            'shelve': __import__('shelve'),
-            'dbm': __import__('dbm'),
-            'sqlite3': __import__('sqlite3'),
-            'zlib': __import__('zlib'),
-            'gzip': __import__('gzip'),
-            'bz2': __import__('bz2'),
-            'lzma': __import__('lzma'),
-            'zipfile': __import__('zipfile'),
-            'tarfile': __import__('tarfile'),
-        }
 
-        # 尝试导入可选模块
-        optional_modules = [
-            ('numpy', 'numpy'),
-            ('xlrd', 'xlrd'),
-            ('xlwt', 'xlwt'),
-            ('xlsxwriter', 'xlsxwriter'),
-        ]
+        # 只有在第一次使用时初始化缓存
+        if CodeSandbox._cached_safe_modules is None:
+            with CodeSandbox._modules_lock:
+                if CodeSandbox._cached_safe_modules is None:
+                    self.logger.info("正在初始化沙箱核心模块缓存 (pandas, openpyxl)...")
+                    CodeSandbox._cached_safe_modules = {
+                        'pandas': pd,
+                        'openpyxl': openpyxl,
+                        'os': os,
+                        'sys': sys,
+                        'pathlib': Path,
+                        'json': __import__('json'),
+                        're': __import__('re'),
+                        'datetime': __import__('datetime'),
+                        'math': __import__('math'),
+                        'typing': __import__('typing'),
+                        'collections': __import__('collections'),
+                        'itertools': __import__('itertools'),
+                        'functools': __import__('functools'),
+                        'statistics': __import__('statistics'),
+                        'decimal': __import__('decimal'),
+                        'fractions': __import__('fractions'),
+                        'random': __import__('random'),
+                        'string': __import__('string'),
+                        'hashlib': __import__('hashlib'),
+                        # 健壮性工具函数
+                        'robust_utils': self._import_robust_utils(),
+                        # 沙箱辅助函数（公共方法）
+                        'sandbox_helpers': self._import_sandbox_helpers(),
+                        'base64': __import__('base64'),
+                        'csv': __import__('csv'),
+                        'io': io,
+                        'tempfile': tempfile,
+                        # 'shutil': __import__('shutil'),  # 移除shutil，因为它包含rmtree等危险操作
+                        'copy': __import__('copy'),
+                        'pprint': __import__('pprint'),
+                        'textwrap': __import__('textwrap'),
+                        'unicodedata': __import__('unicodedata'),
+                        'numbers': __import__('numbers'),
+                        'operator': __import__('operator'),
+                        'bisect': __import__('bisect'),
+                        'heapq': __import__('heapq'),
+                        'array': __import__('array'),
+                        'struct': __import__('struct'),
+                        'pickle': __import__('pickle'),
+                        'shelve': __import__('shelve'),
+                        'dbm': __import__('dbm'),
+                        'sqlite3': __import__('sqlite3'),
+                        'zlib': __import__('zlib'),
+                        'gzip': __import__('gzip'),
+                        'bz2': __import__('bz2'),
+                        'lzma': __import__('lzma'),
+                        'zipfile': __import__('zipfile'),
+                        'tarfile': __import__('tarfile'),
+                    }
 
-        for module_name, import_name in optional_modules:
-            try:
-                self.safe_modules[module_name] = __import__(import_name)
-            except ImportError:
-                # 模块未安装，跳过
-                pass
+                    # 尝试导入可选模块
+                    optional_modules = [
+                        ('numpy', 'numpy'),
+                        ('xlrd', 'xlrd'),
+                        ('xlwt', 'xlwt'),
+                        ('xlsxwriter', 'xlsxwriter'),
+                    ]
+
+                    for module_name, import_name in optional_modules:
+                        try:
+                            CodeSandbox._cached_safe_modules[module_name] = __import__(import_name)
+                        except ImportError:
+                            pass
+
+        # 浅拷贝字典，确保各实例环境隔离且快速
+        self.safe_modules = CodeSandbox._cached_safe_modules.copy()
 
         # 危险模块和函数
         self.dangerous_modules = {

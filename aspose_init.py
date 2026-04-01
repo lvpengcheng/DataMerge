@@ -99,31 +99,31 @@ def init_aspose():
 def _apply_license(lic_path: str = None):
     """注册 Aspose 许可证
 
-    首次从文件读取字节缓存到内存，后续使用 MemoryStream 设置，
-    避免并发 FileStream 读取导致 "license file is corrupted" 错误。
+    首次用 .NET 原生 File.ReadAllBytes 读取字节并缓存，避免 Python→.NET
+    字节转换导致 "license file is corrupted"。后续使用缓存的 .NET 字节数组
+    通过 MemoryStream 设置，线程安全且无文件 IO。
     """
     global _license_applied, _license_obj, _license_bytes
 
     path = lic_path or _lic_path
 
     try:
-        # 首次：读取许可证文件到内存缓存
+        from Aspose.Cells import License
+        from System.IO import MemoryStream
+
+        # 首次：用 .NET 原生读取许可证文件到 .NET byte[]（避免 Python bytes 转换损坏）
         if _license_bytes is None:
             if not os.path.exists(path):
                 logger.warning(f"[Aspose] 许可证文件不存在: {path}")
                 return False
-            with open(path, 'rb') as f:
-                _license_bytes = f.read()
-            logger.info(f"[Aspose] 许可证文件已缓存到内存 ({len(_license_bytes)} bytes)")
+            from System.IO import File as NetFile
+            _license_bytes = NetFile.ReadAllBytes(path)
+            logger.info(f"[Aspose] 许可证文件已缓存到 .NET 内存 ({_license_bytes.Length} bytes)")
 
         # 用 MemoryStream 设置许可证（线程安全，无文件 IO）
-        from Aspose.Cells import License
-        from System.IO import MemoryStream
-        import System
-
         lic = License()
-        byte_array = System.Array[System.Byte](list(_license_bytes))
-        ms = MemoryStream(byte_array)
+        ms = MemoryStream(_license_bytes)
+        ms.Position = 0
         lic.SetLicense(ms)
         ms.Close()
 
@@ -132,7 +132,19 @@ def _apply_license(lic_path: str = None):
         return True
     except Exception as e:
         logger.error(f"[Aspose] 许可证设置失败: {e}")
-        return False
+        # 回退：直接用文件路径（仅初始化时，无并发风险）
+        try:
+            logger.info("[Aspose] 尝试回退方案：直接用文件路径设置许可证...")
+            from Aspose.Cells import License
+            lic = License()
+            lic.SetLicense(lic_path or _lic_path)
+            _license_obj = lic
+            _license_applied = True
+            logger.info("[Aspose] 回退方案成功")
+            return True
+        except Exception as e2:
+            logger.error(f"[Aspose] 回退方案也失败: {e2}")
+            return False
 
 
 def is_initialized() -> bool:
