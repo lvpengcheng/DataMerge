@@ -93,6 +93,96 @@ def _create_formula_generator(ai_provider_name: str, stream_callback=None):
     return generator, provider
 
 
+def _build_source_structure_from_generator(generator) -> Dict[str, Any]:
+    """从 FormulaCodeGenerator 的已加载数据构建 source_structure。
+
+    返回格式与 TrainingEngine._analyze_source_structure 一致：
+    {"files": {"文件名.xlsx": {"sheets": {"Sheet1": {"headers": {"列名": "A", ...}}}}}}
+    这是 FastHeaderMatcher 计算时进行表头匹配的依据。
+    """
+    structure = {"files": {}, "total_sheets": 0, "total_regions": 0}
+
+    source_sheets = getattr(getattr(generator, 'formula_builder', None), 'source_sheets', None)
+    if not source_sheets:
+        return structure
+
+    for sheet_key, sheet_info in source_sheets.items():
+        filename = sheet_info.get("source_file", "")
+        sheet_name = sheet_info.get("source_sheet", "")
+        columns = sheet_info.get("columns", [])
+
+        if not filename or not columns:
+            continue
+
+        if filename not in structure["files"]:
+            structure["files"][filename] = {
+                "file_name": filename,
+                "sheets": {},
+                "total_regions": 0,
+            }
+
+        # 构建 headers: {列名: 列字母}
+        headers = {}
+        for i, col in enumerate(columns):
+            if i < 26:
+                letter = chr(65 + i)
+            else:
+                letter = chr(64 + i // 26) + chr(65 + i % 26)
+            headers[col] = letter
+
+        structure["files"][filename]["sheets"][sheet_name] = {
+            "sheet_name": sheet_name,
+            "regions": 1,
+            "headers": headers,
+            "data_sample": [],
+        }
+        structure["files"][filename]["total_regions"] += 1
+        structure["total_sheets"] += 1
+        structure["total_regions"] += 1
+
+    return structure
+
+
+def _build_source_structure_from_dir(source_dir: str, manual_headers: Dict = None) -> Dict[str, Any]:
+    """从源文件目录直接构建 source_structure（用于直接导入等无 generator 的场景）。"""
+    from excel_parser import IntelligentExcelParser
+
+    structure = {"files": {}, "total_sheets": 0, "total_regions": 0}
+    parser = IntelligentExcelParser()
+
+    for filename in sorted(os.listdir(source_dir)):
+        if not filename.endswith(('.xlsx', '.xls')) or filename.startswith('~'):
+            continue
+        file_path = os.path.join(source_dir, filename)
+        try:
+            results = parser.parse_excel_file(
+                file_path, manual_headers=manual_headers,
+                active_sheet_only=True, best_region_only=True,
+                max_data_rows=3, headers_only=True,
+            )
+            file_struct = {"file_name": filename, "sheets": {}, "total_regions": 0}
+            for sheet_data in results:
+                headers = {}
+                for region in sheet_data.regions:
+                    headers.update(region.head_data)
+                if headers:
+                    file_struct["sheets"][sheet_data.sheet_name] = {
+                        "sheet_name": sheet_data.sheet_name,
+                        "regions": len(sheet_data.regions),
+                        "headers": headers,
+                        "data_sample": [],
+                    }
+                    file_struct["total_regions"] += len(sheet_data.regions)
+            structure["files"][filename] = file_struct
+            structure["total_sheets"] += len(results)
+            structure["total_regions"] += file_struct["total_regions"]
+        except Exception as e:
+            logger.warning(f"构建 source_structure 解析 {filename} 失败: {e}")
+            structure["files"][filename] = {"error": str(e), "file_name": filename}
+
+    return structure
+
+
 def _analyze_expected_structure(expected_file: str) -> Dict[str, Any]:
     """分析预期文件结构（与 TrainingEngine._analyze_expected_structure 一致）"""
     from excel_parser import IntelligentExcelParser
@@ -887,6 +977,14 @@ def main(source_dir, output_dir, **kwargs):
                 except Exception:
                     src_files = []
 
+                # 构建真正的 source_structure（供计算时 FastHeaderMatcher 使用）
+                try:
+                    ts.source_structure = _build_source_structure_from_dir(
+                        src_dir, config.get("manual_headers"))
+                    db.commit()
+                except Exception as _ss_err:
+                    logger.warning(f"直接导入构建 source_structure 失败: {_ss_err}")
+
                 _add_message(db, sid, "assistant",
                              f"直接导入模式：源文件直接作为输出（{len(src_files)} 个文件）", "code",
                              {"has_code": True, "direct_import": True})
@@ -932,6 +1030,9 @@ def main(source_dir, output_dir, **kwargs):
                         accuracy=1.0,
                         created_by=current_user.id if current_user else None,
                         manual_headers=config.get("manual_headers"),
+                        source_structure=ts.source_structure,
+                        rules_content=config.get("rules_content", ""),
+                        expected_structure=config.get("expected_structure", {}),
                     )
                 except Exception as e:
                     logger.warning(f"直接导入 DB save_script 失败: {e}")
@@ -1028,8 +1129,10 @@ def main(source_dir, output_dir, **kwargs):
                 source_structure_desc = generator.formula_builder.get_source_structure_for_prompt()
                 config["source_structure_desc"] = source_structure_desc[:70000]
                 ts.config = config
-                # 写入正式列
-                ts.source_structure = {"desc": source_structure_desc[:70000]}
+
+                # 构建真正的 source_structure（供计算时 FastHeaderMatcher 使用）
+                real_source_structure = _build_source_structure_from_generator(generator)
+                ts.source_structure = real_source_structure
                 db.commit()
             except Exception as e:
                 logger.warning(f"获取源数据结构描述失败: {e}")
@@ -1644,6 +1747,10 @@ def set_as_best(
         source_session_id=session_id,
         accuracy=iteration.accuracy,
         created_by=current_user.id,
+        manual_headers=config.get("manual_headers"),
+        source_structure=session.source_structure,
+        rules_content=config.get("rules_content", ""),
+        expected_structure=config.get("expected_structure", {}),
     )
 
     # 同步保存到磁盘（使老版智算路径也能读到）

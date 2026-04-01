@@ -1476,14 +1476,8 @@ async def calculate_data(
         excel_files = glob.glob(os.path.join(output_folder, "*.xlsx")) + glob.glob(os.path.join(output_folder, "*.xls"))
 
         if excel_files:
-            # 使用Excel COM计算公式（公式模式下输出文件包含未计算的公式）
-            from backend.utils.excel_comparator import calculate_excel_formulas
-            for ef in excel_files:
-                try:
-                    calculate_excel_formulas(ef)
-                    logger.info(f"公式计算完成: {os.path.basename(ef)}")
-                except Exception as calc_err:
-                    logger.warning(f"公式计算失败（不影响输出）: {calc_err}")
+            # 【性能优化】跳过公式计算 — 智算时 Excel 由用户打开，公式会自动重算
+            logger.info(f"跳过公式计算（用户打开Excel时自动重算）")
 
             # 取第一个Excel文件作为结果
             output_file = excel_files[0]
@@ -2565,14 +2559,8 @@ async def calculate_data_split(
         excel_files = glob.glob(os.path.join(output_folder, "*.xlsx")) + glob.glob(os.path.join(output_folder, "*.xls"))
 
         if excel_files:
-            # 使用Excel COM计算公式（公式模式下输出文件包含未计算的公式）
-            from backend.utils.excel_comparator import calculate_excel_formulas
-            for ef in excel_files:
-                try:
-                    calculate_excel_formulas(ef)
-                    logger.info(f"公式计算完成: {os.path.basename(ef)}")
-                except Exception as calc_err:
-                    logger.warning(f"公式计算失败（不影响输出）: {calc_err}")
+            # 【性能优化】跳过公式计算 — 智算时 Excel 由用户打开，公式会自动重算
+            logger.info(f"跳过公式计算（用户打开Excel时自动重算）")
 
             # 取第一个Excel文件作为结果
             output_file = excel_files[0]
@@ -3138,12 +3126,8 @@ async def _execute_email_calculation(
 
         result_file = output_files[0]
 
-        # 尝试COM公式计算
-        try:
-            from ..utils.excel_comparator import calculate_excel_formulas
-            calculate_excel_formulas(str(result_file))
-        except Exception as calc_err:
-            logger.warning(f"公式计算失败（非致命）: {calc_err}")
+        # 【性能优化】跳过公式计算 — 智算时 Excel 由用户打开，公式会自动重算
+        logger.info(f"跳过公式计算（用户打开Excel时自动重算）")
 
         batch_id = f"{salary_year}{salary_month:02d}"
         return {
@@ -4053,10 +4037,14 @@ async def compute_with_script_stream(
                                 }
                                 await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
 
-                                match_success, match_error, smart_mapping = fast_matcher.match_and_prepare(
-                                    source_structure=source_structure,
-                                    input_files=input_files,
-                                    manual_headers=manual_headers
+                                _loop = asyncio.get_event_loop()
+                                match_success, match_error, smart_mapping = await _loop.run_in_executor(
+                                    None,
+                                    lambda: fast_matcher.match_and_prepare(
+                                        source_structure=source_structure,
+                                        input_files=input_files,
+                                        manual_headers=manual_headers
+                                    )
                                 )
 
                                 if match_success and smart_mapping and smart_mapping.get("file_mapping"):
@@ -4068,10 +4056,16 @@ async def compute_with_script_stream(
                                         expected_file = mapping_info.get("expected_file")
 
                                         if needs_rewrite:
-                                            old_path = os.path.join(str(source_dir), input_file_name)
-                                            if os.path.exists(old_path):
-                                                os.remove(old_path)
-                                            FastHeaderMatcher.rewrite_excel(mapping_info, str(source_dir))
+                                            await _loop.run_in_executor(
+                                                None,
+                                                FastHeaderMatcher.rewrite_excel,
+                                                mapping_info, str(source_dir)
+                                            )
+                                            # rewrite完成后，如果输入文件名和期望文件名不同，删除原文件
+                                            if input_file_name != expected_file:
+                                                old_path = os.path.join(str(source_dir), input_file_name)
+                                                if os.path.exists(old_path):
+                                                    os.remove(old_path)
                                             logger.info(f"[compute/stream] 生成映射文件: {input_file_name} → {expected_file}")
                                             log_msg = {
                                                 "type": "log",
@@ -4324,24 +4318,15 @@ async def compute_with_script_stream(
                     }
                     await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
 
-                    # 【关键修复】计算公式（公式模式下输出文件包含未计算的公式）
-                    # 训练时 compare_excel_files 会自动计算公式，但计算端之前缺失此步骤
-                    try:
-                        from backend.utils.excel_comparator import calculate_excel_formulas
-                        for ef in output_files:
-                            calc_ok = calculate_excel_formulas(str(ef))
-                            if calc_ok:
-                                log_calc = {
-                                    "type": "log",
-                                    "timestamp": datetime.now().strftime("%H:%M:%S"),
-                                    "level": "info",
-                                    "message": f"公式计算完成: {ef.name}"
-                                }
-                                await logs_queue.put(json.dumps(log_calc, ensure_ascii=False))
-                            else:
-                                logger.warning(f"[compute/stream] 公式计算未成功: {ef.name}")
-                    except Exception as calc_err:
-                        logger.warning(f"[compute/stream] 公式计算失败（不影响输出）: {calc_err}")
+                    # 【性能优化】跳过公式计算 — 智算时 Excel 由用户打开，公式会自动重算
+                    # 训练时仍需计算（compare_excel_files 负责），但计算端无需此步骤
+                    logger.info(f"[compute/stream] 跳过公式计算（用户打开Excel时自动重算）")
+                    await logs_queue.put(json.dumps({
+                        "type": "log",
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "level": "info",
+                        "message": "跳过公式计算（Excel打开时自动重算）"
+                    }, ensure_ascii=False))
 
                     # 保存到租户目录
                     tenant_dir = storage_manager.get_tenant_dir(tenant_id)
@@ -4420,9 +4405,14 @@ async def compute_with_script_stream(
             compute_task = asyncio.create_task(run_compute())
 
             try:
-                # 流式输出日志
+                # 流式输出日志（带心跳防超时）
                 while True:
-                    log_message = await logs_queue.get()
+                    try:
+                        log_message = await asyncio.wait_for(logs_queue.get(), timeout=15)
+                    except asyncio.TimeoutError:
+                        # 15秒无新日志，发送心跳包保持连接
+                        yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
+                        continue
                     if log_message is None:
                         break  # 结束标记
                     # 发送日志消息
@@ -4671,14 +4661,8 @@ async def compute_with_script(
 
             output_file = output_files[0]
 
-            # 【关键修复】计算公式（公式模式下输出文件包含未计算的公式）
-            try:
-                from backend.utils.excel_comparator import calculate_excel_formulas
-                for ef in output_files:
-                    calculate_excel_formulas(str(ef))
-                    logger.info(f"[compute] 公式计算完成: {ef.name}")
-            except Exception as calc_err:
-                logger.warning(f"[compute] 公式计算失败（不影响输出）: {calc_err}")
+            # 【性能优化】跳过公式计算 — 智算时 Excel 由用户打开，公式会自动重算
+            logger.info(f"[compute] 跳过公式计算（用户打开Excel时自动重算）")
 
             # 保存到租户目录
             tenant_dir = storage_manager.get_tenant_dir(tenant_id)

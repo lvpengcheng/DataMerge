@@ -2,9 +2,9 @@
 快速表头匹配器 - 性能优化版
 
 优化策略：
-1. 一次完整解析同时获取表头+数据（避免 headers_only + full 两次解析）
+1. headers_only 模式快速解析表头（避免全量解析50MB大文件）
 2. 多文件并行解析（ThreadPoolExecutor）
-3. 缓存完整解析结果供后续注入脚本执行环境
+3. 需要重写的文件由 rewrite_excel() 单独做全量解析
 """
 
 import os
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class FastHeaderMatcher:
-    """快速表头匹配器 - 性能优化版（一次解析+并行+缓存注入）"""
+    """快速表头匹配器 - 性能优化版（headers_only + 并行 + 按需全量解析）"""
 
     def __init__(self, similarity_threshold: float = None):
         if similarity_threshold is None:
@@ -44,13 +44,13 @@ class FastHeaderMatcher:
         input_files: List[str],
         manual_headers: Optional[Dict[str, Any]] = None
     ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
-        """主入口：一次解析 + 并行 + 缓存
+        """主入口：表头匹配（headers_only + 并行）
 
-        优化后流程：
+        流程：
         1. 从source_structure提取训练基准
-        2. 一次性完整解析所有上传文件（并行），同时提取表头
+        2. headers_only解析所有上传文件（并行），提取表头
         3. 对比表头建立映射
-        4. 直接从缓存取已解析数据（不再重复读取）
+        注：需要重写的文件由 rewrite_excel() 单独做全量解析
         """
         try:
             # 防御性处理：source_structure 可能是 JSON 字符串（从DB或文件读取时未反序列化）
@@ -67,13 +67,14 @@ class FastHeaderMatcher:
             logger.info("[匹配] ===== 步骤1: 提取训练基准 =====")
             train_sheets = self._build_training_sheets(source_structure)
             if not train_sheets:
-                return False, "训练时的source_structure为空或格式异常", None
-            for ts in train_sheets:
-                logger.info(f"[匹配] 训练基准: {ts['file_name']}/{ts['sheet_name']} - {len(ts['headers'])}列")
+                logger.warning("[匹配] 训练时的source_structure为空或格式异常，将尝试基于文件名兜底匹配")
+            else:
+                for ts in train_sheets:
+                    logger.info(f"[匹配] 训练基准: {ts['file_name']}/{ts['sheet_name']} - {len(ts['headers'])}列")
 
-            # 步骤2: 【优化】一次性完整解析所有文件（并行），同时提取表头
-            logger.info("[匹配] ===== 步骤2: 完整解析上传文件（并行） =====")
-            input_sheets, full_parsed_cache = self._parse_all_files_with_headers(
+            # 步骤2: 【优化】解析所有文件表头（headers_only，并行）
+            logger.info("[匹配] ===== 步骤2: 解析上传文件表头（并行） =====")
+            input_sheets = self._parse_all_files_with_headers(
                 input_files, manual_headers
             )
             if not input_sheets:
@@ -90,19 +91,6 @@ class FastHeaderMatcher:
                 return False, match_result["error"], None
 
             logger.info("[匹配] ===== 匹配成功 =====")
-
-            # 步骤4: 【优化】直接从缓存取已解析数据，不再重复读取
-            logger.info("[匹配] ===== 步骤4: 关联缓存数据 =====")
-            file_mapping = match_result["mapping"]["file_mapping"]
-            for input_file, mapping_info in file_mapping.items():
-                # 所有文件都从缓存获取完整解析结果（供后续注入脚本环境）
-                mapping_info["parsed_data"] = full_parsed_cache.get(
-                    mapping_info["file_path"], []
-                )
-                if mapping_info.get("needs_rewrite"):
-                    logger.info(f"[匹配] {input_file} 需要映射，使用缓存数据")
-                else:
-                    logger.info(f"[匹配] {input_file} 完全一致，缓存数据备用")
 
             return True, None, match_result["mapping"]
 
@@ -133,22 +121,19 @@ class FastHeaderMatcher:
 
         return result
 
-    # ==================== 步骤2: 一次性完整解析所有文件（并行） ====================
+    # ==================== 步骤2: 解析所有文件表头（并行） ====================
 
     def _parse_all_files_with_headers(
         self, file_paths: List[str], manual_headers: Optional[Dict[str, Any]] = None
-    ) -> Tuple[List[Dict[str, Any]], Dict[str, List[Any]]]:
-        """一次性完整解析所有文件（并行），同时提取表头信息
+    ) -> List[Dict[str, Any]]:
+        """解析所有文件的表头（headers_only=True，并行）
 
         Returns:
-            (header_info_list, full_parsed_cache)
-            - header_info_list: 表头信息列表（用于匹配）
-            - full_parsed_cache: {file_path: [SheetData, ...]} 完整解析缓存
+            header_info_list: 表头信息列表（用于匹配）
         """
         from excel_parser import IntelligentExcelParser
 
         header_info_list = []
-        full_parsed_cache = {}
 
         def _parse_one_file(file_path):
             """单文件解析（线程安全：每线程独立parser实例）"""
@@ -158,9 +143,12 @@ class FastHeaderMatcher:
                 file_manual_headers = manual_headers.get(file_name)
 
             parser = IntelligentExcelParser()
+            # 【性能优化】匹配表头阶段开启 headers_only=True，避免全量解析50MB大文件
+            # 这能将匹配过程从分钟级提速至秒级
             sheet_list = parser.parse_excel_file(
                 file_path, manual_headers=file_manual_headers,
-                active_sheet_only=True, best_region_only=True
+                active_sheet_only=True, best_region_only=True,
+                headers_only=True
             )
             return file_path, file_name, sheet_list
 
@@ -182,8 +170,6 @@ class FastHeaderMatcher:
 
         # 整理结果
         for file_path, file_name, sheet_list in results:
-            full_parsed_cache[file_path] = sheet_list
-
             for sheet_data in sheet_list:
                 all_headers = {}
                 for region in sheet_data.regions:
@@ -200,7 +186,7 @@ class FastHeaderMatcher:
                     })
                     logger.info(f"[匹配] 解析完成: {file_name}/{sheet_data.sheet_name} - {len(all_headers)}列")
 
-        return header_info_list, full_parsed_cache
+        return header_info_list
 
     # ==================== 步骤3: 对比表头 ====================
 
@@ -213,6 +199,22 @@ class FastHeaderMatcher:
         used_input_indices = set()
         match_results = []
         errors = []
+
+        # 如果没有训练基准，直接基于文件名映射
+        if not train_sheets:
+            logger.info("[匹配] 无训练基准，直接基于文件名进行1:1映射")
+            file_mapping = {}
+            for i, input_sheet in enumerate(input_sheets):
+                f_name = input_sheet["file_name"]
+                if f_name not in file_mapping:
+                    file_mapping[f_name] = {
+                        "expected_file": f_name,
+                        "sheet_mapping": {},
+                        "header_mapping": {},
+                        "file_path": input_sheet["file_path"]
+                    }
+                file_mapping[f_name]["sheet_mapping"][input_sheet["sheet_name"]] = input_sheet["sheet_name"]
+            return {"success": True, "mapping": {"file_mapping": file_mapping}}
 
         for train_idx, train_sheet in enumerate(train_sheets):
             train_file = train_sheet["file_name"]
@@ -234,6 +236,10 @@ class FastHeaderMatcher:
                 col_mapping, score = self._match_headers(
                     list(input_headers.keys()), list(train_headers.keys())
                 )
+
+                # 如果文件名完全匹配且分数过得去，加权
+                if input_sheet['file_name'] == train_file:
+                    score += 0.1
 
                 logger.info(f"[匹配]   vs {input_sheet['file_name']}/{input_sheet['sheet_name']}: 得分={score:.2f}")
 
@@ -353,7 +359,6 @@ class FastHeaderMatcher:
                     "sheet_mapping": {},
                     "header_mapping": {},
                     "needs_rewrite": False,
-                    "parsed_data": [],  # 稍后填充
                     "file_path": mr["input_file_path"]
                 }
 
@@ -416,17 +421,33 @@ class FastHeaderMatcher:
 
     @staticmethod
     def rewrite_excel(mapping_info: Dict[str, Any], output_dir: str) -> str:
-        """用内存数据按映射关系生成新Excel文件（write_only优化版）"""
+        """按映射关系生成新Excel文件
+
+        方案B：匹配阶段只解析表头(headers_only=True)，
+        重写阶段对需要映射的文件单独做一次全量解析再写出。
+        """
         import openpyxl
+        from excel_parser import IntelligentExcelParser
 
         expected_file = mapping_info["expected_file"]
         sheet_mapping = mapping_info.get("sheet_mapping", {})
         header_mapping = mapping_info.get("header_mapping", {})
-        parsed_data = mapping_info.get("parsed_data", [])
+        file_path = mapping_info.get("file_path", "")
 
         output_path = os.path.join(output_dir, expected_file)
 
-        # 【性能优化】使用 write_only 模式，内存更低、写入更快
+        # 对需要重写的文件做一次全量解析（带数据）
+        logger.info(f"[匹配] 全量解析文件用于重写: {os.path.basename(file_path)}")
+        parser = IntelligentExcelParser()
+        parsed_data = parser.parse_excel_file(
+            file_path, active_sheet_only=True, best_region_only=True
+        )
+
+        if not parsed_data:
+            logger.error(f"[匹配] 全量解析失败，无法生成映射文件: {file_path}")
+            return output_path
+
+        # 使用 write_only 模式，内存更低、写入更快
         wb = openpyxl.Workbook(write_only=True)
 
         for sheet_data in parsed_data:
@@ -448,5 +469,5 @@ class FastHeaderMatcher:
 
         wb.save(output_path)
         wb.close()
-        logger.info(f"[匹配] 生成映射文件(write_only): {output_path}")
+        logger.info(f"[匹配] 生成映射文件(write_only): {output_path} ({len(parsed_data)}个sheet)")
         return output_path

@@ -1300,19 +1300,25 @@ class IntelligentExcelParser:
 
         try:
             # 使用 Aspose.Cells for .NET 加载
+            # 【性能优化】配置加载选项，针对大文件开启内存优化模式
+            from Aspose.Cells import MemorySetting as _MemorySetting
+            load_opts = _AsposeLoadOptions()
+            load_opts.MemorySetting = _MemorySetting.MemoryPreference
+
             if password:
                 # 尝试用密码打开；如果文件已解密则 Aspose 会抛 "Invalid password"，此时回退到无密码打开
                 try:
-                    load_opts = _AsposeLoadOptions()
                     load_opts.Password = password
                     aspose_wb = _licensed_workbook(str(file_path), load_opts)
                 except Exception as _pwd_err:
                     if 'Invalid password' in str(_pwd_err):
-                        aspose_wb = _licensed_workbook(str(file_path))
+                        # 重置选项回退打开
+                        load_opts.Password = None
+                        aspose_wb = _licensed_workbook(str(file_path), load_opts)
                     else:
                         raise
             else:
-                aspose_wb = _licensed_workbook(str(file_path))
+                aspose_wb = _licensed_workbook(str(file_path), load_opts)
 
             # 提取当前文件的 manual_headers 配置
             file_manual_headers = self._extract_file_manual_headers(file_path, manual_headers)
