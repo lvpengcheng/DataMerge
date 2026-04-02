@@ -126,7 +126,8 @@ class StorageManager:
             "source_structure": training_result.get("source_structure", {}),
             "expected_structure": training_result.get("expected_structure", {}),
             "rules_content": training_result.get("rules_content", ""),
-            "validation_rules": training_result.get("validation_rules", {})
+            "validation_rules": training_result.get("validation_rules", {}),
+            "ai_provider": training_result.get("ai_provider"),
         }
 
         info_file = scripts_dir / f"{script_id}_info.json"

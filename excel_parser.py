@@ -1277,7 +1277,8 @@ class IntelligentExcelParser:
                         manual_headers: Dict[str, Any] = None, headers_only: bool = False,
                         active_sheet_only: bool = False,
                         best_region_only: bool = False,
-                        password: str = None) -> List[SheetData]:
+                        password: str = None,
+                        read_formulas: bool = True) -> List[SheetData]:
         """读取并解析Excel文件
 
         Args:
@@ -1292,6 +1293,7 @@ class IntelligentExcelParser:
             best_region_only: 是否只保留每个sheet的最优区域（使用_find_valid_region策略）
                             True时每个sheet最多保留1个最优区域（或合并后的区域组）
             password: 文件打开密码（加密文件需要）
+            read_formulas: 是否读取公式，False时使用ExportArray批量读取大幅提升性能
 
         Returns:
             解析后的Sheet数据列表
@@ -1346,7 +1348,7 @@ class IntelligentExcelParser:
                                 manual_header_range = value
                                 break
 
-                sheet_data = self._parse_sheet(ws, max_data_rows, skip_rows, manual_header_range, headers_only)
+                sheet_data = self._parse_sheet(ws, max_data_rows, skip_rows, manual_header_range, headers_only, read_formulas=read_formulas)
                 if sheet_data and sheet_data.regions:
                     if best_region_only:
                         # 每个sheet只保留最优区域
@@ -1363,7 +1365,8 @@ class IntelligentExcelParser:
         return result
     
     def _parse_sheet(self, worksheet: Any, max_data_rows: int = None, skip_rows: int = 0,
-                    manual_header_range: List[int] = None, headers_only: bool = False) -> Optional[SheetData]:
+                    manual_header_range: List[int] = None, headers_only: bool = False,
+                    read_formulas: bool = True) -> Optional[SheetData]:
         """解析单个Sheet
 
         Args:
@@ -1372,6 +1375,7 @@ class IntelligentExcelParser:
             skip_rows: 从文件开头跳过的行数
             manual_header_range: 手动指定的表头范围 [start_row, end_row]
             headers_only: 是否只读取表头，不读取数据行
+            read_formulas: 是否读取公式
 
         Returns:
             解析后的Sheet数据
@@ -1413,7 +1417,7 @@ class IntelligentExcelParser:
                 # 确保manual_header_range是有效的范围
                 if isinstance(manual_header_range, (list, tuple)) and len(manual_header_range) == 2:
                     start_row, end_row = manual_header_range
-                    region = self._parse_region_with_manual_header(worksheet, start_row, end_row, max_row, max_col, max_data_rows)
+                    region = self._parse_region_with_manual_header(worksheet, start_row, end_row, max_row, max_col, max_data_rows, read_formulas=read_formulas)
                     if region:
                         sheet_data.regions.append(region)
                     return sheet_data
@@ -1436,7 +1440,7 @@ class IntelligentExcelParser:
             header_info = self._analyze_header_range(worksheet, current_row, min(current_row + 20, max_row), max_col)
             
             if header_info:
-                region = self._parse_region(worksheet, header_info.start_row, max_row, max_col, max_data_rows)
+                region = self._parse_region(worksheet, header_info.start_row, max_row, max_col, max_data_rows, read_formulas=read_formulas)
                 
                 if region:
                     sheet_data.regions.append(region)
@@ -2246,7 +2250,7 @@ class IntelligentExcelParser:
         # 提高阈值，至少50%的列发生转换才认为是表头到数据的转换
         return (transition_count / valid_compare_count) > 0.5
     
-    def _parse_region(self, worksheet: Any, header_start_row: int, max_row: int, max_col: int, max_data_rows: int = None) -> Optional[ExcelRegion]:
+    def _parse_region(self, worksheet: Any, header_start_row: int, max_row: int, max_col: int, max_data_rows: int = None, read_formulas: bool = True) -> Optional[ExcelRegion]:
         """解析单个数据区域
 
         Args:
@@ -2255,6 +2259,7 @@ class IntelligentExcelParser:
             max_row: 最大行数
             max_col: 最大列数
             max_data_rows: 最多读取的数据行数，None表示读取全部
+            read_formulas: 是否读取公式
 
         Returns:
             解析后的区域数据
@@ -2289,31 +2294,12 @@ class IntelligentExcelParser:
         region.data_row_end = potential_data_end_row
 
         # 收集数据行（限制行数）
-        collected_rows = 0
-        for row in range(region.data_row_start, region.data_row_end + 1):
-            # 如果设置了最大行数限制且已达到限制，则停止收集
-            if max_data_rows is not None and collected_rows >= max_data_rows:
-                break
-
-            # 【性能优化】快速预检：先检查第1列是否有值，大部分数据行第1列非空
-            first_cell_val = worksheet.cell(row, 1).value
-            if first_cell_val is not None and str(first_cell_val).strip():
-                # 第1列有值，大概率不是空行，直接快速检查汇总行（只查前几列）
-                if self._is_summary_row(worksheet, row, max_col):
-                    continue
-            else:
-                # 第1列为空，进行完整检查
-                if self._is_empty_row(worksheet, row, max_col):
-                    continue
-
-            if self._is_title_row(worksheet, row, max_col):
-                continue
-
-            data_row = self._collect_row_data(worksheet, row, max_col, region.head_data, region.formula)
-
-            if data_row and self._has_valid_data(data_row):
-                region.data.append(data_row)
-                collected_rows += 1
+        if not read_formulas:
+            # 【性能优化】使用 ExportArray 批量读取，避免逐格 .NET interop
+            self._collect_data_bulk(worksheet, region, max_col, max_data_rows)
+        else:
+            # 需要读取公式时，使用逐格读取
+            self._collect_data_cell_by_cell(worksheet, region, max_col, max_data_rows)
 
         # 后验证：验证并尝试修正区域
         validated_region, fixes = self.post_validator.validate_and_fix(worksheet, region, max_col)
@@ -2324,9 +2310,10 @@ class IntelligentExcelParser:
         return validated_region
     
     def _parse_region_with_manual_header(self, worksheet: Any, header_start_row: int, header_end_row: int,
-                                        max_row: int, max_col: int, max_data_rows: int = None) -> Optional[ExcelRegion]:
+                                        max_row: int, max_col: int, max_data_rows: int = None,
+                                        read_formulas: bool = True) -> Optional[ExcelRegion]:
         """使用手动指定的表头范围解析数据区域
-        
+
         Args:
             worksheet: 工作表对象
             header_start_row: 表头起始行
@@ -2334,7 +2321,8 @@ class IntelligentExcelParser:
             max_row: 最大行数
             max_col: 最大列数
             max_data_rows: 最多读取的数据行数，None表示读取全部
-        
+            read_formulas: 是否读取公式
+
         Returns:
             解析后的区域数据
         """
@@ -2362,32 +2350,15 @@ class IntelligentExcelParser:
             return region
         
         region.data_row_end = potential_data_end_row
-        
+
         # 收集数据行（限制行数）
-        collected_rows = 0
-        for row in range(region.data_row_start, region.data_row_end + 1):
-            # 如果设置了最大行数限制且已达到限制，则停止收集
-            if max_data_rows is not None and collected_rows >= max_data_rows:
-                break
+        if not read_formulas:
+            # 【性能优化】使用 ExportArray 批量读取
+            self._collect_data_bulk(worksheet, region, max_col, max_data_rows)
+        else:
+            # 需要读取公式时，使用逐格读取
+            self._collect_data_cell_by_cell(worksheet, region, max_col, max_data_rows)
 
-            # 【性能优化】快速预检
-            first_cell_val = worksheet.cell(row, 1).value
-            if first_cell_val is not None and str(first_cell_val).strip():
-                if self._is_summary_row(worksheet, row, max_col):
-                    continue
-            else:
-                if self._is_empty_row(worksheet, row, max_col):
-                    continue
-
-            if self._is_title_row(worksheet, row, max_col):
-                continue
-
-            data_row = self._collect_row_data(worksheet, row, max_col, region.head_data, region.formula)
-
-            if data_row and self._has_valid_data(data_row):
-                region.data.append(data_row)
-                collected_rows += 1
-        
         return region
     
     def _find_data_end_row(self, worksheet: Any, start_row: int, max_row: int, max_col: int) -> int:
@@ -2564,7 +2535,224 @@ class IntelligentExcelParser:
                 header_mapping[final_header] = column_letter
 
         return header_mapping
-    
+
+    def _collect_data_bulk(self, worksheet: Any, region: 'ExcelRegion', max_col: int, max_data_rows: int = None):
+        """【性能优化】使用 Aspose ExportArray 批量读取数据区域，避免逐格 .NET interop
+
+        一次 interop 调用读取整个数据矩形，然后在纯 Python 中过滤行。
+        相比逐格读取，对于 30000行×40列 的数据可减少 ~120万次 interop 调用至 1 次。
+        """
+        total_rows = region.data_row_end - region.data_row_start + 1
+        if total_rows <= 0:
+            return
+
+        try:
+            # Aspose Cells 使用 0-indexed
+            raw_cells = worksheet._ws.Cells
+            data_array = raw_cells.ExportArray(
+                region.data_row_start - 1,  # firstRow (0-indexed)
+                0,                           # firstColumn
+                total_rows,                  # totalRows
+                max_col                      # totalColumns
+            )
+        except Exception as e:
+            self.logger.warning(f"ExportArray 失败，回退到逐格读取: {e}")
+            self._collect_data_cell_by_cell(worksheet, region, max_col, max_data_rows)
+            return
+
+        # 预计算列映射: header_name -> (column_letter, col_0idx)
+        col_mapping = []
+        for header, column_letter in region.head_data.items():
+            col_idx = self._get_column_number(column_letter) - 1  # 转为 0-indexed
+            col_mapping.append((header, column_letter, col_idx))
+
+        collected_rows = 0
+        for row_offset in range(total_rows):
+            if max_data_rows is not None and collected_rows >= max_data_rows:
+                break
+
+            # 从 .NET 数组提取一行值（只访问一次 interop 的结果）
+            row_values = []
+            for c in range(max_col):
+                row_values.append(data_array[row_offset, c])
+
+            # --- 纯 Python 行过滤 ---
+
+            # 快速预检：第1列是否有值
+            first_val = row_values[0]
+            first_val_valid = first_val is not None and str(first_val).strip() != ''
+
+            if first_val_valid:
+                # 第1列有值，检查是否为汇总行（只看前5列）
+                if self._is_summary_row_from_values(row_values, max_col):
+                    continue
+            else:
+                # 第1列为空，检查是否为空行
+                if self._is_empty_row_from_values(row_values):
+                    continue
+
+            # 检查是否为标题行
+            if self._is_title_row_from_values(row_values, max_col):
+                continue
+
+            # 构建数据行 dict
+            data_row = {}
+            has_valid = False
+            for header, column_letter, col_idx in col_mapping:
+                if col_idx < max_col:
+                    val = row_values[col_idx]
+                    val = self._normalize_exported_value(val)
+                    data_row[column_letter] = val
+                    if val is not None and str(val).strip():
+                        has_valid = True
+                else:
+                    data_row[column_letter] = None
+
+            if has_valid:
+                region.data.append(data_row)
+                collected_rows += 1
+
+    def _collect_data_cell_by_cell(self, worksheet: Any, region: 'ExcelRegion', max_col: int, max_data_rows: int = None):
+        """逐格读取数据行（原始方式，支持公式读取）"""
+        collected_rows = 0
+        for row in range(region.data_row_start, region.data_row_end + 1):
+            if max_data_rows is not None and collected_rows >= max_data_rows:
+                break
+
+            # 快速预检：先检查第1列是否有值
+            first_cell_val = worksheet.cell(row, 1).value
+            if first_cell_val is not None and str(first_cell_val).strip():
+                if self._is_summary_row(worksheet, row, max_col):
+                    continue
+            else:
+                if self._is_empty_row(worksheet, row, max_col):
+                    continue
+
+            if self._is_title_row(worksheet, row, max_col):
+                continue
+
+            data_row = self._collect_row_data(worksheet, row, max_col, region.head_data, region.formula)
+
+            if data_row and self._has_valid_data(data_row):
+                region.data.append(data_row)
+                collected_rows += 1
+
+    @staticmethod
+    def _normalize_exported_value(val):
+        """将 ExportArray 导出的值转换为与 _get_cell_value 一致的 Python 类型"""
+        if val is None:
+            return None
+        # pythonnet 会自动转换基本类型，但 .NET DateTime 需要特殊处理
+        val_type = type(val).__name__
+        if val_type == 'DateTime':
+            try:
+                return f"{val.Year:04d}-{val.Month:02d}-{val.Day:02d}"
+            except Exception:
+                return str(val)
+        if isinstance(val, str):
+            return val if val.strip() else None
+        if isinstance(val, (int, float)):
+            return val
+        # 其他 .NET 类型转字符串
+        return str(val)
+
+    def _is_empty_row_from_values(self, row_values: list) -> bool:
+        """纯 Python 版空行检查"""
+        for v in row_values:
+            if v is not None and str(v).strip():
+                return False
+        return True
+
+    def _is_summary_row_from_values(self, row_values: list, max_col: int) -> bool:
+        """纯 Python 版汇总行检查（检查前5列）"""
+        check_cols = min(5, max_col, len(row_values))
+        for i in range(check_cols):
+            value = row_values[i]
+            if value and isinstance(value, str):
+                value_lower = value.lower().strip()
+                if '@' in value_lower:
+                    continue
+                for keyword in self.SUMMARY_KEYWORDS:
+                    keyword_lower = keyword.lower()
+                    if any(ord(c) > 127 for c in keyword):
+                        if keyword_lower in value_lower:
+                            return True
+                    else:
+                        pattern = self._summary_en_patterns.get(keyword_lower)
+                        if pattern and pattern.search(value_lower):
+                            words = value_lower.split()
+                            if len(words) > 2:
+                                continue
+                            if len(value_lower) > 20 and len(keyword_lower) / len(value_lower) < 0.3:
+                                continue
+                            return True
+        return False
+
+    def _is_title_row_from_values(self, row_values: list, max_col: int) -> bool:
+        """纯 Python 版标题行检查"""
+        non_empty_cells = 0
+        first_value = None
+        second_value = None
+        has_required_marker = False
+
+        for i in range(min(max_col, len(row_values))):
+            val = row_values[i]
+            if val is not None and str(val).strip():
+                non_empty_cells += 1
+                str_val = str(val).strip()
+
+                for marker in self.REQUIRED_FIELD_MARKERS:
+                    if marker in str_val:
+                        has_required_marker = True
+                        break
+
+                if first_value is None:
+                    first_value = val
+                elif second_value is None:
+                    second_value = val
+
+                if non_empty_cells > 3 and not has_required_marker:
+                    return False
+
+        if has_required_marker and non_empty_cells >= 3:
+            return False
+
+        if not first_value or not isinstance(first_value, str):
+            return False
+
+        first_value_str = str(first_value).strip()
+
+        if non_empty_cells == 1:
+            garbage_keywords = ["示例", "样例", "例子", "example", "sample", "demo"]
+            if any(keyword.lower() in first_value_str.lower() for keyword in self.TITLE_KEYWORDS):
+                return True
+            if any(keyword in first_value_str for keyword in garbage_keywords):
+                return True
+
+        is_instruction = False
+        for keyword in self.INSTRUCTION_KEYWORDS:
+            if keyword.lower() in first_value_str.lower():
+                is_instruction = True
+                break
+
+        if is_instruction:
+            if first_value_str.startswith('※') or first_value_str.startswith('*'):
+                rest = first_value_str.lstrip('※* ').strip()
+                if any(keyword.lower() in rest.lower() for keyword in self.HEADER_KEYWORDS):
+                    return False
+            return True
+
+        if non_empty_cells <= 2:
+            if first_value_str.endswith('：') or first_value_str.endswith(':'):
+                return True
+
+        if second_value and isinstance(second_value, str):
+            second_str = str(second_value).strip()
+            if len(second_str) > 2 and second_str[0].isdigit() and second_str[1] in '、.．)）':
+                return True
+
+        return False
+
     def _collect_row_data(self, worksheet: Any, row: int, max_col: int,
                          head_data: Dict[str, str], formula_dict: Dict[str, str]) -> Dict[str, Any]:
         """收集行数据"""

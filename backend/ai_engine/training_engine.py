@@ -1591,11 +1591,12 @@ class TrainingEngine:
                 passwords = file_passwords or {}
                 parsed_data = self.excel_parser.parse_excel_file(
                       file_path,
-                    max_data_rows=10,  # 训练时只读取10行数据用于分析结构
+                    max_data_rows=10,
           manual_headers=manual_headers,
-                    active_sheet_only=True,  # 只加载激活的sheet
-                    best_region_only=True,  # 只取有效区域
-                    password=passwords.get(file_name)
+                    active_sheet_only=True,
+                    best_region_only=True,
+                    password=passwords.get(file_name),
+                    read_formulas=False
                 )
 
                 file_structure = {
@@ -1841,17 +1842,19 @@ class TrainingEngine:
         """比较两个Excel文件"""
         try:
             passwords = file_passwords or {}
-            # 解析实际输出文件
+            # 解析实际输出文件（对比只需数据值，不需公式，使用批量读取加速）
             actual_data = self.excel_parser.parse_excel_file(
                 actual_file,
                 manual_headers=manual_headers,
-                active_sheet_only=True  # 只加载激活的sheet
+                active_sheet_only=True,
+                read_formulas=False
             )
             expected_data = self.excel_parser.parse_excel_file(
                 expected_file,
                 manual_headers=manual_headers,
-                active_sheet_only=True,  # 只加载激活的sheet
-                password=passwords.get(Path(expected_file).name)
+                active_sheet_only=True,
+                password=passwords.get(Path(expected_file).name),
+                read_formulas=False
             )
 
             # 转换为结构化的字典

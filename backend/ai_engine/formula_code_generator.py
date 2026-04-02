@@ -1944,6 +1944,7 @@ def load_source_data(input_folder, manual_headers):
                 manual_headers=manual_headers,
                 active_sheet_only=True,
                 best_region_only=True,  # 只取有效区域（与merge_source_to_target逻辑一致）
+                read_formulas=False,    # 智算阶段不需要公式，使用批量读取提升性能
                 # 不限制 max_data_rows → 执行时加载全量数据
                 # （训练时通过 _pre_loaded_source_data 注入预解析的全量数据，通常不会走到这里）
             )
@@ -2083,18 +2084,16 @@ def write_source_sheets(wb, source_data):
         )
     source_sheets = {}
     header_fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
+    from openpyxl.utils import get_column_letter
 
     for sheet_name, data_info in source_data.items():
         df = data_info["df"]
 
         # 清理列名：只去除换行符和首尾空格，保留列名内的正常空格
-        # （不能用 \s+ 去除所有空格，否则 'Employee ID' 变成 'EmployeeID'，
-        #   导致 fill_result_sheets 中用原始列名取值时匹配不上）
         import re as _re_clean
         cleaned_cols = {}
         for col in df.columns:
             if isinstance(col, str):
-                # 只去除换行符、制表符等非空格空白字符，然后trim首尾空格
                 clean = _re_clean.sub(r'[\\t\\n\\r\\x0b\\x0c]+', '', col).strip()
                 if clean != col:
                     cleaned_cols[col] = clean
@@ -2111,34 +2110,74 @@ def write_source_sheets(wb, source_data):
             if _is_date_column(col_name, df):
                 date_cols.add(col_name)
 
-        # 写入表头
-        for col_idx, col_name in enumerate(df.columns, 1):
-            cell = ws.cell(row=1, column=col_idx, value=col_name)
+        # ========== 批量预处理 DataFrame ==========
+        write_df = df.copy()
+
+        # 1) 日期列批量转换为 Python datetime
+        for col_name in date_cols:
+            def _safe_to_datetime(v):
+                if pd.isna(v):
+                    return v
+                if hasattr(v, 'to_pydatetime'):
+                    try:
+                        return v.to_pydatetime()
+                    except Exception:
+                        return v
+                if isinstance(v, str) and v.strip():
+                    try:
+                        return pd.to_datetime(v).to_pydatetime()
+                    except Exception:
+                        return v
+                return v
+            write_df[col_name] = write_df[col_name].apply(_safe_to_datetime)
+
+        # 2) NaN → ""
+        write_df = write_df.fillna("")
+
+        # 3) 识别含公式前缀的列（向量化预扫描，减少后处理范围）
+        formula_risk_col_indices = []
+        for col_idx, col_name in enumerate(write_df.columns):
+            col_data = write_df[col_name]
+            if col_data.dtype == object:
+                try:
+                    str_col = col_data.astype(str)
+                    mask = (str_col.str.len() > 1) & (str_col.str[0].isin(['=', '+', '-']))
+                    if mask.any():
+                        formula_risk_col_indices.append(col_idx)
+                except Exception:
+                    pass
+
+        # ========== 写入表头（append + 样式） ==========
+        ws.append(list(write_df.columns))
+        for cell in ws[1]:
             cell.fill = header_fill
             cell.font = Font(bold=True)
 
-        # 写入数据
-        for row_idx, row in enumerate(df.itertuples(index=False), 2):
-            for col_idx, value in enumerate(row, 1):
-                col_name = df.columns[col_idx - 1]
-                # 日期列安全网：如果仍有未转换的值，在写入时兜底转换
-                if col_name in date_cols and pd.notna(value):
-                    if hasattr(value, 'to_pydatetime'):
-                        try:
-                            value = value.to_pydatetime()
-                        except Exception:
-                            pass
-                    elif isinstance(value, str) and value.strip():
-                        try:
-                            value = pd.to_datetime(value).to_pydatetime()
-                        except Exception:
-                            pass
-                cell = ws.cell(row=row_idx, column=col_idx, value=value if pd.notna(value) else "")
-                # 源数据sheet只存值，防止公式字符串被Excel当公式执行（产生外部链接）
-                if isinstance(value, str) and len(value) > 1 and value[0] in ('=', '+', '-'):
-                    cell.data_type = 's'
-                if col_name in date_cols:
-                    cell.number_format = 'yyyy/mm/dd'  # 设置显示格式
+        # ========== 批量写入数据（values.tolist 在 NumPy C 层转换，比 itertuples 更快） ==========
+        rows = write_df.values.tolist()
+        for row in rows:
+            ws.append(row)
+
+        total_rows = len(write_df)
+
+        # ========== 列级后处理：仅遍历需要特殊处理的列 ==========
+        # 日期列：设置 number_format
+        if date_cols:
+            date_col_indices = [i for i, c in enumerate(write_df.columns) if c in date_cols]
+            for ci in date_col_indices:
+                col_letter = get_column_letter(ci + 1)
+                for cell in ws[col_letter][1:]:  # 跳过表头
+                    if cell.value != "":
+                        cell.number_format = 'yyyy/mm/dd'
+
+        # 公式风险列：设置 data_type = 's' 防止 Excel 当公式执行
+        if formula_risk_col_indices:
+            for ci in formula_risk_col_indices:
+                col_letter = get_column_letter(ci + 1)
+                for cell in ws[col_letter][1:]:  # 跳过表头
+                    val = cell.value
+                    if isinstance(val, str) and len(val) > 1 and val[0] in ('=', '+', '-'):
+                        cell.data_type = 's'
 
         source_sheets[sheet_name] = {"df": df, "ws": ws}
 

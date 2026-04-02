@@ -610,6 +610,9 @@ async def train_model(
                 )
                 template_schema = document_validator.extract_document_schema(parsed_data)
 
+                # 记录训练使用的AI提供商
+                training_result["ai_provider"] = os.getenv("AI_PROVIDER", "")
+
                 # 保存生成的脚本
                 script_info = storage_manager.save_script(
                     tenant_id,
@@ -1059,6 +1062,9 @@ async def train_model_stream(
                         )
                         template_schema = document_validator.extract_document_schema(parsed_data)
 
+                        # 记录训练使用的AI提供商，供后续修正时复用
+                        training_result["ai_provider"] = ai_provider or os.getenv("AI_PROVIDER", "")
+
                         # 保存生成的脚本
                         script_info = storage_manager.save_script(
                             tenant_id,
@@ -1316,6 +1322,10 @@ async def calculate_data(
         match_success = True
         match_error = None
         smart_mapping = None
+        pre_loaded_source_data = None
+
+        import shutil
+        input_dir = os.path.dirname(saved_files["input_files"][0])
 
         if source_structure:
             try:
@@ -1326,14 +1336,53 @@ async def calculate_data(
                     if f.endswith(('.xlsx', '.xls')) and not os.path.basename(f).startswith('~')
                 ]
                 if current_input_files:
-                    match_success, match_error, smart_mapping = fast_matcher.match_and_prepare(
-                        source_structure=source_structure,
-                        input_files=current_input_files,
-                        manual_headers=manual_headers
-                    )
+                    # ===== 单次解析优化：每文件仅 1 次 Aspose 调用 =====
+                    _single_parse_ok = False
+                    try:
+                        match_success, match_error, _file_mapping, pre_loaded_source_data = \
+                            fast_matcher.match_parse_and_prepare(
+                                source_structure=source_structure,
+                                input_files=current_input_files,
+                                manual_headers=manual_headers,
+                                output_dir=input_dir,
+                            )
+                        _single_parse_ok = True
+                    except Exception as _sp_err:
+                        logger.warning(f"[compute] 单次解析优化失败: {_sp_err}，回退到多次解析流程", exc_info=True)
+
+                    # ===== 回退：原有多次解析流程 =====
+                    if not _single_parse_ok:
+                        pre_loaded_source_data = None
+                        match_success, match_error, smart_mapping = fast_matcher.match_and_prepare(
+                            source_structure=source_structure,
+                            input_files=current_input_files,
+                            manual_headers=manual_headers
+                        )
+                        if match_success and smart_mapping and smart_mapping.get("file_mapping"):
+                            for input_file_name, mapping_info in smart_mapping["file_mapping"].items():
+                                needs_rewrite = mapping_info.get("needs_rewrite", False)
+                                expected_file = mapping_info.get("expected_file")
+                                if needs_rewrite:
+                                    old_path = os.path.join(input_dir, input_file_name)
+                                    if os.path.exists(old_path):
+                                        os.remove(old_path)
+                                    FastHeaderMatcher.rewrite_excel(mapping_info, input_dir)
+                                else:
+                                    if input_file_name != expected_file:
+                                        old_path = os.path.join(input_dir, input_file_name)
+                                        new_path = os.path.join(input_dir, expected_file)
+                                        if os.path.exists(new_path):
+                                            os.remove(new_path)
+                                        shutil.move(old_path, new_path)
             except Exception as _match_err:
                 logger.warning(f"FastHeaderMatcher匹配出错: {_match_err}")
                 match_success = True  # 出错时不阻塞，让脚本自行解析
+
+            # 更新 input_files 列表
+            saved_files["input_files"] = [
+                os.path.join(input_dir, f) for f in os.listdir(input_dir)
+                if f.endswith(('.xlsx', '.xls')) and not f.startswith('~')
+            ]
 
         if not match_success:
             logger.error(f"FastHeaderMatcher匹配失败: {match_error}")
@@ -1344,81 +1393,6 @@ async def calculate_data(
                 "error": match_error,
                 "message": "文件或表头匹配失败，请检查上传的文件是否与训练时的文件结构一致"
             }
-
-        logger.info(f"文件匹配成功")
-
-        # ========== 根据匹配结果处理文件 ==========
-        import shutil
-        input_dir = os.path.dirname(saved_files["input_files"][0])
-
-        if smart_mapping and smart_mapping.get("file_mapping"):
-            for input_file_name, mapping_info in smart_mapping["file_mapping"].items():
-                needs_rewrite = mapping_info.get("needs_rewrite", False)
-                expected_file = mapping_info.get("expected_file")
-
-                if needs_rewrite:
-                    # 不一致：用内存中的数据按映射关系生成新Excel
-                    logger.info(f"[映射] 生成映射文件: {input_file_name} → {expected_file}")
-
-                    # 删除原文件
-                    old_path = os.path.join(input_dir, input_file_name)
-                    if os.path.exists(old_path):
-                        os.remove(old_path)
-
-                    # 用已解析的内存数据生成新文件
-                    FastHeaderMatcher.rewrite_excel(mapping_info, input_dir)
-                else:
-                    # 完全一致：只需要重命名文件（如果文件名不同）
-                    if input_file_name != expected_file:
-                        old_path = os.path.join(input_dir, input_file_name)
-                        new_path = os.path.join(input_dir, expected_file)
-                        if os.path.exists(new_path):
-                            os.remove(new_path)
-                        shutil.move(old_path, new_path)
-                        logger.info(f"[映射] 文件重命名: {input_file_name} → {expected_file}")
-                    else:
-                        logger.info(f"[映射] {input_file_name} 完全一致，直接使用")
-
-            # 更新 input_files 列表
-            saved_files["input_files"] = [
-                os.path.join(input_dir, f) for f in os.listdir(input_dir)
-                if f.endswith(('.xlsx', '.xls')) and not f.startswith('~')
-            ]
-
-        # ========== 【性能优化】构建预加载源数据（消除脚本内的重复解析） ==========
-        pre_loaded_source_data = None
-        if smart_mapping and smart_mapping.get("file_mapping"):
-            try:
-                pre_loaded_source_data = _build_pre_loaded_source_data(
-                    smart_mapping["file_mapping"]
-                )
-                if pre_loaded_source_data:
-                    logger.info(f"[性能优化] 预加载源数据: {len(pre_loaded_source_data)}个sheet")
-
-                    # 验证预加载数据是否包含训练时的所有 sheet
-                    expected_keys = set()
-                    for train_file, file_data in source_structure.get("files", {}).items():
-                        if "error" in file_data:
-                            continue
-                        file_base = train_file.replace('.xlsx', '').replace('.xls', '')
-                        for sheet_name in file_data.get("sheets", {}).keys():
-                            key = f"{file_base}_{sheet_name}"
-                            if len(key) > 31:
-                                key = key[:31]
-                            expected_keys.add(key)
-
-                    missing_keys = expected_keys - set(pre_loaded_source_data.keys())
-                    if missing_keys:
-                        logger.warning(f"[性能优化] 预加载数据缺少训练时的 sheet（可能是空文件）: {missing_keys}")
-                        logger.warning(f"[性能优化] 将禁用预加载，脚本自行解析（可能导致相同的 KeyError）")
-                        pre_loaded_source_data = None
-
-                # 释放 parsed_data 内存（已转换为 source_data）
-                for mapping_info in smart_mapping["file_mapping"].values():
-                    mapping_info.pop("parsed_data", None)
-            except Exception as e:
-                logger.warning(f"[性能优化] 构建预加载数据失败，脚本将自行解析: {e}")
-                pre_loaded_source_data = None
 
         # ========== 准备执行环境并执行计算 ==========
         # 使用批次的output文件夹作为输出目录
@@ -2085,81 +2059,6 @@ def _reorder_columns(ws, training_headers: Dict[str, str], parsed_sheets, sheet_
         logger.error(f"列重排失败: {e}", exc_info=True)
 
 
-def _build_pre_loaded_source_data(file_mapping: dict) -> dict:
-    """从匹配结果中构建预加载的 source_data（与脚本 load_source_data 返回格式一致）
-
-    返回格式: {"文件名_Sheet名": {"df": DataFrame, "columns": [列名]}}
-    """
-    from backend.utils.data_helpers import convert_region_to_dataframe
-
-    source_data = {}
-
-    for input_file_name, mapping_info in file_mapping.items():
-        expected_file = mapping_info.get("expected_file", input_file_name)
-        file_base = expected_file.replace('.xlsx', '').replace('.xls', '')
-        parsed_data = mapping_info.get("parsed_data", [])
-        if not parsed_data:
-            continue
-
-        needs_rewrite = mapping_info.get("needs_rewrite", False)
-        sheet_mapping = mapping_info.get("sheet_mapping", {})
-        header_mapping = mapping_info.get("header_mapping", {})
-
-        for sheet_data in parsed_data:
-            # 确定最终的 sheet 名
-            if needs_rewrite:
-                target_sheet = sheet_mapping.get(sheet_data.sheet_name, sheet_data.sheet_name)
-            else:
-                target_sheet = sheet_data.sheet_name
-
-            # 收集同sheet下所有region并合并（处理同列头多区域合并场景）
-            dfs = []
-            first_columns = None
-            for region in sheet_data.regions:
-                # needs_rewrite 时需要映射表头名
-                if needs_rewrite and header_mapping:
-                    from excel_parser import ExcelRegion
-                    mapped_head = {}
-                    for col_name, col_letter in region.head_data.items():
-                        mapped_name = header_mapping.get(col_name, col_name)
-                        mapped_head[mapped_name] = col_letter
-                    mapped_region = ExcelRegion(
-                        head_data=mapped_head,
-                        data=region.data,
-                        formula=region.formula
-                    )
-                    df = convert_region_to_dataframe(mapped_region)
-                else:
-                    df = convert_region_to_dataframe(region)
-
-                if df.empty and len(df.columns) == 0:
-                    continue
-                if first_columns is None:
-                    first_columns = list(df.columns)
-                dfs.append(df)
-
-            if not dfs:
-                continue
-
-            # 合并多个同列头区域的数据
-            if len(dfs) == 1:
-                merged_df = dfs[0]
-            else:
-                import pandas as _pd
-                merged_df = _pd.concat(dfs, ignore_index=True)
-
-            sheet_name = f"{file_base}_{target_sheet}"
-            if len(sheet_name) > 31:
-                sheet_name = sheet_name[:31]
-
-            source_data[sheet_name] = {
-                "df": merged_df,
-                "columns": first_columns
-            }
-            logger.info(f"[性能优化] 预加载: {sheet_name} ({len(merged_df)}行, {len(first_columns)}列)")
-
-    return source_data
-
 
 async def _save_temp_file(upload_file: UploadFile) -> str:
     """保存单个上传文件到临时目录"""
@@ -2438,71 +2337,53 @@ async def calculate_data_split(
             ]
 
             if current_input_files and source_structure:
-                match_success, match_error, smart_mapping = fast_matcher.match_and_prepare(
-                    source_structure=source_structure,
-                    input_files=current_input_files,
-                    manual_headers=manual_headers
-                )
+                # ===== 单次解析优化 =====
+                _single_parse_ok = False
+                try:
+                    match_success, match_error, _file_mapping, pre_loaded_source_data = \
+                        fast_matcher.match_parse_and_prepare(
+                            source_structure=source_structure,
+                            input_files=current_input_files,
+                            manual_headers=manual_headers,
+                            output_dir=input_dir,
+                        )
+                    _single_parse_ok = True
+                except Exception as _sp_err:
+                    logger.warning(f"[calculate/split] 单次解析优化失败: {_sp_err}，回退到多次解析流程", exc_info=True)
 
-                if match_success and smart_mapping and smart_mapping.get("file_mapping"):
-                    fm = smart_mapping["file_mapping"]
+                # ===== 回退：原有多次解析流程 =====
+                if not _single_parse_ok:
+                    match_success, match_error, smart_mapping = fast_matcher.match_and_prepare(
+                        source_structure=source_structure,
+                        input_files=current_input_files,
+                        manual_headers=manual_headers
+                    )
 
-                    # 根据映射结果重写/重命名文件
-                    for input_file_name, mapping_info in fm.items():
-                        needs_rewrite = mapping_info.get("needs_rewrite", False)
-                        expected_file = mapping_info.get("expected_file")
-
-                        if needs_rewrite:
-                            old_path = os.path.join(input_dir, input_file_name)
-                            if os.path.exists(old_path):
-                                os.remove(old_path)
-                            FastHeaderMatcher.rewrite_excel(mapping_info, input_dir)
-                            logger.info(f"[calculate/split] 生成映射文件: {input_file_name} → {expected_file}")
-                        else:
-                            if input_file_name != expected_file:
+                    if match_success and smart_mapping and smart_mapping.get("file_mapping"):
+                        fm = smart_mapping["file_mapping"]
+                        for input_file_name, mapping_info in fm.items():
+                            needs_rewrite = mapping_info.get("needs_rewrite", False)
+                            expected_file = mapping_info.get("expected_file")
+                            if needs_rewrite:
                                 old_path = os.path.join(input_dir, input_file_name)
-                                new_path = os.path.join(input_dir, expected_file)
-                                if os.path.exists(new_path):
-                                    os.remove(new_path)
-                                shutil.move(old_path, new_path)
-                                logger.info(f"[calculate/split] 文件重命名: {input_file_name} → {expected_file}")
+                                if os.path.exists(old_path):
+                                    os.remove(old_path)
+                                FastHeaderMatcher.rewrite_excel(mapping_info, input_dir)
+                            else:
+                                if input_file_name != expected_file:
+                                    old_path = os.path.join(input_dir, input_file_name)
+                                    new_path = os.path.join(input_dir, expected_file)
+                                    if os.path.exists(new_path):
+                                        os.remove(new_path)
+                                    shutil.move(old_path, new_path)
 
-                    # 更新 input_files 列表
-                    saved_files["input_files"] = [
-                        os.path.join(input_dir, f) for f in os.listdir(input_dir)
-                        if f.endswith(('.xlsx', '.xls')) and not f.startswith('~')
-                    ]
+                # 更新 input_files 列表
+                saved_files["input_files"] = [
+                    os.path.join(input_dir, f) for f in os.listdir(input_dir)
+                    if f.endswith(('.xlsx', '.xls')) and not f.startswith('~')
+                ]
 
-                    # 构建预加载源数据
-                    try:
-                        pre_loaded_source_data = _build_pre_loaded_source_data(fm)
-                        if pre_loaded_source_data:
-                            logger.info(f"[calculate/split] 预加载源数据: {len(pre_loaded_source_data)}个sheet")
-
-                            # 验证预加载数据
-                            expected_keys = set()
-                            for train_file, file_data in source_structure.get("files", {}).items():
-                                if "error" in file_data:
-                                    continue
-                                file_base = train_file.replace('.xlsx', '').replace('.xls', '')
-                                for sn in file_data.get("sheets", {}).keys():
-                                    key = f"{file_base}_{sn}"
-                                    if len(key) > 31:
-                                        key = key[:31]
-                                    expected_keys.add(key)
-
-                            missing_keys = expected_keys - set(pre_loaded_source_data.keys())
-                            if missing_keys:
-                                logger.warning(f"[calculate/split] 预加载数据缺少: {missing_keys}")
-                                pre_loaded_source_data = None
-                    except Exception as e:
-                        logger.warning(f"[calculate/split] 构建预加载数据失败: {e}")
-                        pre_loaded_source_data = None
-
-                    # 释放 parsed_data 内存
-                    for mapping_info in fm.values():
-                        mapping_info.pop("parsed_data", None)
-                elif not match_success:
+                if not match_success:
                     logger.warning(f"[calculate/split] FastHeaderMatcher匹配失败: {match_error}")
         except Exception as e:
             logger.warning(f"[calculate/split] 表头映射过程出错: {e}，将使用原始文件名", exc_info=True)
@@ -3220,7 +3101,15 @@ async def adjust_code(
 
         # 3. 构建调整提示词并调用AI
         is_formula_mode = "def fill_result_sheets" in script_content or "def fill_result_sheet" in script_content
-        ai_provider = AIProviderFactory.create_with_fallback()
+
+        # 优先使用训练时保存的AI提供商，保持修正与训练使用同一模型
+        training_ai_provider = script_info.get("ai_provider")
+        if training_ai_provider:
+            ai_provider = AIProviderFactory.create_provider(training_ai_provider)
+            logger.info(f"修正使用训练时的AI提供商: {training_ai_provider}")
+        else:
+            ai_provider = AIProviderFactory.create_with_fallback()
+            logger.info("脚本未记录AI提供商，使用默认提供商")
 
         # 预先定义时间戳和日志目录（供后续日志保存使用）
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -3982,12 +3871,14 @@ async def compute_with_script_stream(
                         source_structure = _script_info.get("source_structure")
                         manual_headers = _script_info.get("manual_headers")
 
-                        # 确保从DB读出的JSON列是dict（SQLite可能返回字符串）
-                        if isinstance(source_structure, str):
-                            try:
-                                source_structure = json.loads(source_structure)
-                            except (json.JSONDecodeError, TypeError):
-                                source_structure = None
+                        # 确保从DB读出的JSON列是dict（SQLite可能返回字符串，甚至双重编码）
+                        for _ in range(2):
+                            if isinstance(source_structure, str):
+                                try:
+                                    source_structure = json.loads(source_structure)
+                                except (json.JSONDecodeError, TypeError):
+                                    source_structure = None
+                                    break
                         if isinstance(manual_headers, str):
                             try:
                                 manual_headers = json.loads(manual_headers)
@@ -4038,34 +3929,61 @@ async def compute_with_script_stream(
                                 await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
 
                                 _loop = asyncio.get_event_loop()
-                                match_success, match_error, smart_mapping = await _loop.run_in_executor(
-                                    None,
-                                    lambda: fast_matcher.match_and_prepare(
-                                        source_structure=source_structure,
-                                        input_files=input_files,
-                                        manual_headers=manual_headers
+
+                                # ===== 单次解析优化：每文件仅 1 次 Aspose 调用 =====
+                                _single_parse_ok = False
+                                file_mapping = None
+                                try:
+                                    match_success, match_error, file_mapping, pre_loaded_source_data = \
+                                        await _loop.run_in_executor(None, lambda: fast_matcher.match_parse_and_prepare(
+                                            source_structure=source_structure,
+                                            input_files=input_files,
+                                            manual_headers=manual_headers,
+                                            output_dir=str(source_dir),
+                                        ))
+                                    _single_parse_ok = True
+                                except Exception as _sp_err:
+                                    logger.warning(f"[compute/stream] 单次解析优化失败: {_sp_err}，回退到多次解析流程", exc_info=True)
+
+                                # ===== 回退：原有多次解析流程 =====
+                                if not _single_parse_ok:
+                                    pre_loaded_source_data = None
+                                    match_success, match_error, smart_mapping = await _loop.run_in_executor(
+                                        None,
+                                        lambda: fast_matcher.match_and_prepare(
+                                            source_structure=source_structure,
+                                            input_files=input_files,
+                                            manual_headers=manual_headers
+                                        )
                                     )
-                                )
+                                    if match_success and smart_mapping and smart_mapping.get("file_mapping"):
+                                        file_mapping = smart_mapping["file_mapping"]
+                                        for _fb_input, _fb_info in file_mapping.items():
+                                            _fb_rewrite = _fb_info.get("needs_rewrite", False)
+                                            _fb_expected = _fb_info.get("expected_file")
+                                            if _fb_rewrite:
+                                                await _loop.run_in_executor(
+                                                    None, FastHeaderMatcher.rewrite_excel,
+                                                    _fb_info, str(source_dir)
+                                                )
+                                                if _fb_input != _fb_expected:
+                                                    _old = os.path.join(str(source_dir), _fb_input)
+                                                    if os.path.exists(_old):
+                                                        os.remove(_old)
+                                            else:
+                                                if _fb_input != _fb_expected:
+                                                    _old = os.path.join(str(source_dir), _fb_input)
+                                                    _new = os.path.join(str(source_dir), _fb_expected)
+                                                    if os.path.exists(_new):
+                                                        os.remove(_new)
+                                                    shutil.move(_old, _new)
 
-                                if match_success and smart_mapping and smart_mapping.get("file_mapping"):
-                                    file_mapping = smart_mapping["file_mapping"]
-
-                                    # 根据映射结果重写/重命名文件
+                                # ===== 处理匹配结果 =====
+                                if match_success and file_mapping:
+                                    # 输出映射日志
                                     for input_file_name, mapping_info in file_mapping.items():
-                                        needs_rewrite = mapping_info.get("needs_rewrite", False)
                                         expected_file = mapping_info.get("expected_file")
-
-                                        if needs_rewrite:
-                                            await _loop.run_in_executor(
-                                                None,
-                                                FastHeaderMatcher.rewrite_excel,
-                                                mapping_info, str(source_dir)
-                                            )
-                                            # rewrite完成后，如果输入文件名和期望文件名不同，删除原文件
-                                            if input_file_name != expected_file:
-                                                old_path = os.path.join(str(source_dir), input_file_name)
-                                                if os.path.exists(old_path):
-                                                    os.remove(old_path)
+                                        if mapping_info.get("needs_rewrite"):
                                             logger.info(f"[compute/stream] 生成映射文件: {input_file_name} → {expected_file}")
                                             log_msg = {
                                                 "type": "log",
@@ -4074,70 +3992,54 @@ async def compute_with_script_stream(
                                                 "message": f"生成映射文件: {input_file_name} → {expected_file}"
                                             }
                                             await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
-                                        else:
-                                            if input_file_name != expected_file:
-                                                old_path = os.path.join(str(source_dir), input_file_name)
-                                                new_path = os.path.join(str(source_dir), expected_file)
-                                                if os.path.exists(new_path):
-                                                    os.remove(new_path)
-                                                shutil.move(old_path, new_path)
-                                                logger.info(f"[compute/stream] 文件重命名: {input_file_name} → {expected_file}")
-                                                log_msg = {
-                                                    "type": "log",
-                                                    "timestamp": datetime.now().strftime("%H:%M:%S"),
-                                                    "level": "info",
-                                                    "message": f"文件重命名: {input_file_name} → {expected_file}"
-                                                }
-                                                await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
-
-                                    # 构建预加载源数据
-                                    try:
-                                        pre_loaded_source_data = _build_pre_loaded_source_data(file_mapping)
-                                        if pre_loaded_source_data:
-                                            logger.info(f"[compute/stream] 预加载源数据: {len(pre_loaded_source_data)}个sheet")
+                                        elif input_file_name != expected_file:
+                                            logger.info(f"[compute/stream] 文件重命名: {input_file_name} → {expected_file}")
                                             log_msg = {
                                                 "type": "log",
                                                 "timestamp": datetime.now().strftime("%H:%M:%S"),
                                                 "level": "info",
-                                                "message": f"预加载源数据: {len(pre_loaded_source_data)}个sheet"
+                                                "message": f"文件重命名: {input_file_name} → {expected_file}"
                                             }
                                             await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
 
-                                            # 发送每个sheet的详细信息
-                                            for sheet_name, sheet_info in pre_loaded_source_data.items():
-                                                df = sheet_info.get("df")
-                                                if df is not None:
-                                                    log_msg = {
-                                                        "type": "log",
-                                                        "timestamp": datetime.now().strftime("%H:%M:%S"),
-                                                        "level": "info",
-                                                        "message": f"  └─ {sheet_name}: {len(df)}行 × {len(df.columns)}列"
-                                                    }
-                                                    await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
+                                    # 验证预加载数据
+                                    if pre_loaded_source_data:
+                                        logger.info(f"[compute/stream] 预加载源数据: {len(pre_loaded_source_data)}个sheet")
+                                        log_msg = {
+                                            "type": "log",
+                                            "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                            "level": "info",
+                                            "message": f"预加载源数据: {len(pre_loaded_source_data)}个sheet"
+                                        }
+                                        await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
 
-                                            # 验证预加载数据是否包含训练时的所有 sheet
-                                            expected_keys = set()
-                                            for train_file, file_data in source_structure.get("files", {}).items():
-                                                if "error" in file_data:
-                                                    continue
-                                                file_base = train_file.replace('.xlsx', '').replace('.xls', '')
-                                                for sn in file_data.get("sheets", {}).keys():
-                                                    key = f"{file_base}_{sn}"
-                                                    if len(key) > 31:
-                                                        key = key[:31]
-                                                    expected_keys.add(key)
+                                        for sheet_name, sheet_info in pre_loaded_source_data.items():
+                                            df = sheet_info.get("df")
+                                            if df is not None:
+                                                log_msg = {
+                                                    "type": "log",
+                                                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                                    "level": "info",
+                                                    "message": f"  └─ {sheet_name}: {len(df)}行 × {len(df.columns)}列"
+                                                }
+                                                await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
 
-                                            missing_keys = expected_keys - set(pre_loaded_source_data.keys())
-                                            if missing_keys:
-                                                logger.warning(f"[compute/stream] 预加载数据缺少: {missing_keys}，将由脚本自行解析")
-                                                pre_loaded_source_data = None
-                                    except Exception as e:
-                                        logger.warning(f"[compute/stream] 构建预加载数据失败: {e}")
-                                        pre_loaded_source_data = None
+                                        # 验证预加载数据是否包含训练时的所有 sheet
+                                        expected_keys = set()
+                                        for train_file, file_data in source_structure.get("files", {}).items():
+                                            if "error" in file_data:
+                                                continue
+                                            file_base = train_file.replace('.xlsx', '').replace('.xls', '')
+                                            for sn in file_data.get("sheets", {}).keys():
+                                                key = f"{file_base}_{sn}"
+                                                if len(key) > 31:
+                                                    key = key[:31]
+                                                expected_keys.add(key)
 
-                                    # 释放 parsed_data 内存
-                                    for mapping_info in file_mapping.values():
-                                        mapping_info.pop("parsed_data", None)
+                                        missing_keys = expected_keys - set(pre_loaded_source_data.keys())
+                                        if missing_keys:
+                                            logger.warning(f"[compute/stream] 预加载数据缺少: {missing_keys}，将由脚本自行解析")
+                                            pre_loaded_source_data = None
 
                                     log_msg = {
                                         "type": "log",
@@ -4337,10 +4239,11 @@ async def compute_with_script_stream(
                     saved_file = compute_dir / f"result_{timestamp}_{output_file.name}"
                     shutil.copy(output_file, saved_file)
 
-                    # 统计行数
+                    # 统计行数（read_only 模式避免加载全部数据到内存）
                     import openpyxl
-                    wb = openpyxl.load_workbook(saved_file)
+                    wb = openpyxl.load_workbook(saved_file, read_only=True)
                     rows_processed = sum(ws.max_row for ws in wb.worksheets)
+                    wb.close()
 
                     log_msg = {
                         "type": "log",
@@ -4673,10 +4576,11 @@ async def compute_with_script(
             saved_file = compute_dir / f"result_{timestamp}_{output_file.name}"
             shutil.copy(output_file, saved_file)
 
-            # 统计行数
+            # 统计行数（read_only 模式避免加载全部数据到内存）
             import openpyxl
-            wb = openpyxl.load_workbook(saved_file)
+            wb = openpyxl.load_workbook(saved_file, read_only=True)
             rows_processed = sum(ws.max_row for ws in wb.worksheets)
+            wb.close()
 
             # DB持久化：注册结果文件 + 标记任务完成
             if db_session:

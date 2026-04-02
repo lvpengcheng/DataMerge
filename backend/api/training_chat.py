@@ -159,6 +159,7 @@ def _build_source_structure_from_dir(source_dir: str, manual_headers: Dict = Non
                 file_path, manual_headers=manual_headers,
                 active_sheet_only=True, best_region_only=True,
                 max_data_rows=3, headers_only=True,
+                read_formulas=False,
             )
             file_struct = {"file_name": filename, "sheets": {}, "total_regions": 0}
             for sheet_data in results:
@@ -246,6 +247,7 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None) -> Dict
                 manual_headers=manual_headers,
                 active_sheet_only=True,
                 best_region_only=True,
+                read_formulas=False,  # 脚本执行阶段不需要公式，使用批量读取提升性能
                 # 不传 max_data_rows → 加载全量数据
             )
             if not results:

@@ -104,7 +104,7 @@ class DataValidator:
             if file_path.name.startswith("~"):
                 continue
             try:
-                results = parser.parse_excel_file(str(file_path), active_sheet_only=True)
+                results = parser.parse_excel_file(str(file_path), active_sheet_only=True, read_formulas=False)
                 sheets_info = {}
                 for sheet_data in results:
                     headers = []

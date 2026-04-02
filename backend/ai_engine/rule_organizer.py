@@ -233,6 +233,7 @@ class RuleOrganizer:
                     active_sheet_only=True,
                     best_region_only=True,
                     password=passwords.get(file_name),
+                    read_formulas=False,
                 )
                 part = f"=== 源文件: {file_name} ===\n"
                 for sheet_data in parsed_data:
