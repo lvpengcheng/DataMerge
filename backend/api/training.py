@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from ..database.connection import get_db
 from ..database.models import TrainingSession, TrainingIteration, Script
-from ..auth.dependencies import get_current_user
+from ..auth.dependencies import get_current_user, get_accessible_tenants
 
 router = APIRouter(prefix="/api/training", tags=["训练管理"])
 
@@ -23,11 +23,18 @@ def list_training_sessions(
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible_tenants: list = Depends(get_accessible_tenants),
 ):
-    """训练会话列表"""
+    """训练会话列表（按租户权限过滤）"""
     q = db.query(TrainingSession)
     if tenant_id:
+        # 指定了 tenant_id 时检查权限
+        if tenant_id not in accessible_tenants:
+            raise HTTPException(status_code=403, detail="无权访问该租户")
         q = q.filter(TrainingSession.tenant_id == tenant_id)
+    else:
+        # 未指定时只返回有权限的租户
+        q = q.filter(TrainingSession.tenant_id.in_(accessible_tenants))
     if status:
         q = q.filter(TrainingSession.status == status)
     total = q.count()
@@ -58,11 +65,14 @@ def get_training_session(
     session_id: int,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible_tenants: list = Depends(get_accessible_tenants),
 ):
     """训练会话详情"""
     session = db.query(TrainingSession).filter_by(id=session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="训练会话不存在")
+    if session.tenant_id not in accessible_tenants:
+        raise HTTPException(status_code=403, detail="无权访问该租户")
 
     return {
         "id": session.id,
@@ -84,11 +94,14 @@ def get_training_iterations(
     session_id: int,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible_tenants: list = Depends(get_accessible_tenants),
 ):
     """训练会话的所有迭代记录"""
     session = db.query(TrainingSession).filter_by(id=session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="训练会话不存在")
+    if session.tenant_id not in accessible_tenants:
+        raise HTTPException(status_code=403, detail="无权访问该租户")
 
     iterations = (
         db.query(TrainingIteration)
@@ -120,11 +133,16 @@ def list_scripts(
     is_active: bool = Query(True),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible_tenants: list = Depends(get_accessible_tenants),
 ):
-    """脚本列表"""
+    """脚本列表（按租户权限过滤）"""
     q = db.query(Script).filter(Script.is_active == is_active)
     if tenant_id:
+        if tenant_id not in accessible_tenants:
+            raise HTTPException(status_code=403, detail="无权访问该租户")
         q = q.filter(Script.tenant_id == tenant_id)
+    else:
+        q = q.filter(Script.tenant_id.in_(accessible_tenants))
     scripts = q.order_by(Script.created_at.desc()).all()
 
     return [
@@ -147,11 +165,14 @@ def get_script(
     script_id: int,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible_tenants: list = Depends(get_accessible_tenants),
 ):
     """脚本详情（含代码）"""
     script = db.query(Script).filter_by(id=script_id).first()
     if not script:
         raise HTTPException(status_code=404, detail="脚本不存在")
+    if script.tenant_id not in accessible_tenants:
+        raise HTTPException(status_code=403, detail="无权访问该租户")
 
     return {
         "id": script.id,

@@ -11,12 +11,13 @@ services:
       - .env
     environment:
       - REDIS_URL=redis://redis:6379/0
-      - DATABASE_URL=sqlite:///./data/data.db
+      # DATABASE_URL 从 .env 读取（PostgreSQL），不在此处硬编码
       - LD_LIBRARY_PATH=/app/libs:/usr/lib
       - DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
       - DOTNET_ROLL_FORWARD=LatestMajor
     volumes:
       - ./tenants:/app/tenants
+      - ./global_assets:/app/global_assets
       - ./data:/app/data
       - ./logs:/app/logs
       - ./output:/app/output

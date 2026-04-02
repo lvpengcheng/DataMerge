@@ -171,7 +171,7 @@ class TrainingSession(Base):
     config = Column(JSON, nullable=True)                            # 训练配置参数
     source_asset_ids = Column(JSON, nullable=True)                  # 关联的源文件 asset id 列表
     expected_asset_id = Column(Integer, ForeignKey("data_assets.id"), nullable=True)
-    final_script_id = Column(Integer, ForeignKey("scripts.id"), nullable=True)
+    final_script_id = Column(Integer, nullable=True)  # 逻辑关联 scripts.id，不设外键避免循环引用
     ai_provider = Column(String(50), nullable=True)              # deepseek / claude / openai
     salary_year = Column(Integer, nullable=True)
     salary_month = Column(Integer, nullable=True)
@@ -187,7 +187,7 @@ class TrainingSession(Base):
 
     user = relationship("User", foreign_keys=[user_id])
     expected_asset = relationship("DataAsset", foreign_keys=[expected_asset_id])
-    final_script = relationship("Script", foreign_keys=[final_script_id])
+    # final_script: 不用 relationship，通过 final_script_id 手动查询（无外键约束）
     iterations = relationship("TrainingIteration", back_populates="session", order_by="TrainingIteration.iteration_num")
     messages = relationship("TrainingMessage", back_populates="session", order_by="TrainingMessage.created_at")
 

@@ -12,14 +12,14 @@ from pathlib import Path
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, UploadFile, File, Form, Query, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload, selectinload
 from pydantic import BaseModel
 
 from ..database.connection import get_db
 from ..database.models import (
     ComputeTask, ComputeTaskInput, DataAsset, Script,
 )
-from ..auth.dependencies import get_current_user
+from ..auth.dependencies import get_current_user, get_accessible_tenants
 
 router = APIRouter(prefix="/api/compute2", tags=["计算任务"])
 
@@ -83,23 +83,21 @@ class ExecuteRequest(BaseModel):
 
 # ==================== 辅助函数 ====================
 
-def _task_to_dict(task: ComputeTask) -> dict:
-    # 查询输出资产
-    output_assets = []
-    if task.id:
-        from sqlalchemy import inspect
-        session = inspect(task).session
-        if session:
-            assets = session.query(DataAsset).filter_by(source_task_id=task.id, is_active=True).all()
-            output_assets = [
-                {
-                    "id": a.id,
-                    "name": a.name,
-                    "file_name": a.file_name,
-                    "file_size": a.file_size,
-                }
-                for a in assets
-            ]
+def _task_to_dict(task: ComputeTask, output_assets_list=None) -> dict:
+    """完整详情（详情接口使用）"""
+    if output_assets_list is None:
+        output_assets_list = getattr(task, 'output_assets', []) or []
+
+    output_assets = [
+        {
+            "id": a.id,
+            "name": a.name,
+            "file_name": a.file_name,
+            "file_size": a.file_size,
+        }
+        for a in output_assets_list
+        if a.is_active
+    ]
 
     return {
         "id": task.id,
@@ -129,6 +127,21 @@ def _task_to_dict(task: ComputeTask) -> dict:
             for inp in task.inputs
         ] if task.inputs else [],
         "output_assets": output_assets,
+    }
+
+
+def _task_to_summary(task: ComputeTask) -> dict:
+    """轻量摘要（列表接口使用，不含大字段和关联数据）"""
+    return {
+        "id": task.id,
+        "tenant_id": task.tenant_id,
+        "script_id": task.script_id,
+        "salary_year": task.salary_year,
+        "salary_month": task.salary_month,
+        "status": task.status,
+        "duration_seconds": task.duration_seconds,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "finished_at": task.finished_at.isoformat() if task.finished_at else None,
     }
 
 
@@ -352,18 +365,23 @@ def list_compute_tasks(
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible_tenants: list = Depends(get_accessible_tenants),
 ):
-    """计算任务列表"""
+    """计算任务列表（按租户权限过滤，轻量摘要）"""
     q = db.query(ComputeTask)
     if tenant_id:
+        if tenant_id not in accessible_tenants:
+            raise HTTPException(status_code=403, detail="无权访问该租户")
         q = q.filter(ComputeTask.tenant_id == tenant_id)
+    else:
+        q = q.filter(ComputeTask.tenant_id.in_(accessible_tenants))
     if status:
         q = q.filter(ComputeTask.status == status)
     total = q.count()
     tasks = q.order_by(ComputeTask.created_at.desc()).offset(offset).limit(limit).all()
     return {
         "total": total,
-        "items": [_task_to_dict(t) for t in tasks],
+        "items": [_task_to_summary(t) for t in tasks],
     }
 
 
@@ -372,11 +390,14 @@ def get_compute_task(
     task_id: int,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible_tenants: list = Depends(get_accessible_tenants),
 ):
     """计算任务详情"""
     task = db.query(ComputeTask).filter_by(id=task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="计算任务不存在")
+    if task.tenant_id not in accessible_tenants:
+        raise HTTPException(status_code=403, detail="无权访问该租户")
     return _task_to_dict(task)
 
 
@@ -415,8 +436,11 @@ def compute_history(
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible_tenants: list = Depends(get_accessible_tenants),
 ):
-    """计算历史（含计算链路追溯）"""
+    """计算历史（轻量列表，按租户权限过滤）"""
+    if tenant_id not in accessible_tenants:
+        raise HTTPException(status_code=403, detail="无权访问该租户")
     tasks = (
         db.query(ComputeTask)
         .filter_by(tenant_id=tenant_id)
@@ -425,16 +449,4 @@ def compute_history(
         .all()
     )
 
-    result = []
-    for task in tasks:
-        item = _task_to_dict(task)
-        # 追溯输出资产被哪些后续任务使用
-        output_assets = db.query(DataAsset).filter_by(source_task_id=task.id).all()
-        downstream_tasks = []
-        for oa in output_assets:
-            usages = db.query(ComputeTaskInput).filter_by(asset_id=oa.id).all()
-            for u in usages:
-                downstream_tasks.append(u.task_id)
-        item["downstream_task_ids"] = list(set(downstream_tasks))
-        result.append(item)
-    return result
+    return [_task_to_summary(t) for t in tasks]

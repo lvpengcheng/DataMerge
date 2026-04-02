@@ -108,4 +108,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:8000/api/health || exit 1
 
 # ========== 12. 启动 ==========
-CMD ["sh", "-c", "python -m backend.database.init_db && uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --workers 2"]
+CMD ["sh", "-c", "python -m backend.database.init_db && uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --workers 2 --timeout-keep-alive 600"]

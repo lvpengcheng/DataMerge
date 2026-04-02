@@ -493,6 +493,10 @@ function handleComputeEvent(event) {
             }
             break;
 
+        case 'heartbeat':
+            // 心跳包，保持连接，不做任何处理
+            break;
+
         case 'complete':
             updateProgress(100);
             updateStatus('计算完成');

@@ -1165,9 +1165,13 @@ async def train_model_stream(
             training_task = asyncio.create_task(run_training())
 
             try:
-                # 流式输出日志
+                # 流式输出日志（带心跳防超时）
                 while True:
-                    log_message = await logs_queue.get()
+                    try:
+                        log_message = await asyncio.wait_for(logs_queue.get(), timeout=5)
+                    except asyncio.TimeoutError:
+                        yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
+                        continue
                     if log_message is None:
                         break  # 结束标记
 
@@ -4311,9 +4315,9 @@ async def compute_with_script_stream(
                 # 流式输出日志（带心跳防超时）
                 while True:
                     try:
-                        log_message = await asyncio.wait_for(logs_queue.get(), timeout=15)
+                        log_message = await asyncio.wait_for(logs_queue.get(), timeout=5)
                     except asyncio.TimeoutError:
-                        # 15秒无新日志，发送心跳包保持连接
+                        # 5秒无新日志，发送心跳包保持连接
                         yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
                         continue
                     if log_message is None:
@@ -4668,14 +4672,20 @@ async def training_page():
     raise HTTPException(status_code=404, detail="训练页面未找到")
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 async def index_page():
-    """首页 - 重定向到Dashboard"""
+    """首页 - 重定向到Dashboard（支持 HEAD 供负载均衡健康检查）"""
     _frontend_dir = Path(__file__).resolve().parent.parent.parent / "frontend"
     template_file = _frontend_dir / "templates" / "dashboard.html"
     if template_file.exists():
         return HTMLResponse(content=template_file.read_text(encoding="utf-8"))
     return HTMLResponse(content="<h1>DataMerge - 请访问 <a href='/dashboard'>首页</a></h1>")
+
+
+@app.api_route("/health", methods=["GET", "HEAD", "POST", "OPTIONS"])
+async def health_check():
+    """健康检查端点（供负载均衡 / WAF 使用，支持所有常见方法）"""
+    return {"status": "ok"}
 
 
 @app.get("/compute", response_class=HTMLResponse)
@@ -5218,8 +5228,10 @@ async def list_tenants():
 
 
 @app.get("/api/training-history")
-async def get_all_training_history():
-    """获取所有租户的训练历史（含每次训练的关键文件）"""
+async def get_all_training_history(
+    accessible_tenants: list = Depends(get_accessible_tenants),
+):
+    """获取当前用户有权限的租户的训练历史"""
     try:
         tenants_dir = storage_manager.base_dir
         result = {}
@@ -5227,10 +5239,15 @@ async def get_all_training_history():
         if not tenants_dir.exists():
             return {"history": result}
 
+        # 只返回用户有权限的租户
+        allowed_set = set(accessible_tenants)
+
         for tenant_dir in sorted(tenants_dir.iterdir()):
             if not tenant_dir.is_dir():
                 continue
             tenant_id = tenant_dir.name
+            if tenant_id not in allowed_set:
+                continue
             logs_dir = tenant_dir / "training_logs"
 
             if not logs_dir.exists():
