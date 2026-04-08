@@ -4,6 +4,9 @@ let currentTenantId = '';
 let currentScriptId = '';
 let _filePasswordsMap = null;  // 文件名→密码映射
 let _encryptionCheckInProgress = false;  // 加密检测进行中
+let _currentEventSource = null;  // 当前 EventSource 连接
+let _lastEventId = 0;           // 最后收到的 SSE event id
+let _currentTaskId = null;      // 当前计算任务 ID
 
 /**
  * 弹出密码输入对话框，为加密文件输入密码
@@ -143,6 +146,9 @@ document.addEventListener('DOMContentLoaded', function() {
 
     // 脚本选择器
     document.getElementById('script-selector').addEventListener('change', onScriptSelected);
+
+    // 恢复进行中的计算任务
+    _tryResumeActiveTask();
 });
 
 // 点击外部关闭下拉框
@@ -372,15 +378,15 @@ async function startCompute() {
 
     try {
         updateProgress(20);
-        addLog('info', '正在连接服务器...');
+        addLog('info', '正在提交计算任务...');
 
-        const resp = await AUTH.authFetch('/api/compute/stream', {
+        // Step 1: 提交任务
+        const resp = await AUTH.authFetch('/api/compute/submit', {
             method: 'POST',
             body: formData
         });
 
         if (!resp.ok) {
-            // 尝试读取错误详情
             let errorData = null;
             try { errorData = await resp.json(); } catch (e) {}
 
@@ -392,12 +398,14 @@ async function startCompute() {
                     addLog('info', '用户取消了密码输入');
                     btn.disabled = false;
                     btn.textContent = '开始计算';
+                    updateStatus('等待计算');
+                    updateProgress(0);
                     return;
                 }
                 addLog('info', '正在使用密码重新提交...');
-                _filePasswordsMap = passwords;  // 保存密码供后续使用
+                _filePasswordsMap = passwords;
                 formData.set('file_passwords', JSON.stringify(passwords));
-                const retryResp = await AUTH.authFetch('/api/compute/stream', {
+                const retryResp = await AUTH.authFetch('/api/compute/submit', {
                     method: 'POST',
                     body: formData
                 });
@@ -406,8 +414,12 @@ async function startCompute() {
                     try { retryError = (await retryResp.json()).detail || ''; } catch (e) {}
                     throw new Error(retryError || `HTTP error! status: ${retryResp.status}`);
                 }
-                addLog('info', '连接成功，开始接收数据...');
-                await _processComputeStream(retryResp);
+                const retryData = await retryResp.json();
+                _currentTaskId = retryData.task_id;
+                _saveActiveTask(_currentTaskId, 0);
+                addLog('info', `任务已提交 (ID: ${_currentTaskId})，正在连接日志流...`);
+                _lastEventId = 0;
+                _connectComputeStream(_currentTaskId, 0);
                 return;
             }
 
@@ -415,22 +427,182 @@ async function startCompute() {
             throw new Error(typeof errorMsg === 'string' ? errorMsg : JSON.stringify(errorMsg));
         }
 
-        addLog('info', '连接成功，开始接收数据...');
-        await _processComputeStream(resp);
+        // Step 2: 获取 task_id，连接 SSE 流
+        const data = await resp.json();
+        _currentTaskId = data.task_id;
+        _saveActiveTask(_currentTaskId, 0);
+        addLog('info', `任务已提交 (ID: ${_currentTaskId})，正在连接日志流...`);
+        _lastEventId = 0;
+        _connectComputeStream(_currentTaskId, 0);
 
     } catch (e) {
-        console.error('计算失败:', e);
+        console.error('计算提交失败:', e);
         addLog('error', `计算失败: ${e.message}`);
         updateStatus('计算失败');
         showError(e.message);
-    } finally {
         btn.disabled = false;
         btn.textContent = '开始计算';
     }
 }
 
 /**
- * 处理计算流式响应
+ * 将活跃任务信息存入 sessionStorage
+ */
+function _saveActiveTask(taskId, lastId) {
+    sessionStorage.setItem('_compute_task_id', taskId);
+    sessionStorage.setItem('_compute_last_event_id', String(lastId || 0));
+}
+
+/**
+ * 清除 sessionStorage 中的活跃任务
+ */
+function _clearActiveTask() {
+    sessionStorage.removeItem('_compute_task_id');
+    sessionStorage.removeItem('_compute_last_event_id');
+}
+
+/**
+ * 页面加载时尝试恢复进行中的计算任务
+ */
+async function _tryResumeActiveTask() {
+    const savedTaskId = sessionStorage.getItem('_compute_task_id');
+    if (!savedTaskId) return;
+
+    const savedLastId = parseInt(sessionStorage.getItem('_compute_last_event_id') || '0');
+
+    try {
+        const resp = await AUTH.authFetch(`/api/compute/${savedTaskId}/status`);
+        if (!resp.ok) {
+            _clearActiveTask();
+            return;
+        }
+        const st = await resp.json();
+
+        if (st.status === 'completed') {
+            updateProgress(100);
+            updateStatus('计算完成');
+            addLog('success', '✓ 计算成功完成!');
+            if (st.result_summary) showResult(st.result_summary);
+            _clearActiveTask();
+        } else if (st.status === 'failed') {
+            addLog('error', '✗ 错误: ' + (st.error_message || '未知错误'));
+            updateStatus('计算失败');
+            showError(st.error_message || '未知错误');
+            _clearActiveTask();
+        } else {
+            // 任务仍在进行中，恢复连接
+            _currentTaskId = savedTaskId;
+            _lastEventId = savedLastId;
+            const btn = document.getElementById('compute-btn');
+            if (btn) { btn.disabled = true; btn.textContent = '计算中...'; }
+            updateStatus('计算中');
+            addLog('info', `恢复连接到计算任务 (ID: ${savedTaskId})...`);
+
+            if (st.stream_available) {
+                _connectComputeStream(savedTaskId, savedLastId);
+            } else {
+                // buffer 已过期，轮询
+                _reconnectOrPoll(savedTaskId);
+            }
+        }
+    } catch (e) {
+        console.error('恢复任务失败:', e);
+        _clearActiveTask();
+    }
+}
+
+/**
+ * 连接 SSE 流，使用 EventSource 支持断线重连
+ */
+function _connectComputeStream(taskId, fromId) {
+    if (_currentEventSource) {
+        _currentEventSource.close();
+        _currentEventSource = null;
+    }
+
+    const url = `/api/compute/${taskId}/stream?last_event_id=${fromId}`;
+    const es = new EventSource(url);
+    _currentEventSource = es;
+
+    es.onmessage = (e) => {
+        try {
+            const event = JSON.parse(e.data);
+            if (e.lastEventId) {
+                _lastEventId = parseInt(e.lastEventId);
+                _saveActiveTask(taskId, _lastEventId);
+            }
+            handleComputeEvent(event);
+
+            // 计算完成或失败时关闭连接并恢复按钮
+            if (event.type === 'complete' || event.type === 'error') {
+                es.close();
+                _currentEventSource = null;
+                _clearActiveTask();
+                const btn = document.getElementById('compute-btn');
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = '开始计算';
+                }
+            }
+        } catch (err) {
+            console.error('解析 SSE 事件失败:', err, e.data);
+        }
+    };
+
+    es.onerror = () => {
+        es.close();
+        _currentEventSource = null;
+        addLog('warning', '连接中断，正在尝试重连...');
+        setTimeout(() => _reconnectOrPoll(taskId), 2000);
+    };
+}
+
+/**
+ * 断线后重连或轮询兜底
+ */
+async function _reconnectOrPoll(taskId) {
+    try {
+        const resp = await AUTH.authFetch(`/api/compute/${taskId}/status`);
+        if (!resp.ok) {
+            addLog('warning', '获取任务状态失败，稍后重试...');
+            setTimeout(() => _reconnectOrPoll(taskId), 5000);
+            return;
+        }
+
+        const st = await resp.json();
+
+        if (st.status === 'completed') {
+            updateProgress(100);
+            updateStatus('计算完成');
+            addLog('success', '✓ 计算成功完成!');
+            if (st.result_summary) showResult(st.result_summary);
+            _clearActiveTask();
+            const btn = document.getElementById('compute-btn');
+            if (btn) { btn.disabled = false; btn.textContent = '开始计算'; }
+        } else if (st.status === 'failed') {
+            addLog('error', '✗ 错误: ' + (st.error_message || '未知错误'));
+            updateStatus('计算失败');
+            showError(st.error_message || '未知错误');
+            _clearActiveTask();
+            const btn = document.getElementById('compute-btn');
+            if (btn) { btn.disabled = false; btn.textContent = '开始计算'; }
+        } else if (st.stream_available) {
+            // buffer 仍然存在，重新连接 SSE
+            addLog('info', '重新连接日志流...');
+            _connectComputeStream(taskId, _lastEventId);
+        } else {
+            // buffer 已过期，继续轮询
+            addLog('info', '等待任务完成...');
+            setTimeout(() => _reconnectOrPoll(taskId), 3000);
+        }
+    } catch (e) {
+        console.error('重连/轮询异常:', e);
+        setTimeout(() => _reconnectOrPoll(taskId), 5000);
+    }
+}
+
+/**
+ * 处理计算流式响应（旧版 ReadableStream 方式，保留备用）
  */
 async function _processComputeStream(resp) {
     const reader = resp.body.getReader();
@@ -584,6 +756,10 @@ function clearResult() {
 }
 
 function resetCompute() {
+    if (_currentEventSource) { _currentEventSource.close(); _currentEventSource = null; }
+    _currentTaskId = null;
+    _lastEventId = 0;
+    _clearActiveTask();
     clearResult();
     updateStatus('等待计算');
     updateProgress(0);
@@ -592,6 +768,10 @@ function resetCompute() {
 }
 
 function fullReset() {
+    if (_currentEventSource) { _currentEventSource.close(); _currentEventSource = null; }
+    _currentTaskId = null;
+    _lastEventId = 0;
+    _clearActiveTask();
     clearResult();
     updateStatus('等待计算');
     updateProgress(0);

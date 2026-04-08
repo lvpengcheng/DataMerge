@@ -447,6 +447,7 @@ def _build_template_resp(t: Template) -> dict:
         "group_by": getattr(t, "group_by", "") or "",
         "skip_rows": getattr(t, "skip_rows", 1) or 1,
         "name_field": getattr(t, "name_field", "") or "",
+        "split_by": getattr(t, "split_by", "") or "",
         "show_empty_period": getattr(t, "show_empty_period", True),
         "is_active": t.is_active,
         "created_by": t.created_by,
@@ -489,6 +490,7 @@ async def create_template(
     group_by: str = Form(""),
     skip_rows: int = Form(1),
     name_field: str = Form(""),
+    split_by: str = Form(""),
     show_empty_period: bool = Form(True),
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
@@ -509,6 +511,7 @@ async def create_template(
         group_by=group_by,
         skip_rows=skip_rows,
         name_field=name_field,
+        split_by=split_by,
         show_empty_period=show_empty_period,
         created_by=admin.id,
     )
@@ -546,6 +549,7 @@ async def update_template(
     group_by: Optional[str] = Form(None),
     skip_rows: Optional[int] = Form(None),
     name_field: Optional[str] = Form(None),
+    split_by: Optional[str] = Form(None),
     show_empty_period: Optional[bool] = Form(None),
     db: Session = Depends(get_db),
     _admin: User = Depends(require_admin),
@@ -594,6 +598,10 @@ async def update_template(
         tpl.name_field = str(form.get('name_field', ''))
     elif name_field is not None:
         tpl.name_field = name_field
+    if 'split_by' in form:
+        tpl.split_by = str(form.get('split_by', ''))
+    elif split_by is not None:
+        tpl.split_by = split_by
     if show_empty_period is not None:
         tpl.show_empty_period = show_empty_period
 
@@ -906,9 +914,10 @@ async def generate_report(
     skip_rows_val = getattr(tpl, "skip_rows", 1) or 1
     name_field_val = getattr(tpl, "name_field", "") or ""
     show_empty = getattr(tpl, "show_empty_period", True)
+    split_by_field = getattr(tpl, "split_by", "") or ""
 
-    # zip/block 模式前置校验：group_by 不能为空，且必须在数据列中
-    if report_mode in ("zip", "block"):
+    # zip/block/sheet 模式前置校验：group_by 不能为空，且必须在数据列中
+    if report_mode in ("zip", "block", "sheet"):
         if not group_by_field:
             raise HTTPException(
                 status_code=400,
@@ -932,8 +941,8 @@ async def generate_report(
             logger.info(f"group_by 模糊匹配: '{group_by_field}' -> '{matched_col}'")
             group_by_field = matched_col
 
-    # zip 模式输出 .zip，其余输出原始扩展名
-    if report_mode == "zip":
+    # 有 split_by 或 zip 模式时输出 .zip，其余输出原始扩展名
+    if report_mode == "zip" or split_by_field:
         output_ext = ".zip"
         output_name_final = os.path.splitext(output_name)[0] + output_ext
     else:
@@ -944,7 +953,7 @@ async def generate_report(
     timestamp = now.strftime("%Y%m%d%H%M%S")
     output_path = str(output_dir / f"{timestamp}_{output_name_final}")
 
-    logger.info(f"报表模式: {report_mode}, group_by={group_by_field}, skip_rows={skip_rows_val}")
+    logger.info(f"报表模式: {report_mode}, group_by={group_by_field}, split_by={split_by_field}, skip_rows={skip_rows_val}")
 
     try:
         actual_output_path = aspose_helper.generate_from_template(
@@ -957,6 +966,7 @@ async def generate_report(
             skip_rows=skip_rows_val,
             name_field=name_field_val,
             show_empty_period=show_empty,
+            split_by=split_by_field,
         )
         # 实际输出路径可能和请求路径不同（如 zip 回退到 fill 时扩展名变为 .xlsx）
         output_path = actual_output_path

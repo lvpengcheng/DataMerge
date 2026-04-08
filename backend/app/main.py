@@ -473,6 +473,16 @@ async def startup_event():
     # 增量迁移：为已有表添加新列
     from backend.database.init_db import _migrate_add_columns
     _migrate_add_columns()
+    # 定期清理日志缓冲区
+    async def _cleanup_log_buffers():
+        from backend.compute.task_log_buffer import TaskLogBuffer
+        while True:
+            await asyncio.sleep(300)
+            try:
+                TaskLogBuffer.get_instance().cleanup_expired()
+            except Exception as e:
+                logger.warning(f"清理日志缓冲区异常: {e}")
+    asyncio.create_task(_cleanup_log_buffers())
 
 
 # 挂载前端静态文件
@@ -3694,6 +3704,763 @@ def _persist_compute_failed(db, task_id, error_message):
             db.rollback()
         except Exception:
             pass
+
+
+async def run_compute_task(
+    task_id: str,
+    buffer,
+    tenant_id: str,
+    script_id: str,
+    script_content: str,
+    source_dir: Path,
+    salary_year=None,
+    salary_month=None,
+    standard_hours=None,
+    file_passwords=None,
+):
+    """独立的计算任务函数，由 submit 端点触发后台运行。
+
+    参数:
+        task_id: 计算任务 ID（字符串）
+        buffer: TaskLogBuffer 实例
+        tenant_id: 租户 ID
+        script_id: 脚本 ID
+        script_content: 脚本内容
+        source_dir: 已保存源文件的目录（Path）
+        salary_year: 薪资年份
+        salary_month: 薪资月份
+        standard_hours: 标准工时
+        file_passwords: 文件密码 JSON 字符串
+    """
+    from backend.compute.task_log_buffer import TaskLogBuffer
+
+    import tempfile
+    import shutil
+    import io
+    import sys
+
+    temp_dir = None
+    db_session = None
+    compute_task_id = None
+    compute_start_time = None
+    try:
+        # DB持久化：打开会话并加载任务
+        from backend.database.connection import SessionLocal
+        import backend.database.models as db_models
+
+        db_session = SessionLocal()
+        compute_task_id = int(task_id)
+        compute_start_time = datetime.now()
+
+        start_msg = {
+            "type": "status",
+            "message": "计算开始",
+            "tenant_id": tenant_id,
+            "script_id": script_id,
+            "timestamp": datetime.now().isoformat()
+        }
+        buffer.push(task_id, json.dumps(start_msg, ensure_ascii=False))
+
+        # source_dir 已由 submit 端点创建，temp_dir 为其父目录
+        temp_dir = source_dir.parent  # source_dir is temp_dir/source, so parent is temp_dir
+
+        log_msg = {
+            "type": "log",
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "level": "info",
+            "message": f"保存源文件到临时目录: {source_dir}"
+        }
+        buffer.push(task_id, json.dumps(log_msg, ensure_ascii=False))
+
+        # 解析文件密码
+        passwords_dict = {}
+        if file_passwords:
+            try:
+                passwords_dict = json.loads(file_passwords)
+            except Exception:
+                pass
+        logger.info(f"[compute/task密码] raw={repr(file_passwords)}")
+        logger.info(f"[compute/task密码] parsed keys={list(passwords_dict.keys())}, values_len={[len(str(v)) for v in passwords_dict.values()]}")
+
+        # 检测所有文件的加密状态
+        from backend.utils.aspose_helper import is_encrypted as _is_enc, decrypt_excel as _dec_excel
+        encrypted_files = []
+        for file_path in source_dir.iterdir():
+            if file_path.is_file() and file_path.suffix.lower() in ('.xlsx', '.xls', '.xlsm'):
+                file_path_resolved = str(file_path.resolve())
+                if _is_enc(file_path_resolved) and not passwords_dict.get(file_path.name):
+                    encrypted_files.append(file_path.name)
+
+        if encrypted_files:
+            buffer.push(task_id, json.dumps({
+                "type": "encrypted_files",
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "encrypted_files": encrypted_files,
+                "message": f"检测到加密文件: {', '.join(encrypted_files)}"
+            }, ensure_ascii=False))
+            raise ValueError(f"以下文件有密码保护: {', '.join(encrypted_files)}")
+
+        # 解密有密码的文件
+        for file_path in source_dir.iterdir():
+            if not file_path.is_file() or file_path.suffix.lower() not in ('.xlsx', '.xls', '.xlsm'):
+                continue
+            file_path_str = str(file_path.resolve())
+            enc_status = _is_enc(file_path_str)
+            pwd = passwords_dict.get(file_path.name)
+            logger.info(f"[compute/task解密] {file_path.name}: encrypted={enc_status}, has_password={bool(pwd)}")
+            if enc_status and pwd:
+                decrypted = _dec_excel(file_path_str, password=pwd)
+                shutil.move(decrypted, file_path_str)
+                buffer.push(task_id, json.dumps({
+                    "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                    "level": "info", "message": f"已解密文件: {file_path.name}"
+                }, ensure_ascii=False))
+
+        # DB持久化：注册源文件为数据资产
+        if db_session:
+            for src_file in source_dir.iterdir():
+                if src_file.is_file():
+                    _persist_source_file(
+                        db_session, compute_task_id, tenant_id,
+                        str(src_file), src_file.name, src_file.stat().st_size
+                    )
+
+        # ========== 【关键修复】根据列头映射表名/sheet名/列名 ==========
+        pre_loaded_source_data = None
+        try:
+            # 优先从 DB scripts 表读取元数据
+            _script_info = None
+            try:
+                if db_session:
+                    _db_script = db_session.query(db_models.Script).filter(
+                        db_models.Script.tenant_id == tenant_id,
+                        db_models.Script.is_active == True,
+                    ).order_by(db_models.Script.created_at.desc()).first()
+                    if _db_script and (_db_script.manual_headers or _db_script.source_structure):
+                        _script_info = {
+                            "manual_headers": _db_script.manual_headers,
+                            "source_structure": _db_script.source_structure,
+                        }
+            except Exception as _e:
+                logger.warning(f"DB 读取 script 元数据失败: {_e}")
+
+            # 回退：从文件系统读取
+            if not _script_info:
+                try:
+                    _info_file = storage_manager.get_tenant_dir(tenant_id) / "scripts" / f"{script_id}_info.json"
+                    if _info_file.exists():
+                        _script_info = json.loads(_info_file.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            if not _script_info:
+                _active = storage_manager.get_active_script(tenant_id)
+                _script_info = _active.get("script_info", {}) if _active else {}
+
+            source_structure = _script_info.get("source_structure")
+            manual_headers = _script_info.get("manual_headers")
+
+            # 确保从DB读出的JSON列是dict（SQLite可能返回字符串，甚至双重编码）
+            for _ in range(2):
+                if isinstance(source_structure, str):
+                    try:
+                        source_structure = json.loads(source_structure)
+                    except (json.JSONDecodeError, TypeError):
+                        source_structure = None
+                        break
+            if isinstance(manual_headers, str):
+                try:
+                    manual_headers = json.loads(manual_headers)
+                except (json.JSONDecodeError, TypeError):
+                    manual_headers = None
+
+            # ========== 自动补全缺失源文件（从基础资料） ==========
+            if source_structure and db_session:
+                try:
+                    from backend.utils.source_auto_filler import auto_fill_missing_sources
+                    _filled, _still_missing = auto_fill_missing_sources(
+                        source_dir=str(source_dir),
+                        source_structure=source_structure,
+                        tenant_id=tenant_id,
+                        db_session=db_session,
+                    )
+                    if _filled:
+                        _filled_names = [f["file_name"] for f in _filled]
+                        _filled_detail = ", ".join(
+                            f'{f["file_name"]}(来自{f["source"]}基础资料)' for f in _filled
+                        )
+                        buffer.push(task_id, json.dumps({'type': 'info', 'message': f'自动补全源文件: {_filled_detail}'}, ensure_ascii=False))
+                        logger.info(f"[Compute] 自动补全源文件: {_filled_names}")
+                    if _still_missing:
+                        raise ValueError(f"以下源文件缺失，请上传或添加到基础资料: {', '.join(_still_missing)}")
+                except Exception as _af_err:
+                    logger.warning(f"[Compute] 自动补全源文件异常（不阻塞计算）: {_af_err}")
+
+            if source_structure:
+                from backend.utils.fast_header_matcher import FastHeaderMatcher
+
+                fast_matcher = FastHeaderMatcher()
+                input_files = [
+                    str(f) for f in source_dir.glob("*.xlsx")
+                    if not f.name.startswith("~")
+                ] + [
+                    str(f) for f in source_dir.glob("*.xls")
+                    if not f.name.startswith("~")
+                ]
+
+                if input_files:
+                    log_msg = {
+                        "type": "log",
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "level": "info",
+                        "message": f"开始表头匹配映射（{len(input_files)}个文件）..."
+                    }
+                    buffer.push(task_id, json.dumps(log_msg, ensure_ascii=False))
+
+                    _loop = asyncio.get_event_loop()
+
+                    # ===== 单次解析优化：每文件仅 1 次 Aspose 调用 =====
+                    _single_parse_ok = False
+                    file_mapping = None
+                    try:
+                        match_success, match_error, file_mapping, pre_loaded_source_data = \
+                            await _loop.run_in_executor(None, lambda: fast_matcher.match_parse_and_prepare(
+                                source_structure=source_structure,
+                                input_files=input_files,
+                                manual_headers=manual_headers,
+                                output_dir=str(source_dir),
+                            ))
+                        _single_parse_ok = True
+                    except Exception as _sp_err:
+                        logger.warning(f"[compute/task] 单次解析优化失败: {_sp_err}，回退到多次解析流程", exc_info=True)
+
+                    # ===== 回退：原有多次解析流程 =====
+                    if not _single_parse_ok:
+                        pre_loaded_source_data = None
+                        match_success, match_error, smart_mapping = await _loop.run_in_executor(
+                            None,
+                            lambda: fast_matcher.match_and_prepare(
+                                source_structure=source_structure,
+                                input_files=input_files,
+                                manual_headers=manual_headers
+                            )
+                        )
+                        if match_success and smart_mapping and smart_mapping.get("file_mapping"):
+                            file_mapping = smart_mapping["file_mapping"]
+                            for _fb_input, _fb_info in file_mapping.items():
+                                _fb_rewrite = _fb_info.get("needs_rewrite", False)
+                                _fb_expected = _fb_info.get("expected_file")
+                                if _fb_rewrite:
+                                    await _loop.run_in_executor(
+                                        None, FastHeaderMatcher.rewrite_excel,
+                                        _fb_info, str(source_dir)
+                                    )
+                                    if _fb_input != _fb_expected:
+                                        _old = os.path.join(str(source_dir), _fb_input)
+                                        if os.path.exists(_old):
+                                            os.remove(_old)
+                                else:
+                                    if _fb_input != _fb_expected:
+                                        _old = os.path.join(str(source_dir), _fb_input)
+                                        _new = os.path.join(str(source_dir), _fb_expected)
+                                        if os.path.exists(_new):
+                                            os.remove(_new)
+                                        shutil.move(_old, _new)
+
+                    # ===== 处理匹配结果 =====
+                    if match_success and file_mapping:
+                        # 输出映射日志
+                        for input_file_name, mapping_info in file_mapping.items():
+                            expected_file = mapping_info.get("expected_file")
+                            if mapping_info.get("needs_rewrite"):
+                                logger.info(f"[compute/task] 生成映射文件: {input_file_name} → {expected_file}")
+                                log_msg = {
+                                    "type": "log",
+                                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                    "level": "info",
+                                    "message": f"生成映射文件: {input_file_name} → {expected_file}"
+                                }
+                                buffer.push(task_id, json.dumps(log_msg, ensure_ascii=False))
+                            elif input_file_name != expected_file:
+                                logger.info(f"[compute/task] 文件重命名: {input_file_name} → {expected_file}")
+                                log_msg = {
+                                    "type": "log",
+                                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                    "level": "info",
+                                    "message": f"文件重命名: {input_file_name} → {expected_file}"
+                                }
+                                buffer.push(task_id, json.dumps(log_msg, ensure_ascii=False))
+
+                        # 验证预加载数据
+                        if pre_loaded_source_data:
+                            logger.info(f"[compute/task] 预加载源数据: {len(pre_loaded_source_data)}个sheet")
+                            log_msg = {
+                                "type": "log",
+                                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                "level": "info",
+                                "message": f"预加载源数据: {len(pre_loaded_source_data)}个sheet"
+                            }
+                            buffer.push(task_id, json.dumps(log_msg, ensure_ascii=False))
+
+                            for sheet_name, sheet_info in pre_loaded_source_data.items():
+                                df = sheet_info.get("df")
+                                if df is not None:
+                                    log_msg = {
+                                        "type": "log",
+                                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                        "level": "info",
+                                        "message": f"  └─ {sheet_name}: {len(df)}行 × {len(df.columns)}列"
+                                    }
+                                    buffer.push(task_id, json.dumps(log_msg, ensure_ascii=False))
+
+                            # 验证预加载数据是否包含训练时的所有 sheet
+                            expected_keys = set()
+                            for train_file, file_data in source_structure.get("files", {}).items():
+                                if "error" in file_data:
+                                    continue
+                                file_base = train_file.replace('.xlsx', '').replace('.xls', '')
+                                for sn in file_data.get("sheets", {}).keys():
+                                    key = f"{file_base}_{sn}"
+                                    if len(key) > 31:
+                                        key = key[:31]
+                                    expected_keys.add(key)
+
+                            missing_keys = expected_keys - set(pre_loaded_source_data.keys())
+                            if missing_keys:
+                                logger.warning(f"[compute/task] 预加载数据缺少: {missing_keys}，将由脚本自行解析")
+                                pre_loaded_source_data = None
+
+                        log_msg = {
+                            "type": "log",
+                            "timestamp": datetime.now().strftime("%H:%M:%S"),
+                            "level": "info",
+                            "message": f"表头匹配映射完成"
+                        }
+                        buffer.push(task_id, json.dumps(log_msg, ensure_ascii=False))
+                    elif not match_success:
+                        log_msg = {
+                            "type": "log",
+                            "timestamp": datetime.now().strftime("%H:%M:%S"),
+                            "level": "warning",
+                            "message": f"表头匹配失败: {match_error}，将使用原始文件名"
+                        }
+                        buffer.push(task_id, json.dumps(log_msg, ensure_ascii=False))
+        except Exception as e:
+            logger.warning(f"[compute/task] 表头映射过程出错: {e}，将使用原始文件名", exc_info=True)
+
+        # 保存脚本
+        script_path = temp_dir / f"{script_id}.py"
+        script_path.write_text(script_content, encoding='utf-8')
+
+        # 执行脚本
+        output_dir = temp_dir / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        log_msg = {
+            "type": "log",
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "level": "info",
+            "message": "开始执行计算脚本..."
+        }
+        buffer.push(task_id, json.dumps(log_msg, ensure_ascii=False))
+
+        # 在线程池中执行脚本（避免阻塞事件循环）
+        import concurrent.futures
+        loop = asyncio.get_event_loop()
+
+        def execute_script():
+            # 捕获标准输出
+            output_buffer = io.StringIO()
+            old_stdout = sys.stdout
+            sys.stdout = output_buffer
+
+            try:
+                # 动态导入并执行
+                import importlib.util
+                sys.path.insert(0, str(temp_dir))
+                spec = importlib.util.spec_from_file_location("compute_script", script_path)
+                module = importlib.util.module_from_spec(spec)
+
+                # 设置全局变量
+                module.input_folder = str(source_dir)
+                module.output_folder = str(output_dir)
+                if salary_year is not None:
+                    module.salary_year = salary_year
+                if salary_month is not None:
+                    module.salary_month = salary_month
+                if standard_hours is not None:
+                    module.monthly_standard_hours = standard_hours
+
+                # 注入历史数据提供者（供公式代码模板的 write_history_sheet 使用）
+                try:
+                    from backend.utils.historical_data import HistoricalDataProvider
+                    module.history_provider = HistoricalDataProvider(tenant_id)
+                except Exception as _hp_err:
+                    logger.warning(f"历史数据提供者注入失败: {_hp_err}")
+
+                # 【关键】注入预加载源数据，避免因文件名/sheet名不同导致KeyError
+                if pre_loaded_source_data:
+                    module._pre_loaded_source_data = pre_loaded_source_data
+
+                spec.loader.exec_module(module)
+
+                # 【加密支持】monkey-patch IntelligentExcelParser 自动注入密码
+                # 注意：文件已在上游被 _dec_excel 解密，仅对仍加密的文件注入密码
+                if passwords_dict:
+                    try:
+                        from excel_parser import IntelligentExcelParser as _IEP
+                        from backend.utils.aspose_helper import is_encrypted as _chk_enc
+                        _IEP._orig_parse_backup = _IEP.parse_excel_file
+                        _orig_parse = _IEP.parse_excel_file
+                        _fp_map = passwords_dict
+
+                        def _auto_pwd_parse(self_parser, file_path, *args, **kwargs):
+                            if 'password' not in kwargs or kwargs.get('password') is None:
+                                fname = os.path.basename(str(file_path))
+                                pwd = _fp_map.get(fname)
+                                if pwd:
+                                    try:
+                                        still_enc = _chk_enc(str(file_path))
+                                    except Exception:
+                                        still_enc = True  # 检测失败时保守注入
+                                    if still_enc:
+                                        kwargs['password'] = pwd
+                                        print(f"[加密支持] 为 {fname} 自动注入密码")
+                                    else:
+                                        print(f"[加密支持] {fname} 已解密，跳过密码注入")
+                            return _orig_parse(self_parser, file_path, *args, **kwargs)
+
+                        _IEP.parse_excel_file = _auto_pwd_parse
+                        print(f"[加密支持] 已注入密码映射（{len(passwords_dict)}个文件）")
+                    except Exception as _e:
+                        logger.warning(f"[加密支持] 注入失败: {_e}")
+
+                # 【关键】替换 load_source_data，使用预加载数据
+                if pre_loaded_source_data and hasattr(module, 'load_source_data'):
+                    _original_load = module.load_source_data
+                    def _cached_load(input_folder, manual_headers, _data=pre_loaded_source_data):
+                        print(f"[性能优化] 使用预加载源数据（{len(_data)}个sheet，跳过Excel解析）")
+                        return _data
+                    module.load_source_data = _cached_load
+
+                # 调用main函数
+                if hasattr(module, 'main'):
+                    import inspect
+                    sig = inspect.signature(module.main)
+                    params = list(sig.parameters.keys())
+
+                    kwargs = {}
+                    if len(params) >= 2:
+                        args = [str(source_dir), str(output_dir)]
+                        if 'salary_year' in params and salary_year is not None:
+                            kwargs['salary_year'] = salary_year
+                        if 'salary_month' in params and salary_month is not None:
+                            kwargs['salary_month'] = salary_month
+                        if 'monthly_standard_hours' in params and standard_hours is not None:
+                            kwargs['monthly_standard_hours'] = standard_hours
+                        result = module.main(*args, **kwargs)
+                    elif len(params) == 0:
+                        result = module.main()
+                    else:
+                        result = module.main(str(source_dir))
+                else:
+                    raise Exception("脚本缺少main函数")
+
+                return {"success": True, "output": output_buffer.getvalue()}
+            finally:
+                sys.stdout = old_stdout
+                # 恢复 monkey-patch
+                if passwords_dict:
+                    try:
+                        from excel_parser import IntelligentExcelParser as _IEP2
+                        if hasattr(_IEP2, '_orig_parse_backup'):
+                            _IEP2.parse_excel_file = _IEP2._orig_parse_backup
+                            del _IEP2._orig_parse_backup
+                    except Exception:
+                        pass
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            exec_result = await loop.run_in_executor(executor, execute_script)
+
+        # 发送脚本输出日志
+        if exec_result.get("output"):
+            for line in exec_result["output"].split('\n'):
+                if line.strip():
+                    log_msg = {
+                        "type": "log",
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "level": "info",
+                        "message": line
+                    }
+                    buffer.push(task_id, json.dumps(log_msg, ensure_ascii=False))
+
+        # 查找输出文件
+        output_files = list(output_dir.glob("*.xlsx"))
+        if not output_files:
+            raise Exception("未生成输出文件")
+
+        output_file = output_files[0]
+
+        log_msg = {
+            "type": "log",
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "level": "success",
+            "message": f"生成输出文件: {output_file.name}"
+        }
+        buffer.push(task_id, json.dumps(log_msg, ensure_ascii=False))
+
+        # 【性能优化】跳过公式计算 — 智算时 Excel 由用户打开，公式会自动重算
+        # 训练时仍需计算（compare_excel_files 负责），但计算端无需此步骤
+        logger.info(f"[compute/task] 跳过公式计算（用户打开Excel时自动重算）")
+        buffer.push(task_id, json.dumps({
+            "type": "log",
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "level": "info",
+            "message": "跳过公式计算（Excel打开时自动重算）"
+        }, ensure_ascii=False))
+
+        # 保存到租户目录
+        tenant_dir = storage_manager.get_tenant_dir(tenant_id)
+        compute_dir = tenant_dir / "compute_results"
+        compute_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        saved_file = compute_dir / f"result_{timestamp}_{output_file.name}"
+        shutil.copy(output_file, saved_file)
+
+        # 统计行数（read_only 模式避免加载全部数据到内存）
+        import openpyxl
+        wb = openpyxl.load_workbook(saved_file, read_only=True)
+        rows_processed = sum(ws.max_row for ws in wb.worksheets)
+        wb.close()
+
+        log_msg = {
+            "type": "log",
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "level": "success",
+            "message": f"结果已保存，共处理 {rows_processed} 行数据"
+        }
+        buffer.push(task_id, json.dumps(log_msg, ensure_ascii=False))
+
+        # DB持久化：注册结果文件 + 标记任务完成
+        if db_session:
+            _persist_result_file(
+                db_session, compute_task_id, tenant_id,
+                saved_file, output_file.name
+            )
+            duration = (datetime.now() - compute_start_time).total_seconds() if compute_start_time else 0
+            _persist_compute_complete(
+                db_session, compute_task_id, duration,
+                {"output_file": saved_file.name, "rows_processed": rows_processed}
+            )
+
+        # 发送完成消息
+        final_result = {
+            "type": "complete",
+            "success": True,
+            "data": {
+                "output_file": saved_file.name,
+                "rows_processed": rows_processed,
+                "tenant_id": tenant_id,
+                "script_id": script_id
+            }
+        }
+        buffer.push(task_id, json.dumps(final_result, ensure_ascii=False))
+
+    except Exception as e:
+        logger.error(f"计算执行失败: {e}", exc_info=True)
+        # DB持久化：标记任务失败
+        if db_session:
+            _persist_compute_failed(db_session, compute_task_id, str(e))
+        error_result = {
+            "type": "error",
+            "message": str(e),
+            "tenant_id": tenant_id,
+            "script_id": script_id,
+            "timestamp": datetime.now().isoformat()
+        }
+        buffer.push(task_id, json.dumps(error_result, ensure_ascii=False))
+    finally:
+        # 清理临时目录
+        if temp_dir and temp_dir.exists():
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        # 关闭DB会话
+        if db_session:
+            try:
+                db_session.close()
+            except Exception:
+                pass
+        buffer.finish(task_id)
+
+
+# ==================== 新版计算接口：任务队列 + SSE 重连 ====================
+
+@app.post("/api/compute/submit")
+async def compute_submit(
+    tenant_id: str = Form(...),
+    script_id: str = Form(...),
+    source_files: List[UploadFile] = File(...),
+    salary_year: Optional[int] = Form(None),
+    salary_month: Optional[int] = Form(None),
+    standard_hours: Optional[float] = Form(None),
+    file_passwords: Optional[str] = Form(None),
+):
+    """提交计算任务，立即返回 task_id，计算在后台运行。"""
+    try:
+        logger.info(f"[compute/submit] 租户={tenant_id}, 脚本={script_id}")
+
+        # 1. 获取脚本内容
+        script_content = storage_manager.get_script_content(tenant_id, script_id)
+        if not script_content:
+            raise HTTPException(status_code=404, detail=f"脚本不存在: {script_id}")
+
+        # 2. 保存文件到临时目录
+        temp_dir = Path(tempfile.mkdtemp(prefix="compute_"))
+        source_dir = temp_dir / "source"
+        source_dir.mkdir(parents=True, exist_ok=True)
+
+        for file in source_files:
+            file_path = source_dir / file.filename
+            with open(file_path, 'wb') as f:
+                shutil.copyfileobj(file.file, f)
+
+        # 3. 同步检测加密文件
+        passwords_dict = {}
+        if file_passwords:
+            try:
+                passwords_dict = json.loads(file_passwords)
+            except Exception:
+                pass
+
+        from backend.utils.aspose_helper import is_encrypted as _is_enc
+        encrypted_files = []
+        for file_path in source_dir.iterdir():
+            if file_path.is_file() and file_path.suffix.lower() in ('.xlsx', '.xls', '.xlsm'):
+                if _is_enc(str(file_path.resolve())) and not passwords_dict.get(file_path.name):
+                    encrypted_files.append(file_path.name)
+
+        if encrypted_files:
+            # 清理临时目录
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=422,
+                content={"error_type": "encrypted_files", "encrypted_files": encrypted_files,
+                         "message": f"检测到加密文件: {', '.join(encrypted_files)}"},
+            )
+
+        # 4. 创建 DB 任务
+        db_session, compute_task_id = _persist_compute_start(
+            tenant_id, script_id, salary_year=salary_year, salary_month=salary_month
+        )
+
+        task_id_str = str(compute_task_id) if compute_task_id else str(id(temp_dir))
+
+        # 5. 创建日志缓冲区
+        from backend.compute.task_log_buffer import TaskLogBuffer
+        buffer = TaskLogBuffer.get_instance()
+        buffer.create_task(task_id_str)
+
+        # 6. 后台启动计算
+        asyncio.create_task(run_compute_task(
+            task_id=task_id_str,
+            buffer=buffer,
+            tenant_id=tenant_id,
+            script_id=script_id,
+            script_content=script_content,
+            source_dir=source_dir,
+            salary_year=salary_year,
+            salary_month=salary_month,
+            standard_hours=standard_hours,
+            file_passwords=file_passwords,
+        ))
+
+        logger.info(f"[compute/submit] 任务已提交: task_id={task_id_str}")
+        return {"task_id": task_id_str}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[compute/submit] 提交失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/compute/{task_id}/stream")
+async def compute_task_stream(task_id: str, last_event_id: int = 0):
+    """SSE 流：从 last_event_id 开始读取计算日志，支持断线重连。"""
+    from backend.compute.task_log_buffer import TaskLogBuffer
+    buffer = TaskLogBuffer.get_instance()
+
+    status = buffer.get_status(task_id)
+    if status is None:
+        # buffer 已过期或不存在，查 DB
+        try:
+            db = SessionLocal()
+            task = db.query(db_models.ComputeTask).filter_by(id=int(task_id)).first()
+            db.close()
+            if task and task.status in ("completed", "failed"):
+                # 返回最终状态事件后关闭
+                async def _final_event():
+                    if task.status == "completed":
+                        data = json.dumps({"type": "complete", "message": "计算完成",
+                                           "result_summary": task.result_summary}, ensure_ascii=False)
+                    else:
+                        data = json.dumps({"type": "error", "message": task.error_message or "计算失败"},
+                                          ensure_ascii=False)
+                    yield f"id: 0\ndata: {data}\n\n"
+                return StreamingResponse(_final_event(), media_type="text/event-stream",
+                                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        except Exception:
+            pass
+        raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
+
+    async def _sse_generator():
+        async for event_id, data in buffer.read_from(task_id, from_id=last_event_id):
+            if event_id == -1:
+                # 心跳
+                yield ": heartbeat\n\n"
+            else:
+                yield f"id: {event_id}\ndata: {data}\n\n"
+
+    return StreamingResponse(
+        _sse_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/compute/{task_id}/status")
+async def compute_task_status(task_id: str):
+    """轮询兜底：获取计算任务状态。"""
+    from backend.compute.task_log_buffer import TaskLogBuffer
+    buffer = TaskLogBuffer.get_instance()
+
+    result = {"task_id": task_id}
+
+    # 从 buffer 获取流状态
+    buf_status = buffer.get_status(task_id)
+    result["stream_available"] = buf_status is not None
+    if buf_status:
+        result["event_count"] = buf_status["event_count"]
+
+    # 从 DB 获取任务信息
+    try:
+        db = SessionLocal()
+        task = db.query(db_models.ComputeTask).filter_by(id=int(task_id)).first()
+        if task:
+            result["status"] = task.status
+            result["error_message"] = task.error_message
+            result["result_summary"] = task.result_summary
+            result["duration_seconds"] = task.duration_seconds
+            result["created_at"] = task.created_at.isoformat() if task.created_at else None
+            result["finished_at"] = task.finished_at.isoformat() if task.finished_at else None
+        else:
+            result["status"] = "unknown"
+        db.close()
+    except Exception as e:
+        logger.warning(f"[compute/status] DB查询失败: {e}")
+        result["status"] = "unknown"
+
+    return result
 
 
 @app.post("/api/compute/stream")

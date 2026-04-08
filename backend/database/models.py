@@ -92,10 +92,11 @@ class Template(Base):
     file_name_rule = Column(String(500), default="")                     # 输出文件命名规则
     encrypt_type = Column(String(20), default="none")                    # none / password / write_protect
     encrypt_password = Column(String(100), default="")                   # 加密密码
-    report_mode = Column(String(20), default="fill")                     # fill / block / zip
-    group_by = Column(String(100), default="")                           # block/zip 分组字段名
+    report_mode = Column(String(20), default="fill")                     # fill / block / zip / sheet
+    group_by = Column(String(100), default="")                           # block/zip/sheet 分组字段名
     skip_rows = Column(Integer, default=1)                               # block 块间空行数
     name_field = Column(String(100), default="")                         # zip 文件命名字段
+    split_by = Column(String(100), default="")                           # 文件级拆分字段（如：部门）
     show_empty_period = Column(Boolean, default=True)                    # 多月合并时是否显示空月份
     is_active = Column(Boolean, default=True)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)

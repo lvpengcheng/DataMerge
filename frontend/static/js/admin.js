@@ -652,7 +652,7 @@ const Admin = {
             <td>${t.file_name}</td>
             <td>${t.file_name_rule || '-'}</td>
             <td>${t.encrypt_password || '<span style="color:#999">不加密</span>'}</td>
-            <td>${t.report_mode === 'block' ? '<span class="tag" style="background:#fff3e0;color:#e65100">block</span>' : t.report_mode === 'zip' ? '<span class="tag" style="background:#e8eaf6;color:#283593">zip</span>' : 'fill'}${t.group_by ? ' <small>(' + t.group_by + ')</small>' : ''}</td>
+            <td>${t.report_mode === 'block' ? '<span class="tag" style="background:#fff3e0;color:#e65100">block</span>' : t.report_mode === 'zip' ? '<span class="tag" style="background:#e8eaf6;color:#283593">zip</span>' : t.report_mode === 'sheet' ? '<span class="tag" style="background:#e8f5e9;color:#2e7d32">sheet</span>' : 'fill'}${t.group_by ? ' <small>(' + t.group_by + ')</small>' : ''}${t.split_by ? ' <small style="color:#1565c0;">[拆分:' + t.split_by + ']</small>' : ''}</td>
             <td>${t.is_active ? '<span style="color:green">启用</span>' : '<span style="color:#999">停用</span>'}</td>
             <td class="actions">
                 <button class="btn btn-sm" onclick="Admin.downloadTemplate(${t.id}, '${t.file_name.replace(/'/g, "\\'")}')">下载</button>
@@ -696,7 +696,12 @@ const Admin = {
                         <option value="fill">fill — 整表填充</option>
                         <option value="block">block — 分组合并（每组一块）</option>
                         <option value="zip">zip — 分组打包（每组一文件）</option>
+                        <option value="sheet">sheet — 分组多Sheet（每组一个Sheet）</option>
                     </select>
+                </div>
+                <div class="form-group"><label>文件拆分字段</label>
+                    <input id="m-tpl-split-by" placeholder="如：部门（留空则不拆分文件）" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                    <small style="color:#888;">按此列值将数据拆分到不同文件中，拆分后自动打包为 zip</small>
                 </div>
                 <div id="m-tpl-mode-fields" style="display:none;">
                     <div class="form-group"><label>分组字段</label>
@@ -731,6 +736,7 @@ const Admin = {
             fd.append('group_by', document.getElementById('m-tpl-group-by')?.value || '');
             fd.append('skip_rows', document.getElementById('m-tpl-skip-rows')?.value || '1');
             fd.append('name_field', document.getElementById('m-tpl-name-field')?.value || '');
+            fd.append('split_by', document.getElementById('m-tpl-split-by')?.value || '');
             fd.append('show_empty_period', document.getElementById('m-tpl-show-empty')?.checked ? 'true' : 'false');
             const resp = await AUTH.authFetch('/api/admin/templates', { method: 'POST', body: fd });
             if (resp.ok) { this.closeModal(); this.loadTemplates(); }
@@ -776,9 +782,14 @@ const Admin = {
                         <option value="fill" ${(t.report_mode||'fill')==='fill'?'selected':''}>fill — 整表填充</option>
                         <option value="block" ${t.report_mode==='block'?'selected':''}>block — 分组合并（每组一块）</option>
                         <option value="zip" ${t.report_mode==='zip'?'selected':''}>zip — 分组打包（每组一文件）</option>
+                        <option value="sheet" ${t.report_mode==='sheet'?'selected':''}>sheet — 分组多Sheet（每组一个Sheet）</option>
                     </select>
                 </div>
-                <div id="m-tpl-mode-fields" style="display:${(t.report_mode==='block'||t.report_mode==='zip')?'block':'none'};">
+                <div class="form-group"><label>文件拆分字段</label>
+                    <input id="m-tpl-split-by" value="${t.split_by || ''}" placeholder="如：部门（留空则不拆分文件）" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                    <small style="color:#888;">按此列值将数据拆分到不同文件中，拆分后自动打包为 zip</small>
+                </div>
+                <div id="m-tpl-mode-fields" style="display:${(t.report_mode==='block'||t.report_mode==='zip'||t.report_mode==='sheet')?'block':'none'};">
                     <div class="form-group"><label>分组字段</label>
                         <input id="m-tpl-group-by" value="${t.group_by || ''}" placeholder="如: 工号" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
                         <small style="color:#888;">按此列的值分组，每组独立填充模板</small>
@@ -808,6 +819,7 @@ const Admin = {
             fd.append('group_by', document.getElementById('m-tpl-group-by')?.value || '');
             fd.append('skip_rows', document.getElementById('m-tpl-skip-rows')?.value || '1');
             fd.append('name_field', document.getElementById('m-tpl-name-field')?.value || '');
+            fd.append('split_by', document.getElementById('m-tpl-split-by')?.value || '');
             fd.append('show_empty_period', document.getElementById('m-tpl-show-empty')?.checked ? 'true' : 'false');
             const resp = await AUTH.authFetch(`/api/admin/templates/${id}`, { method: 'PUT', body: fd });
             if (resp.ok) { this.closeModal(); this.loadTemplates(); }
@@ -827,7 +839,7 @@ const Admin = {
         const fields = document.getElementById('m-tpl-mode-fields');
         const skipGroup = document.getElementById('m-tpl-skip-rows-group');
         const nameGroup = document.getElementById('m-tpl-name-field-group');
-        if (fields) fields.style.display = (mode === 'block' || mode === 'zip') ? 'block' : 'none';
+        if (fields) fields.style.display = (mode === 'block' || mode === 'zip' || mode === 'sheet') ? 'block' : 'none';
         if (skipGroup) skipGroup.style.display = mode === 'block' ? 'block' : 'none';
         if (nameGroup) nameGroup.style.display = mode === 'zip' ? 'block' : 'none';
     },

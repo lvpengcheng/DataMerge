@@ -125,6 +125,7 @@ def _migrate_add_columns():
         ("templates", "skip_rows", "INTEGER DEFAULT 1"),
         ("templates", "name_field", "VARCHAR(100) DEFAULT ''"),
         ("templates", "show_empty_period", "BOOLEAN DEFAULT TRUE"),
+        ("templates", "split_by", "VARCHAR(100) DEFAULT ''"),
         # ---------- training_sessions ----------
         ("training_sessions", "ai_provider", "VARCHAR(50)"),
         ("training_sessions", "salary_year", "INTEGER"),

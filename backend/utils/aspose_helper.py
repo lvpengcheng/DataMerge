@@ -709,14 +709,19 @@ def generate_from_template(
     skip_rows: int = 1,
     name_field: str = "",
     show_empty_period: bool = True,
+    split_by: str = "",
 ) -> str:
     """
     使用 Aspose WorkbookDesigner（SmartMarker 引擎）填充模板生成文件。
 
-    三种模式:
+    四种模式:
       fill  — 整个 DataFrame 一次性填入模板（默认，适合汇总表）
       block — 按 group_by 字段分组，每组独立填充模板后合并到一个文件
       zip   — 按 group_by 字段分组，每组生成独立 xlsx，打包为 zip 下载
+      sheet — 按 group_by 字段分组，每组生成独立 sheet
+
+    split_by: 文件级拆分字段，按此列值将数据拆分到多个文件，打包为 zip。
+              可与 fill/block/sheet 模式组合使用。
 
     模板标记:
       &=DT.Column              数据集字段
@@ -727,9 +732,20 @@ def generate_from_template(
       {"DT": pd.DataFrame(...), "$year": "2026", "$month": "03"}
 
     Returns:
-      fill/block → output_path (xlsx)
-      zip        → output_path (zip)
+      fill/block/sheet → output_path (xlsx)
+      zip / 有split_by → output_path (zip)
     """
+    # 如果有 split_by，走文件级拆分包装器
+    if split_by:
+        return _generate_with_split(
+            output_path, template_path, data,
+            split_by=split_by, mode=mode,
+            group_by=group_by, skip_rows=skip_rows,
+            name_field=name_field,
+            password=password, watermark_text=watermark_text,
+            show_empty_period=show_empty_period,
+        )
+
     if mode == "block":
         return _generate_block(
             output_path, template_path, data,
@@ -741,6 +757,13 @@ def generate_from_template(
         return _generate_zip(
             output_path, template_path, data,
             group_by=group_by, name_field=name_field,
+            password=password, watermark_text=watermark_text,
+            show_empty_period=show_empty_period,
+        )
+    elif mode == "sheet":
+        return _generate_sheet(
+            output_path, template_path, data,
+            group_by=group_by,
             password=password, watermark_text=watermark_text,
             show_empty_period=show_empty_period,
         )
@@ -886,6 +909,61 @@ def _generate_block(
     return _finalize_workbook(result_wb, output_path, password, watermark_text)
 
 
+# ── sheet 模式 ────────────────────────────────────────
+
+def _generate_sheet(
+    output_path: str, template_path: str, data: Dict,
+    group_by: str = "",
+    password: Optional[str] = None, watermark_text: Optional[str] = None,
+    show_empty_period: bool = True,
+) -> str:
+    """按 group_by 分组，每组生成一个独立 sheet，sheet 名取自分组值。"""
+    ds_name, full_df, vars_data = _extract_datasource(data)
+
+    # 模糊匹配 group_by 列名
+    if group_by and group_by not in full_df.columns:
+        matched = _fuzzy_match_column(group_by, full_df.columns)
+        if matched:
+            logger.info(f"[sheet] group_by 模糊匹配: '{group_by}' -> '{matched}'")
+            group_by = matched
+
+    if not group_by or group_by not in full_df.columns:
+        logger.warning(f"[sheet] group_by='{group_by}' 不在列 {list(full_df.columns)} 中，回退到 fill 模式")
+        return _generate_fill(output_path, template_path, data, password, watermark_text)
+
+    groups = full_df.groupby(group_by, sort=False)
+    logger.info(f"[报表生成] sheet 模式: {len(groups)} 组, group_by={group_by}")
+
+    result_wb = None
+    sheet_names = set()
+
+    for group_idx, (group_key, group_df) in enumerate(groups):
+        group_df = group_df.reset_index(drop=True)
+        group_vars = _extract_group_vars(group_df, vars_data)
+        group_data = {ds_name: group_df, **group_vars}
+
+        # SmartMarker 填充该组
+        filled_wb = _smartmarker_fill(template_path, group_data)
+
+        sheet_name = _sanitize_sheet_name(str(group_key), sheet_names)
+
+        if result_wb is None:
+            # 第一组：直接用填好的 workbook，重命名第一个 sheet
+            result_wb = filled_wb
+            result_wb.Worksheets[0].Name = sheet_name
+        else:
+            # 后续组：从填好的 workbook 复制 sheet 到结果 workbook
+            filled_ws = filled_wb.Worksheets[0]
+            result_wb.Worksheets.AddCopy(result_wb.Worksheets.Count - 1)
+            new_ws = result_wb.Worksheets[result_wb.Worksheets.Count - 1]
+            new_ws.Copy(filled_ws)
+            new_ws.Name = sheet_name
+
+        logger.info(f"[sheet] 组 {group_idx+1}/{len(groups)}: sheet='{sheet_name}', {len(group_df)} 行数据")
+
+    return _finalize_workbook(result_wb, output_path, password, watermark_text)
+
+
 # ── zip 模式 ──────────────────────────────────────────
 
 def _generate_zip(
@@ -962,6 +1040,99 @@ def _generate_zip(
     return output_path
 
 
+# ── split_by 文件级拆分 ────────────────────────────────
+
+def _generate_with_split(
+    output_path: str, template_path: str, data: Dict,
+    split_by: str = "", mode: str = "fill",
+    group_by: str = "", skip_rows: int = 1,
+    name_field: str = "",
+    password: Optional[str] = None, watermark_text: Optional[str] = None,
+    show_empty_period: bool = True,
+) -> str:
+    """按 split_by 字段拆分数据到多个文件，每个文件内按 mode 模式生成，打包为 zip。"""
+    ds_name, full_df, vars_data = _extract_datasource(data)
+
+    # 模糊匹配 split_by 列名
+    if split_by not in full_df.columns:
+        matched = _fuzzy_match_column(split_by, full_df.columns)
+        if matched:
+            logger.info(f"[split] split_by 模糊匹配: '{split_by}' -> '{matched}'")
+            split_by = matched
+
+    if split_by not in full_df.columns:
+        logger.warning(f"[split] split_by='{split_by}' 不在列 {list(full_df.columns)} 中，忽略拆分，走普通模式")
+        if mode == "sheet":
+            return _generate_sheet(output_path, template_path, data, group_by=group_by,
+                                   password=password, watermark_text=watermark_text,
+                                   show_empty_period=show_empty_period)
+        elif mode == "block":
+            return _generate_block(output_path, template_path, data, group_by=group_by,
+                                   skip_rows=skip_rows, password=password,
+                                   watermark_text=watermark_text, show_empty_period=show_empty_period)
+        elif mode == "zip":
+            return _generate_zip(output_path, template_path, data, group_by=group_by,
+                                 name_field=name_field, password=password,
+                                 watermark_text=watermark_text, show_empty_period=show_empty_period)
+        else:
+            return _generate_fill(output_path, template_path, data, password=password,
+                                  watermark_text=watermark_text)
+
+    # split_by + zip 时，split_by 覆盖 zip 的 group_by 语义
+    if mode == "zip":
+        logger.info(f"[split] split_by + zip 模式，split_by 覆盖 group_by，等同于按 '{split_by}' 做 zip")
+        return _generate_zip(output_path, template_path, data,
+                             group_by=split_by, name_field=name_field,
+                             password=password, watermark_text=watermark_text,
+                             show_empty_period=show_empty_period)
+
+    # 确保输出路径是 .zip
+    if not output_path.endswith(".zip"):
+        output_path = os.path.splitext(output_path)[0] + ".zip"
+
+    split_groups = full_df.groupby(split_by, sort=False)
+    logger.info(f"[报表生成] split 模式: {len(split_groups)} 个文件, split_by={split_by}, 内部模式={mode}")
+
+    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for split_idx, (split_key, split_df) in enumerate(split_groups):
+            split_df = split_df.reset_index(drop=True)
+            split_vars = _extract_group_vars(split_df, vars_data)
+            split_data = {ds_name: split_df, **split_vars}
+
+            with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+                tmp_path = tmp.name
+
+            try:
+                if mode == "sheet":
+                    _generate_sheet(tmp_path, template_path, split_data,
+                                    group_by=group_by, password=password,
+                                    watermark_text=watermark_text,
+                                    show_empty_period=show_empty_period)
+                elif mode == "block":
+                    _generate_block(tmp_path, template_path, split_data,
+                                    group_by=group_by, skip_rows=skip_rows,
+                                    password=password, watermark_text=watermark_text,
+                                    show_empty_period=show_empty_period)
+                else:
+                    _generate_fill(tmp_path, template_path, split_data,
+                                   password=password, watermark_text=watermark_text)
+
+                file_label = re.sub(r'[\\/:*?"<>|]', '_', str(split_key).strip())
+                if not file_label:
+                    file_label = f"group_{split_idx + 1}"
+                inner_name = f"{file_label}.xlsx"
+
+                zf.write(tmp_path, inner_name)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+
+            logger.info(f"[split] 文件 {split_idx+1}/{len(split_groups)}: {inner_name}, {len(split_df)} 行, 内部模式={mode}")
+
+    logger.info(f"[报表生成] split 完成: {output_path}")
+    return output_path
+
+
 # ── 公共工具 ──────────────────────────────────────────
 
 def _extract_datasource(data: Dict):
@@ -1012,6 +1183,28 @@ def _extract_group_vars(group_df: pd.DataFrame, global_vars: Dict) -> Dict:
             result[var_key] = str(val)
 
     return result
+
+
+def _sanitize_sheet_name(name: str, existing_names: set) -> str:
+    """清洗 sheet 名称：截断至31字符，替换非法字符，处理重名。"""
+    # 替换非法字符
+    clean = re.sub(r'[\\/:*?\[\]]', '_', str(name).strip())
+    # 截断至 31 字符（Excel 限制）
+    if len(clean) > 31:
+        clean = clean[:31]
+    # 空名称兜底
+    if not clean:
+        clean = "Sheet"
+    # 处理重名
+    base = clean
+    counter = 2
+    while clean in existing_names:
+        suffix = f"_{counter}"
+        max_base_len = 31 - len(suffix)
+        clean = base[:max_base_len] + suffix
+        counter += 1
+    existing_names.add(clean)
+    return clean
 
 
 def _fill_template_data(wb, name: str, df: pd.DataFrame) -> None:
