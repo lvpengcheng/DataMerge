@@ -3555,7 +3555,7 @@ def _persist_compute_start(tenant_id: str, script_id_str: str,
 
 
 def _persist_source_file(db, task_id, tenant_id, src_file_path, file_name, file_size):
-    """注册源文件为数据资产并关联到计算任务"""
+    """注册源文件为数据资产并关联到计算任务（仅存表头摘要，不全量解析）"""
     try:
         project_root = Path(__file__).resolve().parent.parent.parent
         asset_dir = project_root / "tenants" / tenant_id / "assets" / "source"
@@ -3564,15 +3564,14 @@ def _persist_source_file(db, task_id, tenant_id, src_file_path, file_name, file_
         dest_path = asset_dir / f"{timestamp}_{file_name}"
         shutil.copy2(src_file_path, dest_path)
 
-        # 解析 Excel 完整内容存入 DB
-        parsed_data = None
+        # 仅读取表头摘要（headers_only + read_formulas=False），避免全量解析大文件
         sheet_summary = None
         try:
-            import dataclasses as _dc
             from excel_parser import IntelligentExcelParser
             parser = IntelligentExcelParser()
-            results = parser.parse_excel_file(str(dest_path))
-            parsed_data = [_dc.asdict(s) for s in results]
+            results = parser.parse_excel_file(
+                str(dest_path), headers_only=True, read_formulas=False, best_region_only=True
+            )
             sheet_summary = []
             for sd in results:
                 headers = []
@@ -3582,7 +3581,7 @@ def _persist_source_file(db, task_id, tenant_id, src_file_path, file_name, file_
                     total_rows += len(r.data)
                 sheet_summary.append({"sheet_name": sd.sheet_name, "rows": total_rows, "headers": headers[:50], "regions": len(sd.regions)})
         except Exception as parse_err:
-            logger.warning(f"解析源文件内容失败: {parse_err}")
+            logger.warning(f"解析源文件表头失败: {parse_err}")
 
         asset = db_models.DataAsset(
             tenant_id=tenant_id,
@@ -3592,7 +3591,7 @@ def _persist_source_file(db, task_id, tenant_id, src_file_path, file_name, file_
             file_name=file_name,
             file_size=file_size,
             sheet_summary=sheet_summary,
-            parsed_data=parsed_data,
+            parsed_data=None,
         )
         db.add(asset)
         db.commit()
@@ -3616,26 +3615,18 @@ def _persist_source_file(db, task_id, tenant_id, src_file_path, file_name, file_
 
 
 def _persist_result_file(db, task_id, tenant_id, saved_file_path, original_name):
-    """注册计算结果为数据资产"""
+    """注册计算结果为数据资产（仅存表头摘要，不做公式计算和全量解析）"""
     try:
         saved_path = Path(saved_file_path) if not isinstance(saved_file_path, Path) else saved_file_path
 
-        # 解析结果文件内容存入 DB（先计算公式再解析，确保存的是计算值）
-        parsed_data = None
+        # 仅读取表头和行数摘要，跳过 CalculateFormula（用户打开 Excel 时自动重算）
         sheet_summary = None
         try:
-            import dataclasses as _dc
-            from Aspose.Cells import Workbook as _RWb
             from excel_parser import IntelligentExcelParser
-
-            # 先用 Aspose 计算公式并覆盖保存，确保缓存值可用
-            _rwb = _RWb(str(saved_path))
-            _rwb.CalculateFormula()
-            _rwb.Save(str(saved_path))
-
             parser = IntelligentExcelParser()
-            results = parser.parse_excel_file(str(saved_path))
-            parsed_data = [_dc.asdict(s) for s in results]
+            results = parser.parse_excel_file(
+                str(saved_path), headers_only=True, read_formulas=False, best_region_only=True
+            )
             sheet_summary = []
             for sd in results:
                 headers = []
@@ -3645,7 +3636,7 @@ def _persist_result_file(db, task_id, tenant_id, saved_file_path, original_name)
                     total_rows += len(r.data)
                 sheet_summary.append({"sheet_name": sd.sheet_name, "rows": total_rows, "headers": headers[:50], "regions": len(sd.regions)})
         except Exception as parse_err:
-            logger.warning(f"解析结果文件内容失败: {parse_err}")
+            logger.warning(f"解析结果文件表头失败: {parse_err}")
 
         asset = db_models.DataAsset(
             tenant_id=tenant_id,
@@ -3656,7 +3647,7 @@ def _persist_result_file(db, task_id, tenant_id, saved_file_path, original_name)
             file_size=saved_path.stat().st_size,
             source_task_id=task_id,
             sheet_summary=sheet_summary,
-            parsed_data=parsed_data,
+            parsed_data=None,
         )
         db.add(asset)
         db.commit()
@@ -3782,39 +3773,22 @@ async def run_compute_task(
         logger.info(f"[compute/task密码] raw={repr(file_passwords)}")
         logger.info(f"[compute/task密码] parsed keys={list(passwords_dict.keys())}, values_len={[len(str(v)) for v in passwords_dict.values()]}")
 
-        # 检测所有文件的加密状态
-        from backend.utils.aspose_helper import is_encrypted as _is_enc, decrypt_excel as _dec_excel
-        encrypted_files = []
-        for file_path in source_dir.iterdir():
-            if file_path.is_file() and file_path.suffix.lower() in ('.xlsx', '.xls', '.xlsm'):
-                file_path_resolved = str(file_path.resolve())
-                if _is_enc(file_path_resolved) and not passwords_dict.get(file_path.name):
-                    encrypted_files.append(file_path.name)
-
-        if encrypted_files:
-            buffer.push(task_id, json.dumps({
-                "type": "encrypted_files",
-                "timestamp": datetime.now().strftime("%H:%M:%S"),
-                "encrypted_files": encrypted_files,
-                "message": f"检测到加密文件: {', '.join(encrypted_files)}"
-            }, ensure_ascii=False))
-            raise ValueError(f"以下文件有密码保护: {', '.join(encrypted_files)}")
-
-        # 解密有密码的文件
-        for file_path in source_dir.iterdir():
-            if not file_path.is_file() or file_path.suffix.lower() not in ('.xlsx', '.xls', '.xlsm'):
-                continue
-            file_path_str = str(file_path.resolve())
-            enc_status = _is_enc(file_path_str)
-            pwd = passwords_dict.get(file_path.name)
-            logger.info(f"[compute/task解密] {file_path.name}: encrypted={enc_status}, has_password={bool(pwd)}")
-            if enc_status and pwd:
-                decrypted = _dec_excel(file_path_str, password=pwd)
-                shutil.move(decrypted, file_path_str)
-                buffer.push(task_id, json.dumps({
-                    "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
-                    "level": "info", "message": f"已解密文件: {file_path.name}"
-                }, ensure_ascii=False))
+        # 解密有密码的文件（加密检测已在 submit 端点完成，此处只做解密）
+        if passwords_dict:
+            from backend.utils.aspose_helper import is_encrypted as _is_enc, decrypt_excel as _dec_excel
+            for file_path in source_dir.iterdir():
+                if not file_path.is_file() or file_path.suffix.lower() not in ('.xlsx', '.xls', '.xlsm'):
+                    continue
+                pwd = passwords_dict.get(file_path.name)
+                if pwd:
+                    file_path_str = str(file_path.resolve())
+                    if _is_enc(file_path_str):
+                        decrypted = _dec_excel(file_path_str, password=pwd)
+                        shutil.move(decrypted, file_path_str)
+                        buffer.push(task_id, json.dumps({
+                            "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                            "level": "info", "message": f"已解密文件: {file_path.name}"
+                        }, ensure_ascii=False))
 
         # DB持久化：注册源文件为数据资产
         if db_session:
@@ -4227,11 +4201,14 @@ async def run_compute_task(
         saved_file = compute_dir / f"result_{timestamp}_{output_file.name}"
         shutil.copy(output_file, saved_file)
 
-        # 统计行数（read_only 模式避免加载全部数据到内存）
-        import openpyxl
-        wb = openpyxl.load_workbook(saved_file, read_only=True)
-        rows_processed = sum(ws.max_row for ws in wb.worksheets)
-        wb.close()
+        # 统计行数（使用 Aspose 轻量读取，避免额外引入 openpyxl）
+        try:
+            from Aspose.Cells import Workbook as _CountWb
+            _cwb = _CountWb(str(saved_file))
+            rows_processed = sum(_cwb.Worksheets[i].Cells.MaxDataRow + 1
+                                 for i in range(_cwb.Worksheets.Count))
+        except Exception:
+            rows_processed = 0
 
         log_msg = {
             "type": "log",
@@ -4561,43 +4538,33 @@ async def compute_with_script_stream(
                         }
                         await logs_queue.put(json.dumps(log_msg, ensure_ascii=False))
 
-                    # 检测所有文件的加密状态
+                    # 检测加密并解密（合并为单次遍历）
                     from ..utils.aspose_helper import is_encrypted as _is_enc, decrypt_excel as _dec_excel
-                    encrypted_files = []
+                    encrypted_no_pwd = []
                     for file in source_files:
                         file_path = source_dir / file.filename
-                        file_path_resolved = str(file_path.resolve())
-                        if _is_enc(file_path_resolved) and not passwords_dict.get(file.filename):
-                            encrypted_files.append(file.filename)
+                        file_path_str = str(file_path.resolve())
+                        if not _is_enc(file_path_str):
+                            continue
+                        pwd = passwords_dict.get(file.filename)
+                        if not pwd:
+                            encrypted_no_pwd.append(file.filename)
+                        else:
+                            decrypted = _dec_excel(file_path_str, password=pwd)
+                            shutil.move(decrypted, file_path_str)
+                            await logs_queue.put(json.dumps({
+                                "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                "level": "info", "message": f"已解密文件: {file.filename}"
+                            }, ensure_ascii=False))
 
-                    if encrypted_files:
+                    if encrypted_no_pwd:
                         await logs_queue.put(json.dumps({
                             "type": "encrypted_files",
                             "timestamp": datetime.now().strftime("%H:%M:%S"),
-                            "encrypted_files": encrypted_files,
-                            "message": f"检测到加密文件: {', '.join(encrypted_files)}"
+                            "encrypted_files": encrypted_no_pwd,
+                            "message": f"检测到加密文件: {', '.join(encrypted_no_pwd)}"
                         }, ensure_ascii=False))
-                        raise ValueError(f"以下文件有密码保护: {', '.join(encrypted_files)}")
-
-                    # 解密有密码的文件
-                    for file in source_files:
-                        file_path = source_dir / file.filename
-                        # 将路径resolve为长路径（避免Windows 8.3短路径问题）
-                        file_path_str = str(file_path.resolve())
-                        enc_status = _is_enc(file_path_str)
-                        pwd = passwords_dict.get(file.filename)
-                        logger.info(f"[compute/stream解密] {file.filename}: encrypted={enc_status}, has_password={bool(pwd)}, pwd_repr={repr(pwd)}, path={file_path_str}")
-                        if enc_status:
-                            if pwd:
-                                decrypted = _dec_excel(file_path_str, password=pwd)
-                                shutil.move(decrypted, file_path_str)
-                                # 验证解密后状态
-                                enc_after = _is_enc(file_path_str)
-                                logger.info(f"[compute/stream解密] {file.filename}: 解密后 encrypted={enc_after}")
-                                await logs_queue.put(json.dumps({
-                                    "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
-                                    "level": "info", "message": f"已解密文件: {file.filename}"
-                                }, ensure_ascii=False))
+                        raise ValueError(f"以下文件有密码保护: {', '.join(encrypted_no_pwd)}")
 
                     # DB持久化：注册源文件为数据资产
                     if db_session:
@@ -5010,11 +4977,14 @@ async def compute_with_script_stream(
                     saved_file = compute_dir / f"result_{timestamp}_{output_file.name}"
                     shutil.copy(output_file, saved_file)
 
-                    # 统计行数（read_only 模式避免加载全部数据到内存）
-                    import openpyxl
-                    wb = openpyxl.load_workbook(saved_file, read_only=True)
-                    rows_processed = sum(ws.max_row for ws in wb.worksheets)
-                    wb.close()
+                    # 统计行数（使用 Aspose 轻量读取）
+                    try:
+                        from Aspose.Cells import Workbook as _CountWb
+                        _cwb = _CountWb(str(saved_file))
+                        rows_processed = sum(_cwb.Worksheets[i].Cells.MaxDataRow + 1
+                                             for i in range(_cwb.Worksheets.Count))
+                    except Exception:
+                        rows_processed = 0
 
                     log_msg = {
                         "type": "log",
@@ -5180,37 +5150,30 @@ async def compute_with_script(
                 # 检测并解密加密文件
                 from ..utils.aspose_helper import is_encrypted as _is_enc, decrypt_excel as _dec_excel
 
-            # 先检测所有文件加密状态
-            encrypted_files = []
+            # 检测加密并解密（单次遍历）
+            encrypted_no_pwd = []
             for file in source_files:
                 file_path = source_dir / file.filename
-                if _is_enc(str(file_path)) and not passwords_dict.get(file.filename):
-                    encrypted_files.append(file.filename)
+                file_path_str = str(file_path.resolve())
+                if not _is_enc(file_path_str):
+                    continue
+                pwd = passwords_dict.get(file.filename)
+                if not pwd:
+                    encrypted_no_pwd.append(file.filename)
+                else:
+                    decrypted = _dec_excel(file_path_str, password=pwd)
+                    shutil.move(decrypted, file_path_str)
 
-            if encrypted_files:
+            if encrypted_no_pwd:
                 from fastapi.responses import JSONResponse
                 return JSONResponse(
                     status_code=422,
                     content={
                         "error_type": "encrypted_files",
-                        "encrypted_files": encrypted_files,
-                        "message": f"以下文件有密码保护: {', '.join(encrypted_files)}",
+                        "encrypted_files": encrypted_no_pwd,
+                        "message": f"以下文件有密码保护: {', '.join(encrypted_no_pwd)}",
                     }
                 )
-
-            # 解密有密码的文件
-            for file in source_files:
-                file_path = source_dir / file.filename
-                enc_status = _is_enc(str(file_path))
-                has_pwd = bool(passwords_dict.get(file.filename))
-                logger.info(f"[compute解密] {file.filename}: encrypted={enc_status}, has_password={has_pwd}")
-                if enc_status:
-                    pwd = passwords_dict.get(file.filename)
-                    if pwd:
-                        decrypted = _dec_excel(str(file_path), password=pwd)
-                        shutil.move(decrypted, str(file_path))
-                        enc_after = _is_enc(str(file_path))
-                        logger.info(f"[compute解密] {file.filename}: 解密后 encrypted={enc_after}")
 
             # DB持久化：注册源文件为数据资产
             if db_session:
@@ -5347,11 +5310,14 @@ async def compute_with_script(
             saved_file = compute_dir / f"result_{timestamp}_{output_file.name}"
             shutil.copy(output_file, saved_file)
 
-            # 统计行数（read_only 模式避免加载全部数据到内存）
-            import openpyxl
-            wb = openpyxl.load_workbook(saved_file, read_only=True)
-            rows_processed = sum(ws.max_row for ws in wb.worksheets)
-            wb.close()
+            # 统计行数（使用 Aspose 轻量读取）
+            try:
+                from Aspose.Cells import Workbook as _CountWb
+                _cwb = _CountWb(str(saved_file))
+                rows_processed = sum(_cwb.Worksheets[i].Cells.MaxDataRow + 1
+                                     for i in range(_cwb.Worksheets.Count))
+            except Exception:
+                rows_processed = 0
 
             # DB持久化：注册结果文件 + 标记任务完成
             if db_session:
