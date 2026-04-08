@@ -1738,6 +1738,8 @@ def set_as_best(
     if not iteration or not iteration.generated_code:
         raise HTTPException(status_code=400, detail="没有可用的代码")
 
+    config = session.config or {}
+
     from ..api.training_persistence import TrainingPersistence
     persistence = TrainingPersistence(db)
 
@@ -1756,7 +1758,6 @@ def set_as_best(
     )
 
     # 同步保存到磁盘（使老版智算路径也能读到）
-    config = session.config or {}
     try:
         from ..storage.storage_manager import StorageManager
         _sm = StorageManager()
