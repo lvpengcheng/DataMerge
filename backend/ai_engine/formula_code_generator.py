@@ -23,6 +23,7 @@ from pathlib import Path
 from .ai_provider import BaseAIProvider, AIProviderFactory
 from .prompt_generator import PromptGenerator
 from .excel_formula_builder import ExcelFormulaBuilder
+from backend.utils.indentation_fixer import IndentationFixer
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ class FormulaCodeGenerator:
         self.training_logger = training_logger
         self.prompt_generator = PromptGenerator()
         self.formula_builder = ExcelFormulaBuilder()
+        self._indent_fixer = IndentationFixer()
 
     def generate_code(
         self,
@@ -59,7 +61,8 @@ class FormulaCodeGenerator:
         rules_content: str,
         expected_structure: Dict[str, Any],
         manual_headers: Dict = None,
-        stream_callback: callable = None
+        stream_callback: callable = None,
+        multi_sheet_source: bool = False,
     ) -> Tuple[str, str]:
         """生成公式模式的Python代码
 
@@ -84,10 +87,12 @@ class FormulaCodeGenerator:
 
         log("=== 公式模式：开始生成代码 ===")
         self.last_prompt = None  # 记录实际提示词，供调用方获取
+        self._multi_sheet_source = multi_sheet_source  # 记录给 _build_complete_code 使用
 
         # 1. 加载源数据获取结构信息
         log("步骤1: 分析源数据结构...")
-        source_info = self.formula_builder.load_source_data(input_folder, manual_headers)
+        source_info = self.formula_builder.load_source_data(input_folder, manual_headers,
+                                                             multi_sheet_source=multi_sheet_source)
         log(f"发现 {len(source_info['sheets'])} 个源数据sheet")
 
         # 2. 从规则中解析主表名称，传给源数据结构描述
@@ -134,7 +139,8 @@ class FormulaCodeGenerator:
                 source_structure=source_structure,
                 expected_structure=expected_structure,
                 rules_content=rules_content,
-                manual_headers=manual_headers
+                manual_headers=manual_headers,
+                multi_sheet_source=multi_sheet_source,
             )
             log(f"提示词长度: {len(prompt)} 字符")
             self.last_prompt = prompt  # 存储实际提示词
@@ -188,13 +194,9 @@ class FormulaCodeGenerator:
                 log=log
             )
 
-        # 5.5 修复for循环体缩进脱离
+        # 5.5-5.6 统一缩进修复（for循环体脱离 + 列级联缩进）
         if fill_function_code:
-            fill_function_code = self._fix_for_loop_body_indentation(fill_function_code)
-
-        # 5.6 修复列代码的级联缩进问题
-        if fill_function_code:
-            fill_function_code = self._fix_cascading_indentation(fill_function_code)
+            fill_function_code = self._indent_fixer.fix_formula_pipeline(fill_function_code)
 
         # 5.7 彻底修复f-string引号冲突和未闭合括号
         if fill_function_code:
@@ -254,7 +256,11 @@ class FormulaCodeGenerator:
             "你是一个专业的Python程序员，擅长处理各种Excel数据处理任务，"
             "包括人力资源、财务、供应链等不同业务场景。请生成准确、高效的Python代码。"
             "特别注意根据业务场景选择合适的主键进行数据关联和计算。"
-            "只返回Python代码，不要包含解释或其他文本。"
+            "只返回Python代码，不要包含解释或其他文本。\n\n"
+            "⚠️ 缩进纪律（必须严格遵守）：\n"
+            "1. break退出for循环后，下一行代码必须回退到for语句的缩进级别\n"
+            "2. if/elif/else块结束后，后续独立代码必须与if同级，禁止嵌套在else内部\n"
+            "3. 各步骤注释（# === N. ===）必须全部在同一缩进级别，绝对不能递增嵌套"
         )
 
         # 根据provider类型构建初始messages
@@ -418,12 +424,13 @@ class FormulaCodeGenerator:
                 f"## 代码上下文（最后15行）\n```python\n{tail_snippet}\n```\n\n"
                 f"请紧接着上面的代码继续生成，从第{next_col_num}列{' [' + missing[0] + ']' if missing else ''} 开始。要求：\n"
                 f"1. 绝对不要重复第1~{last_col_num}列的代码，直接从第{next_col_num}列开始\n"
-                f"2. 保持相同的缩进级别（8空格，在for循环内）\n"
+                f"2. 保持相同的缩进级别（8空格，在for循环内），禁止级联嵌套\n"
                 f"3. 只输出Python代码块，不要解释\n"
                 f"4. 【格式要求】每列代码必须独立一行，列与列之间用空行分隔，每列前必须有注释行。绝对不要把多列代码写在同一行\n"
                 f"5. 尽可能多生成列，一次性生成全部{len(missing)}个缺失列，不要只生成几列就停止\n"
                 f"6. 只使用上面列出的已定义变量，不要引用未定义的变量\n"
-                f"7. 预计还需要生成约{len(missing)}列的代码，请一次性全部输出，直到所有列都完成"
+                f"7. 预计还需要生成约{len(missing)}列的代码，请一次性全部输出，直到所有列都完成\n"
+                f"8. ⚠️ 缩进纪律：break后回退到for同级，if/else后续代码与if平级，禁止将下一列嵌套在上一列的if/else块内"
             )
 
             # 构建assistant预填充，包含代码块开头引导AI直接输出代码
@@ -498,183 +505,6 @@ class FormulaCodeGenerator:
             log(f"⚠️ VLOOKUP后处理: 未检测到sn_变量定义，所有VLOOKUP可能使用了硬编码sheet名")
 
         return code
-
-    def _fix_for_loop_body_indentation(self, code: str) -> str:
-        """修复AI生成代码中for循环体缩进脱离的问题
-
-        AI常见错误：for i in range(n_rows): 后面的列赋值代码
-        缩进从8空格降回4空格，导致代码跑到循环外面，只有最后一行的值被写入。
-
-        检测模式：
-            for i in range(n_rows):     # 4空格
-                r = i + 2               # 8空格（正确）
-            # XX列(N): ...              # 4空格（错误！应该8空格）
-            val = main_df.iloc[i]...    # 4空格（错误！引用了循环变量i）
-        """
-        lines = code.split('\n')
-
-        # 1. 找到 for i in range(n_rows):
-        for_line_idx = None
-        for_indent = None
-        for idx, line in enumerate(lines):
-            stripped = line.strip()
-            if re.match(r'for\s+i\s+in\s+range\s*\(\s*n_rows\s*\)', stripped):
-                for_line_idx = idx
-                for_indent = len(line) - len(line.lstrip())
-                break
-
-        if for_line_idx is None:
-            return code
-
-        expected_body_indent = for_indent + 4
-        col_marker_pattern = re.compile(r'#\s*\S*列\s*\(\s*\d+\s*\)')
-
-        # 2. 找到for之后第一个非空行，判断缩进情况
-        first_code_after_for = None
-        for idx in range(for_line_idx + 1, len(lines)):
-            if lines[idx].strip():
-                first_code_after_for = idx
-                break
-
-        if first_code_after_for is None:
-            return code
-
-        first_indent = len(lines[first_code_after_for]) - len(lines[first_code_after_for].lstrip())
-
-        drop_start = None
-        if first_indent == expected_body_indent:
-            # Case A: 循环开头缩进正确（r = i + 2 在8空格），后面掉回去了
-            for idx in range(first_code_after_for + 1, len(lines)):
-                stripped = lines[idx].strip()
-                if not stripped:
-                    continue
-                current_indent = len(lines[idx]) - len(lines[idx].lstrip())
-                if current_indent == for_indent and (
-                    col_marker_pattern.search(stripped) or
-                    'main_df.iloc[i]' in stripped or
-                    'ws.cell(row=r' in stripped or
-                    '.iloc[i]' in stripped
-                ):
-                    drop_start = idx
-                    break
-        elif first_indent == for_indent:
-            # Case B: 整个循环体都在for_indent级别
-            stripped = lines[first_code_after_for].strip()
-            if any(var in stripped for var in ['= i +', 'iloc[i]', 'row=r', '列(']):
-                drop_start = first_code_after_for
-        else:
-            return code
-
-        if drop_start is None:
-            return code
-
-        # 3. 找到循环体的结束位置
-        loop_end = len(lines)
-        for idx in range(drop_start, len(lines)):
-            stripped = lines[idx].strip()
-            if not stripped:
-                continue
-            current_indent = len(lines[idx]) - len(lines[idx].lstrip())
-            # 新的函数定义
-            if stripped.startswith('def ') and current_indent <= for_indent:
-                loop_end = idx
-                break
-            # return语句在函数级别
-            if stripped.startswith('return ') and current_indent == for_indent:
-                loop_end = idx
-                break
-            # 模块级别的section标记（0缩进的 # === 注释）
-            if current_indent == 0 and stripped.startswith('#') and '===' in stripped:
-                loop_end = idx
-                break
-
-        # 4. 修复：给drop_start到loop_end之间的所有行加4空格
-        indent_add = ' ' * 4
-        fixed_lines = lines[:drop_start]
-        for idx in range(drop_start, loop_end):
-            line = lines[idx]
-            if not line.strip():
-                fixed_lines.append('')
-            else:
-                fixed_lines.append(indent_add + line)
-        fixed_lines.extend(lines[loop_end:])
-
-        logger.info(
-            f"修复for循环体缩进：第{drop_start + 1}-{loop_end}行，"
-            f"共{loop_end - drop_start}行从{for_indent}空格修正为{expected_body_indent}空格"
-        )
-
-        return '\n'.join(fixed_lines)
-
-    def _fix_cascading_indentation(self, code: str) -> str:
-        """修复AI生成代码中的级联缩进问题
-
-        AI常见错误：把下一列的代码嵌套在上一列的if/else分支内，
-        导致缩进越来越深。本方法：
-        1. 找到所有列标记注释
-        2. 如果缩进不一致，统一拉平到第一个列标记的缩进
-        3. 每个列块内部保持相对缩进关系
-        """
-        lines = code.split('\n')
-        col_marker_pattern = re.compile(r'^#\s*\S*列\s*\(\s*\d+\s*\)\s*[:：]')
-
-        # 第一遍：找到所有列标记及其缩进
-        col_markers = []  # (line_index, indent_level)
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if col_marker_pattern.match(stripped):
-                indent = len(line) - len(line.lstrip())
-                col_markers.append((i, indent))
-
-        if len(col_markers) < 2:
-            return code
-
-        # 检测是否存在级联缩进
-        base_indent = col_markers[0][1]
-        has_cascade = any(m[1] != base_indent for m in col_markers)
-
-        if not has_cascade:
-            return code
-
-        logger.info(f"检测到级联缩进问题：{len(col_markers)}个列标记，"
-                    f"缩进范围 {min(m[1] for m in col_markers)}-{max(m[1] for m in col_markers)} 空格，"
-                    f"统一修正为 {base_indent} 空格")
-
-        # 第二遍：按列块修复缩进
-        fixed_lines = lines[:col_markers[0][0]]  # 列标记之前的代码保持不变
-
-        # 找到列代码区域的结束位置（return语句或文件末尾）
-        code_end = len(lines)
-        for j in range(col_markers[-1][0] + 1, len(lines)):
-            if lines[j].strip().startswith('return '):
-                code_end = j
-                break
-
-        for idx, (marker_line, marker_indent) in enumerate(col_markers):
-            # 确定当前列块的范围
-            if idx + 1 < len(col_markers):
-                block_end = col_markers[idx + 1][0]
-            else:
-                block_end = code_end
-
-            # 计算缩进偏移量
-            indent_diff = marker_indent - base_indent
-
-            # 修复这个列块内所有行的缩进
-            for j in range(marker_line, block_end):
-                line = lines[j]
-                if not line.strip():
-                    fixed_lines.append('')
-                    continue
-                current_indent = len(line) - len(line.lstrip())
-                new_indent = max(0, current_indent - indent_diff)
-                fixed_lines.append(' ' * new_indent + line.lstrip())
-
-        # 添加列块之后的剩余代码（return语句等）
-        for j in range(code_end, len(lines)):
-            fixed_lines.append(lines[j])
-
-        return '\n'.join(fixed_lines)
 
     def _truncate_to_last_complete_column(self, code: str) -> Tuple[str, str]:
         """截断到最后一个完整列，去掉末尾可能的半截代码
@@ -1305,59 +1135,10 @@ class FormulaCodeGenerator:
 
         # 强制归一化缩进到8空格（for循环体内的标准缩进）
         TARGET_INDENT = 8
-        reindented = self._normalize_column_indentation(cleaned_comp_lines, TARGET_INDENT)
+        reindented = self._indent_fixer.normalize_column_indentation(cleaned_comp_lines, TARGET_INDENT)
 
         new_lines = lines[:insert_pos] + [''] + reindented + [''] + lines[insert_pos:]
         return '\n'.join(new_lines)
-
-    def _normalize_column_indentation(self, lines: list, target_base: int = 8) -> list:
-        """将列代码块的缩进归一化到指定基准
-
-        优先使用列标记注释（# XX列(N): 说明）的缩进作为基准，
-        而不是简单取第一个非空行。这样即使AI生成的代码前面有
-        非列标记的行（变量定义等），也能正确归一化。
-
-        Args:
-            lines: 代码行列表
-            target_base: 目标基准缩进（默认8空格，即for循环体内）
-
-        Returns:
-            归一化缩进后的代码行列表
-        """
-        if not lines:
-            return lines
-
-        # 优先用列标记注释的缩进作为基准
-        col_marker_pattern = re.compile(r'^\s*#\s*\S*列\s*\(\s*\d+\s*\)\s*[:：]')
-        actual_base = None
-        for line in lines:
-            if line.strip() and col_marker_pattern.match(line.strip()):
-                actual_base = len(line) - len(line.lstrip())
-                break
-
-        # 如果没有列标记，回退到第一个非空行
-        if actual_base is None:
-            for line in lines:
-                if line.strip():
-                    actual_base = len(line) - len(line.lstrip())
-                    break
-            if actual_base is None:
-                return lines
-
-        if actual_base == target_base:
-            return lines  # 已经是正确缩进
-
-        indent_diff = actual_base - target_base
-        result = []
-        for line in lines:
-            if not line.strip():
-                result.append('')
-                continue
-            current_indent = len(line) - len(line.lstrip())
-            new_indent = max(0, current_indent - indent_diff)
-            result.append(' ' * new_indent + line.lstrip())
-
-        return result
 
     def _fix_fstring_and_brackets(self, code: str) -> str:
         """彻底修复f-string引号冲突和未闭合括号问题
@@ -1930,6 +1711,7 @@ def load_source_data(input_folder, manual_headers):
         return _cached
 
     source_data = {}
+    _used_keys = set()
     parser = IntelligentExcelParser()
 
     for filename in sorted(os.listdir(input_folder)):
@@ -1942,7 +1724,7 @@ def load_source_data(input_folder, manual_headers):
             results = parser.parse_excel_file(
                 file_path,
                 manual_headers=manual_headers,
-                active_sheet_only=True,
+                active_sheet_only=__ACTIVE_SHEET_ONLY__,
                 best_region_only=True,  # 只取有效区域（与merge_source_to_target逻辑一致）
                 read_formulas=False,    # 智算阶段不需要公式，使用批量读取提升性能
                 # 不限制 max_data_rows → 执行时加载全量数据
@@ -1976,8 +1758,24 @@ def load_source_data(input_folder, manual_headers):
 
                 # sheet名称格式：文件名_sheet名
                 sheet_name = f"{file_base}_{sheet_data.sheet_name}"
+                # 截断到31字符（Excel sheet名限制），碰撞时追加后缀
                 if len(sheet_name) > 31:
                     sheet_name = sheet_name[:31]
+                _base = sheet_name
+                _counter = 2
+                while sheet_name in _used_keys:
+                    _suffix = f"_{_counter}"
+                    sheet_name = _base[:31 - len(_suffix)] + _suffix
+                    _counter += 1
+                _used_keys.add(sheet_name)
+
+                # 序号列补全：如果序号/SN列存在但全为空，填充连续序号
+                # 防止清洗代码误将None转"None"后过滤掉所有行
+                for _sn_col in merged_df.columns:
+                    if ('序号' in str(_sn_col) or 'S/N' in str(_sn_col).upper()) and len(merged_df) > 0:
+                        if merged_df[_sn_col].isna().all():
+                            merged_df[_sn_col] = range(1, len(merged_df) + 1)
+                            print(f"[序号补全] {sheet_name}: 列'{_sn_col}'全空, 已填充1~{len(merged_df)}")
 
                 source_data[sheet_name] = {
                     "df": merged_df,
@@ -2184,15 +1982,23 @@ def write_source_sheets(wb, source_data):
     return source_sheets
 
 
-def find_source_sheet(source_sheets, target_columns=None, sheet_name_hint=None):
-    """辅助函数：根据列名或sheet名称提示查找源数据sheet
+def find_source_sheet(source_sheets, target_columns=None, sheet_name_hint=None,
+                      salary_year=None, salary_month=None):
+    """辅助函数：根据sheet名称或列名查找源数据sheet
 
-    这个函数用于在计算时动态查找源数据sheet，避免硬编码文件名导致的KeyError。
+    匹配优先级（严格顺序）：
+    1. 唯一sheet → 直接返回
+    2. Sheet名称精确匹配（最高优先级 — 与智训一致的sheet名）
+    3. 薪资年月匹配（YYYYMM 格式 sheet 名）
+    4. 表头结构匹配（target_columns 列名匹配度）
+    5. 回退到第一个sheet
 
     Args:
         source_sheets: 源数据字典 {"文件名_sheet名": {"df": DataFrame, "ws": worksheet}}
         target_columns: 目标列名列表（用于匹配），例如 ["姓名", "部门", "基本工资"]
         sheet_name_hint: sheet名称提示（比如"薪资"、"考勤"等关键词）
+        salary_year: 薪资年份（如 2025），用于匹配 YYYYMM 格式 sheet
+        salary_month: 薪资月份（如 1~12），用于匹配 YYYYMM 格式 sheet
 
     Returns:
         匹配的sheet key
@@ -2203,14 +2009,50 @@ def find_source_sheet(source_sheets, target_columns=None, sheet_name_hint=None):
     if len(source_sheets) == 1:
         return list(source_sheets.keys())[0]
 
-    # 策略2: 根据列名匹配（如果提供了target_columns）
+    # 策略2: 根据sheet名称提示匹配（最高优先级 — 与智训一致的sheet名）
+    if sheet_name_hint:
+        hint_lower = sheet_name_hint.strip().lower()
+        # 2a: 精确包含匹配
+        for sheet_key in source_sheets.keys():
+            if sheet_name_hint in sheet_key:
+                return sheet_key
+        # 2b: 忽略大小写包含匹配
+        for sheet_key in source_sheets.keys():
+            if hint_lower in sheet_key.lower():
+                return sheet_key
+        # 2c: 去掉文件名前缀后匹配（如 hint="社保明细"，key="人员信息_社保明细"）
+        for sheet_key in source_sheets.keys():
+            parts = sheet_key.split('_', 1)
+            if len(parts) > 1 and hint_lower in parts[1].lower():
+                return sheet_key
+
+    # 策略3: 薪资年月匹配（适用于 202501、2025-01、2025年1月 等格式的 sheet 名）
+    if salary_year and salary_month:
+        ym_patterns = [
+            f"{salary_year}{int(salary_month):02d}",       # 202501
+            f"{salary_year}-{int(salary_month):02d}",      # 2025-01
+            f"{salary_year}年{int(salary_month)}月",        # 2025年1月
+            f"{int(salary_month)}月",                       # 1月
+        ]
+        # 如果有 sheet_name_hint，优先在包含 hint 的 sheet 中匹配年月
+        candidates = list(source_sheets.keys())
+        if sheet_name_hint:
+            hint_candidates = [k for k in candidates if sheet_name_hint.lower() in k.lower()]
+            if hint_candidates:
+                candidates = hint_candidates
+
+        for pattern in ym_patterns:
+            for sheet_key in candidates:
+                if pattern in sheet_key:
+                    return sheet_key
+
+    # 策略4: 根据列名匹配（如果提供了target_columns）
     if target_columns:
         best_match = None
         best_score = 0
         for sheet_key, sheet_data in source_sheets.items():
             sheet_columns = set(sheet_data["df"].columns)
             target_set = set(target_columns)
-            # 计算列名匹配度
             match_count = len(sheet_columns & target_set)
             if match_count > best_score:
                 best_score = match_count
@@ -2218,17 +2060,11 @@ def find_source_sheet(source_sheets, target_columns=None, sheet_name_hint=None):
         if best_match and best_score > 0:
             return best_match
 
-    # 策略3: 根据sheet名称提示匹配
-    if sheet_name_hint:
-        for sheet_key in source_sheets.keys():
-            if sheet_name_hint in sheet_key:
-                return sheet_key
-
-    # 策略4: 返回第一个sheet
+    # 策略5: 返回第一个sheet
     if source_sheets:
         return list(source_sheets.keys())[0]
 
-    # 无可用sheet → 抛出明确异常（避免返回 None 导致下游 KeyError: None）
+    # 无可用sheet → 抛出明确异常
     hint_info = f", sheet_name_hint='{sheet_name_hint}'" if sheet_name_hint else ""
     col_info = f", target_columns={target_columns}" if target_columns else ""
     available = list(source_sheets.keys()) if source_sheets else []
@@ -2470,6 +2306,10 @@ def main():
             fill_function_code = self._clean_after_function_body(fill_function_code)
 
         complete_code = template + fill_function_code + main_template
+
+        # 替换模板中的 active_sheet_only 占位符
+        _aso_value = "False" if getattr(self, "_multi_sheet_source", False) else "True"
+        complete_code = complete_code.replace("__ACTIVE_SHEET_ONLY__", _aso_value)
 
         # 最终验证：确保代码包含fill_result_sheets函数定义
         if 'def fill_result_sheets' not in complete_code and 'def fill_result_sheet' not in complete_code:
@@ -2806,6 +2646,7 @@ def main():
 2. **必须保留原始代码中所有变量定义**（如 sn_xxx = "表名" 等 sheet name 变量），不得删除或遗漏任何变量
 3. **输出完整的fill_result_sheets函数**，包含所有原有的变量定义、所有列的处理逻辑
 4. **对于未提到的列，直接复制粘贴原始代码** — 不要"优化"、"改进"、"简化"任何未被用户指出的列
+5. **缩进纪律** — break退出for循环后必须回退到for的缩进级别；if/else结束后后续代码必须与if同级，禁止嵌套在else内部；所有# === N. ===步骤注释必须在同一缩进级别
 
 ## 原始fill_result_sheets函数
 ```python
@@ -2866,9 +2707,7 @@ def main():
 
         # 修复for循环体缩进、级联缩进和f-string引号冲突（与generate_code主流程一致）
         if corrected_fill_function:
-            corrected_fill_function = self._fix_for_loop_body_indentation(corrected_fill_function)
-        if corrected_fill_function:
-            corrected_fill_function = self._fix_cascading_indentation(corrected_fill_function)
+            corrected_fill_function = self._indent_fixer.fix_formula_pipeline(corrected_fill_function)
         if corrected_fill_function:
             corrected_fill_function = self._fix_fstring_and_brackets(corrected_fill_function)
 
@@ -3006,8 +2845,7 @@ def main():
             patched_function = self.inject_pre_loop_code(patched_function, parsed["pre_loop_code"])
 
         # 7. 后处理
-        patched_function = self._fix_for_loop_body_indentation(patched_function)
-        patched_function = self._fix_cascading_indentation(patched_function)
+        patched_function = self._indent_fixer.fix_formula_pipeline(patched_function)
         patched_function = self._fix_fstring_and_brackets(patched_function)
 
         # 8. 拼接完整代码
@@ -3251,7 +3089,8 @@ def main():
             source_structure=source_structure,
             expected_structure=expected_structure,
             rules_content=rules_content,
-            manual_headers=manual_headers
+            manual_headers=manual_headers,
+            multi_sheet_source=getattr(self, "_multi_sheet_source", False),
         )
 
         system_prompt = prompts["system"]
@@ -3371,7 +3210,8 @@ def main():
                     f"2. 保持8空格缩进，只输出Python代码块\n"
                     f"3. 【格式要求】每列代码必须独立一行，列与列之间用空行分隔，每列前必须有注释行。绝对不要把多列代码写在同一行\n"
                     f"4. 一次性生成全部{len(missing)}个缺失列，不要只生成几列就停止\n"
-                    f"5. 只使用上面列出的已定义变量，不要引用未定义的变量"
+                    f"5. 只使用上面列出的已定义变量，不要引用未定义的变量\n"
+                    f"6. ⚠️ 缩进纪律：break后回退到for同级，if/else后续代码与if平级，禁止级联嵌套"
                 )
 
                 # 构建assistant预填充
@@ -3426,8 +3266,7 @@ def main():
 
         # 后处理
         if accumulated_code:
-            accumulated_code = self._fix_for_loop_body_indentation(accumulated_code)
-            accumulated_code = self._fix_cascading_indentation(accumulated_code)
+            accumulated_code = self._indent_fixer.fix_formula_pipeline(accumulated_code)
             accumulated_code = self._fix_fstring_and_brackets(accumulated_code)
             accumulated_code = self.ai_provider.validate_and_fix_code_format(accumulated_code)
             accumulated_code = self._post_validate_vlookup(accumulated_code, log)

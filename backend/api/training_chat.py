@@ -26,6 +26,7 @@ from ..database.models import (
     TrainingSession, TrainingIteration, TrainingMessage, Script, DataAsset,
 )
 from ..auth.dependencies import get_current_user
+from ..utils.data_helpers import make_unique_sheet_key
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +144,8 @@ def _build_source_structure_from_generator(generator) -> Dict[str, Any]:
     return structure
 
 
-def _build_source_structure_from_dir(source_dir: str, manual_headers: Dict = None) -> Dict[str, Any]:
+def _build_source_structure_from_dir(source_dir: str, manual_headers: Dict = None,
+                                     multi_sheet_source: bool = False) -> Dict[str, Any]:
     """从源文件目录直接构建 source_structure（用于直接导入等无 generator 的场景）。"""
     from excel_parser import IntelligentExcelParser
 
@@ -157,7 +159,7 @@ def _build_source_structure_from_dir(source_dir: str, manual_headers: Dict = Non
         try:
             results = parser.parse_excel_file(
                 file_path, manual_headers=manual_headers,
-                active_sheet_only=True, best_region_only=True,
+                active_sheet_only=not multi_sheet_source, best_region_only=True,
                 max_data_rows=3, headers_only=True,
                 read_formulas=False,
             )
@@ -192,7 +194,7 @@ def _analyze_expected_structure(expected_file: str) -> Dict[str, Any]:
     parsed_data = parser.parse_excel_file(
         expected_file,
         max_data_rows=10,
-        active_sheet_only=True,
+        active_sheet_only=False,  # 加载所有sheet以支持多Sheet训练
         best_region_only=True,
     )
 
@@ -222,7 +224,8 @@ def _analyze_expected_structure(expected_file: str) -> Dict[str, Any]:
 # ==================== 后台全量数据加载 ====================
 
 
-def _load_full_source_data(source_dir: str, manual_headers: Dict = None) -> Dict:
+def _load_full_source_data(source_dir: str, manual_headers: Dict = None,
+                           multi_sheet_source: bool = False) -> Dict:
     """全量加载源文件数据（无 max_data_rows 限制），供脚本执行时使用。
     该函数设计为在后台线程中运行，与 AI 代码生成并行执行。
 
@@ -233,6 +236,7 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None) -> Dict
     from excel_parser import IntelligentExcelParser
 
     source_data = {}
+    _used_keys = set()
     parser = IntelligentExcelParser()
 
     for filename in sorted(os.listdir(source_dir)):
@@ -245,7 +249,7 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None) -> Dict
             results = parser.parse_excel_file(
                 file_path,
                 manual_headers=manual_headers,
-                active_sheet_only=True,
+                active_sheet_only=not multi_sheet_source,
                 best_region_only=True,
                 read_formulas=False,  # 脚本执行阶段不需要公式，使用批量读取提升性能
                 # 不传 max_data_rows → 加载全量数据
@@ -279,9 +283,18 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None) -> Dict
                     continue
 
                 merged_df = dfs[0] if len(dfs) == 1 else pd.concat(dfs, ignore_index=True)
+
+                # 序号列补全：如果序号/SN列存在但全为空，填充连续序号
+                # 防止AI生成的clean_source_data误将None转"None"后过滤掉所有行
+                _sn_candidates = [c for c in merged_df.columns
+                                  if '序号' in str(c) or 'S/N' in str(c).upper()]
+                for _sn_col in _sn_candidates:
+                    if len(merged_df) > 0 and merged_df[_sn_col].isna().all():
+                        merged_df[_sn_col] = range(1, len(merged_df) + 1)
+                        logger.info(f"[序号补全] {file_base}: 列'{_sn_col}'全空, 已填充1~{len(merged_df)}")
+
                 sheet_name = f"{file_base}_{sheet_data.sheet_name}"
-                if len(sheet_name) > 31:
-                    sheet_name = sheet_name[:31]
+                sheet_name = make_unique_sheet_key(sheet_name, _used_keys)
                 source_data[sheet_name] = {"df": merged_df, "columns": columns}
                 logger.info(f"[后台全量加载] {sheet_name}: {len(merged_df)} 行")
 
@@ -372,10 +385,11 @@ def _build_chat_system_prompt(context: Dict, config: Dict, rules: str) -> str:
         "请用中文回答。",
     ]
 
-    # 当前代码信息
+    # 当前代码（全量传入，供讨论分析和精准定位问题）
     if context.get("latest_code"):
-        code_lines = context["latest_code"].strip().split("\n")
-        parts.append(f"\n当前代码共 {len(code_lines)} 行。")
+        code = context["latest_code"].strip()
+        code_lines = code.split("\n")
+        parts.append(f"\n当前代码共 {len(code_lines)} 行:\n```python\n{code}\n```")
 
     # 准确率信息
     if context.get("latest_accuracy") is not None:
@@ -437,7 +451,7 @@ def _persist_iteration_files(tenant_id: str, session_id: int, iteration_num: int
             for fn in os.listdir(output_dir):
                 if fn.endswith((".xlsx", ".xls")) and not fn.startswith("~"):
                     src = os.path.join(output_dir, fn)
-                    if "diff" in fn.lower() or "_diff" in fn:
+                    if "diff" in fn.lower() or "_diff" in fn or "差异对比" in fn:
                         dst = iter_dir / f"diff_{fn}"
                         shutil.copy2(src, dst)
                         paths["diff_file"] = str(dst)
@@ -467,10 +481,11 @@ def _run_single_iteration(
     file_passwords: Dict = None,
     pre_loaded_source_data: Dict = None,
     rules_content: str = None,
+    expected_structure: Dict = None,
 ) -> Dict[str, Any]:
     """执行单轮训练：运行代码 → 对比 → 返回结果（与 TrainingEngine._execute_and_validate 一致）"""
     from ..sandbox.code_sandbox import CodeSandbox
-    from ..utils.excel_comparator import compare_excel_files, extract_primary_keys_from_rules
+    from ..utils.excel_comparator import compare_excel_files, compare_excel_files_multi_sheet, extract_primary_keys_from_rules
 
     sandbox = CodeSandbox()
 
@@ -543,11 +558,15 @@ def _run_single_iteration(
             }
         result_file = str(output_files[0])
 
-        # 对比 — 从规则中提取主键以精确匹配行
+        # 对比 — 根据预期文件sheet数选择单sheet或多sheet对比
         diff_output = str(output_dir / "_diff.xlsx")
         comparison_primary_keys = extract_primary_keys_from_rules(rules_content) if rules_content else None
         logger.info(f"[对比] rules_content长度={len(rules_content) if rules_content else 0}, 提取到主键={comparison_primary_keys}")
-        comparison = compare_excel_files(result_file, expected_file, diff_output, primary_keys=comparison_primary_keys)
+        _exp_sheet_count = len((expected_structure or {}).get("sheets", {}))
+        if _exp_sheet_count > 1:
+            comparison = compare_excel_files_multi_sheet(result_file, expected_file, diff_output, primary_keys=comparison_primary_keys)
+        else:
+            comparison = compare_excel_files(result_file, expected_file, diff_output, primary_keys=comparison_primary_keys)
 
         total = comparison.get("total_cells", 1)
         matched = comparison.get("matched_cells", 0)
@@ -765,6 +784,7 @@ async def start_training(
     manual_headers: Optional[str] = Form(None),
     force_retrain: bool = Form(False),
     session_id: Optional[int] = Form(None),  # 传入已有 session_id 则继续
+    multi_sheet_source: Optional[str] = Form(None),  # "true" 启用数据源多Sheet读取
     current_user=Depends(get_current_user),
 ):
     """开始训练（首轮），返回 SSE 流"""
@@ -885,6 +905,7 @@ async def start_training(
                     "salary_month": salary_month,
                     "monthly_standard_hours": monthly_standard_hours,
                     "manual_headers": manual_headers_dict,
+                    "multi_sheet_source": multi_sheet_source == "true",
                 }
                 ts = persistence.create_session(
                     tenant_id=tenant_id,
@@ -982,7 +1003,8 @@ def main(source_dir, output_dir, **kwargs):
                 # 构建真正的 source_structure（供计算时 FastHeaderMatcher 使用）
                 try:
                     ts.source_structure = _build_source_structure_from_dir(
-                        src_dir, config.get("manual_headers"))
+                        src_dir, config.get("manual_headers"),
+                        multi_sheet_source=config.get("multi_sheet_source", False))
                     db.commit()
                 except Exception as _ss_err:
                     logger.warning(f"直接导入构建 source_structure 失败: {_ss_err}")
@@ -1053,6 +1075,7 @@ def main(source_dir, output_dir, **kwargs):
                     logger.warning(f"直接导入持久化失败: {e}")
 
                 if saved_files:
+                    saved_files["has_rules"] = bool(config.get("rules_content"))
                     config["latest_files"] = saved_files
                     ts.config = config
                     flag_modified(ts, "config")
@@ -1099,7 +1122,8 @@ def main(source_dir, output_dir, **kwargs):
             # 【后台全量加载】在 AI 代码生成期间并行加载全量源数据
             # 这样 AI 生成代码时（耗时最长），全量数据同时解析
             _full_data_future = _executor.submit(
-                _load_full_source_data, src_dir, config.get("manual_headers")
+                _load_full_source_data, src_dir, config.get("manual_headers"),
+                multi_sheet_source=config.get("multi_sheet_source", False),
             )
 
             # 使用 FormulaCodeGenerator.generate_code()（与原训练引擎一致）
@@ -1111,6 +1135,7 @@ def main(source_dir, output_dir, **kwargs):
                 expected_structure=expected_struct,
                 manual_headers=config.get("manual_headers"),
                 stream_callback=stream_cb,
+                multi_sheet_source=config.get("multi_sheet_source", False),
             )
 
             if not code:
@@ -1163,6 +1188,7 @@ def main(source_dir, output_dir, **kwargs):
                 monthly_standard_hours=monthly_standard_hours,
                 pre_loaded_source_data=_full_source_data,
                 rules_content=config.get("rules_content", ""),
+                expected_structure=config.get("expected_structure"),
             )
 
             # 记录迭代
@@ -1232,6 +1258,7 @@ def main(source_dir, output_dir, **kwargs):
 
             # 持久化训练产物（脚本、输出文件、差异文件）
             saved_files = _persist_iteration_files(tenant_id, sid, iteration_num, code, run_result)
+            saved_files["has_rules"] = bool(config.get("rules_content"))
             if saved_files:
                 config["latest_files"] = saved_files
                 ts.config = config
@@ -1462,7 +1489,8 @@ async def send_message(
             # 【后台全量加载】修正轮次也需要全量数据
             src_dir = config.get("source_dir", "")
             _full_data_future = _executor.submit(
-                _load_full_source_data, src_dir, config.get("manual_headers")
+                _load_full_source_data, src_dir, config.get("manual_headers"),
+                multi_sheet_source=config.get("multi_sheet_source", False),
             ) if src_dir and os.path.isdir(src_dir) else None
 
             code = None
@@ -1558,6 +1586,7 @@ async def send_message(
                 monthly_standard_hours=config.get("monthly_standard_hours"),
                 pre_loaded_source_data=_full_source_data,
                 rules_content=config.get("rules_content", ""),
+                expected_structure=config.get("expected_structure"),
             )
 
             # 保存详细差异文本到 config
@@ -1598,6 +1627,7 @@ async def send_message(
                     "accuracy": prev_best,
                     "rollback": True,
                     "attempted_accuracy": accuracy,
+                    "files": config.get("latest_files", {}),
                 })
             else:
                 persistence.record_iteration(
@@ -1657,6 +1687,7 @@ async def send_message(
 
                 # 持久化训练产物
                 saved_files = _persist_iteration_files(session.tenant_id, session_id, iteration_num, code, run_result)
+                saved_files["has_rules"] = bool(config.get("rules_content"))
                 if saved_files:
                     config["latest_files"] = saved_files
                     session.config = config
@@ -1830,6 +1861,7 @@ async def upload_code(
         salary_month=config.get("salary_month"),
         monthly_standard_hours=config.get("monthly_standard_hours"),
         rules_content=config.get("rules_content", ""),
+        expected_structure=config.get("expected_structure"),
     )
 
     from ..api.training_persistence import TrainingPersistence
@@ -1984,7 +2016,7 @@ def download_iteration_file(
                 for f in iter_dir.iterdir():
                     if f.name == "script.py":
                         files["script_file"] = str(f)
-                    elif "diff" in f.name.lower() and f.suffix in (".xlsx", ".xls"):
+                    elif ("diff" in f.name.lower() or "差异对比" in f.name) and f.suffix in (".xlsx", ".xls"):
                         files["diff_file"] = str(f)
                     elif f.suffix in (".xlsx", ".xls") and not f.name.startswith("~"):
                         files.setdefault("output_file", str(f))

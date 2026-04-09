@@ -14,7 +14,7 @@ from .prompt_generator import PromptGenerator
 from .training_logger import TrainingLogger
 from excel_parser import IntelligentExcelParser
 from ..sandbox.code_sandbox import CodeSandbox
-from ..utils.excel_comparator import compare_excel_files
+from ..utils.excel_comparator import compare_excel_files, compare_excel_files_multi_sheet
 
 
 class TrainingEngine:
@@ -274,16 +274,20 @@ class TrainingEngine:
         except Exception as e:
             self.logger.warning(f"保存历史最佳分数失败: {e}")
 
-    def _format_detailed_diff(self, field_diff_samples: Dict[str, Any], total_diff: int, matched_cells: int, total_cells: int) -> str:
+    def _format_detailed_diff(self, field_diff_samples: Dict[str, Any], total_diff: int,
+                              matched_cells: int, total_cells: int,
+                              comparison_result: Optional[Dict[str, Any]] = None) -> str:
         """格式化详细的差异信息用于AI修正
 
         按字段分类汇总差异，显示字段名、使用的公式和差异数量。
+        支持多Sheet模式：当 comparison_result 包含 per_sheet / missing_sheets 时按 Sheet 分组展示。
 
         Args:
             field_diff_samples: 按字段分类的差异样本 {字段名: {formula, count}}
             total_diff: 总差异数
             matched_cells: 匹配的单元格数
             total_cells: 总单元格数
+            comparison_result: 完整比对结果（可选，多Sheet时包含 per_sheet 等）
 
         Returns:
             格式化的差异描述文本
@@ -291,33 +295,76 @@ class TrainingEngine:
         if not field_diff_samples:
             return f"总体匹配率: {matched_cells}/{total_cells}, 差异 {total_diff} 处"
 
+        per_sheet = (comparison_result or {}).get("per_sheet", {})
+        missing_sheets = (comparison_result or {}).get("missing_sheets", [])
+        extra_sheets = (comparison_result or {}).get("extra_sheets", [])
+        is_multi_sheet = len(per_sheet) > 1 or len(missing_sheets) > 0
+
         lines = [
             "## 差异汇总",
             f"- 总体匹配率: {matched_cells}/{total_cells} ({matched_cells/total_cells*100:.1f}%)" if total_cells > 0 else "- 总体匹配率: N/A",
             f"- 总差异数: {total_diff} 处",
             f"- 涉及字段数: {len(field_diff_samples)} 个",
-            "",
-            "## 有差异的字段及其公式",
-            ""
         ]
 
-        # 按差异数量排序，优先显示差异最多的字段
-        sorted_fields = sorted(field_diff_samples.items(), key=lambda x: x[1].get("count", 1), reverse=True)
+        if is_multi_sheet:
+            if missing_sheets:
+                lines.append(f"- 缺失Sheet: {', '.join(missing_sheets)}")
+            if extra_sheets:
+                lines.append(f"- 多余Sheet: {', '.join(extra_sheets)}")
 
-        for field_name, sample in sorted_fields:
-            formula = sample.get("formula", "")
-            count = sample.get("count", 1)
-            samples = sample.get("samples", [])
+        lines.append("")
 
-            if formula:
-                line = f"- **{field_name}** ({count}处差异): `{formula}`"
-            else:
-                line = f"- **{field_name}** ({count}处差异): [非公式列/直接赋值]"
-            # 附加样本值帮助AI理解偏差
-            if samples:
-                s = samples[0]
-                line += f"  (实际: {s.get('actual', '?')}, 预期: {s.get('expected', '?')})"
-            lines.append(line)
+        # ---- 多Sheet模式：按 sheet 分组展示 ----
+        if is_multi_sheet:
+            for sheet_name, sheet_info in per_sheet.items():
+                s_matched = sheet_info.get("matched_cells", 0)
+                s_total = sheet_info.get("total_cells", 0)
+                s_rate = f"{s_matched}/{s_total} ({s_matched/s_total*100:.1f}%)" if s_total > 0 else "N/A"
+                if sheet_info.get("missing"):
+                    lines.append(f"### Sheet: {sheet_name} (缺失！)")
+                    lines.append(f"- 此Sheet在结果文件中不存在，请确保 fill_result_sheets 创建了名为 '{sheet_name}' 的Sheet")
+                    lines.append("")
+                    continue
+                lines.append(f"### Sheet: {sheet_name}")
+                lines.append(f"- 匹配率: {s_rate}")
+                # 该 sheet 的字段差异
+                prefix = f"[{sheet_name}]."
+                sheet_fields = {k[len(prefix):]: v for k, v in field_diff_samples.items() if k.startswith(prefix)}
+                if not sheet_fields:
+                    # 单sheet时 field key 不带前缀
+                    sheet_fields = sheet_info.get("field_diff_samples", {})
+                sorted_fields = sorted(sheet_fields.items(), key=lambda x: x[1].get("count", 1), reverse=True)
+                for field_name, sample in sorted_fields:
+                    formula = sample.get("formula", "")
+                    count = sample.get("count", 1)
+                    samples = sample.get("samples", [])
+                    if formula:
+                        line = f"- **{field_name}** ({count}处差异): `{formula}`"
+                    else:
+                        line = f"- **{field_name}** ({count}处差异): [非公式列/直接赋值]"
+                    if samples:
+                        s = samples[0]
+                        line += f"  (实际: {s.get('actual', '?')}, 预期: {s.get('expected', '?')})"
+                    lines.append(line)
+                lines.append("")
+        else:
+            # ---- 单Sheet模式：原有逻辑 ----
+            lines.append("## 有差异的字段及其公式")
+            lines.append("")
+            sorted_fields = sorted(field_diff_samples.items(), key=lambda x: x[1].get("count", 1), reverse=True)
+            for field_name, sample in sorted_fields:
+                formula = sample.get("formula", "")
+                count = sample.get("count", 1)
+                samples = sample.get("samples", [])
+                if formula:
+                    line = f"- **{field_name}** ({count}处差异): `{formula}`"
+                else:
+                    line = f"- **{field_name}** ({count}处差异): [非公式列/直接赋值]"
+                if samples:
+                    s = samples[0]
+                    line += f"  (实际: {s.get('actual', '?')}, 预期: {s.get('expected', '?')})"
+                lines.append(line)
 
         # 根因分类（帮助AI快速定位问题方向）
         categorized = self._categorize_diffs(field_diff_samples)
@@ -332,6 +379,8 @@ class TrainingEngine:
         lines.append("2. 数据源sheet名称正确引用")
         lines.append("3. 条件判断逻辑符合规则要求")
         lines.append("4. 主键类型和数据类型是否一致，不一致vlookup需要转换")
+        if is_multi_sheet:
+            lines.append("5. fill_result_sheets 必须创建所有预期的Sheet，名称要完全匹配")
         return "\n".join(lines)
 
     def _categorize_diffs(self, field_diff_samples: Dict[str, Any]) -> str:
@@ -404,7 +453,8 @@ class TrainingEngine:
         salary_month: Optional[int] = None,
         monthly_standard_hours: Optional[float] = None,
         force_retrain: bool = False,
-        file_passwords: Optional[Dict[str, str]] = None
+        file_passwords: Optional[Dict[str, str]] = None,
+        multi_sheet_source: bool = False,
     ) -> Dict[str, Any]:
         """训练AI生成数据处理脚本
 
@@ -499,7 +549,10 @@ class TrainingEngine:
         self._validate_input_files(source_files, expected_file, rule_files)
 
         # 1. 解析源文件结构
-        source_structure = self._analyze_source_structure(source_files, manual_headers, file_passwords=self.file_passwords)
+        source_structure = self._analyze_source_structure(
+            source_files, manual_headers, file_passwords=self.file_passwords,
+            multi_sheet_source=multi_sheet_source,
+        )
         self.training_logger.log_info(f"解析源文件结构完成，共 {len(source_structure.get('files', {}))} 个文件")
 
         # 2. 解析预期文件结构
@@ -546,7 +599,8 @@ class TrainingEngine:
             result = self._train_formula_mode(
                 source_files, expected_file, rules_content,
                 source_structure, expected_structure,
-                manual_headers, tenant_id, force_retrain
+                manual_headers, tenant_id, force_retrain,
+                multi_sheet_source=multi_sheet_source,
             )
             # 添加校验规则到结果
             result["validation_rules"] = validation_rules
@@ -668,7 +722,8 @@ class TrainingEngine:
                 execution_result = self._execute_and_validate(
                     code, source_files, expected_file, manual_headers,
                     tenant_id=tenant_id, iteration_num=iteration_num,
-                    comparison_primary_keys=simple_comparison_primary_keys
+                    comparison_primary_keys=simple_comparison_primary_keys,
+                    expected_structure=expected_structure,
                 )
 
                 # 记录执行结果
@@ -759,7 +814,8 @@ class TrainingEngine:
         expected_structure: Dict[str, Any],
         manual_headers: Optional[Dict[str, Any]] = None,
         tenant_id: str = "default",
-        force_retrain: bool = False
+        force_retrain: bool = False,
+        multi_sheet_source: bool = False,
     ) -> Dict[str, Any]:
         """使用公式模式训练 - 生成使用Excel公式的Python代码
 
@@ -860,7 +916,8 @@ class TrainingEngine:
                         rules_content=rules_content,
                         expected_structure=expected_structure,
                         manual_headers=manual_headers,
-                        stream_callback=self.stream_callback
+                        stream_callback=self.stream_callback,
+                        multi_sheet_source=multi_sheet_source,
                     )
                     # 保存源数据结构描述用于后续修正
                     source_structure_desc = formula_generator.formula_builder.get_source_structure_for_prompt()
@@ -883,7 +940,15 @@ class TrainingEngine:
 请根据以上错误信息修正代码。常见问题：
 - "could not convert string to float" → 对文本列（如工号'YN00002'）误用了数值转换，需要在groupby/agg前区分数值列和文本列
 - TypeError: 数据类型不匹配 → 检查是否对混合类型列做了不当操作
-- KeyError: 列名不存在 → 检查列名拼写和大小写"""
+- KeyError: 列名不存在 → 检查列名拼写和大小写
+- "too many statically nested blocks" 或 SyntaxError → **级联缩进错误（最高频致命错误）**。
+  根因：break退出for循环后，后续代码没有回退到for语句的缩进级别，而是错误地留在break同级；
+  或者if/else块结束后，后续独立代码被错误地嵌套在else块内部。
+  修正方法：
+  1. 检查每个break语句后面的代码：下一行必须回退到for语句的同一缩进级别
+  2. 检查每个if/elif/else块后面的代码：后续独立逻辑必须与if同级，不能在else内部
+  3. 检查所有# === N. ===步骤注释的缩进是否完全相同（缩进递增说明有级联错误）
+  4. fill_result_sheets函数体缩进4空格，for循环体缩进8空格，绝对不能更深"""
 
                     # 确定用于修正的原始代码：优先使用best_code，否则使用上一次迭代的代码
                     original_code_for_correction = best_code
@@ -899,7 +964,8 @@ class TrainingEngine:
                             rules_content=rules_content,
                             expected_structure=expected_structure,
                             manual_headers=manual_headers,
-                            stream_callback=self.stream_callback
+                            stream_callback=self.stream_callback,
+                            multi_sheet_source=multi_sheet_source,
                         )
                     else:
                         # 决策：列级修正 vs 全量修正
@@ -1048,14 +1114,23 @@ class TrainingEngine:
                 # 使用training_logger保存输出Excel到训练日志目录
                 saved_output_path = self.training_logger.save_output_excel(output_path, mode_type="formula")
 
-                # 比较结果 - 直接保存到training_logs目录
+                # 比较结果 - 根据预期文件sheet数选择单sheet或多sheet对比
                 comparison_output_file = str(self.training_logger.log_dir / f"差异对比_{iteration_num}.xlsx")
-                comparison_result = compare_excel_files(
-                    result_file=output_path,
-                    expected_file=expected_file,
-                    output_file=comparison_output_file,
-                    primary_keys=comparison_primary_keys
-                )
+                _exp_sheet_count = len(expected_structure.get("sheets", {}))
+                if _exp_sheet_count > 1:
+                    comparison_result = compare_excel_files_multi_sheet(
+                        result_file=output_path,
+                        expected_file=expected_file,
+                        output_file=comparison_output_file,
+                        primary_keys=comparison_primary_keys
+                    )
+                else:
+                    comparison_result = compare_excel_files(
+                        result_file=output_path,
+                        expected_file=expected_file,
+                        output_file=comparison_output_file,
+                        primary_keys=comparison_primary_keys
+                    )
 
                 # 计算匹配分数（基于单元格匹配数量）
                 total_cells = comparison_result.get("total_cells", 0)
@@ -1079,7 +1154,10 @@ class TrainingEngine:
 
                 # 生成详细的差异描述用于AI修正
                 field_diff_samples = comparison_result.get("field_diff_samples", {})
-                detailed_diff_text = self._format_detailed_diff(field_diff_samples, total_diff, matched_cells, total_cells)
+                detailed_diff_text = self._format_detailed_diff(
+                    field_diff_samples, total_diff, matched_cells, total_cells,
+                    comparison_result=comparison_result
+                )
 
                 # 重命名差异对比文件为统一格式
                 saved_comparison_path = ""
@@ -1273,7 +1351,8 @@ class TrainingEngine:
                 execution_result = self._execute_and_validate(
                     code, source_files, expected_file, manual_headers,
                     tenant_id=tenant_id, iteration_num=iteration_num,
-                    comparison_primary_keys=modular_comparison_primary_keys
+                    comparison_primary_keys=modular_comparison_primary_keys,
+                    expected_structure=expected_structure,
                 )
 
                 # 记录执行结果
@@ -1572,7 +1651,8 @@ class TrainingEngine:
 
     def _analyze_source_structure(
         self, source_files: List[str], manual_headers: Optional[Dict[str, Any]] = None,
-        file_passwords: Optional[Dict[str, str]] = None
+        file_passwords: Optional[Dict[str, str]] = None,
+        multi_sheet_source: bool = False,
     ) -> Dict[str, Any]:
         """分析源文件结构"""
         structure = {
@@ -1593,7 +1673,7 @@ class TrainingEngine:
                       file_path,
                     max_data_rows=10,
           manual_headers=manual_headers,
-                    active_sheet_only=True,
+                    active_sheet_only=not multi_sheet_source,
                     best_region_only=True,
                     password=passwords.get(file_name),
                     read_formulas=False
@@ -1651,7 +1731,7 @@ class TrainingEngine:
                 expected_file,
              max_data_rows=10,  # 训练时只读取10行数据用于分析结构
                 manual_headers=manual_headers,
-                active_sheet_only=True,  # 只加载激活的sheet
+                active_sheet_only=False,  # 加载所有sheet以支持多Sheet训练
                 best_region_only=True,  # 只取有效区域
                 password=(file_passwords or {}).get(Path(expected_file).name)
             )
@@ -1699,7 +1779,8 @@ class TrainingEngine:
         manual_headers: Optional[Dict[str, Any]] = None,
         tenant_id: str = "default",
         iteration_num: int = 0,
-        comparison_primary_keys: Optional[List[str]] = None
+        comparison_primary_keys: Optional[List[str]] = None,
+        expected_structure: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """执行代码并验证结果"""
         result = {
@@ -1790,14 +1871,23 @@ class TrainingEngine:
                     self.training_logger.log_info(f"输出文件已复制到: {training_output_file}")
                     result["training_output_file"] = str(training_output_file)
 
-                    # 使用独立的差异对比组件进行对比
+                    # 使用独立的差异对比组件进行对比（根据预期sheet数选择）
                     comparison_output_file = str(output_dir / "差异对比.xlsx")
-                    comparison_result = compare_excel_files(
-                        result_file=str(output_file),
-                        expected_file=expected_file,
-                        output_file=comparison_output_file,
-                        primary_keys=comparison_primary_keys
-                    )
+                    _exp_sheet_count = len((expected_structure or {}).get("sheets", {}))
+                    if _exp_sheet_count > 1:
+                        comparison_result = compare_excel_files_multi_sheet(
+                            result_file=str(output_file),
+                            expected_file=expected_file,
+                            output_file=comparison_output_file,
+                            primary_keys=comparison_primary_keys
+                        )
+                    else:
+                        comparison_result = compare_excel_files(
+                            result_file=str(output_file),
+                            expected_file=expected_file,
+                            output_file=comparison_output_file,
+                            primary_keys=comparison_primary_keys
+                        )
 
                     # 保存差异对比Excel到training_logs，然后删除临时文件
                     if Path(comparison_output_file).exists():

@@ -675,6 +675,8 @@ function _startTraining(userText) {
     if (standardHours) formData.append('monthly_standard_hours', standardHours);
     const manualHeaders = document.getElementById('manual-headers').value.trim();
     if (manualHeaders) formData.append('manual_headers', manualHeaders);
+    const multiSheetSource = document.getElementById('multi-sheet-source').checked;
+    if (multiSheetSource) formData.append('multi_sheet_source', 'true');
     if (_currentSessionId) formData.append('session_id', _currentSessionId);
 
     _addMessage('user', userText);
@@ -794,7 +796,7 @@ function _handleSSEEvent(event) {
             }
 
             // 显示下载按钮区
-            if (event.success && _currentSessionId) {
+            if ((event.success || event.rollback) && _currentSessionId) {
                 _showDownloadBar(_currentSessionId, event.files);
             }
 
@@ -925,9 +927,9 @@ function _showDownloadBar(sessionId, files) {
     const baseUrl = `/api/training/chat/sessions/${sessionId}/download`;
 
     const items = [
-        { type: 'script', label: '脚本 (.py)', icon: '📄' },
         { type: 'output', label: '生成结果 (.xlsx)', icon: '📊' },
         { type: 'diff', label: '差异对比 (.xlsx)', icon: '📋' },
+        { type: 'script', label: '脚本 (.py)', icon: '📄' },
     ];
 
     items.forEach(item => {
@@ -945,6 +947,22 @@ function _showDownloadBar(sessionId, files) {
         btn.onclick = () => _downloadFile(sessionId, item.type);
         contentDiv.appendChild(btn);
     });
+
+    // 提示词/上下文下载
+    const promptBtn = document.createElement('button');
+    promptBtn.className = 'download-btn prompt-btn';
+    promptBtn.textContent = '📝 提示词/上下文';
+    promptBtn.onclick = () => _downloadOriginalFile(sessionId, 'prompt');
+    contentDiv.appendChild(promptBtn);
+
+    // 规则文件下载
+    if (files && files.has_rules) {
+        const rulesBtn = document.createElement('button');
+        rulesBtn.className = 'download-btn';
+        rulesBtn.textContent = '📖 规则文件';
+        rulesBtn.onclick = () => _downloadOriginalFile(sessionId, 'rules');
+        contentDiv.appendChild(rulesBtn);
+    }
 
     if (contentDiv.children.length === 0) return;  // 没有可下载的文件
 
@@ -1177,9 +1195,9 @@ function _showHistoryDownloadBar(sessionId, latestFiles, hasRules) {
     contentDiv.className = 'message-content download-buttons';
 
     const items = [
-        { type: 'script', label: '脚本 (.py)', icon: '\uD83D\uDCC4', has: latestFiles.script_file },
         { type: 'output', label: '生成结果 (.xlsx)', icon: '\uD83D\uDCCA', has: latestFiles.output_file },
         { type: 'diff', label: '差异对比 (.xlsx)', icon: '\uD83D\uDCCB', has: latestFiles.diff_file },
+        { type: 'script', label: '脚本 (.py)', icon: '\uD83D\uDCC4', has: latestFiles.script_file },
     ];
 
     items.forEach(item => {

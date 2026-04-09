@@ -146,6 +146,46 @@ for sheet_data in results:
                 "- FormulaRule(formula=['条件公式'], fill=fill)"
             ),
         },
+        "indentation_discipline": {
+            "compact": "【规则9】缩进纪律：break后回退到for同级，if/else后续代码与if平级，禁止级联嵌套",
+            "detailed": (
+                "【规则9】缩进纪律（最常见的致命错误，必须严格遵守）\n"
+                "- ⚠️ 这是AI生成代码最高频的错误，违反将导致SyntaxError或逻辑错误\n\n"
+                "**规则A - break后缩进回退**：break退出for循环后，下一行代码必须回退到for语句的同级缩进\n"
+                "  ✅ 正确：\n"
+                "    for col in df.columns:\n"
+                "        if '姓名' in col:\n"
+                "            name = col\n"
+                "            break\n"
+                "    # break后回到for的同级（缩进4空格）\n"
+                "    result = do_something(name)\n\n"
+                "  ❌ 错误（级联嵌套）：\n"
+                "    for col in df.columns:\n"
+                "        if '姓名' in col:\n"
+                "            name = col\n"
+                "            break\n"
+                "            # 错误！还在if块内，没有回退\n"
+                "            result = do_something(name)\n\n"
+                "**规则B - if/else后续代码平级**：if/else块结束后，后续独立代码必须与if语句同级\n"
+                "  ✅ 正确：\n"
+                "    if condition:\n"
+                "        a = 1\n"
+                "    else:\n"
+                "        a = 2\n"
+                "    # 与if同级，不在else内部\n"
+                "    b = a + 1\n\n"
+                "  ❌ 错误（级联嵌套）：\n"
+                "    if condition:\n"
+                "        a = 1\n"
+                "    else:\n"
+                "        a = 2\n"
+                "        # 错误！嵌套在else内部\n"
+                "        b = a + 1\n\n"
+                "**规则C - 各步骤平级**：# === N. === 标记的步骤必须保持同一缩进级别\n"
+                "  所有步骤注释（# === 1. ...、# === 2. ...）的缩进必须完全一致\n"
+                "  禁止把步骤N+1写在步骤N的if/else/for块内部"
+            ),
+        },
     }
 
     # 修正专用额外规则
@@ -337,6 +377,12 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
         "- 日期参与减法运算前，也需要先用 `IFERROR(DATEVALUE(x),x)` 确保是数值\n"
         "- 禁止用TEXT()将日期转为文本，否则日期无法参与运算\n"
         "- ⚠️ AND()/OR()不短路：空单元格调MONTH()/YEAR()仍报#VALUE!，需用IFERROR包裹：`IFERROR(MONTH(A2),0)`\n\n"
+        "## 缩进纪律（⚠️ 最高频致命错误）\n"
+        "- fill_result_sheets函数体缩进4空格，for循环体缩进8空格\n"
+        "- 各步骤注释（# === N. ===）必须全部在同一缩进级别，禁止递增嵌套\n"
+        "- break退出循环后，下一行必须回到for语句的缩进级别，不能留在break同级\n"
+        "- if/elif/else块结束后，后续独立代码必须与if同级，禁止嵌套在else块内\n"
+        "- 自检方法：检查所有# === N. ===注释的缩进是否完全相同，不同则说明有级联错误\n\n"
         "## 完整性要求\n"
         "- 必须为全部 __TOTAL_COLUMNS__ 列生成处理逻辑\n"
         "- 在代码最后添加注释：# 共处理了 X 列（预期 __TOTAL_COLUMNS__ 列）\n"
@@ -353,11 +399,21 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
 def clean_source_data(source_data):
     \"\"\"应用数据清洗规则：过滤无效数据 + 按主键汇总多行为单行
 
+    ⚠️ 最重要前提（必须理解）：
+    - source_data中的每个DataFrame已经由Excel解析器自动完成了最佳区域检测和表头识别
+    - df = val["df"] 拿到的DataFrame，列名（df.columns）就是正确的表头名称
+    - columns = val["columns"] 就是表头列表
+    - **禁止手动扫描行来查找表头**（禁止遍历行检测"序号""姓名"等关键字来重设df.columns）
+    - **禁止重置df.columns**（禁止df.columns = ...，禁止df.iloc[N:]重截数据）
+    - 只需专注于数据清洗逻辑本身：过滤无效行、按主键汇总、补位、类型转换等
+
     代码结构要求（必须严格遵守）：
     - 必须用 for key, val in source_data.items(): 遍历所有表
     - 在循环内用 if/elif 判断不同的 key 做对应清洗
     - 不需要清洗的表也必须原样拷贝到 cleaned 中
     - return cleaned 必须在函数最外层（与for同级），禁止嵌套在if内部
+    - ⚠️ 缩进纪律：break/continue后必须正确回退缩进。break退出循环后，后续代码必须回到循环语句的同级；各处理步骤（查找列、过滤数据、构建字典等）必须保持平级排列，禁止把下一步骤嵌套在上一步骤的if块内
+    - ⚠️ 级联嵌套是最高频致命错误：if/else块结束后，后续独立逻辑必须与if同级缩进，绝对不能写在else块内部。自检方法：所有# === N. ===注释的缩进必须完全相同
 
     重要汇总规则（单人多行→单人单行）：
     - groupby的key只能是清洗规则中指定的汇总主键（如工号），除主键外的其他字段都不能作为groupby key
@@ -394,6 +450,8 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
 - [ ] f-string中是否有裸""（必须用{EMPTY}代替，包括<>""、=""、,"" 等所有场景）
 - [ ] 每行代码是否完整，没有截断，没有跨行赋值
 - [ ] 缩进是否一致（for循环内8空格，列之间平级，无级联嵌套）
+- [ ] break/continue后缩进是否正确回退（不能继续在break同级写代码）
+- [ ] 各处理步骤是否保持平级（不能把步骤N+1嵌套在步骤N的if块内）
 
 ### 2. VLOOKUP验证
 - [ ] 每个VLOOKUP取的字段是否正确（字段名和源表对应）
@@ -474,7 +532,9 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
                 if rule['original_text'] and not rule['original_text'].startswith('--'):
                     text += f"{i}. {rule['original_text']}\n"
             text += (
-                "\n**实现方式**：生成clean_source_data函数，对每个DataFrame应用清洗逻辑后返回清洗后的数据。\n"
+                "\n**重要前提**：source_data中每个DataFrame的表头（df.columns）已由解析器自动识别，"
+                "禁止在clean_source_data中手动扫描行来查找表头或重置df.columns。只需专注于数据清洗逻辑本身。\n"
+                "**实现方式**：生成clean_source_data函数，对每个DataFrame应用清洗逻辑后返回清洗后的数据。\n"
                 "**汇总规则**：如果某个表存在单人多行数据需要汇总，groupby的key只能是清洗规则中指定的汇总主键，"
                 "除主键外的其他字段都不能作为groupby key。数值型列（包括用文本表示的数值，但不包括日期）用sum聚合，"
                 "文本列和日期列用first取值。禁止使用pivot_table，不允许改变原表的列结构（表头必须和清洗前完全一致）。\n"
@@ -1623,7 +1683,8 @@ input_folder, output_folder, manual_headers: {manual_headers_json}
         source_structure: str,
         expected_structure: Dict[str, Any],
         rules_content: str,
-        manual_headers: Optional[Dict[str, Any]] = None
+        manual_headers: Optional[Dict[str, Any]] = None,
+        multi_sheet_source: bool = False,
     ) -> str:
         """生成Excel公式模式的提示词 - 精简版"""
         compressed_expected = self._compress_structure(expected_structure, max_length=30000)
@@ -1657,10 +1718,12 @@ input_folder, output_folder, manual_headers: {manual_headers_json}
 - 已定义常量：EMPTY = Excel空字符串""
 - 已定义函数：excel_text('文本') = Excel文本值"文本"
 - 已定义函数：get_vlookup_col_num(target_col, range_start_col) -> int
-- 已定义函数：find_source_sheet(source_sheets, target_columns=[...], sheet_name_hint="...") -> key
+- 已定义函数：find_source_sheet(source_sheets, target_columns=[...], sheet_name_hint="...", salary_year=None, salary_month=None) -> key
+  匹配优先级：①Sheet名称精确匹配 ②薪资年月匹配YYYYMM格式sheet ③表头列名匹配
 
 __SOURCE_STRUCTURE__
 __EXPECTED_SHEETS_INFO__
+__MULTI_SHEET_SOURCE_GUIDANCE__
 
 ⚠️ 如果规则文档中包含「列处理分层」信息，请严格按照层级处理：L1同源列用main_df.iloc[i].get()直接复制（不查列号），L2跨表列才使用VLOOKUP查找。
 ⚠️ 主表选择：优先使用规则中「列处理分层→主表」指定的表，用find_source_sheet()定位。禁止用max(len(df))——行数最多的不一定是主表！如果规则未指定主表，根据主键列名和特征列推断。
@@ -1680,10 +1743,28 @@ __RULES__
 """
 
 
+        # 多Sheet数据源匹配优先级指导
+        multi_sheet_guidance = ""
+        if multi_sheet_source:
+            multi_sheet_guidance = """## ⚠️ 多Sheet数据源模式
+本次数据源包含多个Sheet（每个源文件可能有多个Sheet），使用find_source_sheet()匹配时必须严格按照以下优先级：
+1. **Sheet名称匹配**（最高优先级）：优先通过 sheet_name_hint 精确匹配Sheet名称
+2. **表头结构匹配**：当名称无法匹配时，通过 target_columns 检查表头列名匹配度
+3. **禁止猜测**：如果无法确定匹配关系，使用find_source_sheet()的返回值，不要硬编码Sheet名称
+
+注意事项：
+- 同一源文件的不同Sheet会被命名为 "文件名_Sheet名"，例如 "人员信息_基本信息", "人员信息_社保明细"
+- VLOOKUP公式引用的Sheet名称必须与实际写入的Sheet名称完全一致
+- 使用find_source_sheet()查找时，传入准确的 sheet_name_hint（如规则中提到的表名）和 target_columns（需要的列名列表）
+- 如果数据源有YYYYMM格式的sheet名（如202501、202502），调用find_source_sheet时传入salary_year和salary_month参数，函数会自动匹配当前月份的sheet
+- 示例：find_source_sheet(source_sheets, sheet_name_hint="考勤", salary_year=salary_year_val, salary_month=salary_month_val)
+"""
+
         return (template
                 .replace('__TOTAL_COLUMNS__', str(total_columns))
                 .replace('__SOURCE_STRUCTURE__', source_structure)
                 .replace('__EXPECTED_SHEETS_INFO__', expected_sheets_info)
+                .replace('__MULTI_SHEET_SOURCE_GUIDANCE__', multi_sheet_guidance)
                 .replace('__COMPRESSED_EXPECTED__', compressed_expected)
                 .replace('__DATA_CLEANING_RULES__', rules_info["data_cleaning"])
                 .replace('__CONDITIONAL_FORMAT_RULES__', rules_info["conditional_format"])
@@ -1927,7 +2008,8 @@ def fill_columns_batch_{batch_index + 1}(ws, r, source_sheets):
         source_structure: str,
         expected_structure: Dict[str, Any],
         rules_content: str,
-        manual_headers: Optional[Dict[str, Any]] = None
+        manual_headers: Optional[Dict[str, Any]] = None,
+        multi_sheet_source: bool = False,
     ) -> Dict[str, str]:
         """生成+验证模式的提示词
 
@@ -1949,6 +2031,17 @@ def fill_columns_batch_{batch_index + 1}(ws, r, source_sheets):
 
         # 黄金样例 + 补充规则 + 函数签名（在f-string中需要转义花括号）
         golden_and_rules = self._build_golden_and_rules(total_columns, escape_braces=True)
+
+        # 多Sheet数据源匹配指导
+        _ms_guidance = ""
+        if multi_sheet_source:
+            _ms_guidance = (
+                "## ⚠️ 多Sheet数据源模式\n"
+                "本次数据源包含多个Sheet，使用find_source_sheet()匹配时必须严格按照优先级：\n"
+                "1. **Sheet名称匹配**（最高优先级）：优先通过 sheet_name_hint 精确匹配\n"
+                "2. **表头结构匹配**：当名称无法匹配时，通过 target_columns 检查表头列名匹配度\n"
+                "3. **禁止猜测**：如果无法确定匹配关系，使用find_source_sheet()的返回值\n"
+            )
 
         system_prompt = (
             "你是一个专业的Python程序员，擅长处理各种Excel数据处理任务，"
@@ -1979,10 +2072,12 @@ def fill_columns_batch_{batch_index + 1}(ws, r, source_sheets):
 - 已定义常量：EMPTY = Excel空字符串""
 - 已定义函数：excel_text('文本') = Excel文本值"文本"
 - 已定义函数：get_vlookup_col_num(target_col, range_start_col) -> int
-- 已定义函数：find_source_sheet(source_sheets, target_columns=[...], sheet_name_hint="...") -> key
+- 已定义函数：find_source_sheet(source_sheets, target_columns=[...], sheet_name_hint="...", salary_year=None, salary_month=None) -> key
+  匹配优先级：①Sheet名称精确匹配 ②薪资年月匹配YYYYMM格式sheet ③表头列名匹配
 
 {source_structure}
 {expected_sheets_info}
+{_ms_guidance}
 
 ## 预期输出结构
 {compressed_expected}

@@ -12,6 +12,7 @@ import logging
 import concurrent.futures
 from typing import Dict, List, Any, Tuple, Optional
 from difflib import SequenceMatcher
+from .data_helpers import make_unique_sheet_key
 
 logger = logging.getLogger(__name__)
 
@@ -638,6 +639,7 @@ class FastHeaderMatcher:
         import pandas as pd
 
         source_data = {}
+        _used_keys = set()
 
         for input_file_name, mapping_info in file_mapping.items():
             expected_file = mapping_info.get("expected_file", input_file_name)
@@ -687,8 +689,7 @@ class FastHeaderMatcher:
                     merged_df = pd.concat(dfs, ignore_index=True)
 
                 key = f"{file_base}_{train_sheet}"
-                if len(key) > 31:
-                    key = key[:31]
+                key = make_unique_sheet_key(key, _used_keys)
 
                 source_data[key] = {
                     "df": merged_df,

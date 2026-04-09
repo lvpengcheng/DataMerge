@@ -147,3 +147,21 @@ def load_files_to_dataframes(data_store: Dict[str, Any]) -> Dict[str, pd.DataFra
         if isinstance(file_data, pd.DataFrame):
             result[filename] = file_data
     return result
+
+
+def make_unique_sheet_key(name: str, existing_keys: set, max_len: int = 31) -> str:
+    """将 sheet key 截断到 max_len 字符，并在碰撞时追加 _2, _3... 后缀保证唯一。
+
+    截断是因为 Excel sheet 名最长 31 字符，source_data 的 key 与 sheet 名保持一致。
+    会自动将生成的 key 加入 existing_keys 集合。
+    """
+    if len(name) > max_len:
+        name = name[:max_len]
+    base = name
+    counter = 2
+    while name in existing_keys:
+        suffix = f"_{counter}"
+        name = base[:max_len - len(suffix)] + suffix
+        counter += 1
+    existing_keys.add(name)
+    return name

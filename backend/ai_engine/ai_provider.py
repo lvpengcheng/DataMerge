@@ -9,6 +9,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Dict, List, Any, Optional
 import requests as http_requests
+from backend.utils.indentation_fixer import IndentationFixer
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ class BaseAIProvider(ABC):
         self.last_extracted_code = None
         self._session = http_requests.Session()
         self._default_timeout = 300  # 5分钟，代码生成可能较慢
+        self._indent_fixer = IndentationFixer()
 
     def _request(self, method: str, url: str, headers: dict, json_body: dict,
                  timeout: int = None, stream: bool = False):
@@ -556,8 +558,8 @@ class BaseAIProvider(ABC):
         except SyntaxError as e:
             logger.warning(f"检测到语法错误: {e}，尝试修复缩进")
 
-        # 尝试修复缩进
-        fixed_code = self._fix_python_indentation(code)
+        # 尝试修复缩进（使用统一的缩进修复器）
+        fixed_code = self._indent_fixer.fix_general(code)
 
         # 再次验证修复后的代码
         try:
@@ -565,7 +567,16 @@ class BaseAIProvider(ABC):
             logger.info("缩进修复成功，代码语法验证通过")
             return fixed_code
         except SyntaxError as e:
-            logger.warning(f"缩进修复后仍有语法错误: {e}，尝试截断修复")
+            logger.warning(f"通用缩进修复后仍有语法错误: {e}，尝试沙箱级管线修复")
+
+        # 用更强的沙箱级管线修复（基于原始代码，避免 fix_general 引入的破坏）
+        fixed_code = self._indent_fixer.fix_sandbox_pipeline(code)
+        try:
+            ast.parse(fixed_code)
+            logger.info("沙箱级管线缩进修复成功")
+            return fixed_code
+        except SyntaxError as e:
+            logger.warning(f"沙箱级管线修复后仍有语法错误: {e}，尝试截断修复")
 
         # 如果仍然失败，尝试检测并修复截断问题
         fixed_code = self._detect_and_fix_truncation(fixed_code)
@@ -822,105 +833,6 @@ class BaseAIProvider(ABC):
 
         return line
 
-    def _fix_python_indentation(self, code: str) -> str:
-        """
-        修复Python代码的缩进问题
-
-        这个方法能处理：
-        1. 缩进不一致（混用空格数量）
-        2. 冒号后没有正确缩进
-        3. 代码块缩进层级错误
-
-        Args:
-            code: 需要修复的代码
-
-        Returns:
-            修复缩进后的代码
-        """
-        import logging
-        logger = logging.getLogger(__name__)
-
-        lines = code.split('\n')
-        fixed_lines = []
-
-        # 用于跟踪缩进层级的栈
-        indent_stack = [0]  # 栈中存储每个缩进层级的空格数
-        expected_indent = 0  # 期望的下一行缩进
-
-        # 需要减少缩进的关键字（用于判断块结束）
-        dedent_keywords = ['return ', 'return', 'break', 'continue', 'pass', 'raise ']
-
-        for line in lines:
-            stripped = line.strip()
-
-            # 空行保持不变
-            if not stripped:
-                fixed_lines.append('')
-                continue
-
-            # 注释行 - 使用当前期望缩进
-            if stripped.startswith('#'):
-                fixed_lines.append(' ' * expected_indent + stripped)
-                continue
-
-            # 获取原始缩进
-            original_indent = len(line) - len(line.lstrip())
-
-            # 检查是否是特殊语句（else, elif, except, finally）
-            is_continuation = any(stripped.startswith(kw) for kw in ['else:', 'elif ', 'except', 'finally:'])
-
-            # 如果是continuation语句，使用上一级缩进
-            if is_continuation and len(indent_stack) > 1:
-                current_indent = indent_stack[-2] if len(indent_stack) > 1 else 0
-                # 确保continuation语句与对应的if/try对齐
-                fixed_lines.append(' ' * current_indent + stripped)
-                expected_indent = current_indent + 4
-                continue
-
-            # 判断当前行应该使用的缩进
-            # 如果原始缩进比预期小很多或完全没有缩进，使用期望的缩进
-            if original_indent < expected_indent and expected_indent > 0:
-                # 检查是否是新的顶级定义（def/class在顶级）
-                if any(stripped.startswith(kw) for kw in ['def ', 'class ', 'async def ']):
-                    # 可能是新的函数/类定义，需要判断是否应该在顶级
-                    # 如果原始缩进是0，保持为顶级
-                    if original_indent == 0:
-                        current_indent = 0
-                        indent_stack = [0]
-                        expected_indent = 0
-                    else:
-                        current_indent = expected_indent
-                else:
-                    current_indent = expected_indent
-            else:
-                # 使用原始缩进，但规范化为4的倍数
-                current_indent = (original_indent // 4) * 4
-
-            # 更新缩进栈
-            while indent_stack and current_indent < indent_stack[-1]:
-                indent_stack.pop()
-
-            if current_indent > indent_stack[-1]:
-                indent_stack.append(current_indent)
-
-            # 添加修复后的行
-            fixed_lines.append(' ' * current_indent + stripped)
-
-            # 确定下一行的期望缩进
-            if stripped.endswith(':') and not stripped.startswith('#'):
-                expected_indent = current_indent + 4
-            elif any(stripped.startswith(kw) or stripped == kw.strip() for kw in dedent_keywords):
-                # return/break等语句后，下一行可能需要减少缩进
-                # 但不立即减少，保持当前级别
-                expected_indent = current_indent
-            else:
-                expected_indent = current_indent
-
-        result = '\n'.join(fixed_lines)
-        logger.info(f"缩进修复完成，原始行数: {len(lines)}，修复后行数: {len(fixed_lines)}")
-
-        return result
-
     def _detect_and_fix_truncation(self, code: str) -> str:
         """
         检测并修复代码截断问题
@@ -1090,6 +1002,10 @@ class OpenAIProvider(BaseAIProvider):
             "包括人力资源、财务、供应链等不同业务场景。请生成准确、高效的Python代码。"
             "特别注意根据业务场景选择合适的主键进行数据关联和计算。"
             "只返回Python代码，不要包含解释或其他文本。\n\n"
+            "⚠️ 缩进纪律（必须严格遵守）：\n"
+            "1. break退出for循环后，下一行代码必须回退到for语句的缩进级别\n"
+            "2. if/elif/else块结束后，后续独立代码必须与if同级，禁止嵌套在else内部\n"
+            "3. 各步骤注释（# === N. ===）必须全部在同一缩进级别\n\n"
             "重要：如果代码较长（超过150行），请主动分段输出。"
             "每段在逻辑完整的位置断开（如函数定义之间），"
             f"段末单独输出一行 {self.CONTINUATION_MARKER} 作为标记。"
@@ -1237,6 +1153,10 @@ if __name__ == "__main__":
             "包括人力资源、财务、供应链等不同业务场景。请生成准确、高效的Python代码。"
             "特别注意根据业务场景选择合适的主键进行数据关联和计算。"
             "只返回Python代码，不要包含解释或其他文本。\n\n"
+            "⚠️ 缩进纪律（必须严格遵守）：\n"
+            "1. break退出for循环后，下一行代码必须回退到for语句的缩进级别\n"
+            "2. if/elif/else块结束后，后续独立代码必须与if同级，禁止嵌套在else内部\n"
+            "3. 各步骤注释（# === N. ===）必须全部在同一缩进级别\n\n"
             "重要：如果代码较长（超过150行），请主动分段输出。"
             "每段在逻辑完整的位置断开（如函数定义之间），"
             f"段末单独输出一行 {self.CONTINUATION_MARKER} 作为标记。"
@@ -1392,6 +1312,17 @@ class ClaudeProvider(BaseAIProvider):
                 }
             ]
 
+        # 缓存首条 user message（通常包含规则+源结构+期望结构，20K-120K字符）
+        # 续写/纠正时该消息会被重复发送，缓存命中可节省 90% 的输入 token 费用
+        if use_cache and messages and messages[0].get("role") == "user":
+            first_content = messages[0].get("content")
+            if isinstance(first_content, str) and len(first_content) > 1024:
+                messages = list(messages)
+                messages[0] = {
+                    "role": "user",
+                    "content": [{"type": "text", "text": first_content, "cache_control": {"type": "ephemeral"}}]
+                }
+
         response = self._client.messages.create(
             model=self.model,
             max_tokens=max_tokens or max(self.max_tokens, 64000),
@@ -1426,6 +1357,17 @@ class ClaudeProvider(BaseAIProvider):
                     "cache_control": {"type": "ephemeral"}
                 }
             ]
+
+        # 缓存首条 user message（通常包含规则+源结构+期望结构，20K-120K字符）
+        # 续写/纠正时该消息会被重复发送，缓存命中可节省 90% 的输入 token 费用
+        if use_cache and messages and messages[0].get("role") == "user":
+            first_content = messages[0].get("content")
+            if isinstance(first_content, str) and len(first_content) > 1024:
+                messages = list(messages)
+                messages[0] = {
+                    "role": "user",
+                    "content": [{"type": "text", "text": first_content, "cache_control": {"type": "ephemeral"}}]
+                }
 
         stop_reason = None
         with self._client.messages.stream(
@@ -1462,6 +1404,10 @@ class ClaudeProvider(BaseAIProvider):
                 "包括人力资源、财务、供应链等不同业务场景。请生成准确、高效的Python代码。"
                 "特别注意根据业务场景选择合适的主键进行数据关联和计算。"
                 "只返回Python代码，不要包含解释或其他文本。\n\n"
+                "⚠️ 缩进纪律（必须严格遵守）：\n"
+                "1. break退出for循环后，下一行代码必须回退到for语句的缩进级别\n"
+                "2. if/elif/else块结束后，后续独立代码必须与if同级，禁止嵌套在else内部\n"
+                "3. 各步骤注释（# === N. ===）必须全部在同一缩进级别\n\n"
                 "重要：如果代码较长（超过150行），请主动分段输出。"
                 "每段在逻辑完整的位置断开（如函数定义之间），"
                 f"段末单独输出一行 {self.CONTINUATION_MARKER} 作为标记。"
@@ -1647,6 +1593,10 @@ if __name__ == "__main__":
                 "包括人力资源、财务、供应链等不同业务场景。请生成准确、高效的Python代码。"
                 "特别注意根据业务场景选择合适的主键进行数据关联和计算。"
                 "只返回Python代码，不要包含解释或其他文本。\n\n"
+                "⚠️ 缩进纪律（必须严格遵守）：\n"
+                "1. break退出for循环后，下一行代码必须回退到for语句的缩进级别\n"
+                "2. if/elif/else块结束后，后续独立代码必须与if同级，禁止嵌套在else内部\n"
+                "3. 各步骤注释（# === N. ===）必须全部在同一缩进级别\n\n"
                 "重要：如果代码较长（超过150行），请主动分段输出。"
                 "每段在逻辑完整的位置断开（如函数定义之间），"
                 f"段末单独输出一行 {self.CONTINUATION_MARKER} 作为标记。"
@@ -1784,7 +1734,7 @@ class OllamaProvider(BaseAIProvider):
         """生成代码"""
         try:
             messages = [
-                {"role": "system", "content": "你是一个专业的Python程序员，擅长处理各种Excel数据处理任务，包括人力资源、财务、供应链等不同业务场景。请生成准确、高效的Python代码。特别注意根据业务场景选择合适的主键进行数据关联和计算。只返回Python代码，不要包含解释或其他文本。"},
+                {"role": "system", "content": "你是一个专业的Python程序员，擅长处理各种Excel数据处理任务，包括人力资源、财务、供应链等不同业务场景。请生成准确、高效的Python代码。特别注意根据业务场景选择合适的主键进行数据关联和计算。只返回Python代码，不要包含解释或其他文本。\n\n⚠️ 缩进纪律：break退出for循环后必须回退到for的缩进级别；if/else块结束后后续代码必须与if同级；各步骤注释（# === N. ===）必须在同一缩进级别。"},
                 {"role": "user", "content": prompt}
             ]
 

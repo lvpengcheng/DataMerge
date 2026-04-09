@@ -10,6 +10,7 @@ from .data_helpers import (
     normalize_emp_code,
     print_available_columns,
     load_files_to_dataframes,
+    make_unique_sheet_key,
 )
 
 __all__ = [
@@ -21,4 +22,5 @@ __all__ = [
     'normalize_emp_code',
     'print_available_columns',
     'load_files_to_dataframes',
+    'make_unique_sheet_key',
 ]

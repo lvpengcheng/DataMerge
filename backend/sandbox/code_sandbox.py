@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 import pandas as pd
 import openpyxl
+from backend.utils.indentation_fixer import IndentationFixer
 
 
 class CodeSandbox:
@@ -25,6 +26,7 @@ class CodeSandbox:
     def __init__(self, timeout: int = 360, max_memory_mb: int = 1024):
         self.timeout = timeout
         self.max_memory_mb = max_memory_mb
+        self._indent_fixer = IndentationFixer()
         import logging
         self.logger = logging.getLogger(__name__)
 
@@ -895,7 +897,12 @@ class CodeSandbox:
 
             fixed_lines.append(line)
 
-        return '\n'.join(fixed_lines)
+        code = '\n'.join(fixed_lines)
+
+        # 4-7. 统一缩进修复（逻辑集中在 IndentationFixer）
+        code = self._indent_fixer.fix_sandbox_pipeline(code)
+
+        return code
 
     def validate_code(self, code_content: str) -> Dict[str, Any]:
         """验证代码语法和安全性"""

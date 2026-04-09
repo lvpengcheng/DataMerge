@@ -761,6 +761,323 @@ def compare_excel_files(
     return _compare_dataframes_core(result_df, expected_df, resolved_keys, output_file, result_formulas)
 
 
+def _read_sheet_as_dataframe(wb_data, wb_formula, sheet_name: str) -> pd.DataFrame:
+    """从已打开的 openpyxl workbook 中读取指定 sheet 为 DataFrame。
+
+    内部复用与 read_excel_with_formulas_calculated 相同的逻辑：
+    data_only 取缓存值，formula 版本多遍迭代补算缺失值。
+    """
+    ws_data = wb_data[sheet_name]
+    ws_formula = wb_formula[sheet_name]
+
+    headers = [cell.value for cell in ws_data[1]]
+    valid_headers = [h for h in headers if h is not None]
+
+    max_row = ws_data.max_row
+    max_col = len(headers)
+
+    cell_values = {}
+    formulas = {}
+
+    for row_idx in range(2, max_row + 1):
+        for col_idx in range(1, max_col + 1):
+            if col_idx > len(headers) or headers[col_idx - 1] is None:
+                continue
+            data_cell = ws_data.cell(row=row_idx, column=col_idx)
+            formula_cell = ws_formula.cell(row=row_idx, column=col_idx)
+            cell_formula = formula_cell.value
+            is_formula = cell_formula is not None and str(cell_formula).startswith('=')
+            if is_formula:
+                if data_cell.value is not None:
+                    cell_values[(row_idx, col_idx)] = data_cell.value
+                else:
+                    formulas[(row_idx, col_idx)] = str(cell_formula)
+                    cell_values[(row_idx, col_idx)] = None
+            else:
+                cell_values[(row_idx, col_idx)] = data_cell.value
+
+    # 多遍迭代计算未解析的公式
+    for _iteration in range(10):
+        remaining = sum(1 for k, v in cell_values.items() if k in formulas and v is None)
+        if remaining == 0:
+            break
+        calculated_this_round = 0
+        for (row_idx, col_idx), formula in formulas.items():
+            if cell_values[(row_idx, col_idx)] is not None:
+                continue
+            calculated_value = _try_calculate_formula_with_cache(formula, cell_values, row_idx, max_col)
+            if calculated_value is not None:
+                cell_values[(row_idx, col_idx)] = calculated_value
+                calculated_this_round += 1
+        if calculated_this_round == 0:
+            break
+
+    data = []
+    for row_idx in range(2, max_row + 1):
+        row_data = {}
+        for col_idx, col_name in enumerate(headers, start=1):
+            if col_name is None:
+                continue
+            row_data[col_name] = cell_values.get((row_idx, col_idx))
+        data.append(row_data)
+
+    return pd.DataFrame(data, columns=valid_headers)
+
+
+def _match_sheet_name(target: str, available: List[str]) -> Optional[str]:
+    """在 available 中查找与 target 匹配的 sheet 名称。
+
+    匹配策略：精确 → 忽略大小写/空格 → 包含关系。
+    """
+    # 精确匹配
+    if target in available:
+        return target
+    # 忽略大小写/空格
+    target_norm = target.strip().lower()
+    for name in available:
+        if name.strip().lower() == target_norm:
+            return name
+    # 包含关系
+    for name in available:
+        n_lower = name.strip().lower()
+        if target_norm in n_lower or n_lower in target_norm:
+            return name
+    return None
+
+
+def _get_sheet_formulas(wb_formula, sheet_name: str) -> Dict[str, str]:
+    """从公式版本 workbook 中提取指定 sheet 第 2 行的公式映射 {列名: 公式}。"""
+    ws = wb_formula[sheet_name]
+    header_map = {ws.cell(row=1, column=c).value: c for c in range(1, (ws.max_column or 0) + 1)}
+    formulas = {}
+    if (ws.max_row or 0) >= 2:
+        for col_name, col_idx in header_map.items():
+            if col_name:
+                cell_val = ws.cell(row=2, column=col_idx).value
+                if cell_val and isinstance(cell_val, str) and cell_val.startswith('='):
+                    formulas[col_name] = cell_val
+    return formulas
+
+
+def compare_excel_files_multi_sheet(
+    result_file: str,
+    expected_file: str,
+    output_file: Optional[str] = None,
+    primary_keys: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """对比两个 Excel 文件的所有 Sheet 差异（多Sheet版本）。
+
+    遍历 expected 文件中的所有 sheet，在 result 文件中找对应 sheet 进行逐 sheet 对比，
+    最终汇总返回兼容 compare_excel_files() 的结果字典。
+
+    Args:
+        result_file:  生成的结果文件路径
+        expected_file: 预期的结果文件路径
+        output_file:  差异报告输出文件路径(可选)
+        primary_keys: 主键列名列表，如 ["工号"]。默认自动检测
+
+    Returns:
+        兼容 compare_excel_files() 的结果字典，额外包含 per_sheet / missing_sheets / extra_sheets
+    """
+    import openpyxl
+
+    logger.info("[多Sheet对比] 开始...")
+
+    # 1. 计算公式
+    result_calc_ok = calculate_excel_formulas(result_file)
+    expected_calc_ok = calculate_excel_formulas(expected_file)
+    if not result_calc_ok:
+        logger.error(f"[多Sheet对比] 结果文件公式计算失败: {result_file}")
+    if not expected_calc_ok:
+        logger.error(f"[多Sheet对比] 预期文件公式计算失败: {expected_file}")
+
+    # 2. 打开文件
+    exp_wb_data = openpyxl.load_workbook(expected_file, data_only=True)
+    exp_wb_formula = openpyxl.load_workbook(expected_file, data_only=False)
+    res_wb_data = openpyxl.load_workbook(result_file, data_only=True)
+    res_wb_formula = openpyxl.load_workbook(result_file, data_only=False)
+
+    # 过滤掉 Aspose 评估版水印 sheet
+    def _real_sheets(names):
+        return [n for n in names if "Evaluation" not in n]
+
+    exp_sheets = _real_sheets(exp_wb_data.sheetnames)
+    res_sheets = _real_sheets(res_wb_data.sheetnames)
+
+    # 过滤掉明显的源数据 sheet（数字前缀如 "01_xxx"）和参数 sheet
+    import re as _re_ms
+    skip_keywords = ["参数", "历史数据", "source", "param", "config"]
+    def _is_source_or_param(name: str) -> bool:
+        if _re_ms.match(r'^\d{1,3}_', name):
+            return True
+        return any(kw in name.lower() for kw in skip_keywords)
+
+    exp_compare_sheets = [n for n in exp_sheets if not _is_source_or_param(n)]
+    if not exp_compare_sheets:
+        exp_compare_sheets = exp_sheets  # 全部都像源数据时回退
+
+    logger.info(f"[多Sheet对比] 预期文件sheets: {exp_sheets}, 对比sheets: {exp_compare_sheets}")
+    logger.info(f"[多Sheet对比] 结果文件sheets: {res_sheets}")
+
+    # 3. 逐 sheet 对比
+    per_sheet = {}
+    missing_sheets = []
+    matched_result_sheets = set()
+
+    agg_total_diff = 0
+    agg_total_cells = 0
+    agg_matched_cells = 0
+    agg_unmatched_expected = 0
+    agg_unmatched_result = 0
+    agg_field_diff_samples = {}
+
+    if output_file is None:
+        output_dir = Path(result_file).parent
+        output_file = str(output_dir / "差异对比.xlsx")
+
+    for exp_sheet_name in exp_compare_sheets:
+        res_sheet_name = _match_sheet_name(exp_sheet_name, res_sheets)
+
+        if res_sheet_name is None:
+            # 结果中缺失此 sheet
+            missing_sheets.append(exp_sheet_name)
+            # 读取预期 sheet 以计算缺失的 cell 数
+            try:
+                exp_df = _read_sheet_as_dataframe(exp_wb_data, exp_wb_formula, exp_sheet_name)
+                miss_cells = len(exp_df) * max(len(exp_df.columns) - 1, 1)  # 排除主键列粗估
+            except Exception:
+                miss_cells = 100  # 无法读取时用默认值
+            per_sheet[exp_sheet_name] = {
+                "total_differences": miss_cells,
+                "total_cells": miss_cells,
+                "matched_cells": 0,
+                "match_rate": 0.0,
+                "success": False,
+                "missing": True,
+                "field_diff_samples": {},
+            }
+            agg_total_diff += miss_cells
+            agg_total_cells += miss_cells
+            logger.warning(f"[多Sheet对比] 结果文件中缺失sheet: '{exp_sheet_name}'")
+            continue
+
+        matched_result_sheets.add(res_sheet_name)
+        logger.info(f"[多Sheet对比] 对比 '{exp_sheet_name}' ↔ '{res_sheet_name}'")
+
+        try:
+            exp_df = _read_sheet_as_dataframe(exp_wb_data, exp_wb_formula, exp_sheet_name)
+            res_df = _read_sheet_as_dataframe(res_wb_data, res_wb_formula, res_sheet_name)
+            res_formulas = _get_sheet_formulas(res_wb_formula, res_sheet_name)
+
+            # 标准化列名
+            exp_df.columns = [_standardize_column_name(c) for c in exp_df.columns]
+            res_df.columns = [_standardize_column_name(c) for c in res_df.columns]
+
+            resolved_keys = _resolve_primary_keys(exp_df, res_df, primary_keys)
+
+            # 每个 sheet 的差异报告单独输出
+            sheet_output = str(Path(output_file).parent / f"差异对比_{exp_sheet_name}.xlsx")
+            sheet_result = _compare_dataframes_core(
+                res_df, exp_df, resolved_keys, sheet_output, res_formulas
+            )
+            per_sheet[exp_sheet_name] = sheet_result
+        except Exception as e:
+            logger.error(f"[多Sheet对比] 对比sheet '{exp_sheet_name}' 失败: {e}")
+            per_sheet[exp_sheet_name] = {
+                "total_differences": 0, "total_cells": 0, "matched_cells": 0,
+                "match_rate": 0.0, "success": False, "error": str(e),
+                "field_diff_samples": {},
+            }
+            continue
+
+        # 汇总
+        agg_total_diff += sheet_result.get("total_differences", 0)
+        agg_total_cells += sheet_result.get("total_cells", 0)
+        agg_matched_cells += sheet_result.get("matched_cells", 0)
+        agg_unmatched_expected += sheet_result.get("unmatched_expected", 0)
+        agg_unmatched_result += sheet_result.get("unmatched_result", 0)
+
+        # field_diff_samples 带 sheet 前缀合并
+        is_multi = len(exp_compare_sheets) > 1
+        for field_name, info in sheet_result.get("field_diff_samples", {}).items():
+            key = f"[{exp_sheet_name}].{field_name}" if is_multi else field_name
+            agg_field_diff_samples[key] = info
+
+    # 关闭 workbooks
+    for wb in (exp_wb_data, exp_wb_formula, res_wb_data, res_wb_formula):
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    # 多余的 result sheets（不计入差异，仅提示）
+    extra_sheets = [n for n in res_sheets if n not in matched_result_sheets and not _is_source_or_param(n)]
+
+    agg_match_rate = agg_matched_cells / agg_total_cells if agg_total_cells > 0 else 0.0
+
+    logger.info(f"[多Sheet对比] 汇总: {agg_matched_cells}/{agg_total_cells} = {agg_match_rate:.2%}, "
+                f"缺失sheets={missing_sheets}, 多余sheets={extra_sheets}")
+
+    # 合并各 sheet 的 diff 文件到一个总文件（output_file），供下载栏使用
+    try:
+        per_sheet_diff_files = []
+        output_parent = Path(output_file).parent
+        for exp_sheet_name in exp_compare_sheets:
+            sheet_diff_path = output_parent / f"差异对比_{exp_sheet_name}.xlsx"
+            if sheet_diff_path.exists():
+                per_sheet_diff_files.append((exp_sheet_name, str(sheet_diff_path)))
+
+        if per_sheet_diff_files:
+            combined_wb = openpyxl.Workbook()
+            combined_wb.remove(combined_wb.active)  # 删除默认空 sheet
+
+            for sheet_name, diff_path in per_sheet_diff_files:
+                src_wb = openpyxl.load_workbook(diff_path)
+                src_ws = src_wb.active
+                # sheet 名截断到 31 字符（Excel 限制）
+                safe_name = sheet_name[:31] if len(sheet_name) > 31 else sheet_name
+                dst_ws = combined_wb.create_sheet(title=safe_name)
+                for row in src_ws.iter_rows():
+                    for cell in row:
+                        dst_cell = dst_ws.cell(row=cell.row, column=cell.column, value=cell.value)
+                        if cell.has_style:
+                            dst_cell.font = cell.font.copy()
+                            dst_cell.fill = cell.fill.copy()
+                            dst_cell.alignment = cell.alignment.copy()
+                # 复制列宽
+                for col_letter, dim in src_ws.column_dimensions.items():
+                    dst_ws.column_dimensions[col_letter].width = dim.width
+                src_wb.close()
+
+            combined_wb.save(output_file)
+            combined_wb.close()
+            logger.info(f"[多Sheet对比] 已生成合并diff文件: {output_file}")
+    except Exception as e:
+        logger.warning(f"[多Sheet对比] 合并diff文件失败: {e}，尝试复制第一个sheet的diff作为总diff")
+        # 兜底：复制第一个 sheet 的 diff 文件
+        if per_sheet_diff_files:
+            try:
+                shutil.copy2(per_sheet_diff_files[0][1], output_file)
+            except Exception:
+                pass
+
+    return {
+        "total_differences": agg_total_diff,
+        "unmatched_expected": agg_unmatched_expected,
+        "unmatched_result": agg_unmatched_result,
+        "output_file": output_file,
+        "success": agg_total_diff == 0 and len(missing_sheets) == 0,
+        "total_cells": agg_total_cells,
+        "matched_cells": agg_matched_cells,
+        "match_rate": agg_match_rate,
+        "field_diff_samples": agg_field_diff_samples,
+        # 多Sheet专属字段
+        "per_sheet": per_sheet,
+        "missing_sheets": missing_sheets,
+        "extra_sheets": extra_sheets,
+    }
+
+
 def _compare_dataframes_core(
     result_df: pd.DataFrame,
     expected_df: pd.DataFrame,

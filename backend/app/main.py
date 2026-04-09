@@ -25,6 +25,7 @@ from ..ai_engine.training_engine import TrainingEngine
 from ..storage.storage_manager import StorageManager
 from ..document_validator import DocumentValidator
 from excel_parser import IntelligentExcelParser
+from ..utils.data_helpers import make_unique_sheet_key
 from ..sandbox.code_sandbox import CodeSandbox
 from ..email_processor.email_handler import EmailHandler
 from ..auth.router import router as auth_router
@@ -3988,14 +3989,14 @@ async def run_compute_task(
 
                             # 验证预加载数据是否包含训练时的所有 sheet
                             expected_keys = set()
+                            _ek_used = set()
                             for train_file, file_data in source_structure.get("files", {}).items():
                                 if "error" in file_data:
                                     continue
                                 file_base = train_file.replace('.xlsx', '').replace('.xls', '')
                                 for sn in file_data.get("sheets", {}).keys():
                                     key = f"{file_base}_{sn}"
-                                    if len(key) > 31:
-                                        key = key[:31]
+                                    key = make_unique_sheet_key(key, _ek_used)
                                     expected_keys.add(key)
 
                             missing_keys = expected_keys - set(pre_loaded_source_data.keys())
@@ -4764,14 +4765,14 @@ async def compute_with_script_stream(
 
                                         # 验证预加载数据是否包含训练时的所有 sheet
                                         expected_keys = set()
+                                        _ek_used2 = set()
                                         for train_file, file_data in source_structure.get("files", {}).items():
                                             if "error" in file_data:
                                                 continue
                                             file_base = train_file.replace('.xlsx', '').replace('.xls', '')
                                             for sn in file_data.get("sheets", {}).keys():
                                                 key = f"{file_base}_{sn}"
-                                                if len(key) > 31:
-                                                    key = key[:31]
+                                                key = make_unique_sheet_key(key, _ek_used2)
                                                 expected_keys.add(key)
 
                                         missing_keys = expected_keys - set(pre_loaded_source_data.keys())

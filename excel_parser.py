@@ -2729,6 +2729,11 @@ class IntelligentExcelParser:
             if any(keyword in first_value_str for keyword in garbage_keywords):
                 return True
 
+        # 情况1.5: 只有2个非空单元格，第一个含标题关键字
+        if non_empty_cells == 2:
+            if any(keyword.lower() in first_value_str.lower() for keyword in self.TITLE_KEYWORDS):
+                return True
+
         is_instruction = False
         for keyword in self.INSTRUCTION_KEYWORDS:
             if keyword.lower() in first_value_str.lower():
@@ -2826,6 +2831,7 @@ class IntelligentExcelParser:
         """判断是否为标题行或说明行（增强版 + 性能优化）"""
         non_empty_cells = 0
         first_value = None
+        first_value_col = None
         second_value = None
         has_required_marker = False  # 是否包含必填标记
 
@@ -2843,6 +2849,7 @@ class IntelligentExcelParser:
 
                 if first_value is None:
                     first_value = value
+                    first_value_col = col
                 elif second_value is None:
                     second_value = value
 
@@ -2860,14 +2867,27 @@ class IntelligentExcelParser:
 
         first_value_str = str(first_value).strip()
 
-        # 情况1: 只有1个非空单元格，包含标题关键字或示例关键字
+        # 情况1: 只有1个非空单元格
         if non_empty_cells == 1:
-            # 添加示例、样例等垃圾数据关键字
+            # 1a: 单元格跨越多列合并（>=3列），视为标题行
+            if first_value_col:
+                merged_range = self._get_physical_merged_cell_range(worksheet, row, first_value_col)
+                if merged_range:
+                    col_span = merged_range.max_col - merged_range.min_col + 1
+                    if col_span >= 3:
+                        return True
+            # 1b: 包含标题关键字或示例关键字
             garbage_keywords = ["示例", "样例", "例子", "example", "sample", "demo"]
             if any(keyword.lower() in first_value_str.lower() for keyword in self.TITLE_KEYWORDS):
                 return True
             # 如果只有一个单元格且内容是示例类关键字，也视为标题行（垃圾数据）
             if any(keyword in first_value_str for keyword in garbage_keywords):
+                return True
+
+        # 情况1.5: 只有2个非空单元格，第一个含标题关键字
+        # 典型模式：A列="公司名称：xxx", J列="帐单号：xxx" 这种描述信息行
+        if non_empty_cells == 2:
+            if any(keyword.lower() in first_value_str.lower() for keyword in self.TITLE_KEYWORDS):
                 return True
 
         # 情况2: 第一个单元格包含说明区域关键字（但不是只有必填标记开头）
@@ -3465,9 +3485,10 @@ class IntelligentExcelParser:
 
         选取策略：
         1. 若指定了 active_sheet_name，优先从该 sheet 中选取
-        2. 按列头数量降序排列，选第一个数据行>=1的区域
-        3. 若有其他区域列头完全一致 → 合并（列头取第一个，数据拼接）
-        4. 若最多列头的区域数据行<1，依次查找列头次多的
+        2. 按列头数量降序排列，列头数量相同时优先数据行更多的区域
+        3. 选第一个数据行>=1的区域
+        4. 若有其他区域列头完全一致 → 合并（列头取第一个，数据拼接）
+        5. 若最多列头的区域数据行<1，依次查找列头次多的
 
         Args:
             sheet_data_list: parse_excel_file返回的解析结果
@@ -3501,8 +3522,8 @@ class IntelligentExcelParser:
 
             # 第一个区域（sheet内最上面的）
             first_region = all_regions[0]
-            # 有效列头最多的区域
-            most_cols = max(all_regions, key=lambda x: _real_col_count(x[1]))
+            # 有效列头最多的区域（列头数量相同时优先数据行更多的）
+            most_cols = max(all_regions, key=lambda x: (_real_col_count(x[1]), len(x[1].data)))
 
             # 如果有效列头最多的区域就是第一个区域 → 无条件选它（不要求有数据行）
             if most_cols[1] is first_region[1]:
@@ -3510,7 +3531,7 @@ class IntelligentExcelParser:
             else:
                 # 否则按有效列头数量降序，找第一个数据行>=1的
                 sorted_by_cols = sorted(
-                    all_regions, key=lambda x: _real_col_count(x[1]), reverse=True
+                    all_regions, key=lambda x: (_real_col_count(x[1]), len(x[1].data)), reverse=True
                 )
                 best = None
                 for sheet_name, region in sorted_by_cols:
@@ -3757,20 +3778,37 @@ class IntelligentExcelParser:
             first_region = regions[0]
 
             if len(regions) == 1:
-                # 单区域：整块 Range.Copy（表头+数据）
-                first_row = first_region.head_row_start - 1
-                total_rows = first_region.data_row_end - first_region.head_row_start + 1
+                # 单区域：表头和数据分开Copy（避免合并单元格干扰数据复制）
+                # -- 复制表头 --
+                head_start = first_region.head_row_start - 1
+                head_rows = first_region.head_row_end - first_region.head_row_start + 1
 
                 source_range = src_ws.Cells.CreateRange(
-                    first_row, 0, total_rows, total_cols)
+                    head_start, 0, head_rows, total_cols)
                 dest_range = new_ws.Cells.CreateRange(
-                    0, 0, total_rows, total_cols)
+                    0, 0, head_rows, total_cols)
                 dest_range.Copy(source_range)
 
-                # 复制行高
-                for row in range(total_rows):
+                for row in range(head_rows):
                     new_ws.Cells.SetRowHeight(
-                        row, src_ws.Cells.GetRowHeight(first_row + row))
+                        row, src_ws.Cells.GetRowHeight(head_start + row))
+
+                # -- 单独复制数据（不含表头，避免合并单元格干扰） --
+                data_start = first_region.data_row_start - 1
+                data_rows = first_region.data_row_end - first_region.data_row_start + 1
+                if data_rows > 0:
+                    source_range = src_ws.Cells.CreateRange(
+                        data_start, 0, data_rows, total_cols)
+                    dest_range = new_ws.Cells.CreateRange(
+                        head_rows, 0, data_rows, total_cols)
+                    dest_range.Copy(source_range)
+
+                    for row in range(data_rows):
+                        new_ws.Cells.SetRowHeight(
+                            head_rows + row,
+                            src_ws.Cells.GetRowHeight(data_start + row))
+
+                total_rows = head_rows + max(data_rows, 0)
             else:
                 # 多区域合并：表头取第一个区域，数据逐个区域追加
                 # -- 复制表头 --

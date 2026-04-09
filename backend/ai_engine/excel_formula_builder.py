@@ -18,6 +18,7 @@ from openpyxl.comments import Comment
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
+from backend.utils.data_helpers import make_unique_sheet_key
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +54,11 @@ class ExcelFormulaBuilder:
     def __init__(self):
         self.workbook = None
         self.source_sheets = {}  # {sheet_name: {"df": DataFrame, "columns": [列名列表]}}
+        self._used_sheet_keys = set()
         self.result_sheet = None
 
-    def load_source_data(self, input_folder: str, manual_headers: Dict = None) -> Dict[str, Any]:
+    def load_source_data(self, input_folder: str, manual_headers: Dict = None,
+                          multi_sheet_source: bool = False) -> Dict[str, Any]:
         """加载所有源数据
 
         Args:
@@ -84,7 +87,7 @@ class ExcelFormulaBuilder:
                 results = parser.parse_excel_file(
                     file_path,
                     manual_headers=manual_headers,
-                    active_sheet_only=True,
+                    active_sheet_only=not multi_sheet_source,
                     best_region_only=True,  # 只取有效区域
                     max_data_rows=30,  # 训练时只需结构和样本，不读全量数据
                 )
@@ -113,9 +116,8 @@ class ExcelFormulaBuilder:
                     # 生成sheet名称：文件名_sheet名（统一格式）
                     sheet_name = f"{file_base}_{sheet_data.sheet_name}"
 
-                    # 确保sheet名不超过31个字符（Excel限制）
-                    if len(sheet_name) > 31:
-                        sheet_name = sheet_name[:31]
+                    # 确保sheet名不超过31个字符（Excel限制），碰撞时追加后缀
+                    sheet_name = make_unique_sheet_key(sheet_name, self._used_sheet_keys)
 
                     self.source_sheets[sheet_name] = {
                         "df": merged_df,
