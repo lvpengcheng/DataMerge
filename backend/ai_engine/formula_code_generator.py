@@ -2299,13 +2299,18 @@ def main():
     if default_sheet.title == "Sheet" and default_sheet in wb.worksheets:
         wb.remove(default_sheet)
 
-    # 把第一个结果sheet移到最前面（如果需要）
-    # 找到非源数据的sheet（排除源数据sheet、"参数"sheet和"历史数据"sheet）
+    # 把所有结果sheet移到最前面，保持它们的相对顺序（与目标文件sheet顺序一致）
+    # 排除源数据sheet、"参数"sheet和"历史数据"sheet
     source_sheet_names = set(source_sheets.keys())
-    for ws in wb.worksheets:
-        if ws.title not in source_sheet_names and ws.title != "参数" and ws.title != "历史数据":
-            wb.move_sheet(ws, offset=-len(wb.worksheets)+1)
-            break
+    result_sheets = [ws for ws in wb.worksheets
+                     if ws.title not in source_sheet_names
+                     and ws.title != "参数" and ws.title != "历史数据"]
+    for target_pos, ws in enumerate(result_sheets):
+        current_pos = wb.worksheets.index(ws)
+        if current_pos != target_pos:
+            wb.move_sheet(ws, offset=target_pos - current_pos)
+    if result_sheets:
+        print(f"已将 {len(result_sheets)} 个结果sheet移到最前面: {[ws.title for ws in result_sheets]}")
 
     # 保存文件（公式由 compare_excel_files 在沙箱外用 Aspose 计算，避免占用沙箱执行时间）
     output_path = os.path.join(globals().get('output_folder', ''), "薪资汇总表.xlsx")

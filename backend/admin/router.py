@@ -787,18 +787,19 @@ async def generate_report(
         raise HTTPException(status_code=400, detail="未找到计算结果")
 
     # 4. 从 DB parsed_data 读取数据（优先），无 parsed_data 时回退到读文件
-    #    只取 sheet0 的数据作为 dt
+    #    读取所有 sheet，按 sheet 名分组，每个 sheet 作为独立数据源
     #    use_history 模式下自动补 salary_year / salary_month / 月份 列
     is_multi_month = use_history and period_from and period_to
-    all_dfs = []
+    all_sheet_dfs: dict[str, list] = {}  # {sheet_name: [df1, df2, ...]}
     for asset in assets:
-        asset_dfs = []
+        asset_sheet_dfs: dict[str, list] = {}
         if asset.parsed_data:
             # parsed_data: [{"sheet_name": "...", "regions": [...]}, ...]
-            # 只取第一个 sheet
-            first_sheet = asset.parsed_data[0] if asset.parsed_data else None
-            if first_sheet:
-                for region in (first_sheet.get("regions") or []):
+            for sheet_info in asset.parsed_data:
+                sheet_name = sheet_info.get("sheet_name", "Sheet1")
+                if sheet_name in ("参数", "历史数据"):
+                    continue
+                for region in (sheet_info.get("regions") or []):
                     head_data = region.get("head_data") or {}
                     data_rows = region.get("data") or []
                     if not head_data or not data_rows:
@@ -807,35 +808,50 @@ async def generate_report(
                     mapped_rows = [{col_map.get(c, c): val for c, val in row.items()} for row in data_rows]
                     df = pd.DataFrame(mapped_rows)
                     if not df.empty:
-                        asset_dfs.append(df)
+                        asset_sheet_dfs.setdefault(sheet_name, []).append(df)
         elif os.path.exists(asset.file_path):
-            # 回退：从文件读取，只取第一个 sheet
+            # 回退：从文件读取所有 sheet
             try:
                 sheets = aspose_helper.read_all_sheets_calculated(asset.file_path)
-                if sheets:
-                    first_df = list(sheets.values())[0]
-                    if not first_df.empty:
-                        asset_dfs.append(first_df)
+                for sheet_name, df in sheets.items():
+                    if sheet_name in ("参数", "历史数据"):
+                        continue
+                    if not df.empty:
+                        asset_sheet_dfs.setdefault(sheet_name, []).append(df)
             except Exception as e:
                 logger.warning(f"读取结果文件失败 {asset.file_path}: {e}")
 
         # 多月合并时，自动补 salary_year / salary_month / 月份 列
-        if is_multi_month and asset_dfs and asset.source_task_id in task_ym_map:
+        if is_multi_month and asset_sheet_dfs and asset.source_task_id in task_ym_map:
             y, m = task_ym_map[asset.source_task_id]
-            for df in asset_dfs:
-                if "salary_year" not in df.columns:
-                    df["salary_year"] = y
-                if "salary_month" not in df.columns:
-                    df["salary_month"] = m
-                if "月份" not in df.columns:
-                    df["月份"] = f"{m}月"
+            for dfs in asset_sheet_dfs.values():
+                for df in dfs:
+                    if "salary_year" not in df.columns:
+                        df["salary_year"] = y
+                    if "salary_month" not in df.columns:
+                        df["salary_month"] = m
+                    if "月份" not in df.columns:
+                        df["月份"] = f"{m}月"
 
-        all_dfs.extend(asset_dfs)
+        # 合入全局
+        for sn, dfs in asset_sheet_dfs.items():
+            all_sheet_dfs.setdefault(sn, []).extend(dfs)
 
-    if not all_dfs:
+    if not all_sheet_dfs:
         raise HTTPException(status_code=400, detail="无法读取计算结果数据")
 
-    dataset = pd.concat(all_dfs, ignore_index=True) if len(all_dfs) > 1 else all_dfs[0]
+    # 每个 sheet 合并为一个 DataFrame
+    template_sheets: dict[str, pd.DataFrame] = {}
+    for sheet_name, dfs in all_sheet_dfs.items():
+        template_sheets[sheet_name] = pd.concat(dfs, ignore_index=True) if len(dfs) > 1 else dfs[0]
+
+    # 向后兼容："DT" 指向第一个 sheet（现有模板 &=DT.列名 继续工作）
+    first_sheet_name = next(iter(all_sheet_dfs), None)
+    if first_sheet_name and "DT" not in template_sheets:
+        template_sheets["DT"] = template_sheets[first_sheet_name]
+
+    # dataset 用于后续 show_empty_period / first_row 等逻辑
+    dataset = template_sheets.get("DT", pd.DataFrame())
 
     # 多月合并时：show_empty_period 补齐缺失月份的空行
     show_empty = getattr(tpl, "show_empty_period", True)
@@ -868,13 +884,11 @@ async def generate_report(
         "tenant": tenant_id,
     }
 
-    template_data = {
-        "DT": dataset,
-        "$year": system_vars["year"],
-        "$month": system_vars["month"],
-        "$date": system_vars["date"],
-        "$tenant": tenant_id,
-    }
+    template_data = {**template_sheets}
+    template_data["$year"] = system_vars["year"]
+    template_data["$month"] = system_vars["month"]
+    template_data["$date"] = system_vars["date"]
+    template_data["$tenant"] = tenant_id
 
     # 6. 用数据集第一行来解析文件名和加密规则
     first_row = dataset.iloc[0].to_dict() if len(dataset) > 0 else {}

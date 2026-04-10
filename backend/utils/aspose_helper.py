@@ -854,7 +854,7 @@ def _generate_block(
 ) -> str:
     """按 group_by 分组，每组用 SmartMarker 填充模板，合并到一个文件。"""
     # 找到主数据源（非 $ 开头的第一个 DataFrame）
-    ds_name, full_df, vars_data = _extract_datasource(data)
+    ds_name, full_df, vars_data, extra_dfs = _extract_datasource(data)
 
     # 模糊匹配 group_by 列名
     if group_by and group_by not in full_df.columns:
@@ -879,7 +879,7 @@ def _generate_block(
         group_df = group_df.reset_index(drop=True)
         # 从分组数据首行自动提取 $变量（覆盖全局同名变量）
         group_vars = _extract_group_vars(group_df, vars_data)
-        group_data = {ds_name: group_df, **group_vars}
+        group_data = {ds_name: group_df, **extra_dfs, **group_vars}
 
         # SmartMarker 填充该组
         filled_wb = _smartmarker_fill(template_path, group_data)
@@ -918,7 +918,7 @@ def _generate_sheet(
     show_empty_period: bool = True,
 ) -> str:
     """按 group_by 分组，每组生成一个独立 sheet，sheet 名取自分组值。"""
-    ds_name, full_df, vars_data = _extract_datasource(data)
+    ds_name, full_df, vars_data, extra_dfs = _extract_datasource(data)
 
     # 模糊匹配 group_by 列名
     if group_by and group_by not in full_df.columns:
@@ -940,7 +940,7 @@ def _generate_sheet(
     for group_idx, (group_key, group_df) in enumerate(groups):
         group_df = group_df.reset_index(drop=True)
         group_vars = _extract_group_vars(group_df, vars_data)
-        group_data = {ds_name: group_df, **group_vars}
+        group_data = {ds_name: group_df, **extra_dfs, **group_vars}
 
         # SmartMarker 填充该组
         filled_wb = _smartmarker_fill(template_path, group_data)
@@ -973,7 +973,7 @@ def _generate_zip(
     show_empty_period: bool = True,
 ) -> str:
     """按 group_by 分组，每组生成独立 xlsx，打包为 zip。"""
-    ds_name, full_df, vars_data = _extract_datasource(data)
+    ds_name, full_df, vars_data, extra_dfs = _extract_datasource(data)
 
     # 模糊匹配 group_by 列名（去空格、忽略大小写）
     if group_by and group_by not in full_df.columns:
@@ -1000,7 +1000,7 @@ def _generate_zip(
             group_df = group_df.reset_index(drop=True)
             # 从分组数据首行自动提取 $变量（覆盖全局同名变量）
             group_vars = _extract_group_vars(group_df, vars_data)
-            group_data = {ds_name: group_df, **group_vars}
+            group_data = {ds_name: group_df, **extra_dfs, **group_vars}
 
             filled_wb = _smartmarker_fill(template_path, group_data)
 
@@ -1051,7 +1051,7 @@ def _generate_with_split(
     show_empty_period: bool = True,
 ) -> str:
     """按 split_by 字段拆分数据到多个文件，每个文件内按 mode 模式生成，打包为 zip。"""
-    ds_name, full_df, vars_data = _extract_datasource(data)
+    ds_name, full_df, vars_data, extra_dfs = _extract_datasource(data)
 
     # 模糊匹配 split_by 列名
     if split_by not in full_df.columns:
@@ -1097,7 +1097,7 @@ def _generate_with_split(
         for split_idx, (split_key, split_df) in enumerate(split_groups):
             split_df = split_df.reset_index(drop=True)
             split_vars = _extract_group_vars(split_df, vars_data)
-            split_data = {ds_name: split_df, **split_vars}
+            split_data = {ds_name: split_df, **extra_dfs, **split_vars}
 
             with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
                 tmp_path = tmp.name
@@ -1136,25 +1136,28 @@ def _generate_with_split(
 # ── 公共工具 ──────────────────────────────────────────
 
 def _extract_datasource(data: Dict):
-    """从 data dict 中分离主数据源 DataFrame 和 $ 变量。
-    Returns: (ds_name, DataFrame, vars_dict)
+    """从 data dict 中分离主数据源 DataFrame、额外数据源和 $ 变量。
+    Returns: (ds_name, DataFrame, vars_dict, extra_dfs)
+    extra_dfs: 主数据源之外的其他 DataFrame（用于多 sheet 数据源）
     """
     ds_name = None
     full_df = None
+    extra_dfs = {}
     vars_data = {}
 
     for name, value in data.items():
         if name.startswith("$"):
             vars_data[name] = value
+        elif ds_name is None:
+            ds_name = name
+            full_df = value if isinstance(value, pd.DataFrame) else pd.DataFrame(value)
         else:
-            if ds_name is None:
-                ds_name = name
-                full_df = value if isinstance(value, pd.DataFrame) else pd.DataFrame(value)
+            extra_dfs[name] = value if isinstance(value, pd.DataFrame) else pd.DataFrame(value)
 
     if full_df is None:
         raise ValueError("data 中未找到 DataFrame 数据源")
 
-    return ds_name, full_df, vars_data
+    return ds_name, full_df, vars_data, extra_dfs
 
 
 def _extract_group_vars(group_df: pd.DataFrame, global_vars: Dict) -> Dict:
