@@ -190,34 +190,38 @@ class DocumentParser:
             return f"[Word解析失败: {str(e)}]"
 
     def _parse_excel(self, file_path: str) -> str:
-        """解析Excel文件（提取文本内容）"""
+        """解析Excel文件（提取全部文本内容，适合作为设计文档使用）"""
         try:
             import pandas as pd
 
             text_parts = []
 
-            # 读取所有sheet
             try:
                 excel_file = pd.ExcelFile(file_path)
                 sheet_names = excel_file.sheet_names
 
                 for sheet_name in sheet_names:
                     try:
-                        # 读取前几行了解结构
-                        df = pd.read_excel(file_path, sheet_name=sheet_name, nrows=10)
+                        # 读取全部行
+                        df = pd.read_excel(file_path, sheet_name=sheet_name)
 
                         sheet_text = f"=== Sheet: {sheet_name} ===\n"
                         sheet_text += f"形状: {df.shape[0]}行 x {df.shape[1]}列\n"
 
-                        # 添加列名
                         if not df.empty:
-                            sheet_text += f"列名: {', '.join(map(str, df.columns.tolist()))}\n"
+                            columns = [str(c) for c in df.columns.tolist()]
 
-                            # 添加前几行数据
-                            sheet_text += "前几行数据:\n"
-                            for i in range(min(3, len(df))):
-                                row_data = df.iloc[i].tolist()
-                                sheet_text += f"  行{i+1}: {row_data}\n"
+                            # Markdown 表格格式输出全部数据
+                            sheet_text += "| " + " | ".join(columns) + " |\n"
+                            sheet_text += "| " + " | ".join("---" for _ in columns) + " |\n"
+                            for i in range(len(df)):
+                                row_vals = []
+                                for val in df.iloc[i].tolist():
+                                    cell = str(val) if pd.notna(val) else ""
+                                    # 管道符转义，防止破坏表格
+                                    cell = cell.replace("|", "\\|")
+                                    row_vals.append(cell)
+                                sheet_text += "| " + " | ".join(row_vals) + " |\n"
 
                         text_parts.append(sheet_text)
 

@@ -28,6 +28,20 @@ from backend.utils.indentation_fixer import IndentationFixer
 logger = logging.getLogger(__name__)
 
 
+def replace_source_data_format_in_rules(rules_content: str, new_source_structure: str) -> str:
+    """替换 rules_content 中的 '## 源数据格式' 段落为当前训练数据的源结构。
+
+    检测 '## 源数据格式' 标题，替换到下一个 '## ' 标题（或文档末尾）之间的全部内容。
+    如果 rules_content 不含该段落，原样返回（向后兼容旧规则文件）。
+    """
+    if not rules_content or "## 源数据格式" not in rules_content:
+        return rules_content
+
+    pattern = r'## 源数据格式\s*\n.*?(?=\n## |\Z)'
+    replacement = f"## 源数据格式\n\n{new_source_structure.strip()}\n"
+    return re.sub(pattern, replacement, rules_content, count=1, flags=re.DOTALL)
+
+
 class FormulaCodeGenerator:
     """公式模式代码生成器
 
@@ -108,6 +122,11 @@ class FormulaCodeGenerator:
 
         source_structure = self.formula_builder.get_source_structure_for_prompt(main_table_name=main_table_name)
         log("步骤2: 生成源数据结构描述完成")
+
+        # 2.5 替换规则中的源数据格式为当前训练数据结构
+        if rules_content and "## 源数据格式" in rules_content:
+            rules_content = replace_source_data_format_in_rules(rules_content, source_structure)
+            log("步骤2.5: 已替换规则中的源数据格式为当前训练数据结构")
 
         # 3. 统计预期列数，收集列名
         total_columns = 0
@@ -2617,6 +2636,10 @@ def main():
 
         log("=== 开始修正公式模式代码 ===")
 
+        # 替换规则中的源数据格式为当前训练数据结构
+        if rules_content and source_structure and "## 源数据格式" in rules_content:
+            rules_content = replace_source_data_format_in_rules(rules_content, source_structure)
+
         # 防御性检查：如果原始代码为空
         if not original_code:
             log("警告: 原始代码为空，无法进行修正")
@@ -2779,6 +2802,11 @@ def main():
 
         # 1. 提取目标列和构建修正请求
         target_columns = list(field_diff_samples.keys())
+
+        # 替换规则中的源数据格式为当前训练数据结构
+        if rules_content and source_structure and "## 源数据格式" in rules_content:
+            rules_content = replace_source_data_format_in_rules(rules_content, source_structure)
+
         # 如果有用户反馈，以用户反馈为主；否则从差异样本自动构建
         if user_feedback:
             adjustment_request = f"【用户修正指示】\n{user_feedback}"

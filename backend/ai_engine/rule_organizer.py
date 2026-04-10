@@ -14,6 +14,18 @@ logger = logging.getLogger(__name__)
 # 文档最大字符数（防止超出 AI 上下文窗口），可通过 .env 配置
 MAX_DOC_CHARS = int(os.getenv("RULE_ORGANIZE_MAX_DOC_CHARS", "30000"))
 
+# 源数据格式段落标题（用于检测和替换）
+SOURCE_DATA_FORMAT_HEADER = "## 源数据格式"
+
+
+def format_source_data_section(source_info: str) -> str:
+    """将 _extract_source_structures() 的输出包装为标准 Markdown 段落。
+
+    此段落会追加到 AI 生成的规则文档末尾，使 rules.md 同时包含业务规则和源数据格式。
+    智训时 FormulaCodeGenerator 会检测并替换此段落为实际训练数据的源结构。
+    """
+    return f"\n\n{SOURCE_DATA_FORMAT_HEADER}\n\n{source_info.strip()}\n"
+
 
 SYSTEM_PROMPT = """\
 你是一位专业的数据处理规则分析师，擅长分析Excel文件结构和业务规则，\
@@ -176,6 +188,9 @@ class RuleOrganizer:
 
         result = self.ai_provider.chat(messages)
 
+        # 追加源数据格式段落，使 rules.md 更完整
+        result = result.rstrip() + format_source_data_section(source_info)
+
         logger.info(f"[规则整理] AI 返回, 结果长度: {len(result)}")
         return result
 
@@ -197,6 +212,12 @@ class RuleOrganizer:
         logger.info(f"[规则整理-流式] 开始调用 AI, 消息总长度: {total_len}")
 
         result = self.ai_provider.chat_stream(messages, chunk_callback=chunk_callback)
+
+        # 追加源数据格式段落，使 rules.md 更完整
+        source_section = format_source_data_section(source_info)
+        result = result.rstrip() + source_section
+        if chunk_callback:
+            chunk_callback(source_section)
 
         logger.info(f"[规则整理-流式] AI 返回, 结果长度: {len(result)}")
         return result

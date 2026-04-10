@@ -1738,6 +1738,7 @@ __CONDITIONAL_FORMAT_RULES__
 __PRECISION_RULES__
 
 ## 计算规则
+注意：规则中「公式: 无」表示目标文件没有现成公式，你必须根据该列的「规则描述」自行推导出正确的Excel公式（如VLOOKUP、IF、SUM等）。不要因为公式为空就跳过或仅做简单复制。
 __RULES__
 
 """
@@ -1850,6 +1851,7 @@ __RULES__
 {batch_col_list}
 
 ## 本批次相关的计算规则
+注意：规则中「公式: 无」表示目标文件没有现成公式，你必须根据该列的「规则描述」自行推导出正确的Excel公式（如VLOOKUP、IF、SUM等）。不要因为公式为空就跳过或仅做简单复制。
 {rules_content}
 
 ⚠️ 如果规则中包含「列处理分层」，L1同源列直接用main_df.iloc[i].get()复制（不查列号），L2跨表列才用VLOOKUP。
@@ -1904,6 +1906,7 @@ def fill_columns_batch_{batch_index + 1}(ws, r, source_sheets):
 {batch_col_list}
 
 ## 本批次相关的计算规则
+注意：规则中「公式: 无」表示目标文件没有现成公式，你必须根据该列的「规则描述」自行推导出正确的Excel公式（如VLOOKUP、IF、SUM等）。不要因为公式为空就跳过或仅做简单复制。
 {rules_content}
 
 ## 源数据结构
@@ -2086,6 +2089,7 @@ def fill_columns_batch_{batch_index + 1}(ws, r, source_sheets):
 {extracted['precision']}
 
 ## 计算规则
+注意：规则中「公式: 无」表示目标文件没有现成公式，你必须根据该列的「规则描述」自行推导出正确的Excel公式（如VLOOKUP、IF、SUM等）。不要因为公式为空就跳过或仅做简单复制。
 {rules}
 
 {golden_and_rules}"""

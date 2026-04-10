@@ -30,8 +30,15 @@ class IndentationFixer:
         """沙箱执行前的缩进修复管线
 
         替代 code_sandbox._clean_code_syntax 中的缩进修复调用。
-        按顺序执行所有修复器，编译失败时重跑一轮（最多5轮）。
+        三层防御：
+          L0: Tab→Space 归一化
+          L1: 自定义修复器（最多5轮）
+          L2: autopep8 工业级格式化（最终防线）
         """
+        # --- L0: Tab→Space 归一化 ---
+        code = code.replace('\t', '    ')
+
+        # --- L1: 自定义修复器 ---
         for _round in range(5):
             try:
                 compile(code, '<check>', 'exec')
@@ -47,16 +54,29 @@ class IndentationFixer:
             code = self.fix_expected_indented_block(code)
             code = self.fix_orphaned_break_continue(code)
 
+        # --- L2: autopep8 最终防线 ---
+        try:
+            compile(code, '<check>', 'exec')
+            return code
+        except SyntaxError:
+            code = self._fix_with_autopep8(code)
+
         return code
 
     def fix_formula_pipeline(self, code: str) -> str:
         """公式代码生成后的缩进修复管线
 
         替代 formula_code_generator 中多处调用的 2 步修复。
-        按顺序执行：for循环体脱离 → 列级联缩进
+        按顺序执行：Tab归一化 → for循环体脱离 → 列级联缩进 → autopep8兜底
         """
+        code = code.replace('\t', '    ')
         code = self.fix_for_loop_body_indentation(code)
         code = self.fix_cascading_column_indentation(code)
+        # 如果仍有编译错误，用 autopep8 兜底
+        try:
+            compile(code, '<check>', 'exec')
+        except SyntaxError:
+            code = self._fix_with_autopep8(code)
         return code
 
     def fix_general(self, code: str) -> str:
@@ -65,6 +85,7 @@ class IndentationFixer:
         替代 ai_provider._fix_python_indentation。
         适用于一般性的缩进混乱（混用空格数、冒号后没缩进等）。
         """
+        code = code.replace('\t', '    ')
         return self.fix_python_indentation(code)
 
     # ================================================================
@@ -899,3 +920,47 @@ class IndentationFixer:
             result.append(' ' * new_indent + line.lstrip())
 
         return result
+
+    # ================================================================
+    #  autopep8 工业级格式化（最终防线）
+    # ================================================================
+
+    def _fix_with_autopep8(self, code: str) -> str:
+        """使用 autopep8 修复缩进和格式问题
+
+        作为自定义修复器的最终防线：当自定义规则无法修复时，
+        调用 autopep8 进行工业级格式化。
+        """
+        try:
+            import autopep8
+            fixed = autopep8.fix_code(code, options={
+                'aggressive': 2,           # 激进模式，修复更多问题
+                'max_line_length': 300,     # 不要折行，AI生成的代码行长无所谓
+                'select': [
+                    'E1',                   # 缩进类错误（E101, E111-E131）
+                    'W1',                   # 缩进类警告（W191 tab→space）
+                ],
+            })
+            try:
+                compile(fixed, '<check>', 'exec')
+                logger.info("[autopep8] 成功修复缩进问题")
+                return fixed
+            except SyntaxError:
+                # autopep8 只修 select 的问题后仍然失败，再尝试全量修复
+                fixed_full = autopep8.fix_code(code, options={
+                    'aggressive': 2,
+                    'max_line_length': 300,
+                })
+                try:
+                    compile(fixed_full, '<check>', 'exec')
+                    logger.info("[autopep8] 全量修复成功")
+                    return fixed_full
+                except SyntaxError as e:
+                    logger.warning(f"[autopep8] 全量修复后仍有语法错误: {e}")
+                    return code
+        except ImportError:
+            logger.warning("[autopep8] 未安装 autopep8，跳过自动格式化")
+            return code
+        except Exception as e:
+            logger.warning(f"[autopep8] 修复异常: {e}")
+            return code

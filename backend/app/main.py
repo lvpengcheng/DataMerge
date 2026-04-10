@@ -411,6 +411,31 @@ async def rules_chat_endpoint(
             organizer = RuleOrganizer(provider)
             full_content = organizer.chat_followup(messages, chunk_callback=chunk_cb)
 
+            # 追问后，如果AI重新生成了完整规则文档但缺少源数据格式段落，
+            # 从历史消息中恢复该段落（首次生成时已追加在第一个assistant回复中）
+            if full_content and "## 源数据格式" not in full_content:
+                # 检查回复是否像完整规则文档（含列级规则或基本信息等标志性标题）
+                _looks_like_full_rules = any(
+                    marker in full_content
+                    for marker in ("## 列级规则", "## 基本信息", "## 列处理分层")
+                )
+                if _looks_like_full_rules:
+                    # 从历史消息的 assistant 回复中提取源数据格式段落
+                    import re as _re_chat
+                    for msg in reversed(messages):
+                        if msg.get("role") == "assistant" and "## 源数据格式" in msg.get("content", ""):
+                            _m = _re_chat.search(
+                                r'(## 源数据格式\s*\n.*)',
+                                msg["content"],
+                                flags=_re_chat.DOTALL,
+                            )
+                            if _m:
+                                _source_section = "\n\n" + _m.group(1).strip() + "\n"
+                                full_content = full_content.rstrip() + _source_section
+                                if chunk_cb:
+                                    chunk_cb(_source_section)
+                                break
+
             # ---- 持久化会话 ----
             saved_session_id = _session_id
             try:
@@ -424,7 +449,14 @@ async def rules_chat_endpoint(
                             {"role": "assistant", "content": full_content}
                         ]
                         sess.messages = updated_messages
-                        sess.final_result = full_content
+                        # 只在AI重新输出完整规则文档时更新 final_result，
+                        # 普通对话回复（如"好的，已修改"）不应覆盖
+                        _is_rules_doc = any(
+                            marker in full_content
+                            for marker in ("## 列级规则", "## 基本信息", "## 列处理分层")
+                        )
+                        if _is_rules_doc:
+                            sess.final_result = full_content
                         sess.updated_at = datetime.utcnow()
                         db.commit()
                     db.close()
