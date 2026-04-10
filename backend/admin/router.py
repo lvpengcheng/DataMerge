@@ -845,13 +845,11 @@ async def generate_report(
     for sheet_name, dfs in all_sheet_dfs.items():
         template_sheets[sheet_name] = pd.concat(dfs, ignore_index=True) if len(dfs) > 1 else dfs[0]
 
-    # 向后兼容："DT" 指向第一个 sheet（现有模板 &=DT.列名 继续工作）
+    # 主数据源 "DT" = 第一个 sheet（用于 group_by 分组，向后兼容）
     first_sheet_name = next(iter(all_sheet_dfs), None)
-    if first_sheet_name and "DT" not in template_sheets:
-        template_sheets["DT"] = template_sheets[first_sheet_name]
 
     # dataset 用于后续 show_empty_period / first_row 等逻辑
-    dataset = template_sheets.get("DT", pd.DataFrame())
+    dataset = template_sheets.get(first_sheet_name, pd.DataFrame())
 
     # 多月合并时：show_empty_period 补齐缺失月份的空行
     show_empty = getattr(tpl, "show_empty_period", True)
@@ -884,7 +882,11 @@ async def generate_report(
         "tenant": tenant_id,
     }
 
-    template_data = {**template_sheets}
+    # template_data 键序很重要：DT 必须是第一个非$键（_extract_datasource 取第一个做 group_by 主数据源）
+    template_data = {"DT": dataset}
+    for sheet_name, df in template_sheets.items():
+        if sheet_name != first_sheet_name:  # 第一个 sheet 已作为 DT，不重复
+            template_data[sheet_name] = df
     template_data["$year"] = system_vars["year"]
     template_data["$month"] = system_vars["month"]
     template_data["$date"] = system_vars["date"]
