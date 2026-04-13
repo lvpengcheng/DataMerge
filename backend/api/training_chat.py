@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Form, File, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Query, Form, File, UploadFile, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
@@ -225,7 +225,8 @@ def _analyze_expected_structure(expected_file: str) -> Dict[str, Any]:
 
 
 def _load_full_source_data(source_dir: str, manual_headers: Dict = None,
-                           multi_sheet_source: bool = False) -> Dict:
+                           multi_sheet_source: bool = False,
+                           file_passwords: Dict = None) -> Dict:
     """全量加载源文件数据（无 max_data_rows 限制），供脚本执行时使用。
     该函数设计为在后台线程中运行，与 AI 代码生成并行执行。
 
@@ -238,12 +239,25 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None,
     source_data = {}
     _used_keys = set()
     parser = IntelligentExcelParser()
+    _passwords = file_passwords or {}
 
     for filename in sorted(os.listdir(source_dir)):
         if not filename.endswith(('.xlsx', '.xls')) or filename.startswith('~'):
             continue
         file_path = os.path.join(source_dir, filename)
         file_base = filename.replace('.xlsx', '').replace('.xls', '')
+
+        # 兜底解密：如果文件仍然加密（旧会话迁移场景），用密码解密后再解析
+        if _passwords.get(filename):
+            try:
+                from backend.utils.aspose_helper import is_encrypted, decrypt_excel
+                if is_encrypted(file_path):
+                    import shutil as _shutil
+                    decrypted = decrypt_excel(file_path, password=_passwords[filename])
+                    _shutil.move(decrypted, file_path)
+                    logger.info(f"[后台全量加载] 兜底解密成功: {filename}")
+            except Exception as _dec_e:
+                logger.warning(f"[后台全量加载] 兜底解密失败 {filename}: {_dec_e}")
 
         try:
             results = parser.parse_excel_file(
@@ -772,6 +786,7 @@ def get_session_messages(
 
 @router.post("/start")
 async def start_training(
+    request: Request,
     tenant_id: str = Form(...),
     source_files: List[UploadFile] = File(...),
     expected_result: UploadFile = File(None),
@@ -785,6 +800,7 @@ async def start_training(
     force_retrain: bool = Form(False),
     session_id: Optional[int] = Form(None),  # 传入已有 session_id 则继续
     multi_sheet_source: Optional[str] = Form(None),  # "true" 启用数据源多Sheet读取
+    file_passwords: Optional[str] = Form(None),  # JSON: {"文件名": "密码"}
     current_user=Depends(get_current_user),
 ):
     """开始训练（首轮），返回 SSE 流"""
@@ -806,6 +822,69 @@ async def start_training(
         expected_file = os.path.join(work_dir, ef.filename)
         with open(expected_file, "wb") as fp:
             fp.write(content)
+
+    # 解析密码并解密加密文件
+    passwords = {}
+    logger.info(f"[chat训练] file_passwords参数(Form): {repr(file_passwords)}")
+
+    # FastAPI Form() 参数绑定在 File+Form 混合场景下可能丢失，从 Request 兜底读取
+    _fp_raw = file_passwords
+    if _fp_raw is None:
+        try:
+            form_data = await request.form()
+            _fp_raw = form_data.get("file_passwords")
+            logger.info(f"[chat训练] file_passwords参数(Request fallback): {repr(_fp_raw)}")
+        except Exception as e:
+            logger.warning(f"[chat训练] 读取 request.form() 失败: {e}")
+
+    if _fp_raw:
+        try:
+            passwords = json.loads(_fp_raw)
+            logger.info(f"[chat训练] 解析到密码keys: {list(passwords.keys())}")
+        except Exception:
+            logger.warning(f"file_passwords JSON 解析失败: {_fp_raw}")
+
+    from ..utils.aspose_helper import is_encrypted, decrypt_excel
+    import shutil as _shutil
+
+    # 收集所有 Excel 文件
+    all_excel_files = []
+    for fn in os.listdir(source_dir):
+        if fn.endswith((".xlsx", ".xls")) and not fn.startswith("~"):
+            all_excel_files.append((os.path.join(source_dir, fn), fn))
+    if expected_file:
+        all_excel_files.append((expected_file, os.path.basename(expected_file)))
+
+    # 第一步：尝试用提供的密码解密
+    decrypt_failures = []
+    if passwords:
+        for fpath, fname in all_excel_files:
+            if is_encrypted(fpath) and passwords.get(fname):
+                try:
+                    decrypted = decrypt_excel(fpath, password=passwords[fname])
+                    _shutil.move(decrypted, fpath)
+                    logger.info(f"[chat训练] 已解密文件: {fname}")
+                except Exception as e:
+                    logger.error(f"[chat训练] 解密文件失败 {fname}: {e}")
+                    decrypt_failures.append(fname)
+        if decrypt_failures:
+            raise HTTPException(
+                status_code=422,
+                detail=f"以下文件解密失败，请检查密码是否正确: {', '.join(decrypt_failures)}"
+            )
+
+    # 第二步：无论是否提供了密码，始终检查剩余加密文件
+    encrypted_remaining = []
+    for fpath, fname in all_excel_files:
+        if is_encrypted(fpath):
+            encrypted_remaining.append(fname)
+    if encrypted_remaining:
+        logger.warning(f"[chat训练] 仍有加密文件未解密: {encrypted_remaining}, 提供的密码keys: {list(passwords.keys())}")
+        raise HTTPException(
+            status_code=422,
+            detail=f"检测到加密文件但未提供密码（或密码不匹配）: {', '.join(encrypted_remaining)}。"
+                   f"提供的密码文件名: {list(passwords.keys()) if passwords else '无'}。请检查文件名是否匹配。"
+        )
 
     # 保存规则文件到磁盘，然后用 document_parser 解析（支持 docx/xlsx/pdf 等格式）
     rules_content = ""
@@ -906,6 +985,7 @@ async def start_training(
                     "monthly_standard_hours": monthly_standard_hours,
                     "manual_headers": manual_headers_dict,
                     "multi_sheet_source": multi_sheet_source == "true",
+                    "file_passwords": passwords,
                 }
                 ts = persistence.create_session(
                     tenant_id=tenant_id,
@@ -1119,11 +1199,32 @@ def main(source_dir, output_dir, **kwargs):
             rules = config.get("rules_content", "")
             src_dir = config.get("source_dir", source_dir)
 
+            # 兜底解密：确保 src_dir 中所有加密文件在 AI 分析和全量加载前已解密
+            _cfg_passwords = config.get("file_passwords") or {}
+            if _cfg_passwords:
+                try:
+                    from ..utils.aspose_helper import is_encrypted, decrypt_excel
+                    import shutil as _dec_shutil
+                    for _fn in os.listdir(src_dir):
+                        if not _fn.endswith((".xlsx", ".xls")) or _fn.startswith("~"):
+                            continue
+                        _fp = os.path.join(src_dir, _fn)
+                        if is_encrypted(_fp) and _cfg_passwords.get(_fn):
+                            try:
+                                _dec = decrypt_excel(_fp, password=_cfg_passwords[_fn])
+                                _dec_shutil.move(_dec, _fp)
+                                logger.info(f"[兜底解密] 已解密: {_fn}")
+                            except Exception as _e:
+                                logger.warning(f"[兜底解密] 失败 {_fn}: {_e}")
+                except Exception as _e:
+                    logger.warning(f"[兜底解密] 异常: {_e}")
+
             # 【后台全量加载】在 AI 代码生成期间并行加载全量源数据
             # 这样 AI 生成代码时（耗时最长），全量数据同时解析
             _full_data_future = _executor.submit(
                 _load_full_source_data, src_dir, config.get("manual_headers"),
                 multi_sheet_source=config.get("multi_sheet_source", False),
+                file_passwords=config.get("file_passwords"),
             )
 
             # 使用 FormulaCodeGenerator.generate_code()（与原训练引擎一致）
@@ -1186,6 +1287,7 @@ def main(source_dir, output_dir, **kwargs):
                 salary_year=salary_year,
                 salary_month=salary_month,
                 monthly_standard_hours=monthly_standard_hours,
+                file_passwords=config.get("file_passwords"),
                 pre_loaded_source_data=_full_source_data,
                 rules_content=config.get("rules_content", ""),
                 expected_structure=config.get("expected_structure"),
@@ -1438,6 +1540,24 @@ async def send_message(
 
             _emit({"type": "status", "message": "正在根据反馈修正代码..."})
 
+            # 将对话历史注入到用户反馈中，让 AI 修正代码时能看到完整讨论上下文
+            chat_history_text = ""
+            recent_msgs = context.get("recent_messages", [])
+            if recent_msgs:
+                history_lines = []
+                for m in recent_msgs:
+                    role_label = "用户" if m["role"] == "user" else "AI助手"
+                    history_lines.append(f"[{role_label}]: {m['content']}")
+                chat_history_text = "\n".join(history_lines)
+
+            # 构建包含对话上下文的完整用户反馈
+            message_with_context = message
+            if chat_history_text:
+                message_with_context = (
+                    f"## 之前的对话讨论（供参考）:\n{chat_history_text}\n\n"
+                    f"## 当前修正指示:\n{message}"
+                )
+
             # 获取最新代码（优先最新一轮，而非最佳准确率的一轮）
             original_code = context.get("latest_code") or context.get("best_code")
             if not original_code:
@@ -1491,6 +1611,7 @@ async def send_message(
             _full_data_future = _executor.submit(
                 _load_full_source_data, src_dir, config.get("manual_headers"),
                 multi_sheet_source=config.get("multi_sheet_source", False),
+                file_passwords=config.get("file_passwords"),
             ) if src_dir and os.path.isdir(src_dir) else None
 
             code = None
@@ -1508,7 +1629,7 @@ async def send_message(
                         source_structure=source_structure_desc,
                         expected_structure=config.get("expected_structure", {}),
                         stream_callback=stream_cb,
-                        user_feedback=message,
+                        user_feedback=message_with_context,
                     )
                 except Exception as col_err:
                     logger.warning(f"[chat修正] 列级修正失败: {col_err}, 降级为全量修正")
@@ -1531,7 +1652,7 @@ async def send_message(
                     comparison_result = detailed_diff_text
 
                 # 用户反馈单独传递，不混入差异文本
-                comparison_result += f"\n\n## 用户修正指示（最高优先级，只修改用户提到的列）:\n{message}"
+                comparison_result += f"\n\n## 用户修正指示（最高优先级，只修改用户提到的列）:\n{message_with_context}"
 
                 code = generator.generate_correction_code(
                     original_code=original_code,
@@ -1584,6 +1705,7 @@ async def send_message(
                 salary_year=config.get("salary_year"),
                 salary_month=config.get("salary_month"),
                 monthly_standard_hours=config.get("monthly_standard_hours"),
+                file_passwords=config.get("file_passwords"),
                 pre_loaded_source_data=_full_source_data,
                 rules_content=config.get("rules_content", ""),
                 expected_structure=config.get("expected_structure"),
@@ -1860,6 +1982,7 @@ async def upload_code(
         salary_year=config.get("salary_year"),
         salary_month=config.get("salary_month"),
         monthly_standard_hours=config.get("monthly_standard_hours"),
+        file_passwords=config.get("file_passwords"),
         rules_content=config.get("rules_content", ""),
         expected_structure=config.get("expected_structure"),
     )

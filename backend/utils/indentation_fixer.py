@@ -469,7 +469,7 @@ class IndentationFixer:
 
         AI常见错误：def/if/for/while/try等块头语句后面的代码体
         没有正确缩进（与块头同级或更浅），导致编译报错。
-        策略：定位块头行，只给缩进不足的行补齐到块头+4。
+        策略：定位块头行，把连续缩进不足的行整体加缩进到块头+4。
         """
         for _pass in range(max_passes):
             try:
@@ -523,16 +523,17 @@ class IndentationFixer:
                     f"[expected-indent修复] 块头行{block_head_idx + 1}，"
                     f"体行{body_start + 1}起: 缩进{body_indent}→{expected_body_indent} (加{indent_add})")
 
-                # 只给缩进不足的行补齐，已经正确缩进的行不动
+                # 把所有与 body_indent 同级（或更深）的连续行整体加缩进
+                # 关键改进：不在遇到第二个同级行时 break，而是把整段 body 都修
                 for m in range(body_start, len(lines)):
                     ln = lines[m]
                     if not ln.strip():
                         continue
                     mindent = len(ln) - len(ln.lstrip())
-                    # 遇到缩进 <= 块头且不是首行，说明已经离开这个块了
-                    if mindent <= block_head_indent and m > body_start:
+                    # 遇到比块头更浅的缩进，说明已经离开这个块了
+                    if mindent < block_head_indent:
                         break
-                    # 只修复缩进不足的行（< expected_body_indent）
+                    # 缩进不足的行（在 body_indent 同级或介于 body_indent 和 expected 之间）统一加缩进
                     if mindent < expected_body_indent:
                         lines[m] = ' ' * (mindent + indent_add) + ln.lstrip()
 

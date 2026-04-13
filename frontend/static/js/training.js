@@ -664,11 +664,6 @@ function _startTraining(userText) {
 
     const formData = new FormData();
     formData.append('tenant_id', _currentTenantId);
-    Array.from(sourceFiles).forEach(f => formData.append('source_files', f));
-    if (targetFile) formData.append('target_file', targetFile);
-    if (ruleFiles.length > 0) {
-        Array.from(ruleFiles).forEach(f => formData.append('rule_files', f));
-    }
     formData.append('ai_provider', aiProvider);
     formData.append('mode', mode);
     if (salaryMonth) formData.append('salary_year_month', salaryMonth);
@@ -678,6 +673,16 @@ function _startTraining(userText) {
     const multiSheetSource = document.getElementById('multi-sheet-source').checked;
     if (multiSheetSource) formData.append('multi_sheet_source', 'true');
     if (_currentSessionId) formData.append('session_id', _currentSessionId);
+    if (Object.keys(_filePasswordsMap).length > 0) {
+        formData.append('file_passwords', JSON.stringify(_filePasswordsMap));
+        console.log('[训练] file_passwords:', JSON.stringify(_filePasswordsMap));
+    }
+    // 文件字段放在所有文本字段之后，避免 python-multipart 旧版本解析丢失后续字段
+    Array.from(sourceFiles).forEach(f => formData.append('source_files', f));
+    if (targetFile) formData.append('target_file', targetFile);
+    if (ruleFiles.length > 0) {
+        Array.from(ruleFiles).forEach(f => formData.append('rule_files', f));
+    }
 
     _addMessage('user', userText);
     document.getElementById('attach-popover').style.display = 'none';
