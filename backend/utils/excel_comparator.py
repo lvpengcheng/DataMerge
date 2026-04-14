@@ -845,6 +845,33 @@ def _match_sheet_name(target: str, available: List[str]) -> Optional[str]:
     return None
 
 
+def _match_sheet_with_strategy(
+    target: str,
+    available: List[str],
+    res_wb_data=None,
+    primary_keys: Optional[List[str]] = None,
+) -> Optional[str]:
+    """增强版 sheet 匹配，按优先级：同名 → 目标仅1个sheet → 主键列匹配。"""
+    # 策略1: 同名匹配（精确/忽略大小写/包含关系）
+    matched = _match_sheet_name(target, available)
+    if matched:
+        return matched
+    # 策略2: 目标只有1个sheet → 直接用它
+    if len(available) == 1:
+        return available[0]
+    # 策略3: 基于主键列匹配
+    if primary_keys and res_wb_data:
+        for sheet_name in available:
+            try:
+                ws = res_wb_data[sheet_name]
+                headers = [str(cell.value or '') for cell in ws[1]]
+                if all(any(pk in h for h in headers) for pk in primary_keys):
+                    return sheet_name
+            except Exception:
+                continue
+    return None
+
+
 def _get_sheet_formulas(wb_formula, sheet_name: str) -> Dict[str, str]:
     """从公式版本 workbook 中提取指定 sheet 第 2 行的公式映射 {列名: 公式}。"""
     ws = wb_formula[sheet_name]
@@ -864,6 +891,7 @@ def compare_excel_files_multi_sheet(
     expected_file: str,
     output_file: Optional[str] = None,
     primary_keys: Optional[List[str]] = None,
+    skip_source_filter: bool = False,
 ) -> Dict[str, Any]:
     """对比两个 Excel 文件的所有 Sheet 差异（多Sheet版本）。
 
@@ -912,7 +940,9 @@ def compare_excel_files_multi_sheet(
             return True
         return any(kw in name.lower() for kw in skip_keywords)
 
-    exp_compare_sheets = [n for n in exp_sheets if not _is_source_or_param(n)]
+    exp_compare_sheets = exp_sheets  # 独立对比场景不过滤
+    if not skip_source_filter:
+        exp_compare_sheets = [n for n in exp_sheets if not _is_source_or_param(n)]
     if not exp_compare_sheets:
         exp_compare_sheets = exp_sheets  # 全部都像源数据时回退
 
@@ -936,7 +966,9 @@ def compare_excel_files_multi_sheet(
         output_file = str(output_dir / "差异对比.xlsx")
 
     for exp_sheet_name in exp_compare_sheets:
-        res_sheet_name = _match_sheet_name(exp_sheet_name, res_sheets)
+        res_sheet_name = _match_sheet_with_strategy(
+            exp_sheet_name, res_sheets, res_wb_data, primary_keys
+        )
 
         if res_sheet_name is None:
             # 结果中缺失此 sheet
@@ -1013,7 +1045,7 @@ def compare_excel_files_multi_sheet(
     # 多余的 result sheets（不计入差异，仅提示）
     extra_sheets = [n for n in res_sheets if n not in matched_result_sheets and not _is_source_or_param(n)]
 
-    agg_match_rate = agg_matched_cells / agg_total_cells if agg_total_cells > 0 else 0.0
+    agg_match_rate = min(1.0, agg_matched_cells / agg_total_cells) if agg_total_cells > 0 else 0.0
 
     logger.info(f"[多Sheet对比] 汇总: {agg_matched_cells}/{agg_total_cells} = {agg_match_rate:.2%}, "
                 f"缺失sheets={missing_sheets}, 多余sheets={extra_sheets}")
@@ -1297,7 +1329,7 @@ def _compare_dataframes_core(
     logger.info(f"共发现 {total_differences} 处差异")
     logger.info(f"其中: 仅预期有 {unmatched_expected} 条, 仅生成有 {unmatched_result} 条")
 
-    match_rate = matched_cells / total_cells if total_cells > 0 else 0.0
+    match_rate = min(1.0, matched_cells / total_cells) if total_cells > 0 else 0.0
     logger.info(f"单元格匹配: {matched_cells}/{total_cells} = {match_rate:.2%}")
 
     return {

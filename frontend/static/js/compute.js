@@ -253,9 +253,12 @@ async function loadTenantScripts(tenantId) {
 
         group.style.display = 'block';
 
-        // 自动选择最高分
-        currentScriptId = scripts[0].script_id;
-        updateScriptInfo(scripts[0]);
+        // 优先使用 active 脚本（用户设为最佳的），否则用最高分
+        const activeScript = scripts.find(s => s.is_active);
+        currentScriptId = activeScript ? activeScript.script_id : scripts[0].script_id;
+        // 同步 select 元素的选中状态
+        selector.value = currentScriptId;
+        updateScriptInfo(activeScript || scripts[0]);
 
     } catch (e) {
         console.error('加载脚本列表失败:', e);

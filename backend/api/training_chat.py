@@ -1893,12 +1893,37 @@ def set_as_best(
 
     config = session.config or {}
 
+    # 先保存到磁盘，获取基于内容哈希的 script_id
+    from ..storage.storage_manager import StorageManager
+    _sm = StorageManager()
+    training_result = {
+        "success": True,
+        "best_score": iteration.accuracy or 0,
+        "total_iterations": iteration.iteration_num,
+        "best_code": iteration.generated_code,
+        "mode": session.mode or "formula",
+        "manual_headers": config.get("manual_headers"),
+        "source_structure": session.source_structure or {},
+        "rules_content": config.get("rules_content", ""),
+        "expected_structure": config.get("expected_structure", {}),
+    }
+    try:
+        disk_info = _sm.save_script(
+            session.tenant_id, iteration.generated_code, training_result, {}
+        )
+        disk_script_id = disk_info.get("script_id", f"script_{session.tenant_id}")
+        logger.info(f"[set-best] 脚本已同步到磁盘: tenant={session.tenant_id}, script_id={disk_script_id}")
+    except Exception as e:
+        logger.warning(f"[set-best] 保存脚本到磁盘失败: {e}")
+        disk_script_id = f"script_{session.tenant_id}"
+
+    # DB 存储使用与磁盘一致的 script_id 作为 name，避免智算查找不到
     from ..api.training_persistence import TrainingPersistence
     persistence = TrainingPersistence(db)
 
     script = persistence.save_script(
         tenant_id=session.tenant_id,
-        name=f"script_{session.tenant_id}",
+        name=disk_script_id,
         code=iteration.generated_code,
         mode=session.mode,
         source_session_id=session_id,
@@ -1909,27 +1934,6 @@ def set_as_best(
         rules_content=config.get("rules_content", ""),
         expected_structure=config.get("expected_structure", {}),
     )
-
-    # 同步保存到磁盘（使老版智算路径也能读到）
-    try:
-        from ..storage.storage_manager import StorageManager
-        _sm = StorageManager()
-        _sm.save_script(
-            session.tenant_id, iteration.generated_code,
-            {"success": True,
-             "best_score": iteration.accuracy or 0,
-             "total_iterations": iteration.iteration_num,
-             "best_code": iteration.generated_code,
-             "mode": session.mode or "formula",
-             "manual_headers": config.get("manual_headers"),
-             "source_structure": session.source_structure or {},
-             "rules_content": config.get("rules_content", ""),
-             "expected_structure": config.get("expected_structure", {})},
-            {}
-        )
-        logger.info(f"[set-best] 脚本已同步到磁盘: tenant={session.tenant_id}")
-    except Exception as e:
-        logger.warning(f"[set-best] 保存脚本到磁盘失败: {e}")
 
     # 更新 session
     session.final_script_id = script.id

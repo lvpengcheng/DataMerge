@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>系统管理 - 数据整合平台</title>
-    <link rel="stylesheet" href="/static/css/admin.css?v=20260323t">
+    <link rel="stylesheet" href="/static/css/admin.css?v=20260414t">
 </head>
 <body>
     <div class="container">
@@ -31,6 +31,7 @@
             <button class="tab-btn" data-tab="templates">模版管理</button>
             <button class="tab-btn" data-tab="training-history">训练历史</button>
             <button class="tab-btn" data-tab="compute-history">计算历史</button>
+            <button class="tab-btn" data-tab="data-compare">数据对比</button>
         </div>
 
         <!-- 用户管理 Tab -->
@@ -226,6 +227,46 @@
                 <tbody></tbody>
             </table>
         </div>
+
+        <!-- 数据对比 Tab -->
+        <div class="tab-content" id="tab-data-compare">
+            <div class="toolbar" style="flex-wrap:wrap;gap:12px;align-items:center;">
+                <div style="display:flex;align-items:center;gap:6px;">
+                    <label style="white-space:nowrap;font-weight:500;">基准文件:</label>
+                    <input type="file" id="compare-source-file" accept=".xlsx,.xls">
+                </div>
+                <div style="display:flex;align-items:center;gap:6px;">
+                    <label style="white-space:nowrap;font-weight:500;">目标文件:</label>
+                    <input type="file" id="compare-target-file" accept=".xlsx,.xls">
+                </div>
+                <div style="display:flex;align-items:center;gap:6px;">
+                    <label style="white-space:nowrap;font-weight:500;">主键列:</label>
+                    <input type="text" id="compare-primary-keys" placeholder="工号,中文姓名" value="工号,中文姓名"
+                           style="padding:6px 12px;border:1px solid #ddd;border-radius:6px;width:200px;">
+                </div>
+                <button class="btn btn-primary" onclick="Admin.startCompare()">开始对比</button>
+            </div>
+
+            <div id="compare-result" style="display:none;margin-top:20px;">
+                <div id="compare-summary" style="margin-bottom:16px;"></div>
+                <div id="compare-sheet-details"></div>
+            </div>
+
+            <h4 style="margin-top:24px;">对比历史</h4>
+            <table class="data-table" id="compare-history-table">
+                <thead>
+                    <tr>
+                        <th>时间</th>
+                        <th>基准文件</th>
+                        <th>目标文件</th>
+                        <th>总匹配率</th>
+                        <th>Sheet数</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
     </div>
 
     <!-- 全局加载遮罩 -->
@@ -249,7 +290,7 @@
         </div>
     </div>
 
-    <script src="/static/js/auth.js?v=20260323t3"></script>
-    <script src="/static/js/admin.js?v=20260324e"></script>
+    <script src="/static/js/auth.js?v=20260414t3"></script>
+    <script src="/static/js/admin.js?v=20260414f"></script>
 </body>
 </html>

@@ -235,19 +235,42 @@ class StorageManager:
             return None
 
     def get_script_content(self, tenant_id: str, script_id: str) -> Optional[str]:
-        """获取脚本内容"""
+        """获取脚本内容（磁盘优先，DB 兜底）"""
         tenant_dir = self.get_tenant_dir(tenant_id)
         script_file = tenant_dir / "scripts" / f"{script_id}.py"
 
-        if not script_file.exists():
-            return None
+        if script_file.exists():
+            try:
+                with open(script_file, 'r', encoding='utf-8') as f:
+                    return f.read()
+            except Exception as e:
+                self.logger.error(f"读取脚本内容失败: {e}")
 
+        # 磁盘没找到，尝试从 DB 加载
         try:
-            with open(script_file, 'r', encoding='utf-8') as f:
-                return f.read()
+            from backend.database.connection import SessionLocal
+            from backend.database.models import Script
+            db = SessionLocal()
+            try:
+                db_script = (
+                    db.query(Script)
+                    .filter(
+                        Script.tenant_id == tenant_id,
+                        Script.is_active == True,
+                        Script.name == script_id,
+                    )
+                    .order_by(Script.version.desc())
+                    .first()
+                )
+                if db_script and db_script.code:
+                    self.logger.info(f"从 DB 加载脚本: tenant={tenant_id}, name={script_id}, id={db_script.id}")
+                    return db_script.code
+            finally:
+                db.close()
         except Exception as e:
-            self.logger.error(f"读取脚本内容失败: {e}")
-            return None
+            self.logger.warning(f"DB 脚本加载失败: {e}")
+
+        return None
 
     def save_calculation_files(
         self, tenant_id: str, data_files: List[str]

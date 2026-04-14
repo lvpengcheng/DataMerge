@@ -52,6 +52,7 @@ const Admin = {
                 else if (tab === 'templates') this.loadTemplateTenants().then(() => this.loadTemplates());
                 else if (tab === 'training-history') this.loadTrainingHistory();
                 else if (tab === 'compute-history') this.loadComputeHistory();
+                else if (tab === 'data-compare') this.loadCompareHistory();
             });
         });
     },
@@ -1023,6 +1024,129 @@ const Admin = {
 
         html += '</div>';
         this.openModal(`计算任务 #${taskId} - 详情`, html, null);
+    },
+
+    // ==================== 数据对比 ====================
+    async startCompare() {
+        const sourceFile = document.getElementById('compare-source-file').files[0];
+        const targetFile = document.getElementById('compare-target-file').files[0];
+        const primaryKeys = document.getElementById('compare-primary-keys').value.trim();
+
+        if (!sourceFile || !targetFile) {
+            alert('请选择基准文件和目标文件');
+            return;
+        }
+
+        const loadingEl = document.getElementById('loading-overlay');
+        const loadingText = document.getElementById('loading-text');
+        loadingEl.style.display = 'flex';
+        loadingText.textContent = '正在对比，请稍候...';
+
+        try {
+            const fd = new FormData();
+            fd.append('source_file', sourceFile);
+            fd.append('compare_file', targetFile);
+            fd.append('primary_keys', primaryKeys || '工号,中文姓名');
+
+            const resp = await AUTH.authFetch('/api/compare', { method: 'POST', body: fd });
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({}));
+                alert('对比失败: ' + (err.detail || resp.statusText));
+                return;
+            }
+            const result = await resp.json();
+            this.renderCompareResult(result);
+            this.loadCompareHistory();
+        } catch (e) {
+            alert('对比失败: ' + e.message);
+        } finally {
+            loadingEl.style.display = 'none';
+        }
+    },
+
+    renderCompareResult(result) {
+        const container = document.getElementById('compare-result');
+        container.style.display = 'block';
+
+        const pct = (Math.min(1, result.match_rate) * 100).toFixed(1);
+        const color = result.match_rate >= 0.95 ? '#4caf50' : result.match_rate >= 0.8 ? '#ff9800' : '#f44336';
+
+        let summaryHtml = `
+            <div style="display:flex;gap:20px;flex-wrap:wrap;">
+                <div style="flex:1;min-width:200px;padding:16px;background:#f8f9fa;border-radius:8px;border-left:4px solid ${color};">
+                    <div style="font-size:24px;font-weight:bold;color:${color};">${pct}%</div>
+                    <div style="color:#666;font-size:13px;">总匹配率 (${result.matched_cells || 0}/${result.total_cells || 0})</div>
+                </div>
+                <div style="flex:1;min-width:200px;padding:16px;background:#f8f9fa;border-radius:8px;">
+                    <div style="font-size:16px;font-weight:bold;">${result.different_cells || 0}</div>
+                    <div style="color:#666;font-size:13px;">差异单元格</div>
+                </div>
+                ${result.download_url ? `<div style="display:flex;align-items:center;">
+                    <button class="btn btn-primary" onclick="Admin._fetchAndDownload('${result.download_url}', '差异对比.xlsx')">下载差异报告</button>
+                </div>` : ''}
+            </div>`;
+        document.getElementById('compare-summary').innerHTML = summaryHtml;
+
+        let sheetHtml = '';
+        const perSheet = result.per_sheet || {};
+        if (Object.keys(perSheet).length > 0) {
+            sheetHtml = '<h4 style="margin:16px 0 8px;">各Sheet匹配详情</h4>';
+            sheetHtml += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px;">';
+            for (const [name, info] of Object.entries(perSheet)) {
+                const sPct = (Math.min(1, info.match_rate || 0) * 100).toFixed(1);
+                const sColor = (info.match_rate || 0) >= 0.95 ? '#4caf50' : (info.match_rate || 0) >= 0.8 ? '#ff9800' : '#f44336';
+                sheetHtml += `<div style="padding:12px;background:#fff;border:1px solid #e0e0e0;border-radius:8px;">
+                    <div style="font-weight:bold;margin-bottom:4px;">${name} ${info.missing ? '<span style="color:red;">(缺失)</span>' : ''}</div>
+                    <div style="font-size:20px;font-weight:bold;color:${sColor};">${sPct}%</div>
+                    <div style="color:#888;font-size:12px;">匹配 ${info.matched_cells || 0}/${info.total_cells || 0} 单元格</div>
+                </div>`;
+            }
+            sheetHtml += '</div>';
+        }
+
+        if (result.missing_sheets && result.missing_sheets.length) {
+            sheetHtml += `<div style="margin-top:12px;padding:8px 12px;background:#fff3cd;border-radius:6px;color:#856404;">
+                目标文件中缺失的Sheet: ${result.missing_sheets.join(', ')}
+            </div>`;
+        }
+        document.getElementById('compare-sheet-details').innerHTML = sheetHtml;
+    },
+
+    async loadCompareHistory() {
+        try {
+            const resp = await AUTH.authFetch('/api/compare/history');
+            if (!resp.ok) return;
+            const items = await resp.json();
+            const tbody = document.querySelector('#compare-history-table tbody');
+            if (!items || !items.length) {
+                tbody.innerHTML = '<tr><td colspan="6" class="empty-state">暂无对比记录</td></tr>';
+                return;
+            }
+            tbody.innerHTML = items.map(item => `<tr>
+                <td>${item.created_at ? new Date(item.created_at).toLocaleString() : '-'}</td>
+                <td>${item.source_file || '-'}</td>
+                <td>${item.compare_file || '-'}</td>
+                <td><span style="color:${(item.match_rate || 0) >= 0.95 ? '#4caf50' : '#f44336'}">${(Math.min(1, item.match_rate || 0) * 100).toFixed(1)}%</span></td>
+                <td>${item.sheet_count || 1}</td>
+                <td>
+                    ${item.download_url ? `<button class="btn btn-sm" onclick="Admin._fetchAndDownload('${item.download_url}', '差异对比.xlsx')">下载</button>` : ''}
+                    <button class="btn btn-sm" style="margin-left:4px;" onclick="Admin.showCompareDetail('${item.session_id}')">详情</button>
+                </td>
+            </tr>`).join('');
+        } catch (e) {
+            console.error('加载对比历史失败:', e);
+        }
+    },
+
+    async showCompareDetail(sessionId) {
+        try {
+            const resp = await AUTH.authFetch(`/api/compare/history/${sessionId}`);
+            if (!resp.ok) return alert('获取详情失败');
+            const result = await resp.json();
+            this.renderCompareResult(result);
+        } catch (e) {
+            alert('获取详情失败: ' + e.message);
+        }
     },
 
     async showGenerateReport(taskId, tenantId) {

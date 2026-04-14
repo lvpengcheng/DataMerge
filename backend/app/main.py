@@ -2540,32 +2540,24 @@ async def calculate_data_split(
         raise HTTPException(status_code=500, detail=f"计算失败: {str(e)}")
 
 
+_compare_history = []  # 进程级对比历史存储
+
+
 @app.post("/api/compare")
 async def compare_excel(
     source_file: UploadFile = File(..., description="源文件（基准文件）"),
     compare_file: UploadFile = File(..., description="对比文件"),
-    primary_keys: str = Form(default="工号,中文姓名", description="主键列名，多个用逗号分隔，如 '工号,中文姓名' 或 '订单号'")
+    primary_keys: str = Form(default="工号,中文姓名", description="主键列名，多个用逗号分隔")
 ):
-    """对比两个Excel文件的差异
-
-    Args:
-        source_file: 源文件（作为基准）
-        compare_file: 对比文件
-        primary_keys: 主键列名，多个用逗号分隔
-
-    Returns:
-        对比结果，包含差异统计和下载地址
-    """
+    """对比两个Excel文件的差异（支持多Sheet）"""
     from pathlib import Path
-    from backend.utils.excel_comparator import compare_excel_files
+    from backend.utils.excel_comparator import compare_excel_files_multi_sheet
 
     try:
-        # 解析主键列表
         primary_keys_list = [k.strip() for k in primary_keys.split(",") if k.strip()]
         if not primary_keys_list:
-            primary_keys_list = ["工号", "中文姓名"]  # 默认值
+            primary_keys_list = ["工号", "中文姓名"]
 
-        # 创建对比结果目录（使用固定目录便于下载）
         compare_dir = Path("compare_results")
         compare_dir.mkdir(exist_ok=True)
 
@@ -2574,48 +2566,54 @@ async def compare_excel(
         session_dir = compare_dir / session_id
         session_dir.mkdir(exist_ok=True)
 
-        # 保存上传的文件
         source_path = session_dir / source_file.filename
         compare_path = session_dir / compare_file.filename
 
         with open(source_path, 'wb') as f:
-            content = await source_file.read()
-            f.write(content)
-
+            f.write(await source_file.read())
         with open(compare_path, 'wb') as f:
-            content = await compare_file.read()
-            f.write(content)
+            f.write(await compare_file.read())
 
-        # 生成差异报告文件名
         output_filename = f"差异对比_{timestamp}.xlsx"
         output_path = session_dir / output_filename
 
-        # 执行对比
         logger.info(f"开始对比: {source_file.filename} vs {compare_file.filename}, 主键: {primary_keys_list}")
-        result = compare_excel_files(
-            result_file=str(compare_path),  # 对比文件作为"结果"
-            expected_file=str(source_path),  # 源文件作为"预期"
+        result = compare_excel_files_multi_sheet(
+            result_file=str(compare_path),
+            expected_file=str(source_path),
             output_file=str(output_path),
-            primary_keys=primary_keys_list
+            primary_keys=primary_keys_list,
+            skip_source_filter=True,
         )
 
-        # 构建下载地址
         download_url = f"/api/compare/download/{session_id}/{output_filename}"
+        has_download = output_path.exists()
 
-        return {
+        resp = {
             "status": "completed",
             "message": "对比完成",
             "source_file": source_file.filename,
             "compare_file": compare_file.filename,
-            "match_rate": result.get("match_rate", 0),
+            "match_rate": min(1.0, result.get("match_rate", 0)),
             "total_cells": result.get("total_cells", 0),
             "matched_cells": result.get("matched_cells", 0),
-            "different_cells": result.get("total_diff", 0),
-            "diff_report_file": output_filename if output_path.exists() else None,
-            "download_url": download_url if output_path.exists() else None,
+            "different_cells": result.get("total_differences", 0),
+            "per_sheet": result.get("per_sheet", {}),
+            "missing_sheets": result.get("missing_sheets", []),
+            "extra_sheets": result.get("extra_sheets", []),
+            "sheet_count": len(result.get("per_sheet", {})) or 1,
+            "download_url": download_url if has_download else None,
             "session_id": session_id,
-            "field_diff_summary": result.get("field_diff_samples", {})
+            "field_diff_summary": result.get("field_diff_samples", {}),
         }
+
+        # 存入历史
+        _compare_history.append({
+            **resp,
+            "created_at": datetime.now().isoformat(),
+        })
+
+        return resp
 
     except Exception as e:
         logger.error(f"Excel对比失败: {e}")
@@ -2659,6 +2657,21 @@ async def download_compare_result(session_id: str, filename: str):
     except Exception as e:
         logger.error(f"下载对比结果失败: {e}")
         raise HTTPException(status_code=500, detail=f"下载失败: {str(e)}")
+
+
+@app.get("/api/compare/history")
+async def list_compare_history():
+    """获取对比历史列表（最近50条，最新在前）"""
+    return _compare_history[-50:][::-1]
+
+
+@app.get("/api/compare/history/{session_id}")
+async def get_compare_detail(session_id: str):
+    """获取某次对比的详细结果"""
+    for item in _compare_history:
+        if item.get("session_id") == session_id:
+            return item
+    raise HTTPException(status_code=404, detail="对比记录不存在")
 
 
 @app.post("/api/revalidate")
