@@ -1109,6 +1109,11 @@ const Admin = {
                 目标文件中缺失的Sheet: ${result.missing_sheets.join(', ')}
             </div>`;
         }
+        if (result.warning) {
+            sheetHtml += `<div style="margin-top:12px;padding:8px 12px;background:#f8d7da;border-radius:6px;color:#721c24;">
+                注意: ${result.warning}对比结果可能不准确。
+            </div>`;
+        }
         document.getElementById('compare-sheet-details').innerHTML = sheetHtml;
     },
 

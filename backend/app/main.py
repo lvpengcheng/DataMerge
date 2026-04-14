@@ -2605,6 +2605,7 @@ async def compare_excel(
             "download_url": download_url if has_download else None,
             "session_id": session_id,
             "field_diff_summary": result.get("field_diff_samples", {}),
+            "warning": result.get("warning"),
         }
 
         # 存入历史

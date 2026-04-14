@@ -394,8 +394,14 @@ def _build_chat_system_prompt(context: Dict, config: Dict, rules: str) -> str:
     parts = [
         "你是专业的人力资源薪资计算顾问和 Excel/Python 自动化专家。",
         "你正在帮助用户分析、讨论和优化一个薪资数据处理脚本。",
-        "请根据用户的问题进行专业的分析和讨论。",
-        "如果用户确认了修改方案，请清楚总结需要修改的内容，用户会在准备好后触发代码生成。",
+        "",
+        "## 重要约束",
+        "当前是【对话讨论模式】，你的职责是分析问题、讨论方案、解释逻辑。",
+        "**严禁生成完整代码或大段代码。**",
+        "- 如果用户说某列逻辑有问题，请聚焦分析该列的问题所在，用文字说明修改思路即可。",
+        "- 你可以引用当前代码中的少量关键行（不超过20行）来指出问题，但不要输出完整函数或完整代码。",
+        "- 如果需要展示修改方案，只写伪代码或关键片段（不超过20行），并说明修改意图。",
+        "- 当用户确认了修改方案后，请总结需要修改的要点，告知用户点击【执行修正】来生成完整代码。",
         "请用中文回答。",
     ]
 
@@ -572,12 +578,28 @@ def _run_single_iteration(
             }
         result_file = str(output_files[0])
 
-        # 对比 — 根据预期文件sheet数选择单sheet或多sheet对比
+        # 对比 — 优先使用多sheet对比（自动处理单sheet情况）
         diff_output = str(output_dir / "_diff.xlsx")
         comparison_primary_keys = extract_primary_keys_from_rules(rules_content) if rules_content else None
         logger.info(f"[对比] rules_content长度={len(rules_content) if rules_content else 0}, 提取到主键={comparison_primary_keys}")
-        _exp_sheet_count = len((expected_structure or {}).get("sheets", {}))
-        if _exp_sheet_count > 1:
+
+        # 统计实际文件的sheet数量来决定对比模式
+        import openpyxl as _opx
+        try:
+            _exp_wb = _opx.load_workbook(expected_file, read_only=True, data_only=True)
+            _exp_sheet_count = len([s for s in _exp_wb.sheetnames if "Evaluation" not in s])
+            _exp_wb.close()
+        except Exception:
+            _exp_sheet_count = 1
+        try:
+            _res_wb = _opx.load_workbook(result_file, read_only=True, data_only=True)
+            _res_sheet_count = len([s for s in _res_wb.sheetnames if "Evaluation" not in s])
+            _res_wb.close()
+        except Exception:
+            _res_sheet_count = 1
+
+        if _exp_sheet_count > 1 or _res_sheet_count > 1:
+            logger.info(f"[对比] 多Sheet对比: 预期{_exp_sheet_count}个sheet, 结果{_res_sheet_count}个sheet")
             comparison = compare_excel_files_multi_sheet(result_file, expected_file, diff_output, primary_keys=comparison_primary_keys)
         else:
             comparison = compare_excel_files(result_file, expected_file, diff_output, primary_keys=comparison_primary_keys)

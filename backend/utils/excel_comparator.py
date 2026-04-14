@@ -463,13 +463,25 @@ def _standardize_key_value(value) -> str:
     if pd.isna(value):
         return ""
 
+    # 对 float 类型直接处理，避免 str(float) 产生科学记号或精度问题
+    if isinstance(value, float):
+        if value == int(value):
+            # 用 format 避免科学记号，保持 float→int 的一致性
+            return format(value, '.0f').strip().lower().replace(" ", "")
+        else:
+            return str(value).strip().lower().replace(" ", "")
+
     value_str = str(value).strip()
 
-    # 浮点数转整数（如 1001.0 → "1001"）
+    # 纯数字字符串中带小数点的（如 "1001.0" → "1001"），且位数不超过15位才做转换
     try:
-        f = float(value_str)
-        if f == int(f):
-            value_str = str(int(f))
+        if '.' in value_str:
+            # 去掉符号和前导零后计算有效位数
+            digits = value_str.replace('.', '').replace('-', '').lstrip('0')
+            if len(digits) <= 15:
+                f = float(value_str)
+                if f == int(f):
+                    value_str = str(int(f))
     except (ValueError, OverflowError):
         pass
 
@@ -794,7 +806,12 @@ def _read_sheet_as_dataframe(wb_data, wb_formula, sheet_name: str) -> pd.DataFra
                     formulas[(row_idx, col_idx)] = str(cell_formula)
                     cell_values[(row_idx, col_idx)] = None
             else:
-                cell_values[(row_idx, col_idx)] = data_cell.value
+                val = data_cell.value
+                # 大数字统一用 format('.0f') 转文本，避免 str(float) 出科学记号
+                # 两边 Excel 只要存的是同一个数字（即使精度丢了），标准化后也能匹配
+                if isinstance(val, float) and abs(val) >= 1e15 and val == int(val):
+                    val = format(val, '.0f')
+                cell_values[(row_idx, col_idx)] = val
 
     # 多遍迭代计算未解析的公式
     for _iteration in range(10):
@@ -851,24 +868,14 @@ def _match_sheet_with_strategy(
     res_wb_data=None,
     primary_keys: Optional[List[str]] = None,
 ) -> Optional[str]:
-    """增强版 sheet 匹配，按优先级：同名 → 目标仅1个sheet → 主键列匹配。"""
+    """Sheet 匹配：同名优先，找不到则回退到 sheet0。"""
     # 策略1: 同名匹配（精确/忽略大小写/包含关系）
     matched = _match_sheet_name(target, available)
     if matched:
         return matched
-    # 策略2: 目标只有1个sheet → 直接用它
-    if len(available) == 1:
+    # 策略2: 没有同名sheet，回退到目标的第一个sheet
+    if available:
         return available[0]
-    # 策略3: 基于主键列匹配
-    if primary_keys and res_wb_data:
-        for sheet_name in available:
-            try:
-                ws = res_wb_data[sheet_name]
-                headers = [str(cell.value or '') for cell in ws[1]]
-                if all(any(pk in h for h in headers) for pk in primary_keys):
-                    return sheet_name
-            except Exception:
-                continue
     return None
 
 
@@ -912,12 +919,15 @@ def compare_excel_files_multi_sheet(
     logger.info("[多Sheet对比] 开始...")
 
     # 1. 计算公式
+    formula_warning = ""
     result_calc_ok = calculate_excel_formulas(result_file)
     expected_calc_ok = calculate_excel_formulas(expected_file)
     if not result_calc_ok:
         logger.error(f"[多Sheet对比] 结果文件公式计算失败: {result_file}")
+        formula_warning += "结果文件公式未计算; "
     if not expected_calc_ok:
         logger.error(f"[多Sheet对比] 预期文件公式计算失败: {expected_file}")
+        formula_warning += "基准文件公式未计算; "
 
     # 2. 打开文件
     exp_wb_data = openpyxl.load_workbook(expected_file, data_only=True)
@@ -1103,6 +1113,7 @@ def compare_excel_files_multi_sheet(
         "matched_cells": agg_matched_cells,
         "match_rate": agg_match_rate,
         "field_diff_samples": agg_field_diff_samples,
+        "warning": formula_warning if formula_warning else None,
         # 多Sheet专属字段
         "per_sheet": per_sheet,
         "missing_sheets": missing_sheets,
@@ -1359,15 +1370,52 @@ def _resolve_primary_keys(
 
     # 检查主键列是否存在
     available_keys = []
+    logger.info(f"[主键解析] expected列名: {[repr(c) for c in expected_df.columns]}")
+    logger.info(f"[主键解析] result列名: {[repr(c) for c in result_df.columns]}")
     for key in primary_keys:
         std_key = _standardize_column_name(key)
+        # 精确匹配
         if key in expected_df.columns and key in result_df.columns:
             available_keys.append(key)
-        elif std_key != key:
+        # 标准化后匹配
+        elif std_key in expected_df.columns and std_key in result_df.columns:
+            available_keys.append(std_key)
+        else:
+            # 逐列模糊匹配：标准化后比较，且在两边都能找到
+            matched_col = None
             for col in expected_df.columns:
-                if _standardize_column_name(col) == std_key and col in result_df.columns:
-                    available_keys.append(col)
-                    break
+                if _standardize_column_name(col) == std_key:
+                    # 在 result 中也找对应列
+                    if col in result_df.columns:
+                        matched_col = col
+                        break
+                    # result 列名也可能不同，逐列标准化匹配
+                    for rcol in result_df.columns:
+                        if _standardize_column_name(rcol) == std_key:
+                            # 两边列名不同但标准化后相同，统一用 expected 的列名
+                            result_df.rename(columns={rcol: col}, inplace=True)
+                            matched_col = col
+                            break
+                    if matched_col:
+                        break
+            # 再试包含关系匹配（用户输入 "身份证号码"，列名可能是 "ID NO. 身份证号码"）
+            if not matched_col:
+                key_lower = std_key.lower()
+                for col in expected_df.columns:
+                    if key_lower in col.lower() or col.lower() in key_lower:
+                        for rcol in result_df.columns:
+                            if key_lower in rcol.lower() or rcol.lower() in key_lower:
+                                if col == rcol:
+                                    matched_col = col
+                                else:
+                                    result_df.rename(columns={rcol: col}, inplace=True)
+                                    matched_col = col
+                                break
+                        if matched_col:
+                            break
+            if matched_col:
+                available_keys.append(matched_col)
+                logger.info(f"[主键解析] 模糊匹配成功: '{key}' → '{matched_col}'")
 
     if not available_keys:
         first_col = expected_df.columns[0] if len(expected_df.columns) > 0 else None
