@@ -900,7 +900,12 @@ class CodeSandbox:
         code = '\n'.join(fixed_lines)
 
         # 4-7. 统一缩进修复（逻辑集中在 IndentationFixer）
-        code = self._indent_fixer.fix_sandbox_pipeline(code)
+        # 前置 AST 检查：如果前面的非缩进修复已经产出合法代码，跳过缩进修复
+        # 避免不必要的重写破坏已有的正确缩进
+        try:
+            compile(code, '<sandbox_check>', 'exec')
+        except SyntaxError:
+            code = self._indent_fixer.fix_sandbox_pipeline(code)
 
         return code
 

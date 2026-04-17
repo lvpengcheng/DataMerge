@@ -505,7 +505,7 @@ def _run_single_iteration(
 ) -> Dict[str, Any]:
     """执行单轮训练：运行代码 → 对比 → 返回结果（与 TrainingEngine._execute_and_validate 一致）"""
     from ..sandbox.code_sandbox import CodeSandbox
-    from ..utils.excel_comparator import compare_excel_files, compare_excel_files_multi_sheet, extract_primary_keys_from_rules
+    from ..utils.excel_comparator import compare_excel_files_multi_sheet, extract_primary_keys_from_rules
 
     sandbox = CodeSandbox()
 
@@ -578,31 +578,12 @@ def _run_single_iteration(
             }
         result_file = str(output_files[0])
 
-        # 对比 — 优先使用多sheet对比（自动处理单sheet情况）
+        # 对比 — 统一使用多sheet对比（自动处理单sheet情况，避免预先打开文件数sheet数）
         diff_output = str(output_dir / "_diff.xlsx")
         comparison_primary_keys = extract_primary_keys_from_rules(rules_content) if rules_content else None
         logger.info(f"[对比] rules_content长度={len(rules_content) if rules_content else 0}, 提取到主键={comparison_primary_keys}")
 
-        # 统计实际文件的sheet数量来决定对比模式
-        import openpyxl as _opx
-        try:
-            _exp_wb = _opx.load_workbook(expected_file, read_only=True, data_only=True)
-            _exp_sheet_count = len([s for s in _exp_wb.sheetnames if "Evaluation" not in s])
-            _exp_wb.close()
-        except Exception:
-            _exp_sheet_count = 1
-        try:
-            _res_wb = _opx.load_workbook(result_file, read_only=True, data_only=True)
-            _res_sheet_count = len([s for s in _res_wb.sheetnames if "Evaluation" not in s])
-            _res_wb.close()
-        except Exception:
-            _res_sheet_count = 1
-
-        if _exp_sheet_count > 1 or _res_sheet_count > 1:
-            logger.info(f"[对比] 多Sheet对比: 预期{_exp_sheet_count}个sheet, 结果{_res_sheet_count}个sheet")
-            comparison = compare_excel_files_multi_sheet(result_file, expected_file, diff_output, primary_keys=comparison_primary_keys)
-        else:
-            comparison = compare_excel_files(result_file, expected_file, diff_output, primary_keys=comparison_primary_keys)
+        comparison = compare_excel_files_multi_sheet(result_file, expected_file, diff_output, primary_keys=comparison_primary_keys)
 
         total = comparison.get("total_cells", 1)
         matched = comparison.get("matched_cells", 0)
@@ -1739,130 +1720,107 @@ async def send_message(
                 session.config = config
                 db.commit()
 
-            # 准确率倒退检查
+            # 准确率变化检查（不回滚，始终保留新代码让 AI 继续修正）
             accuracy = run_result.get("accuracy", 0)
             prev_best = context.get("best_accuracy") or 0
-            rollback = False
 
             if accuracy < prev_best and prev_best > 0:
-                rollback = True
-                rollback_msg = (
+                drop_msg = (
                     f"本轮修改导致准确率从 {prev_best*100:.1f}% 下降到 {accuracy*100:.1f}%，"
-                    f"已自动回滚到之前的最佳代码。请调整修改方向。"
+                    f"将基于当前代码继续修正。"
                 )
-                _add_message(db, session_id, "system", rollback_msg, "status",
-                             {"rollback": True, "old_accuracy": prev_best, "new_accuracy": accuracy})
+                _add_message(db, session_id, "system", drop_msg, "status",
+                             {"accuracy_drop": True, "old_accuracy": prev_best, "new_accuracy": accuracy})
 
-                persistence.record_iteration(
-                    session_id=session_id,
-                    iteration_num=iteration_num,
-                    generated_code=code,
-                    accuracy=accuracy,
-                    execution_result={"rollback": True},
-                    status="rolled_back",
+            persistence.record_iteration(
+                session_id=session_id,
+                iteration_num=iteration_num,
+                prompt_text="[FormulaCodeGenerator.generate_correction_code]",
+                ai_response="",
+                generated_code=code,
+                accuracy=accuracy,
+                execution_result={"success": run_result.get("success"),
+                                  "total_cells": run_result.get("total_cells"),
+                                  "matched_cells": run_result.get("matched_cells")},
+                error_details=run_result.get("diff_details"),
+                status="completed" if run_result.get("success") else "failed",
+            )
+            persistence.update_session_best(session_id, accuracy, iteration_num)
+
+            # 保存脚本到 storage（使智算页面可见）
+            try:
+                from ..storage.storage_manager import StorageManager
+                _sm = StorageManager()
+                _sm.save_script(
+                    session.tenant_id, code,
+                    {"success": run_result.get("success", False),
+                     "best_score": accuracy,
+                     "total_iterations": iteration_num,
+                     "best_code": code, "mode": session.mode or "formula",
+                     "manual_headers": config.get("manual_headers"),
+                     "source_structure": session.source_structure or {},
+                     "rules_content": config.get("rules_content", ""),
+                     "expected_structure": config.get("expected_structure", {})},
+                    {}
                 )
-                session.total_iterations = iteration_num
+            except Exception as e:
+                logger.warning(f"save_script 失败: {e}")
+
+            # 保存脚本到 DB（正式列）
+            try:
+                persistence.save_script(
+                    tenant_id=session.tenant_id,
+                    name=f"script_{session.tenant_id}",
+                    code=code,
+                    mode=session.mode or "formula",
+                    source_session_id=session_id,
+                    accuracy=accuracy,
+                    created_by=current_user.id if current_user else None,
+                    config={"manual_headers": config.get("manual_headers"),
+                            "source_structure": config.get("source_structure_desc", ""),
+                            "rules_content": config.get("rules_content", "")},
+                    manual_headers=config.get("manual_headers"),
+                    source_structure=session.source_structure,
+                    rules_content=config.get("rules_content", ""),
+                    expected_structure=config.get("expected_structure"),
+                )
+            except Exception as e:
+                logger.warning(f"DB save_script 失败: {e}")
+
+            # 持久化训练产物
+            saved_files = _persist_iteration_files(session.tenant_id, session_id, iteration_num, code, run_result)
+            saved_files["has_rules"] = bool(config.get("rules_content"))
+            if saved_files:
+                config["latest_files"] = saved_files
+                session.config = config
                 db.commit()
 
-                _emit({
-                    "type": "iteration_complete",
-                    "session_id": session_id,
-                    "iteration": iteration_num,
-                    "accuracy": prev_best,
-                    "rollback": True,
-                    "attempted_accuracy": accuracy,
-                    "files": config.get("latest_files", {}),
-                })
-            else:
-                persistence.record_iteration(
-                    session_id=session_id,
-                    iteration_num=iteration_num,
-                    prompt_text="[FormulaCodeGenerator.generate_correction_code]",
-                    ai_response="",
-                    generated_code=code,
-                    accuracy=accuracy,
-                    execution_result={"success": run_result.get("success"),
-                                      "total_cells": run_result.get("total_cells"),
-                                      "matched_cells": run_result.get("matched_cells")},
-                    error_details=run_result.get("diff_details"),
-                    status="completed" if run_result.get("success") else "failed",
-                )
-                persistence.update_session_best(session_id, accuracy, iteration_num)
-
-                # 保存脚本到 storage（使智算页面可见）
-                try:
-                    from ..storage.storage_manager import StorageManager
-                    _sm = StorageManager()
-                    _sm.save_script(
-                        session.tenant_id, code,
-                        {"success": run_result.get("success", False),
-                         "best_score": accuracy,
-                         "total_iterations": iteration_num,
-                         "best_code": code, "mode": session.mode or "formula",
-                         "manual_headers": config.get("manual_headers"),
-                         "source_structure": session.source_structure or {},
-                         "rules_content": config.get("rules_content", ""),
-                         "expected_structure": config.get("expected_structure", {})},
-                        {}
-                    )
-                except Exception as e:
-                    logger.warning(f"save_script 失败: {e}")
-
-                # 保存脚本到 DB（正式列）
-                try:
-                    persistence.save_script(
-                        tenant_id=session.tenant_id,
-                        name=f"script_{session.tenant_id}",
-                        code=code,
-                        mode=session.mode or "formula",
-                        source_session_id=session_id,
-                        accuracy=accuracy,
-                        created_by=current_user.id if current_user else None,
-                        config={"manual_headers": config.get("manual_headers"),
-                                "source_structure": config.get("source_structure_desc", ""),
-                                "rules_content": config.get("rules_content", "")},
-                        manual_headers=config.get("manual_headers"),
-                        source_structure=session.source_structure,
-                        rules_content=config.get("rules_content", ""),
-                        expected_structure=config.get("expected_structure"),
-                    )
-                except Exception as e:
-                    logger.warning(f"DB save_script 失败: {e}")
-
-                # 持久化训练产物
-                saved_files = _persist_iteration_files(session.tenant_id, session_id, iteration_num, code, run_result)
-                saved_files["has_rules"] = bool(config.get("rules_content"))
-                if saved_files:
-                    config["latest_files"] = saved_files
-                    session.config = config
-                    db.commit()
-
-                if run_result.get("success"):
-                    acc_pct = f"{accuracy * 100:.1f}%"
-                    if accuracy >= 1.0:
-                        diff_msg = f"第 {iteration_num} 轮完成，准确率 {acc_pct}，所有数据匹配！"
-                    else:
-                        diff_text = _format_diff_for_chat(run_result.get("diff_details", {}))
-                        diff_msg = f"第 {iteration_num} 轮完成，准确率 {acc_pct}\n\n差异详情:\n{diff_text}"
-                    _add_message(db, session_id, "system", diff_msg, "diff",
-                                 {"iteration": iteration_num, "accuracy": accuracy,
-                                  "diff_details": run_result.get("diff_details")})
+            if run_result.get("success"):
+                acc_pct = f"{accuracy * 100:.1f}%"
+                if accuracy >= 1.0:
+                    diff_msg = f"第 {iteration_num} 轮完成，准确率 {acc_pct}，所有数据匹配！"
                 else:
-                    error = run_result.get("error", "未知错误")
-                    diff_msg = f"第 {iteration_num} 轮执行失败: {error}"
-                    _add_message(db, session_id, "system", diff_msg, "status",
-                                 {"iteration": iteration_num, "error": error})
+                    diff_text = _format_diff_for_chat(run_result.get("diff_details", {}))
+                    diff_msg = f"第 {iteration_num} 轮完成，准确率 {acc_pct}\n\n差异详情:\n{diff_text}"
+                _add_message(db, session_id, "system", diff_msg, "diff",
+                             {"iteration": iteration_num, "accuracy": accuracy,
+                              "diff_details": run_result.get("diff_details")})
+            else:
+                error = run_result.get("error", "未知错误")
+                diff_msg = f"第 {iteration_num} 轮执行失败: {error}"
+                _add_message(db, session_id, "system", diff_msg, "status",
+                             {"iteration": iteration_num, "error": error})
 
-                _emit({
-                    "type": "iteration_complete",
-                    "session_id": session_id,
-                    "iteration": iteration_num,
-                    "accuracy": accuracy,
-                    "success": run_result.get("success", False),
-                    "diff_details": run_result.get("diff_details"),
-                    "error": run_result.get("error"),
-                    "files": saved_files,
-                })
+            _emit({
+                "type": "iteration_complete",
+                "session_id": session_id,
+                "iteration": iteration_num,
+                "accuracy": accuracy,
+                "success": run_result.get("success", False),
+                "diff_details": run_result.get("diff_details"),
+                "error": run_result.get("error"),
+                "files": saved_files,
+            })
 
         except Exception as e:
             logger.error(f"对话迭代失败: {e}", exc_info=True)
@@ -2340,40 +2298,6 @@ def download_original_file(
 
 # ==================== 辅助函数 ====================
 
-
-def _extract_code(ai_response: str) -> Optional[str]:
-    """从 AI 响应中提取 Python 代码"""
-    if not ai_response:
-        return None
-
-    # 尝试提取 ```python ``` 块
-    import re
-    patterns = [
-        r'```python\s*\n(.*?)```',
-        r'```\s*\n(.*?)```',
-    ]
-    for pattern in patterns:
-        matches = re.findall(pattern, ai_response, re.DOTALL)
-        if matches:
-            # 取最长的代码块
-            code = max(matches, key=len).strip()
-            if "def " in code or "import " in code:
-                return code
-
-    # 如果没有代码块标记，但看起来像代码
-    if ("def main" in ai_response or "def process" in ai_response) and "import " in ai_response:
-        # 去掉明显的非代码行
-        lines = ai_response.split("\n")
-        code_lines = []
-        in_code = False
-        for line in lines:
-            if line.strip().startswith(("import ", "from ", "def ", "class ", "#")) or in_code:
-                in_code = True
-                code_lines.append(line)
-            elif in_code and (line.strip() == "" or line.startswith(" ") or line.startswith("\t")):
-                code_lines.append(line)
-        if code_lines:
-            return "\n".join(code_lines).strip()
 
     return None
 

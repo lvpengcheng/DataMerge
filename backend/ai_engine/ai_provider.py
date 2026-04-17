@@ -443,8 +443,12 @@ class BaseAIProvider(ABC):
         new_first_is_toplevel = (new_base_indent == "")
         existing_last_is_toplevel = (target_indent == "")
 
-        if new_first_is_toplevel and existing_last_is_toplevel:
-            # 都是顶级代码，直接拼接
+        if new_first_is_toplevel:
+            # 新代码以顶级代码开头（如变量定义、import、def），直接拼接
+            # 即使已有代码末尾在函数体内，也不应把顶级代码缩进进去
+            merged = existing_code.rstrip() + '\n\n' + '\n'.join(filtered_lines)
+        elif existing_last_is_toplevel:
+            # 已有代码末尾是顶级的，新代码有缩进 — 直接拼接保留原缩进
             merged = existing_code.rstrip() + '\n\n' + '\n'.join(filtered_lines)
         else:
             # 需要对齐缩进
@@ -489,8 +493,16 @@ class BaseAIProvider(ABC):
         code_blocks = re.findall(code_block_pattern, ai_response, re.DOTALL)
 
         if code_blocks:
-            # 如果有多个代码块，取第一个（通常是最主要的）
-            return code_blocks[0].strip()
+            # 合并所有代码块（AI 可能将变量定义和函数体放在不同代码块中）
+            if len(code_blocks) == 1:
+                return code_blocks[0].strip()
+            # 多个代码块：按长度排序，如果最长的包含 def/class 定义，
+            # 则合并所有块以保留顶层变量定义
+            longest = max(code_blocks, key=len)
+            if 'def ' in longest or 'class ' in longest:
+                return '\n\n'.join(b.strip() for b in code_blocks if b.strip()).strip()
+            # 否则取最长的（避免合并无关的示例片段）
+            return longest.strip()
 
         # 如果没有代码块，尝试提取看起来像Python代码的部分
         # 查找以 import 或 def 或 class 开头的行

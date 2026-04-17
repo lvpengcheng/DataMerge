@@ -30,94 +30,143 @@ def normalize_emp_code(emp_code) -> str:
     return code_str
 
 
-def calculate_excel_formulas(file_path: str) -> bool:
+def calculate_excel_formulas(file_path: str, timeout: int = 120) -> bool:
     """计算Excel文件中的所有公式并保存
 
     优先使用 Aspose.Cells 内存计算（无需 Excel 软件），失败则回退 win32com。
+    两种方案均有超时保护，防止公式计算卡死导致整个训练流程阻塞。
 
     Args:
         file_path: Excel文件路径
+        timeout: 超时秒数，默认120秒
 
     Returns:
         True 表示公式计算成功，False 表示计算失败（文件中的公式值可能不正确）
     """
+    import threading
+
     # ---- 方案1: Aspose.Cells（推荐，无进程开销） ----
     try:
         import aspose_init  # noqa: F401 — 确保 Aspose 已初始化
         aspose_init.ensure_license()
         from Aspose.Cells import Workbook as AsposeWorkbook
 
-        logger.info(f"[Aspose] 开始计算公式: {file_path}")
-        wb = AsposeWorkbook(str(file_path))
-        wb.CalculateFormula()
-        wb.Save(str(file_path))
-        logger.info(f"[Aspose] 公式计算完成: {file_path}")
-        return True
+        logger.info(f"[Aspose] 开始计算公式（超时{timeout}s）: {file_path}")
+        result_holder = {"success": False, "error": None}
+
+        def _aspose_calc():
+            try:
+                wb = AsposeWorkbook(str(file_path))
+                wb.CalculateFormula()
+                wb.Save(str(file_path))
+                result_holder["success"] = True
+            except Exception as e:
+                result_holder["error"] = e
+
+        t = threading.Thread(target=_aspose_calc, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        if t.is_alive():
+            logger.error(f"[Aspose] 公式计算超时（{timeout}s），跳过: {file_path}")
+            return False
+        if result_holder["success"]:
+            logger.info(f"[Aspose] 公式计算完成: {file_path}")
+            return True
+        raise result_holder["error"] or Exception("Aspose计算失败")
     except ImportError:
         logger.info("Aspose.Cells 不可用，尝试 win32com")
     except Exception as e:
         logger.warning(f"[Aspose] 公式计算失败: {e}，尝试 win32com 回退")
 
-    # ---- 方案2: win32com 回退 ----
+    # ---- 方案2: win32com 回退（带超时 + 强制清理） ----
     if platform.system() != 'Windows':
         logger.warning("非Windows系统且Aspose不可用，跳过公式计算")
         return False
 
     try:
-        import pythoncom
-        import win32com.client as win32
+        import subprocess
         import tempfile
 
-        logger.info(f"[win32com] 开始计算公式: {file_path}")
+        logger.info(f"[win32com] 开始计算公式（超时{timeout}s）: {file_path}")
 
-        pythoncom.CoInitialize()
+        result_holder = {"success": False, "error": None, "excel_pid": None}
 
-        try:
-            excel = win32.gencache.EnsureDispatch('Excel.Application')
-            excel.Visible = False
-            excel.DisplayAlerts = False
-
-            abs_path = str(Path(file_path).resolve())
-
-            # 非ASCII路径处理
-            use_temp = False
-            temp_path = None
+        def _win32com_calc():
             try:
-                abs_path.encode('ascii')
-            except UnicodeEncodeError:
-                use_temp = True
-                temp_dir = tempfile.mkdtemp()
-                temp_path = os.path.join(temp_dir, "temp_excel.xlsx")
-                shutil.copy(abs_path, temp_path)
-                work_path = temp_path
-            else:
-                work_path = abs_path
+                import pythoncom
+                import win32com.client as win32
 
-            wb = excel.Workbooks.Open(work_path, UpdateLinks=0)
-            for sheet in wb.Sheets:
-                sheet.Calculate()
-            wb.Application.Calculate()
-            wb.Application.CalculateFull()
-            wb.SaveAs(work_path, FileFormat=51)
-            wb.Close(SaveChanges=False)
-
-            if use_temp and temp_path:
-                shutil.copy(temp_path, abs_path)
+                pythoncom.CoInitialize()
                 try:
-                    os.remove(temp_path)
-                    os.rmdir(os.path.dirname(temp_path))
-                except Exception:
-                    pass
+                    excel = win32.gencache.EnsureDispatch('Excel.Application')
+                    excel.Visible = False
+                    excel.DisplayAlerts = False
+                    # 记录 Excel PID，超时时可强制清理
+                    try:
+                        result_holder["excel_pid"] = excel.Hwnd
+                    except Exception:
+                        pass
 
-            logger.info(f"[win32com] 公式计算完成: {file_path}")
-            return True
+                    abs_path = str(Path(file_path).resolve())
 
-        finally:
+                    # 非ASCII路径处理
+                    use_temp = False
+                    temp_path = None
+                    try:
+                        abs_path.encode('ascii')
+                    except UnicodeEncodeError:
+                        use_temp = True
+                        temp_d = tempfile.mkdtemp()
+                        temp_path = os.path.join(temp_d, "temp_excel.xlsx")
+                        shutil.copy(abs_path, temp_path)
+                        work_path = temp_path
+                    else:
+                        work_path = abs_path
+
+                    wb = excel.Workbooks.Open(work_path, UpdateLinks=0)
+                    for sheet in wb.Sheets:
+                        sheet.Calculate()
+                    wb.Application.Calculate()
+                    wb.Application.CalculateFull()
+                    wb.SaveAs(work_path, FileFormat=51)
+                    wb.Close(SaveChanges=False)
+
+                    if use_temp and temp_path:
+                        shutil.copy(temp_path, abs_path)
+                        try:
+                            os.remove(temp_path)
+                            os.rmdir(os.path.dirname(temp_path))
+                        except Exception:
+                            pass
+
+                    result_holder["success"] = True
+                finally:
+                    try:
+                        excel.Quit()
+                    except Exception:
+                        pass
+                    pythoncom.CoUninitialize()
+            except Exception as e:
+                result_holder["error"] = e
+
+        t = threading.Thread(target=_win32com_calc, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        if t.is_alive():
+            logger.error(f"[win32com] 公式计算超时（{timeout}s），强制终止Excel进程: {file_path}")
+            # 强制杀掉可能残留的 Excel 进程
             try:
-                excel.Quit()
+                subprocess.run(["taskkill", "/F", "/IM", "EXCEL.EXE"], capture_output=True, timeout=10)
             except Exception:
                 pass
-            pythoncom.CoUninitialize()
+            return False
+
+        if result_holder["success"]:
+            logger.info(f"[win32com] 公式计算完成: {file_path}")
+            return True
+        if result_holder["error"]:
+            raise result_holder["error"]
+        return False
 
     except ImportError:
         logger.warning("未安装pywin32，跳过Excel公式计算")
@@ -652,8 +701,8 @@ def detect_primary_keys(df: pd.DataFrame, max_keys: int = 2) -> List[str]:
             col_scores[col] = score
 
     if not col_scores:
-        # 没有任何列匹配关键词，用第一列兜底
-        return [df.columns[0]]
+        # 没有任何列匹配常见主键关键词，返回空列表让上层按排序兜底
+        return []
 
     # 按得分排序
     sorted_cols = sorted(col_scores.items(), key=lambda x: x[1], reverse=True)
@@ -701,6 +750,11 @@ def compare_excel_files(
 ) -> Dict[str, Any]:
     """对比两个Excel文件的差异
 
+    基于 Aspose 直读优化：
+    - result: Aspose 1次(算公式+保存) + Aspose 1次(读值+公式) = 2次
+    - expected: Aspose 1次(读值) = 1次
+    - 总计 3次（消除所有 openpyxl 依赖，之前 4次）
+
     Args:
         result_file: 生成的结果文件路径
         expected_file: 预期的结果文件路径
@@ -710,50 +764,40 @@ def compare_excel_files(
     Returns:
         对比统计结果字典
     """
+    import aspose_init
+    aspose_init.ensure_license()
+    from Aspose.Cells import Workbook as AsposeWorkbook
+
     logger.info("开始差异对比...")
 
-    # 用Excel计算公式
+    # 【第1次打开 result】Aspose 计算公式并保存（expected 不需要，外部已计算）
     result_calc_ok = calculate_excel_formulas(result_file)
-    expected_calc_ok = calculate_excel_formulas(expected_file)
     if not result_calc_ok:
         logger.error(f"[对比] 结果文件公式计算失败，对比结果可能不准确: {result_file}")
-    if not expected_calc_ok:
-        logger.error(f"[对比] 预期文件公式计算失败，对比结果可能不准确: {expected_file}")
 
-    # 先读取预期文件，确定目标sheet名称
-    expected_df = read_excel_with_formulas_calculated(expected_file)
-    # 获取预期文件的sheet名，作为结果文件选择sheet的提示
-    expected_sheet_name = None
+    # 【第2次打开 result】Aspose 直读：值 + 公式，一次全部拿到
+    res_wb = AsposeWorkbook(str(result_file))
+    # 【第3次打开 expected】Aspose 直读：值
+    exp_wb = AsposeWorkbook(str(expected_file))
+
     try:
-        import openpyxl as _opx_hint
-        _wb_hint = _opx_hint.load_workbook(expected_file, read_only=True, data_only=True)
-        if _wb_hint.sheetnames:
-            # 预期文件通常只有一个sheet，取第一个即可
-            expected_sheet_name = _wb_hint.sheetnames[0]
-        _wb_hint.close()
-        logger.info(f"预期文件sheet名: '{expected_sheet_name}'，将作为结果文件sheet选择提示")
-    except Exception:
-        pass
+        # 过滤掉 Aspose 评估版水印 sheet，取第一个有效 sheet
+        def _first_real_ws(wb):
+            for i in range(wb.Worksheets.Count):
+                ws = wb.Worksheets[i]
+                if "Evaluation" not in ws.Name:
+                    return ws
+            return wb.Worksheets[0]
 
-    # 读取结果文件的公式（用于差异分析时展示）
-    result_formulas = {}
-    try:
-        import openpyxl
-        wb_formulas = openpyxl.load_workbook(result_file, data_only=False)
-        ws_formulas_sheet = _select_best_sheet(wb_formulas, wb_formulas, preferred_name=expected_sheet_name)[0]
-        header_row = {ws_formulas_sheet.cell(row=1, column=col).value: col for col in range(1, ws_formulas_sheet.max_column + 1)}
-        if ws_formulas_sheet.max_row >= 2:
-            for col_name, col_idx in header_row.items():
-                if col_name:
-                    cell_value = ws_formulas_sheet.cell(row=2, column=col_idx).value
-                    if cell_value and isinstance(cell_value, str) and cell_value.startswith('='):
-                        result_formulas[col_name] = cell_value
-        wb_formulas.close()
-    except Exception as e:
-        logger.warning(f"读取公式失败: {e}")
+        res_ws = _first_real_ws(res_wb)
+        exp_ws = _first_real_ws(exp_wb)
+        logger.info(f"对比: expected['{exp_ws.Name}'] vs result['{res_ws.Name}']")
 
-    # 读取结果文件（使用预期文件的sheet名作为提示）
-    result_df = read_excel_with_formulas_calculated(result_file, preferred_sheet=expected_sheet_name)
+        # Aspose 一次读取：值 + 公式（result），仅值（expected）
+        result_df, result_formulas = _aspose_read_sheet_df_and_formulas(res_ws)
+        expected_df = _aspose_read_sheet_df(exp_ws)
+    finally:
+        del res_wb, exp_wb
 
     # 标准化列名
     result_df.columns = [_standardize_column_name(col) for col in result_df.columns]
@@ -773,72 +817,134 @@ def compare_excel_files(
     return _compare_dataframes_core(result_df, expected_df, resolved_keys, output_file, result_formulas)
 
 
-def _read_sheet_as_dataframe(wb_data, wb_formula, sheet_name: str) -> pd.DataFrame:
-    """从已打开的 openpyxl workbook 中读取指定 sheet 为 DataFrame。
+def _read_sheet_df_data_only(ws_data) -> pd.DataFrame:
+    """从 data_only 模式的 worksheet 中直接读取 DataFrame（无公式迭代）。
 
-    内部复用与 read_excel_with_formulas_calculated 相同的逻辑：
-    data_only 取缓存值，formula 版本多遍迭代补算缺失值。
+    适用于公式已由 Aspose 计算并保存回文件的场景，
+    data_only=True 直接读缓存值，无需 formula 版本做迭代计算。
     """
-    ws_data = wb_data[sheet_name]
-    ws_formula = wb_formula[sheet_name]
-
     headers = [cell.value for cell in ws_data[1]]
     valid_headers = [h for h in headers if h is not None]
 
     max_row = ws_data.max_row
     max_col = len(headers)
 
-    cell_values = {}
-    formulas = {}
-
-    for row_idx in range(2, max_row + 1):
-        for col_idx in range(1, max_col + 1):
-            if col_idx > len(headers) or headers[col_idx - 1] is None:
-                continue
-            data_cell = ws_data.cell(row=row_idx, column=col_idx)
-            formula_cell = ws_formula.cell(row=row_idx, column=col_idx)
-            cell_formula = formula_cell.value
-            is_formula = cell_formula is not None and str(cell_formula).startswith('=')
-            if is_formula:
-                if data_cell.value is not None:
-                    cell_values[(row_idx, col_idx)] = data_cell.value
-                else:
-                    formulas[(row_idx, col_idx)] = str(cell_formula)
-                    cell_values[(row_idx, col_idx)] = None
-            else:
-                val = data_cell.value
-                # 大数字统一用 format('.0f') 转文本，避免 str(float) 出科学记号
-                # 两边 Excel 只要存的是同一个数字（即使精度丢了），标准化后也能匹配
-                if isinstance(val, float) and abs(val) >= 1e15 and val == int(val):
-                    val = format(val, '.0f')
-                cell_values[(row_idx, col_idx)] = val
-
-    # 多遍迭代计算未解析的公式
-    for _iteration in range(10):
-        remaining = sum(1 for k, v in cell_values.items() if k in formulas and v is None)
-        if remaining == 0:
-            break
-        calculated_this_round = 0
-        for (row_idx, col_idx), formula in formulas.items():
-            if cell_values[(row_idx, col_idx)] is not None:
-                continue
-            calculated_value = _try_calculate_formula_with_cache(formula, cell_values, row_idx, max_col)
-            if calculated_value is not None:
-                cell_values[(row_idx, col_idx)] = calculated_value
-                calculated_this_round += 1
-        if calculated_this_round == 0:
-            break
-
     data = []
     for row_idx in range(2, max_row + 1):
         row_data = {}
-        for col_idx, col_name in enumerate(headers, start=1):
-            if col_name is None:
+        for col_idx in range(1, max_col + 1):
+            if col_idx > len(headers) or headers[col_idx - 1] is None:
                 continue
-            row_data[col_name] = cell_values.get((row_idx, col_idx))
+            val = ws_data.cell(row=row_idx, column=col_idx).value
+            if isinstance(val, float) and abs(val) >= 1e15 and val == int(val):
+                val = format(val, '.0f')
+            row_data[headers[col_idx - 1]] = val
         data.append(row_data)
 
     return pd.DataFrame(data, columns=valid_headers)
+
+
+# ==================== Aspose 直读辅助函数 ====================
+
+def _aspose_read_sheet_df(aspose_ws) -> pd.DataFrame:
+    """使用 Aspose .NET 直接读取 worksheet 为 DataFrame（仅读值，不读公式）。
+
+    通过 Aspose 适配层一次打开即可同时获取计算后的值，
+    无需 openpyxl 的 data_only 模式或多次打开文件。
+
+    Args:
+        aspose_ws: Aspose.Cells.Worksheet .NET 对象
+    Returns:
+        DataFrame，列名取自第一行
+    """
+    from excel_parser import _AsposeWorksheet
+
+    ws = _AsposeWorksheet(aspose_ws)
+    if ws.max_row < 1 or ws.max_column < 1:
+        return pd.DataFrame()
+
+    # 读取表头（第1行，1-indexed）
+    headers = []
+    for col_idx in range(1, ws.max_column + 1):
+        val = ws.cell(row=1, column=col_idx).value
+        headers.append(val)
+
+    valid_headers = [h for h in headers if h is not None]
+    if not valid_headers:
+        return pd.DataFrame()
+
+    max_col = len(headers)
+
+    # 读取数据行
+    data = []
+    for row_idx in range(2, ws.max_row + 1):
+        row_data = {}
+        for col_idx in range(1, max_col + 1):
+            h = headers[col_idx - 1]
+            if h is None:
+                continue
+            val = ws.cell(row=row_idx, column=col_idx).value
+            # 大数字格式化，避免科学计数法
+            if isinstance(val, float) and abs(val) >= 1e15 and val == int(val):
+                val = format(val, '.0f')
+            row_data[h] = val
+        data.append(row_data)
+
+    return pd.DataFrame(data, columns=valid_headers)
+
+
+def _aspose_read_sheet_df_and_formulas(aspose_ws) -> tuple:
+    """使用 Aspose .NET 同时读取 worksheet 的值和公式。
+
+    一次打开文件即可获取：
+    - 计算后的单元格值（DataFrame）
+    - 第一数据行的公式文本（供 AI 修正参考）
+
+    Args:
+        aspose_ws: Aspose.Cells.Worksheet .NET 对象
+    Returns:
+        (DataFrame, formulas_dict)
+        formulas_dict: {列名: 公式文本}，仅包含第一数据行中有公式的列
+    """
+    from excel_parser import _AsposeWorksheet
+
+    ws = _AsposeWorksheet(aspose_ws)
+    if ws.max_row < 1 or ws.max_column < 1:
+        return pd.DataFrame(), {}
+
+    # 读取表头（第1行，1-indexed）
+    headers = []
+    for col_idx in range(1, ws.max_column + 1):
+        val = ws.cell(row=1, column=col_idx).value
+        headers.append(val)
+
+    valid_headers = [h for h in headers if h is not None]
+    if not valid_headers:
+        return pd.DataFrame(), {}
+
+    max_col = len(headers)
+
+    # 读取数据行 + 公式
+    data = []
+    formulas = {}
+    for row_idx in range(2, ws.max_row + 1):
+        row_data = {}
+        for col_idx in range(1, max_col + 1):
+            h = headers[col_idx - 1]
+            if h is None:
+                continue
+            cell = ws.cell(row=row_idx, column=col_idx)
+            val = cell.value
+            # 大数字格式化，避免科学计数法
+            if isinstance(val, float) and abs(val) >= 1e15 and val == int(val):
+                val = format(val, '.0f')
+            row_data[h] = val
+            # 只收集第一数据行的公式（供 AI 修正提示）
+            if row_idx == 2 and cell.formula:
+                formulas[h] = cell.formula
+        data.append(row_data)
+
+    return pd.DataFrame(data, columns=valid_headers), formulas
 
 
 def _match_sheet_name(target: str, available: List[str]) -> Optional[str]:
@@ -902,8 +1008,10 @@ def compare_excel_files_multi_sheet(
 ) -> Dict[str, Any]:
     """对比两个 Excel 文件的所有 Sheet 差异（多Sheet版本）。
 
-    遍历 expected 文件中的所有 sheet，在 result 文件中找对应 sheet 进行逐 sheet 对比，
-    最终汇总返回兼容 compare_excel_files() 的结果字典。
+    基于 Aspose 直读优化：
+    - result: Aspose 1次(算公式+保存) + Aspose 1次(读值+公式) = 2次
+    - expected: Aspose 1次(读值) = 1次
+    - 总计 3次（消除读取阶段的 openpyxl 依赖，之前 4次）
 
     Args:
         result_file:  生成的结果文件路径
@@ -914,33 +1022,38 @@ def compare_excel_files_multi_sheet(
     Returns:
         兼容 compare_excel_files() 的结果字典，额外包含 per_sheet / missing_sheets / extra_sheets
     """
-    import openpyxl
+    import aspose_init
+    aspose_init.ensure_license()
+    from Aspose.Cells import Workbook as AsposeWorkbook
 
     logger.info("[多Sheet对比] 开始...")
 
-    # 1. 计算公式
+    # 【第1次打开 result】Aspose 计算公式（expected 不需要，外部已计算）
     formula_warning = ""
     result_calc_ok = calculate_excel_formulas(result_file)
-    expected_calc_ok = calculate_excel_formulas(expected_file)
     if not result_calc_ok:
         logger.error(f"[多Sheet对比] 结果文件公式计算失败: {result_file}")
         formula_warning += "结果文件公式未计算; "
-    if not expected_calc_ok:
-        logger.error(f"[多Sheet对比] 预期文件公式计算失败: {expected_file}")
-        formula_warning += "基准文件公式未计算; "
 
-    # 2. 打开文件
-    exp_wb_data = openpyxl.load_workbook(expected_file, data_only=True)
-    exp_wb_formula = openpyxl.load_workbook(expected_file, data_only=False)
-    res_wb_data = openpyxl.load_workbook(result_file, data_only=True)
-    res_wb_formula = openpyxl.load_workbook(result_file, data_only=False)
+    # 【第2次打开 result】Aspose 直读（值 + 公式）
+    res_wb = AsposeWorkbook(str(result_file))
+    # 【第3次打开 expected】Aspose 直读（仅值）
+    exp_wb = AsposeWorkbook(str(expected_file))
 
-    # 过滤掉 Aspose 评估版水印 sheet
-    def _real_sheets(names):
-        return [n for n in names if "Evaluation" not in n]
+    # 构建 sheet 名称列表和索引映射（过滤 Aspose 评估版水印 sheet）
+    def _real_sheet_info(wb):
+        """返回 (名称列表, {名称: worksheet对象})"""
+        names = []
+        ws_map = {}
+        for i in range(wb.Worksheets.Count):
+            ws = wb.Worksheets[i]
+            if "Evaluation" not in ws.Name:
+                names.append(ws.Name)
+                ws_map[ws.Name] = ws
+        return names, ws_map
 
-    exp_sheets = _real_sheets(exp_wb_data.sheetnames)
-    res_sheets = _real_sheets(res_wb_data.sheetnames)
+    exp_sheets, exp_ws_map = _real_sheet_info(exp_wb)
+    res_sheets, res_ws_map = _real_sheet_info(res_wb)
 
     # 过滤掉明显的源数据 sheet（数字前缀如 "01_xxx"）和参数 sheet
     import re as _re_ms
@@ -975,20 +1088,21 @@ def compare_excel_files_multi_sheet(
         output_dir = Path(result_file).parent
         output_file = str(output_dir / "差异对比.xlsx")
 
-    for exp_sheet_name in exp_compare_sheets:
-        res_sheet_name = _match_sheet_with_strategy(
-            exp_sheet_name, res_sheets, res_wb_data, primary_keys
-        )
+    for idx, exp_sheet_name in enumerate(exp_compare_sheets):
+        # 按索引位置匹配：sheet0↔sheet0, sheet1↔sheet1
+        if idx < len(res_sheets):
+            res_sheet_name = res_sheets[idx]
+        else:
+            res_sheet_name = None
 
         if res_sheet_name is None:
             # 结果中缺失此 sheet
             missing_sheets.append(exp_sheet_name)
-            # 读取预期 sheet 以计算缺失的 cell 数
             try:
-                exp_df = _read_sheet_as_dataframe(exp_wb_data, exp_wb_formula, exp_sheet_name)
-                miss_cells = len(exp_df) * max(len(exp_df.columns) - 1, 1)  # 排除主键列粗估
+                exp_df = _aspose_read_sheet_df(exp_ws_map[exp_sheet_name])
+                miss_cells = len(exp_df) * max(len(exp_df.columns) - 1, 1)
             except Exception:
-                miss_cells = 100  # 无法读取时用默认值
+                miss_cells = 100
             per_sheet[exp_sheet_name] = {
                 "total_differences": miss_cells,
                 "total_cells": miss_cells,
@@ -1004,12 +1118,12 @@ def compare_excel_files_multi_sheet(
             continue
 
         matched_result_sheets.add(res_sheet_name)
-        logger.info(f"[多Sheet对比] 对比 '{exp_sheet_name}' ↔ '{res_sheet_name}'")
+        logger.info(f"[多Sheet对比] 按索引[{idx}]对比: '{exp_sheet_name}' ↔ '{res_sheet_name}'")
 
         try:
-            exp_df = _read_sheet_as_dataframe(exp_wb_data, exp_wb_formula, exp_sheet_name)
-            res_df = _read_sheet_as_dataframe(res_wb_data, res_wb_formula, res_sheet_name)
-            res_formulas = _get_sheet_formulas(res_wb_formula, res_sheet_name)
+            # Aspose 直读：expected 仅值，result 值+公式
+            exp_df = _aspose_read_sheet_df(exp_ws_map[exp_sheet_name])
+            res_df, res_formulas = _aspose_read_sheet_df_and_formulas(res_ws_map[res_sheet_name])
 
             # 标准化列名
             exp_df.columns = [_standardize_column_name(c) for c in exp_df.columns]
@@ -1045,12 +1159,8 @@ def compare_excel_files_multi_sheet(
             key = f"[{exp_sheet_name}].{field_name}" if is_multi else field_name
             agg_field_diff_samples[key] = info
 
-    # 关闭 workbooks
-    for wb in (exp_wb_data, exp_wb_formula, res_wb_data, res_wb_formula):
-        try:
-            wb.close()
-        except Exception:
-            pass
+    # 释放 Aspose workbook
+    del res_wb, exp_wb
 
     # 多余的 result sheets（不计入差异，仅提示）
     extra_sheets = [n for n in res_sheets if n not in matched_result_sheets and not _is_source_or_param(n)]
@@ -1070,11 +1180,12 @@ def compare_excel_files_multi_sheet(
                 per_sheet_diff_files.append((exp_sheet_name, str(sheet_diff_path)))
 
         if per_sheet_diff_files:
-            combined_wb = openpyxl.Workbook()
+            import openpyxl as _openpyxl_write
+            combined_wb = _openpyxl_write.Workbook()
             combined_wb.remove(combined_wb.active)  # 删除默认空 sheet
 
             for sheet_name, diff_path in per_sheet_diff_files:
-                src_wb = openpyxl.load_workbook(diff_path)
+                src_wb = _openpyxl_write.load_workbook(diff_path)
                 src_ws = src_wb.active
                 # sheet 名截断到 31 字符（Excel 限制）
                 safe_name = sheet_name[:31] if len(sheet_name) > 31 else sheet_name
@@ -1202,13 +1313,32 @@ def _compare_dataframes_core(
         compare_data_columns.discard(f"标准化_{key}")
     total_cells = len(expected_df) * len(compare_data_columns) + len(missing_in_result) * len(expected_df)
 
-    # 创建复合匹配键并合并
+    # 创建复合匹配键
     standardized_key_cols = [f"标准化_{k}" for k in primary_keys]
     for df, label in [(expected_df, "预期"), (result_df, "生成")]:
         if all(col in df.columns for col in standardized_key_cols):
             df["匹配键"] = df[standardized_key_cols].astype(str).agg("_".join, axis=1)
         else:
             df["匹配键"] = df[primary_keys].astype(str).agg("_".join, axis=1)
+
+    # P0: 检查匹配键是否有重复，防止 merge 产生笛卡尔积膨胀
+    exp_has_dup = expected_df["匹配键"].duplicated().any()
+    res_has_dup = result_df["匹配键"].duplicated().any()
+    if exp_has_dup or res_has_dup:
+        logger.warning(f"[对比] 主键存在重复值（预期重复={exp_has_dup}, 生成重复={res_has_dup}），"
+                       "添加组内序号避免 merge 膨胀")
+        # 按匹配键排序，使同key的行相邻且顺序一致
+        expected_df = expected_df.sort_values("匹配键").reset_index(drop=True)
+        result_df = result_df.sort_values("匹配键").reset_index(drop=True)
+        # 同key内按出现顺序编号：001_#0, 001_#1, ...
+        expected_df["匹配键"] = (
+            expected_df["匹配键"] + "_#" +
+            expected_df.groupby("匹配键").cumcount().astype(str)
+        )
+        result_df["匹配键"] = (
+            result_df["匹配键"] + "_#" +
+            result_df.groupby("匹配键").cumcount().astype(str)
+        )
 
     merged_df = pd.merge(
         expected_df, result_df,
@@ -1418,12 +1548,23 @@ def _resolve_primary_keys(
                 logger.info(f"[主键解析] 模糊匹配成功: '{key}' → '{matched_col}'")
 
     if not available_keys:
+        # P1: 优化无主键时的匹配策略
+        # 优先用第一列做匹配键（P0的序号机制自动处理重复），比纯行号更准确
         first_col = expected_df.columns[0] if len(expected_df.columns) > 0 else None
         if first_col and first_col in result_df.columns:
             available_keys = [first_col]
-            logger.warning(f"所有指定主键都不存在，回退到第一列: {first_col}")
+            logger.warning(f"无法确定有效主键，使用第一列 '{first_col}' 作为匹配键（重复值将按顺序配对）")
         else:
-            logger.warning("无法确定有效的主键列，使用行号作为匹配键")
+            # 最终兜底：第一列在结果中不存在，按排序后行号对比
+            if first_col:
+                logger.warning(f"第一列 '{first_col}' 在结果表中不存在，按行号逐行对比")
+                try:
+                    expected_df.sort_values(by=first_col, inplace=True, na_position='last')
+                    expected_df.reset_index(drop=True, inplace=True)
+                except Exception:
+                    pass
+            else:
+                logger.warning("无法确定有效的主键列，使用行号作为匹配键")
             synthetic_key = "__行号__"
             expected_df[synthetic_key] = range(len(expected_df))
             result_df[synthetic_key] = range(len(result_df))

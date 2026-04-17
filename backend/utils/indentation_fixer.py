@@ -67,9 +67,15 @@ class IndentationFixer:
         """公式代码生成后的缩进修复管线
 
         替代 formula_code_generator 中多处调用的 2 步修复。
-        按顺序执行：Tab归一化 → for循环体脱离 → 列级联缩进 → autopep8兜底
+        按顺序执行：Tab归一化 → AST检查 → for循环体脱离 → 列级联缩进 → autopep8兜底
         """
         code = code.replace('\t', '    ')
+        # AST 前置检查：如果代码已经合法，跳过所有修复
+        try:
+            compile(code, '<check>', 'exec')
+            return code
+        except SyntaxError:
+            pass
         code = self.fix_for_loop_body_indentation(code)
         code = self.fix_cascading_column_indentation(code)
         # 如果仍有编译错误，用 autopep8 兜底
