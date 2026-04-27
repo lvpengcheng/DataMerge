@@ -113,7 +113,8 @@
       "Bash(xxd)",
       "Bash(powershell -Command \"\\(Get-Item ''libs/Aspose.Cells.dll''\\).VersionInfo.FileVersion\")",
       "Bash(tasklist)",
-      "Bash(taskkill /F /IM EXCEL.EXE)"
+      "Bash(taskkill /F /IM EXCEL.EXE)",
+      "Read(//c/Users/Administrator/.claude/plans/**)"
     ],
     "additionalDirectories": [
       "E:\\project\\DataMerge20260224\\DataMerge\\backend\\test_data\\data_cleaning_test",

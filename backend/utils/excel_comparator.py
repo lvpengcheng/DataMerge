@@ -1088,12 +1088,16 @@ def compare_excel_files_multi_sheet(
         output_dir = Path(result_file).parent
         output_file = str(output_dir / "差异对比.xlsx")
 
+    # 创建共享workbook，多sheet差异写入同一个文件
+    import openpyxl as _openpyxl_multi
+    combined_wb = _openpyxl_multi.Workbook()
+    combined_wb.remove(combined_wb.active)
+
     for idx, exp_sheet_name in enumerate(exp_compare_sheets):
-        # 按索引位置匹配：sheet0↔sheet0, sheet1↔sheet1
-        if idx < len(res_sheets):
-            res_sheet_name = res_sheets[idx]
-        else:
-            res_sheet_name = None
+        # 按sheet名称匹配（精确→忽略大小写→包含关系→索引回退）
+        res_sheet_name = _match_sheet_name(exp_sheet_name, [n for n in res_sheets if n not in matched_result_sheets])
+        if res_sheet_name is None and idx < len(res_sheets):
+            res_sheet_name = res_sheets[idx] if res_sheets[idx] not in matched_result_sheets else None
 
         if res_sheet_name is None:
             # 结果中缺失此 sheet
@@ -1118,7 +1122,7 @@ def compare_excel_files_multi_sheet(
             continue
 
         matched_result_sheets.add(res_sheet_name)
-        logger.info(f"[多Sheet对比] 按索引[{idx}]对比: '{exp_sheet_name}' ↔ '{res_sheet_name}'")
+        logger.info(f"[多Sheet对比] 按名称匹配对比: '{exp_sheet_name}' ↔ '{res_sheet_name}'")
 
         try:
             # Aspose 直读：expected 仅值，result 值+公式
@@ -1131,10 +1135,10 @@ def compare_excel_files_multi_sheet(
 
             resolved_keys = _resolve_primary_keys(exp_df, res_df, primary_keys)
 
-            # 每个 sheet 的差异报告单独输出
-            sheet_output = str(Path(output_file).parent / f"差异对比_{exp_sheet_name}.xlsx")
+            # 写入共享workbook的对应sheet
             sheet_result = _compare_dataframes_core(
-                res_df, exp_df, resolved_keys, sheet_output, res_formulas
+                res_df, exp_df, resolved_keys, output_file, res_formulas,
+                wb_shared=combined_wb, sheet_title=exp_sheet_name
             )
             per_sheet[exp_sheet_name] = sheet_result
         except Exception as e:
@@ -1170,49 +1174,14 @@ def compare_excel_files_multi_sheet(
     logger.info(f"[多Sheet对比] 汇总: {agg_matched_cells}/{agg_total_cells} = {agg_match_rate:.2%}, "
                 f"缺失sheets={missing_sheets}, 多余sheets={extra_sheets}")
 
-    # 合并各 sheet 的 diff 文件到一个总文件（output_file），供下载栏使用
+    # 保存共享workbook（包含所有sheet的差异）
     try:
-        per_sheet_diff_files = []
-        output_parent = Path(output_file).parent
-        for exp_sheet_name in exp_compare_sheets:
-            sheet_diff_path = output_parent / f"差异对比_{exp_sheet_name}.xlsx"
-            if sheet_diff_path.exists():
-                per_sheet_diff_files.append((exp_sheet_name, str(sheet_diff_path)))
-
-        if per_sheet_diff_files:
-            import openpyxl as _openpyxl_write
-            combined_wb = _openpyxl_write.Workbook()
-            combined_wb.remove(combined_wb.active)  # 删除默认空 sheet
-
-            for sheet_name, diff_path in per_sheet_diff_files:
-                src_wb = _openpyxl_write.load_workbook(diff_path)
-                src_ws = src_wb.active
-                # sheet 名截断到 31 字符（Excel 限制）
-                safe_name = sheet_name[:31] if len(sheet_name) > 31 else sheet_name
-                dst_ws = combined_wb.create_sheet(title=safe_name)
-                for row in src_ws.iter_rows():
-                    for cell in row:
-                        dst_cell = dst_ws.cell(row=cell.row, column=cell.column, value=cell.value)
-                        if cell.has_style:
-                            dst_cell.font = cell.font.copy()
-                            dst_cell.fill = cell.fill.copy()
-                            dst_cell.alignment = cell.alignment.copy()
-                # 复制列宽
-                for col_letter, dim in src_ws.column_dimensions.items():
-                    dst_ws.column_dimensions[col_letter].width = dim.width
-                src_wb.close()
-
+        if combined_wb.sheetnames:
             combined_wb.save(output_file)
-            combined_wb.close()
-            logger.info(f"[多Sheet对比] 已生成合并diff文件: {output_file}")
+            logger.info(f"[多Sheet对比] 已生成多sheet差异文件: {output_file}, sheets={combined_wb.sheetnames}")
+        combined_wb.close()
     except Exception as e:
-        logger.warning(f"[多Sheet对比] 合并diff文件失败: {e}，尝试复制第一个sheet的diff作为总diff")
-        # 兜底：复制第一个 sheet 的 diff 文件
-        if per_sheet_diff_files:
-            try:
-                shutil.copy2(per_sheet_diff_files[0][1], output_file)
-            except Exception:
-                pass
+        logger.warning(f"[多Sheet对比] 保存diff文件失败: {e}")
 
     return {
         "total_differences": agg_total_diff,
@@ -1237,7 +1206,9 @@ def _compare_dataframes_core(
     expected_df: pd.DataFrame,
     primary_keys: List[str],
     output_file: str,
-    result_formulas: Optional[Dict[str, str]] = None
+    result_formulas: Optional[Dict[str, str]] = None,
+    wb_shared: "openpyxl.Workbook" = None,
+    sheet_title: str = None
 ) -> Dict[str, Any]:
     """对比两个 DataFrame 的核心逻辑（供 compare_excel_files 和 compare_dataframes 共用）
 
@@ -1247,6 +1218,8 @@ def _compare_dataframes_core(
         primary_keys: 已解析的主键列名列表
         output_file: 差异报告输出路径
         result_formulas: 结果文件的公式映射 {列名: 公式}（可选，用于 AI 修正提示）
+        wb_shared: 外部传入的openpyxl Workbook（多sheet模式时共用同一个workbook）
+        sheet_title: 多sheet模式时的sheet名称
 
     Returns:
         对比统计结果字典
@@ -1272,9 +1245,15 @@ def _compare_dataframes_core(
         logger.info(f"[主键诊断] '{key_col}' 前3值: 预期={exp_sample}, 生成={res_sample}")
 
     # 创建差异报告
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "差异对比"
+    _own_wb = wb_shared is None
+    if _own_wb:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "差异对比"
+    else:
+        wb = wb_shared
+        safe_name = (sheet_title or "差异对比")[:31]
+        ws = wb.create_sheet(title=safe_name)
 
     # 写入表头
     key_header_names = [f"主键{i+1}({key})" for i, key in enumerate(primary_keys[:3])]
@@ -1465,8 +1444,9 @@ def _compare_dataframes_core(
     for col_idx, width in enumerate(column_widths, start=1):
         ws.column_dimensions[chr(64 + col_idx)].width = width
 
-    wb.save(output_file)
-    logger.info(f"差异对比文件已保存: {output_file}")
+    if _own_wb:
+        wb.save(output_file)
+        logger.info(f"差异对比文件已保存: {output_file}")
     logger.info(f"共发现 {total_differences} 处差异")
     logger.info(f"其中: 仅预期有 {unmatched_expected} 条, 仅生成有 {unmatched_result} 条")
 

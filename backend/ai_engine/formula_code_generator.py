@@ -77,6 +77,8 @@ class FormulaCodeGenerator:
         manual_headers: Dict = None,
         stream_callback: callable = None,
         multi_sheet_source: bool = False,
+        analysis=None,
+        skip_load: bool = False,
     ) -> Tuple[str, str]:
         """生成公式模式的Python代码
 
@@ -90,6 +92,9 @@ class FormulaCodeGenerator:
             expected_structure: 预期输出结构
             manual_headers: 手动表头配置
             stream_callback: 流式回调函数
+            multi_sheet_source: 是否多sheet源
+            analysis: TableAnalysisResult 预分析结果
+            skip_load: 跳过源数据加载（已由外部加载）
 
         Returns:
             (生成的代码, AI原始响应)
@@ -102,16 +107,23 @@ class FormulaCodeGenerator:
         log("=== 公式模式：开始生成代码 ===")
         self.last_prompt = None  # 记录实际提示词，供调用方获取
         self._multi_sheet_source = multi_sheet_source  # 记录给 _build_complete_code 使用
+        self._analysis = analysis  # 保存analysis供 _build_complete_code 使用
 
         # 1. 加载源数据获取结构信息
-        log("步骤1: 分析源数据结构...")
-        source_info = self.formula_builder.load_source_data(input_folder, manual_headers,
-                                                             multi_sheet_source=multi_sheet_source)
-        log(f"发现 {len(source_info['sheets'])} 个源数据sheet")
+        if not skip_load:
+            log("步骤1: 分析源数据结构...")
+            source_info = self.formula_builder.load_source_data(input_folder, manual_headers,
+                                                                 multi_sheet_source=multi_sheet_source)
+            log(f"发现 {len(source_info['sheets'])} 个源数据sheet")
+        else:
+            log("步骤1: 使用预加载的源数据结构")
 
-        # 2. 从规则中解析主表名称，传给源数据结构描述
+        # 2. 从规则/analysis中解析主表名称，传给源数据结构描述
         main_table_name = None
-        if rules_content:
+        if analysis is not None and analysis.primary_key_source:
+            main_table_name = analysis.primary_key_source
+            log(f"步骤2: TableAnalyzer确定主表: {main_table_name}")
+        elif rules_content:
             import re as _re
             main_match = _re.search(r'###\s*主表[:：]\s*(.+?)(?:\n|（|$)', rules_content)
             if not main_match:
@@ -120,7 +132,9 @@ class FormulaCodeGenerator:
                 main_table_name = main_match.group(1).strip()
                 log(f"步骤2: 规则指定主表: {main_table_name}")
 
-        source_structure = self.formula_builder.get_source_structure_for_prompt(main_table_name=main_table_name)
+        source_structure = self.formula_builder.get_source_structure_for_prompt(
+            main_table_name=main_table_name, analysis=analysis
+        )
         log("步骤2: 生成源数据结构描述完成")
 
         # 2.5 替换规则中的源数据格式为当前训练数据结构
@@ -227,7 +241,17 @@ class FormulaCodeGenerator:
 
         # 6. 与固定代码模板拼接
         log("步骤6: 拼接完整代码...")
-        complete_code = self._build_complete_code(fill_function_code)
+        # 从analysis中获取merge_config和L1模板代码
+        _merge_config = None
+        _l1_code = None
+        if analysis is not None:
+            _merge_config = analysis.merge_config
+            from backend.ai_engine.table_analyzer import TableAnalyzer
+            _analyzer = TableAnalyzer()
+            _l1_code = _analyzer.generate_l1_code(analysis, expected_structure)
+        complete_code = self._build_complete_code(
+            fill_function_code, merge_config=_merge_config, l1_code=_l1_code
+        )
 
         # 6.5 最终安全网：只对完整代码做f-string修复，不做缩进修复（避免破坏模板代码）
         if complete_code:
@@ -1572,7 +1596,7 @@ class FormulaCodeGenerator:
         except SyntaxError:
             return line  # 修不了，返回原样
 
-    def _build_complete_code(self, fill_function_code: str) -> str:
+    def _build_complete_code(self, fill_function_code: str, merge_config: dict = None, l1_code: str = None) -> str:
         """将AI生成的fill_result_sheet函数与固定代码模板拼接
 
         两步生成流程：
@@ -1827,7 +1851,7 @@ def load_source_data(input_folder, manual_headers):
 
 
 def _is_date_column(col_name, df=None):
-    \"\"\"判断是否为日期列：先按列名关键词匹配，再按数据内容探测\"\"\"
+    \"\"\"判断是否为日期列：仅按列名关键词判断，不做数据内容探测\"\"\"
     name = str(col_name).lower().strip()
 
     # 排除误匹配（如"工作日数"、"节日"等）
@@ -1836,32 +1860,13 @@ def _is_date_column(col_name, df=None):
         if exc in name:
             return False
 
-    # 列名关键词匹配
-    date_keywords = ['日期', 'date', '入职日', '离职日', '生效日', '截止日', '转正日', '生日']
+    # 列名含日期关键词才认定为日期列
+    date_keywords = ['日期', 'date', '入职日', '离职日', '生效日', '截止日', '转正日', '生日',
+                     '出生日', '开始日', '结束日', '签订日', '到期日', '发放日', '申请日',
+                     '创建时间', '更新时间', '时间戳', 'datetime', 'timestamp']
     for kw in date_keywords:
         if kw in name:
             return True
-
-    # 数据内容探测（采样前10个非空值，70%以上能解析为日期即认定）
-    if df is not None and col_name in df.columns:
-        # 跳过已经是数值类型的列（如工资金额）
-        if pd.api.types.is_numeric_dtype(df[col_name]):
-            return False
-        sample = df[col_name].dropna().head(10)
-        if len(sample) >= 3:
-            success = 0
-            for v in sample:
-                try:
-                    parsed = pd.to_datetime(v)
-                    # 确保不是纯数字被误判（如员工编号 20060112）
-                    if isinstance(v, str) and any(c in str(v) for c in ['-', '/', '年', '月']):
-                        success += 1
-                    elif not isinstance(v, (int, float)):
-                        success += 1
-                except Exception:
-                    pass
-            if success / len(sample) >= 0.7:
-                return True
 
     return False
 
@@ -2236,6 +2241,46 @@ def write_history_sheet(wb, history_prov, salary_year, salary_month):
         main_template = '''
 
 # ============================================================
+# 源数据合并（由TableAnalyzer预分析生成配置）
+# ============================================================
+
+def _merge_source_tables(source_data, merge_config):
+    """根据预分析配置合并源数据表"""
+    import json as _json
+    if isinstance(merge_config, str):
+        merge_config = _json.loads(merge_config)
+
+    merged = dict(source_data)
+    output_key = merge_config.get("output_key", "derived_main_table")
+
+    # 纵向合并（结构相同的多个表拼接）
+    for group in merge_config.get("vertical_groups", []):
+        dfs = [source_data[k]["df"] for k in group if k in source_data]
+        if dfs:
+            combined = pd.concat(dfs, ignore_index=True)
+            columns = source_data[group[0]]["columns"]
+            merged[output_key] = {"df": combined, "columns": list(columns)}
+            print(f"  [纵向合并] {group} -> {output_key}, {len(combined)}行")
+
+    # 横向关联（不同表通过主键join）
+    for join_spec in merge_config.get("horizontal_joins", []):
+        left_key = join_spec["left"]
+        right_key = join_spec["right"]
+        join_col = join_spec["on"]
+        left_data = merged.get(left_key)
+        right_data = merged.get(right_key)
+        if left_data and right_data:
+            left_df = left_data["df"]
+            right_df = right_data["df"]
+            right_cols = [c for c in right_df.columns
+                         if c not in left_df.columns or c == join_col]
+            result = left_df.merge(right_df[right_cols], on=join_col, how="left")
+            merged[left_key] = {"df": result, "columns": list(result.columns)}
+            print(f"  [横向关联] {left_key} JOIN {right_key} ON {join_col}, {len(result)}行")
+
+    return merged
+
+# ============================================================
 # 主函数
 # ============================================================
 
@@ -2258,6 +2303,13 @@ def main():
     # Cannot compare Timestamp with datetime.date
     print("步骤1.1: 预处理日期列...")
     _normalize_date_columns(source_data)
+
+    # 步骤1.2: 合并源数据表（由TableAnalyzer预分析，None表示无需合并）
+    _merge_cfg = __MERGE_CONFIG__
+    if _merge_cfg:
+        print("步骤1.2: 合并源数据表...")
+        source_data = _merge_source_tables(source_data, _merge_cfg)
+        print(f"合并完成，共 {len(source_data)} 个源数据sheet")
 
     # 步骤1.5: 应用数据清洗规则（如果定义了clean_source_data函数）
     if 'clean_source_data' in globals():
@@ -2335,6 +2387,19 @@ def main():
         _aso_value = "False" if getattr(self, "_multi_sheet_source", False) else "True"
         complete_code = complete_code.replace("__ACTIVE_SHEET_ONLY__", _aso_value)
 
+        # 替换 __MERGE_CONFIG__ 占位符
+        if merge_config:
+            import json as _json
+            complete_code = complete_code.replace(
+                "__MERGE_CONFIG__", _json.dumps(merge_config, ensure_ascii=False)
+            )
+        else:
+            complete_code = complete_code.replace("__MERGE_CONFIG__", "None")
+
+        # 注入L1模板代码
+        if l1_code:
+            complete_code = self._inject_l1_code(complete_code, l1_code)
+
         # 最终验证：确保代码包含fill_result_sheets函数定义
         if 'def fill_result_sheets' not in complete_code and 'def fill_result_sheet' not in complete_code:
             logger.error("拼接后的代码中没有fill_result_sheets函数定义")
@@ -2354,6 +2419,23 @@ def main():
             logger.info("已添加 fill_result_sheets = fill_result_sheet 别名")
 
         return complete_code
+
+    def _inject_l1_code(self, code: str, l1_code: str) -> str:
+        """将L1模板代码注入到fill_result_sheets的for循环体开头"""
+        if not l1_code or not l1_code.strip():
+            return code
+
+        # 找 for i in range(...): 循环
+        match = re.search(r'(for\s+i\s+in\s+range\s*\([^)]+\)\s*:\s*\n)', code)
+        if not match:
+            logger.warning("L1注入: 未找到 for i in range() 循环，跳过注入")
+            return code
+
+        insert_pos = match.end()
+        # 在循环体开头插入L1代码
+        code = code[:insert_pos] + l1_code + "\n" + code[insert_pos:]
+        logger.info(f"L1注入: 已注入L1模板代码到for循环体")
+        return code
 
     def _clean_before_function_def(self, code: str) -> str:
         """清理函数定义之前的垃圾代码

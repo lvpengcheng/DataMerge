@@ -589,9 +589,14 @@ def _run_single_iteration(
         matched = comparison.get("matched_cells", 0)
         accuracy = matched / total if total > 0 else 0
 
-        # 格式化差异摘要
+        # 格式化差异摘要（分sheet展示）
         diff_summary = {}
+        per_sheet = comparison.get("per_sheet", {})
+        missing_sheets = comparison.get("missing_sheets", [])
+        extra_sheets = comparison.get("extra_sheets", [])
         field_diffs = comparison.get("field_diff_samples", {})
+        is_multi = len(per_sheet) > 1 or len(missing_sheets) > 0
+
         if field_diffs:
             for col, info in field_diffs.items():
                 diff_summary[col] = {
@@ -601,10 +606,32 @@ def _run_single_iteration(
 
         # 构建详细差异文本（供 generate_correction_code 使用）
         detailed_diff = comparison.get("detailed_text", "")
-        if not detailed_diff and diff_summary:
+        if not detailed_diff and (diff_summary or missing_sheets):
             lines = []
-            for col, info in diff_summary.items():
-                lines.append(f"列 '{col}': {info['count']}处差异, 示例: {info.get('sample', '')}")
+            if is_multi:
+                if missing_sheets:
+                    lines.append(f"缺失Sheet: {', '.join(missing_sheets)}")
+                if extra_sheets:
+                    lines.append(f"多余Sheet: {', '.join(extra_sheets)}")
+                for sheet_name, sheet_info in per_sheet.items():
+                    s_matched = sheet_info.get("matched_cells", 0)
+                    s_total = sheet_info.get("total_cells", 0)
+                    s_rate = f"{s_matched}/{s_total} ({s_matched/s_total*100:.1f}%)" if s_total > 0 else "N/A"
+                    if sheet_info.get("missing"):
+                        lines.append(f"\n### Sheet: {sheet_name} (缺失)")
+                        continue
+                    lines.append(f"\n### Sheet: {sheet_name}  匹配率: {s_rate}")
+                    prefix = f"[{sheet_name}]."
+                    sheet_fields = {k[len(prefix):]: v for k, v in diff_summary.items() if k.startswith(prefix)}
+                    if not sheet_fields:
+                        sheet_fields = sheet_info.get("field_diff_samples", {})
+                    for col, info in sheet_fields.items():
+                        count = info.get("count", 0)
+                        sample = info.get("formula", info.get("sample", ""))
+                        lines.append(f"  列 '{col}': {count}处差异{f', 示例: {sample}' if sample else ''}")
+            else:
+                for col, info in diff_summary.items():
+                    lines.append(f"列 '{col}': {info['count']}处差异, 示例: {info.get('sample', '')}")
             detailed_diff = "\n".join(lines)
 
         return {
@@ -615,6 +642,9 @@ def _run_single_iteration(
             "total_differences": comparison.get("total_differences", 0),
             "diff_details": diff_summary,
             "detailed_diff": detailed_diff,
+            "per_sheet": per_sheet if is_multi else None,
+            "missing_sheets": missing_sheets if missing_sheets else None,
+            "extra_sheets": extra_sheets if extra_sheets else None,
             "diff_file": diff_output if os.path.exists(diff_output) else None,
             "output_dir": str(output_dir),
             "execution_time": execution_time,
@@ -1377,7 +1407,11 @@ def main(source_dir, output_dir, **kwargs):
                     _add_message(db, sid, "system", msg_content, "status",
                                  {"iteration": iteration_num, "accuracy": accuracy})
                 else:
-                    diff_text = _format_diff_for_chat(run_result.get("diff_details", {}))
+                    diff_text = _format_diff_for_chat(
+                        run_result.get("diff_details", {}),
+                        per_sheet=run_result.get("per_sheet"),
+                        missing_sheets=run_result.get("missing_sheets"),
+                        extra_sheets=run_result.get("extra_sheets"))
                     msg_content = f"第 {iteration_num} 轮完成，准确率 {acc_pct}\n\n差异详情:\n{diff_text}"
                     _add_message(db, sid, "system", msg_content, "diff",
                                  {"iteration": iteration_num, "accuracy": accuracy,
@@ -1800,7 +1834,11 @@ async def send_message(
                 if accuracy >= 1.0:
                     diff_msg = f"第 {iteration_num} 轮完成，准确率 {acc_pct}，所有数据匹配！"
                 else:
-                    diff_text = _format_diff_for_chat(run_result.get("diff_details", {}))
+                    diff_text = _format_diff_for_chat(
+                        run_result.get("diff_details", {}),
+                        per_sheet=run_result.get("per_sheet"),
+                        missing_sheets=run_result.get("missing_sheets"),
+                        extra_sheets=run_result.get("extra_sheets"))
                     diff_msg = f"第 {iteration_num} 轮完成，准确率 {acc_pct}\n\n差异详情:\n{diff_text}"
                 _add_message(db, session_id, "system", diff_msg, "diff",
                              {"iteration": iteration_num, "accuracy": accuracy,
@@ -2044,7 +2082,11 @@ async def upload_code(
         acc_pct = f"{accuracy * 100:.1f}%"
         msg = f"手动上传代码已验证，准确率 {acc_pct}"
         if accuracy < 1.0:
-            diff_text = _format_diff_for_chat(run_result.get("diff_details", {}))
+            diff_text = _format_diff_for_chat(
+                run_result.get("diff_details", {}),
+                per_sheet=run_result.get("per_sheet"),
+                missing_sheets=run_result.get("missing_sheets"),
+                extra_sheets=run_result.get("extra_sheets"))
             msg += f"\n\n差异详情:\n{diff_text}"
         _add_message(db, session_id, "system", msg, "diff" if accuracy < 1.0 else "status",
                      {"iteration": iteration_num, "accuracy": accuracy, "source": "upload"})
@@ -2302,15 +2344,40 @@ def download_original_file(
     return None
 
 
-def _format_diff_for_chat(diff_details: Dict) -> str:
-    """将差异详情格式化为可读文本"""
+def _format_diff_for_chat(diff_details: Dict, per_sheet: Dict = None,
+                          missing_sheets: list = None, extra_sheets: list = None) -> str:
+    """将差异详情格式化为可读文本，多sheet时分sheet展示"""
     if not diff_details:
         return "无详细差异信息"
 
+    is_multi = (per_sheet and len(per_sheet) > 1) or (missing_sheets and len(missing_sheets) > 0)
+
     lines = []
-    for col, info in diff_details.items():
-        count = info.get("count", 0)
-        sample = info.get("sample", "")
-        lines.append(f"- {col}: {count}处差异{f' (示例: {sample})' if sample else ''}")
+    if is_multi:
+        if missing_sheets:
+            lines.append(f"**缺失Sheet**: {', '.join(missing_sheets)}")
+        if extra_sheets:
+            lines.append(f"**多余Sheet**: {', '.join(extra_sheets)}")
+        for sheet_name, sheet_info in (per_sheet or {}).items():
+            s_matched = sheet_info.get("matched_cells", 0)
+            s_total = sheet_info.get("total_cells", 0)
+            s_rate = f"{s_matched/s_total*100:.1f}%" if s_total > 0 else "N/A"
+            if sheet_info.get("missing"):
+                lines.append(f"\n**Sheet: {sheet_name}** (缺失!)")
+                continue
+            lines.append(f"\n**Sheet: {sheet_name}** (匹配率: {s_rate})")
+            prefix = f"[{sheet_name}]."
+            sheet_fields = {k[len(prefix):]: v for k, v in diff_details.items() if k.startswith(prefix)}
+            if not sheet_fields:
+                sheet_fields = sheet_info.get("field_diff_samples", {})
+            for col, info in sheet_fields.items():
+                count = info.get("count", 0)
+                sample = info.get("formula", info.get("sample", ""))
+                lines.append(f"- {col}: {count}处差异{f' (示例: {sample})' if sample else ''}")
+    else:
+        for col, info in diff_details.items():
+            count = info.get("count", 0)
+            sample = info.get("sample", "")
+            lines.append(f"- {col}: {count}处差异{f' (示例: {sample})' if sample else ''}")
 
     return "\n".join(lines) if lines else "无详细差异信息"

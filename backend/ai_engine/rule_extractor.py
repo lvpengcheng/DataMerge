@@ -130,6 +130,30 @@ class RuleExtractor:
         if "不参与报表统计" in rule_text:
             rule["action"] = "exclude_from_report"
 
+        # 合并/关联操作识别
+        if any(kw in rule_text for kw in ["纵向合并", "上下合并", "拼接", "concat", "追加合并"]):
+            rule["action"] = "vertical_concat"
+            rule["conditions"].append({
+                "type": "merge",
+                "merge_type": "vertical_concat",
+                "description": rule_text
+            })
+
+        if any(kw in rule_text for kw in ["横向合并", "关联合并", "匹配合并", "join", "左连接", "左关联"]):
+            rule["action"] = "horizontal_join"
+            rule["conditions"].append({
+                "type": "merge",
+                "merge_type": "horizontal_join",
+                "description": rule_text
+            })
+
+        if "合并" in rule_text and rule["action"] == "exclude":
+            rule["conditions"].append({
+                "type": "merge",
+                "merge_type": "unspecified",
+                "description": rule_text
+            })
+
         return rule
 
     def _extract_warning_rules(self, content: str) -> List[Dict[str, Any]]:

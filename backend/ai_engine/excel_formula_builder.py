@@ -361,24 +361,30 @@ class ExcelFormulaBuilder:
 
         return unique_keys[:5]  # 最多返回5个可能的主键列
 
-    def get_source_structure_for_prompt(self, main_table_name: str = None) -> str:
+    def get_source_structure_for_prompt(self, main_table_name: str = None, analysis=None) -> str:
         """生成用于AI提示词的源数据结构描述，包含主键识别信息
 
         Args:
             main_table_name: 规则中指定的主表名称。如果提供，直接确认该表为主表；
                            如果为None，则标注候选让AI根据规则决定。
+            analysis: TableAnalysisResult 对象。如果提供，使用预分析结果确定主表和VLOOKUP信息。
         """
         lines = ["## 源数据Sheet结构\n"]
 
         # 收集所有表的主键信息，用于后面的汇总
         all_key_info = {}
 
-        # 确定主表：优先使用规则指定的主表名，模糊匹配source_sheets的key
+        # 确定主表：优先使用analysis预分析结果，其次规则指定
         confirmed_main = None
-        if main_table_name:
+        confirmed_main_sheets = set()
+        if analysis is not None and analysis.main_table_sheets:
+            confirmed_main_sheets = set(analysis.main_table_sheets)
+            confirmed_main = analysis.main_table_sheets[0]
+        elif main_table_name:
             for k in self.source_sheets:
                 if main_table_name == k or main_table_name in k or k in main_table_name:
                     confirmed_main = k
+                    confirmed_main_sheets = {k}
                     break
 
         # 如果规则没指定或匹配不到，则走候选逻辑
@@ -402,7 +408,7 @@ class ExcelFormulaBuilder:
             columns = sheet_info["columns"]
             row_count = len(sheet_info["df"])
             df = sheet_info["df"]
-            is_main = (sheet_name == confirmed_main)
+            is_main = (sheet_name == confirmed_main or sheet_name in confirmed_main_sheets)
             is_candidate = (not confirmed_main and sheet_name in main_candidate_names)
 
             # 识别可能的主键列
@@ -518,6 +524,17 @@ class ExcelFormulaBuilder:
         lines.append("5. 多条件匹配也必须用INDEX+MATCH：")
         lines.append("   `=IFERROR(INDEX('表名'!$返回列:$返回列, MATCH(1, ('表名'!$A:$A=条件1)*('表名'!$B:$B=条件2), 0)), 0)`")
         lines.append("")
+
+        # 如果有analysis预分析结果，追加VLOOKUP列号速查表和分层摘要
+        if analysis is not None:
+            from backend.ai_engine.table_analyzer import TableAnalyzer
+            analyzer = TableAnalyzer()
+            vlookup_table = analyzer.generate_vlookup_table(analysis)
+            if vlookup_table:
+                lines.append(vlookup_table)
+            layer_summary = analyzer.generate_layer_summary(analysis)
+            if layer_summary:
+                lines.append(layer_summary)
 
         return "\n".join(lines)
 

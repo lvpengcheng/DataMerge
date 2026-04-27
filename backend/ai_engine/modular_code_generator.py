@@ -102,7 +102,8 @@ class ModularCodeGenerator:
         stream_callback: callable = None,
         salary_year: Optional[int] = None,
         salary_month: Optional[int] = None,
-        monthly_standard_hours: Optional[float] = None
+        monthly_standard_hours: Optional[float] = None,
+        analysis=None,
     ) -> Tuple[str, List[Dict[str, Any]]]:
         """完整的模块化代码生成流程
 
@@ -115,6 +116,7 @@ class ModularCodeGenerator:
             salary_year: 薪资年份（可选）
             salary_month: 薪资月份（可选）
             monthly_standard_hours: 当月标准工时（可选）
+            analysis: TableAnalysisResult 预分析结果（可选）
 
         Returns:
             (完整代码, 模块信息列表)
@@ -123,6 +125,7 @@ class ModularCodeGenerator:
         self.salary_year = salary_year
         self.salary_month = salary_month
         self.monthly_standard_hours = monthly_standard_hours
+        self._analysis = analysis
 
         def log(msg):
             logger.info(msg)
@@ -224,8 +227,17 @@ class ModularCodeGenerator:
         如果批量生成失败（未能解析出足够的模块），自动回退到分步生成模式。
         """
         # 生成批量提示词
+        # 如果有analysis，在规则内容前注入分层摘要
+        _rules_for_prompt = rules_content
+        if self._analysis:
+            from backend.ai_engine.table_analyzer import TableAnalyzer
+            _ta = TableAnalyzer()
+            _layer_summary = _ta.generate_layer_summary(self._analysis)
+            if _layer_summary:
+                _rules_for_prompt = _layer_summary + "\n\n" + rules_content
+
         prompt = self.prompt_generator.generate_batch_modular_prompt(
-            rules_content=rules_content,
+            rules_content=_rules_for_prompt,
             source_structure=source_structure,
             expected_structure=expected_structure,
             manual_headers=manual_headers,

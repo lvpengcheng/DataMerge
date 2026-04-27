@@ -895,13 +895,45 @@ class TrainingEngine:
         iteration_results = []
         source_structure_desc = ""  # 用于修正时传递
 
-        # 从规则内容中提取主键列，用于差异对比时精确匹配行
-        from backend.utils.excel_comparator import extract_primary_keys_from_rules
-        comparison_primary_keys = extract_primary_keys_from_rules(rules_content)
-        if comparison_primary_keys:
-            self.training_logger.log_info(f"从规则中提取到对比主键: {comparison_primary_keys}")
+        # === P0优化: 预加载源数据并运行TableAnalyzer ===
+        analysis = None
+        try:
+            source_info = formula_generator.formula_builder.load_source_data(
+                input_folder, manual_headers, multi_sheet_source=multi_sheet_source
+            )
+            self.training_logger.log_info(f"预加载源数据: {len(source_info['sheets'])} 个sheet")
+
+            from backend.ai_engine.table_analyzer import TableAnalyzer
+            analyzer = TableAnalyzer()
+            analysis = analyzer.analyze(
+                source_sheets=formula_generator.formula_builder.source_sheets,
+                expected_structure=expected_structure,
+                rules_content=rules_content,
+            )
+            for entry in analysis.detection_log:
+                self.training_logger.log_info(f"[分析] {entry}")
+            self.training_logger.log_info(
+                f"分析结果: 主键={analysis.primary_key}, 主表类型={analysis.main_table_type}, "
+                f"主表={analysis.main_table_sheets}, 置信度={analysis.confidence:.2f}, "
+                f"L1={len(analysis.l1_columns)}列, L2={len(analysis.l2_columns)}列, "
+                f"L3={len(analysis.l3_columns)}列, VLOOKUP预计算={len(analysis.vlookup_map)}条"
+            )
+        except Exception as e:
+            self.training_logger.log_info(f"TableAnalyzer分析失败，回退到默认模式: {e}")
+            logger.warning(f"TableAnalyzer failed, falling back: {e}")
+
+        # 从分析结果或规则中提取主键列，用于差异对比时精确匹配行
+        comparison_primary_keys = None
+        if analysis and analysis.primary_key:
+            comparison_primary_keys = [analysis.primary_key]
+            self.training_logger.log_info(f"使用分析结果的对比主键: {comparison_primary_keys}")
         else:
-            self.training_logger.log_info("规则中未找到明确主键声明，对比时将使用自动检测")
+            from backend.utils.excel_comparator import extract_primary_keys_from_rules
+            comparison_primary_keys = extract_primary_keys_from_rules(rules_content)
+            if comparison_primary_keys:
+                self.training_logger.log_info(f"从规则中提取到对比主键: {comparison_primary_keys}")
+            else:
+                self.training_logger.log_info("规则中未找到明确主键声明，对比时将使用自动检测")
 
         for iteration in range(self.max_iterations):
             iteration_num = iteration + 1
@@ -918,9 +950,13 @@ class TrainingEngine:
                         manual_headers=manual_headers,
                         stream_callback=self.stream_callback,
                         multi_sheet_source=multi_sheet_source,
+                        analysis=analysis,
+                        skip_load=(analysis is not None),
                     )
                     # 保存源数据结构描述用于后续修正
-                    source_structure_desc = formula_generator.formula_builder.get_source_structure_for_prompt()
+                    source_structure_desc = formula_generator.formula_builder.get_source_structure_for_prompt(
+                        analysis=analysis
+                    )
                 else:
                     # 修正代码
                     # 优先使用详细差异信息，如果没有则使用简单文本
@@ -1295,9 +1331,31 @@ class TrainingEngine:
         best_score = 0.0
         iteration_results = []
 
-        # 从规则内容中提取主键列，用于差异对比
-        from backend.utils.excel_comparator import extract_primary_keys_from_rules
-        modular_comparison_primary_keys = extract_primary_keys_from_rules(rules_content)
+        # === P0优化: 运行TableAnalyzer ===
+        modular_analysis = None
+        try:
+            from backend.ai_engine.table_analyzer import TableAnalyzer
+            from backend.ai_engine.excel_formula_builder import ExcelFormulaBuilder
+            _builder = ExcelFormulaBuilder()
+            input_folder = str(Path(source_files[0]).parent) if source_files else ""
+            _builder.load_source_data(input_folder, manual_headers)
+            analyzer = TableAnalyzer()
+            modular_analysis = analyzer.analyze(
+                source_sheets=_builder.source_sheets,
+                expected_structure=expected_structure,
+                rules_content=rules_content,
+            )
+            for entry in modular_analysis.detection_log:
+                self.training_logger.log_info(f"[分析] {entry}")
+        except Exception as e:
+            self.training_logger.log_info(f"TableAnalyzer分析失败(模块化模式): {e}")
+
+        # 从分析结果或规则中提取主键列
+        if modular_analysis and modular_analysis.primary_key:
+            modular_comparison_primary_keys = [modular_analysis.primary_key]
+        else:
+            from backend.utils.excel_comparator import extract_primary_keys_from_rules
+            modular_comparison_primary_keys = extract_primary_keys_from_rules(rules_content)
 
         for iteration in range(self.max_iterations):
             iteration_num = iteration + 1
@@ -1317,7 +1375,8 @@ class TrainingEngine:
                         stream_callback=self.stream_callback,
                         salary_year=self.salary_year,
                         salary_month=self.salary_month,
-                        monthly_standard_hours=self.monthly_standard_hours
+                        monthly_standard_hours=self.monthly_standard_hours,
+                        analysis=modular_analysis,
                     )
 
                     self.training_logger.log_info(f"模块化生成完成，共 {len(tasks)} 个模块，代码长度: {len(code)}")
@@ -1899,11 +1958,18 @@ class TrainingEngine:
 
                     # 根据对比结果判断是否成功
                     total_diff = comparison_result.get("total_differences", 0)
+                    matched_cells = comparison_result.get("matched_cells", 0)
+                    total_cells = comparison_result.get("total_cells", 0)
                     result["success"] = total_diff == 0
-                    result["comparison"] = f"差异对比完成: 共发现 {total_diff} 处差异"
                     if total_diff == 0:
                         result["comparison"] = "所有检查项都通过！"
-                    self.training_logger.log_info(f"对比结果: {result['comparison']}")
+                    else:
+                        field_diff_samples = comparison_result.get("field_diff_samples", {})
+                        result["comparison"] = self._format_detailed_diff(
+                            field_diff_samples, total_diff, matched_cells, total_cells,
+                            comparison_result=comparison_result
+                        )
+                    self.training_logger.log_info(f"对比结果: 匹配率 {matched_cells}/{total_cells}, 差异 {total_diff} 处")
                 else:
                     # 没有生成输出文件，记录沙箱的错误信息
                     sandbox_error = execution_result.get('error', '')
