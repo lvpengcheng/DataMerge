@@ -309,18 +309,25 @@ async def grant_tenant_auth(
     if not org:
         raise HTTPException(status_code=400, detail="组织不存在")
 
-    # 检查是否已授权
+    # 检查是否已授权（含已撤销的记录，避免 UniqueConstraint 冲突）
     existing = (
         db.query(TenantAuthorization)
         .filter(
             TenantAuthorization.tenant_id == req.tenant_id,
             TenantAuthorization.org_id == req.org_id,
-            TenantAuthorization.revoked_at.is_(None),
         )
         .first()
     )
     if existing:
-        raise HTTPException(status_code=400, detail="该组织已拥有该租户的访问权限")
+        if existing.revoked_at is None:
+            raise HTTPException(status_code=400, detail="该组织已拥有该租户的访问权限")
+        # 恢复已撤销的授权
+        existing.revoked_at = None
+        existing.auth_type = req.auth_type
+        existing.granted_by = admin.id
+        db.commit()
+        db.refresh(existing)
+        return _build_auth_resp(existing)
 
     auth = TenantAuthorization(
         tenant_id=req.tenant_id,
