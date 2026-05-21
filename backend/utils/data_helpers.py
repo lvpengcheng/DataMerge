@@ -165,3 +165,36 @@ def make_unique_sheet_key(name: str, existing_keys: set, max_len: int = 31) -> s
         counter += 1
     existing_keys.add(name)
     return name
+
+
+def assign_sheet_keys(file_sheet_pairs, max_len: int = 31):
+    """根据跨文件 sheet 名是否冲突，决定每个 sheet 的最终 key。
+
+    规则（用户指定）：
+    - 跨文件 sheet 名不重复 → 直接用 sheet_name
+    - 有重复（如多个文件都有 "Sheet1"）→ 用 f"{file_base}_{sheet_name}" 加文件名前缀
+    - 最后统一过 make_unique_sheet_key 做 31 字符截断 + 撞名后缀
+
+    Args:
+        file_sheet_pairs: 可迭代序列，元素为 (file_base, sheet_name) 二元组。
+                         file_base 是文件名去后缀；sheet_name 是 banner-split 后的子 sheet 名。
+        max_len: Excel sheet 名长度上限，默认 31。
+
+    Returns:
+        dict[(file_base, sheet_name)] -> final_key
+        保留输入顺序（dict 在 Python 3.7+ 保持插入序）。
+    """
+    pairs = list(file_sheet_pairs)
+    name_count: dict = {}
+    for _file_base, sheet_name in pairs:
+        name_count[sheet_name] = name_count.get(sheet_name, 0) + 1
+
+    used: set = set()
+    result: dict = {}
+    for file_base, sheet_name in pairs:
+        if name_count.get(sheet_name, 0) <= 1:
+            raw_key = sheet_name
+        else:
+            raw_key = f"{file_base}_{sheet_name}"
+        result[(file_base, sheet_name)] = make_unique_sheet_key(raw_key, used, max_len=max_len)
+    return result

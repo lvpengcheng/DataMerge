@@ -1338,7 +1338,7 @@ class ClaudeProvider(BaseAIProvider):
         response = self._client.messages.create(
             model=self.model,
             max_tokens=max_tokens or max(self.max_tokens, 64000),
-            temperature=temperature,
+            **({} if "-4-7" in self.model else {"temperature": temperature}),
             system=system_prompt,
             messages=messages,
             **filtered_kwargs,
@@ -1385,7 +1385,7 @@ class ClaudeProvider(BaseAIProvider):
         with self._client.messages.stream(
             model=self.model,
             max_tokens=max_tokens or max(self.max_tokens, 64000),
-            temperature=temperature,
+            **({} if "-4-7" in self.model else {"temperature": temperature}),
             system=system_prompt,
             messages=messages,
             **filtered_kwargs,
@@ -1914,13 +1914,17 @@ class AIProviderFactory:
                 "max_tokens": int(os.getenv("OPENAI_MAX_TOKENS", "8000"))
             })
         elif provider_type == "claude":
-            config.update({
+            model_name = os.getenv("ANTHROPIC_MODEL", "claude-3-sonnet-20240229")
+            claude_cfg = {
                 "api_key": os.getenv("ANTHROPIC_API_KEY"),
                 "base_url": os.getenv("ANTHROPIC_BASE_URL"),
-                "model": os.getenv("ANTHROPIC_MODEL", "claude-3-sonnet-20240229"),
+                "model": model_name,
                 "max_tokens": int(os.getenv("ANTHROPIC_MAX_TOKENS", "8000")),
-                "temperature": float(os.getenv("ANTHROPIC_TEMPERATURE", "0.1"))
-            })
+            }
+            # Claude 4.7 模型不应设置 temperature；其他模型若 .env 配置了则读取
+            if "-4-7" not in model_name and os.getenv("ANTHROPIC_TEMPERATURE"):
+                claude_cfg["temperature"] = float(os.getenv("ANTHROPIC_TEMPERATURE"))
+            config.update(claude_cfg)
         elif provider_type == "deepseek":
             config.update({
                 "api_key": os.getenv("DEEPSEEK_API_KEY"),

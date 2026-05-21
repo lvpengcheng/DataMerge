@@ -1027,7 +1027,8 @@ class TrainingEngine:
                                 rules_content=rules_content,
                                 source_structure=source_structure_desc,
                                 expected_structure=expected_structure,
-                                stream_callback=self.stream_callback
+                                stream_callback=self.stream_callback,
+                                iteration_num=iteration_num
                             )
                             # 列级修正失败时自动降级到全量修正
                             if code is None:
@@ -1040,7 +1041,8 @@ class TrainingEngine:
                                 comparison_result=comparison_result,
                                 rules_content=rules_content,
                                 source_structure=source_structure_desc,
-                                stream_callback=self.stream_callback
+                                stream_callback=self.stream_callback,
+                                iteration_num=iteration_num
                             )
 
                 if not code:
@@ -1717,7 +1719,8 @@ class TrainingEngine:
         structure = {
             "files": {},
             "total_sheets": 0,
-            "total_regions": 0
+            "total_regions": 0,
+            "multi_sheet_source": multi_sheet_source,
         }
 
         for file_path in source_files:

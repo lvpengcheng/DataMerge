@@ -1,0 +1,125 @@
+/* 智能小工具页面专属样式 */
+
+/* Sheet 拆分卡片 */
+.tool-page {
+    background: #fff;
+    border-radius: 10px;
+    padding: 24px 28px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
+}
+
+.tool-page h2 {
+    margin: 0 0 4px;
+    font-size: 18px;
+    color: #333;
+}
+
+.tool-page .desc {
+    color: #777;
+    font-size: 13px;
+    line-height: 1.6;
+    margin-bottom: 20px;
+}
+
+.upload-zone {
+    border: 2px dashed #b0bec5;
+    border-radius: 10px;
+    padding: 28px 16px;
+    text-align: center;
+    color: #607d8b;
+    cursor: pointer;
+    transition: background 0.2s, border-color 0.2s;
+}
+
+.upload-zone:hover, .upload-zone.dragover {
+    background: #f5fbff;
+    border-color: #1976d2;
+    color: #1976d2;
+}
+
+.split-file-list {
+    margin-top: 14px;
+    font-size: 13px;
+    color: #444;
+}
+
+.split-file-list .file-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 6px 4px;
+    border-bottom: 1px dashed #eee;
+}
+
+.split-file-list .file-row .rm {
+    color: #c62828;
+    cursor: pointer;
+    user-select: none;
+    padding: 0 8px;
+}
+
+.tool-page .actions {
+    margin-top: 20px;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+
+.status {
+    font-size: 13px;
+    color: #555;
+}
+
+.status.error { color: #c62828; }
+.status.ok { color: #2e7d32; }
+
+/* 分页控件 */
+.pagination {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 14px 4px 4px;
+    font-size: 13px;
+}
+
+.pagination:empty { display: none; }
+
+.pagination .pg-info {
+    color: #666;
+    margin-right: 12px;
+}
+
+.pagination .pg-btn {
+    min-width: 32px;
+    padding: 4px 10px;
+    border: 1px solid #d0d7de;
+    background: #fff;
+    border-radius: 4px;
+    cursor: pointer;
+    color: #444;
+    transition: all 0.15s;
+}
+
+.pagination .pg-btn:hover:not(:disabled):not(.active) {
+    background: #f5f9ff;
+    border-color: #1976d2;
+    color: #1976d2;
+}
+
+.pagination .pg-btn.active {
+    background: #1976d2;
+    border-color: #1976d2;
+    color: #fff;
+    cursor: default;
+}
+
+.pagination .pg-btn:disabled {
+    background: #f5f5f5;
+    color: #bbb;
+    cursor: not-allowed;
+}
+
+.pagination .pg-ellipsis {
+    color: #999;
+    padding: 0 4px;
+}

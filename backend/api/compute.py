@@ -19,7 +19,7 @@ from ..database.connection import get_db
 from ..database.models import (
     ComputeTask, ComputeTaskInput, DataAsset, Script,
 )
-from ..auth.dependencies import get_current_user, get_accessible_tenants
+from ..auth.dependencies import get_current_user, get_accessible_tenants, get_operable_tenants
 
 router = APIRouter(prefix="/api/compute2", tags=["计算任务"])
 
@@ -152,8 +152,13 @@ async def analyze_compute(
     req: AnalyzeRequest,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible_tenants: list = Depends(get_operable_tenants),
 ):
     """第一步：分析数据源，生成匹配报告"""
+    # 租户权限校验
+    if req.tenant_id not in accessible_tenants:
+        raise HTTPException(status_code=403, detail=f"无权访问租户 '{req.tenant_id}'")
+
     # 验证脚本
     script = db.query(Script).filter_by(id=req.script_id, is_active=True).first()
     if not script:
@@ -222,11 +227,15 @@ async def execute_compute(
     req: Optional[ExecuteRequest] = None,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible_tenants: list = Depends(get_operable_tenants),
 ):
     """第二步：确认执行计算"""
     task = db.query(ComputeTask).filter_by(id=task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="计算任务不存在")
+    # 租户权限校验
+    if task.tenant_id not in accessible_tenants:
+        raise HTTPException(status_code=403, detail=f"无权访问租户 '{task.tenant_id}'")
     if task.status not in ("analyzed", "failed"):
         raise HTTPException(status_code=400, detail=f"任务状态不允许执行: {task.status}")
 
@@ -365,16 +374,12 @@ def list_compute_tasks(
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
-    accessible_tenants: list = Depends(get_accessible_tenants),
+    accessible_tenants: list = Depends(get_operable_tenants),
 ):
-    """计算任务列表（按租户权限过滤，轻量摘要）"""
-    q = db.query(ComputeTask)
+    """计算任务列表（按租户权限过滤，轻量摘要；tenant_id 支持模糊包含）"""
+    q = db.query(ComputeTask).filter(ComputeTask.tenant_id.in_(accessible_tenants))
     if tenant_id:
-        if tenant_id not in accessible_tenants:
-            raise HTTPException(status_code=403, detail="无权访问该租户")
-        q = q.filter(ComputeTask.tenant_id == tenant_id)
-    else:
-        q = q.filter(ComputeTask.tenant_id.in_(accessible_tenants))
+        q = q.filter(ComputeTask.tenant_id.like(f"%{tenant_id}%"))
     if status:
         q = q.filter(ComputeTask.status == status)
     total = q.count()
@@ -390,7 +395,7 @@ def get_compute_task(
     task_id: int,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
-    accessible_tenants: list = Depends(get_accessible_tenants),
+    accessible_tenants: list = Depends(get_operable_tenants),
 ):
     """计算任务详情"""
     task = db.query(ComputeTask).filter_by(id=task_id).first()
@@ -436,7 +441,7 @@ def compute_history(
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
-    accessible_tenants: list = Depends(get_accessible_tenants),
+    accessible_tenants: list = Depends(get_operable_tenants),
 ):
     """计算历史（轻量列表，按租户权限过滤）"""
     if tenant_id not in accessible_tenants:

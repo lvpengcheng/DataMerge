@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Body, Request
-from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -25,7 +25,7 @@ from ..ai_engine.training_engine import TrainingEngine
 from ..storage.storage_manager import StorageManager
 from ..document_validator import DocumentValidator
 from excel_parser import IntelligentExcelParser
-from ..utils.data_helpers import make_unique_sheet_key
+from ..utils.data_helpers import assign_sheet_keys
 from ..sandbox.code_sandbox import CodeSandbox
 from ..email_processor.email_handler import EmailHandler
 from ..auth.router import router as auth_router
@@ -36,9 +36,10 @@ from ..api.compute import router as compute_api_router
 from ..api.rules import router as rules_api_router
 from ..api.dashboard import router as dashboard_api_router
 from ..api.training_chat import router as training_chat_router
+from ..api.tools import router as tools_router
 from ..database.connection import engine, get_db, SessionLocal
 from ..database import models as db_models
-from ..auth.dependencies import get_current_user, get_accessible_tenants
+from ..auth.dependencies import get_current_user, get_accessible_tenants, get_operable_tenants
 from sqlalchemy.orm import Session
 
 # 配置日志（控制台 + 文件）
@@ -86,6 +87,7 @@ app.include_router(compute_api_router)
 app.include_router(rules_api_router)
 app.include_router(dashboard_api_router)
 app.include_router(training_chat_router)
+app.include_router(tools_router)
 
 
 # ==================== 文件加密检测 API ====================
@@ -124,10 +126,11 @@ async def check_files_encrypted(
 @app.post("/api/rules/organize")
 async def organize_rules_endpoint(
     source_files: List[UploadFile] = File(...),
-    target_file: UploadFile = File(...),
+    target_file: Optional[UploadFile] = File(None),
     design_docs: List[UploadFile] = File(default=[]),
     ai_provider: Optional[str] = Form(None),
     file_passwords: Optional[str] = Form(None),
+    user_message: Optional[str] = Form(None),
     current_user=Depends(get_current_user),
 ):
     """整理规则 - 从设计文档+源文件结构+目标文件结构生成结构化规则文件"""
@@ -154,10 +157,12 @@ async def organize_rules_endpoint(
                 fp.write(await f.read())
             source_paths.append(path)
 
-        # 保存目标文件
-        target_path = os.path.join(temp_dir, target_file.filename)
-        with open(target_path, "wb") as fp:
-            fp.write(await target_file.read())
+        # 保存目标文件（可选）
+        target_path = None
+        if target_file is not None and target_file.filename:
+            target_path = os.path.join(temp_dir, target_file.filename)
+            with open(target_path, "wb") as fp:
+                fp.write(await target_file.read())
 
         # 保存设计文档
         doc_paths = []
@@ -169,7 +174,8 @@ async def organize_rules_endpoint(
 
         # 解密加密的 Excel 文件
         all_excel = [(p, os.path.basename(p)) for p in source_paths]
-        all_excel.append((target_path, target_file.filename))
+        if target_path:
+            all_excel.append((target_path, target_file.filename))
         for fpath, fname in all_excel:
             if is_encrypted(fpath):
                 pwd = passwords_dict.get(fname)
@@ -181,6 +187,13 @@ async def organize_rules_endpoint(
                 decrypted = decrypt_excel(fpath, password=pwd)
                 shutil.move(decrypted, fpath)
 
+        # 多区域 sheet 预处理（banner 拆分 / 头一致合并 / 头不一致 best-region）
+        try:
+            from ..utils.banner_splitter import preprocess_uploaded_files
+            preprocess_uploaded_files([fp for fp, _ in all_excel])
+        except Exception as _e:
+            logger.warning(f"banner-split 预处理失败（继续）: {_e}")
+
         # 创建 AI 提供者并执行规则整理
         provider = AIProviderFactory.create_provider(ai_provider)
         organizer = RuleOrganizer(provider)
@@ -189,6 +202,7 @@ async def organize_rules_endpoint(
             target_file=target_path,
             design_doc_files=doc_paths,
             file_passwords=passwords_dict,
+            user_message=user_message,
         )
 
         return {"success": True, "content": content}
@@ -205,11 +219,12 @@ async def organize_rules_endpoint(
 @app.post("/api/rules/organize/stream")
 async def organize_rules_stream_endpoint(
     source_files: List[UploadFile] = File(...),
-    target_file: UploadFile = File(...),
+    target_file: Optional[UploadFile] = File(None),
     design_docs: List[UploadFile] = File(default=[]),
     ai_provider: Optional[str] = Form(None),
     file_passwords: Optional[str] = Form(None),
     session_id: Optional[int] = Form(None),
+    user_message: Optional[str] = Form(None),
     current_user=Depends(get_current_user),
 ):
     """流式整理规则 - SSE 实时输出，自动创建/更新会话"""
@@ -238,10 +253,13 @@ async def organize_rules_stream_endpoint(
         source_paths.append(path)
         source_names.append(f.filename)
 
-    target_path = os.path.join(temp_dir, target_file.filename)
-    with open(target_path, "wb") as fp:
-        fp.write(await target_file.read())
-    target_name = target_file.filename
+    target_path = None
+    target_name = None
+    if target_file is not None and target_file.filename:
+        target_path = os.path.join(temp_dir, target_file.filename)
+        with open(target_path, "wb") as fp:
+            fp.write(await target_file.read())
+        target_name = target_file.filename
 
     doc_paths = []
     doc_names = []
@@ -254,7 +272,8 @@ async def organize_rules_stream_endpoint(
 
     # 解密
     all_excel = [(p, os.path.basename(p)) for p in source_paths]
-    all_excel.append((target_path, target_file.filename))
+    if target_path:
+        all_excel.append((target_path, target_name))
     for fpath, fname in all_excel:
         if is_encrypted(fpath):
             pwd = passwords_dict.get(fname)
@@ -263,6 +282,13 @@ async def organize_rules_stream_endpoint(
                 raise HTTPException(status_code=422, detail=f"文件 '{fname}' 有密码保护，请提供密码")
             decrypted = decrypt_excel(fpath, password=pwd)
             shutil.move(decrypted, fpath)
+
+    # 多区域 sheet 预处理（banner 拆分 / 头一致合并 / 头不一致 best-region）
+    try:
+        from ..utils.banner_splitter import preprocess_uploaded_files
+        preprocess_uploaded_files([fp for fp, _ in all_excel])
+    except Exception as _e:
+        logger.warning(f"banner-split 预处理失败（继续）: {_e}")
 
     # 捕获外层变量供线程使用
     _user_id = current_user.id
@@ -290,6 +316,7 @@ async def organize_rules_stream_endpoint(
                 target_file=target_path,
                 design_doc_files=doc_paths,
                 file_passwords=passwords_dict,
+                user_message=user_message,
                 chunk_callback=chunk_cb,
             )
 
@@ -297,8 +324,10 @@ async def organize_rules_stream_endpoint(
             saved_session_id = None
             try:
                 db = SessionLocal()
+                _user_msg_target = f"和目标文件({target_name})" if target_name else "（未提供目标文件）"
+                _user_msg_text = (user_message or "").strip() or f"请根据源文件({', '.join(source_names)}){_user_msg_target}整理数据处理规则"
                 initial_messages = [
-                    {"role": "user", "content": f"请根据源文件({', '.join(source_names)})和目标文件({target_name})整理数据处理规则"},
+                    {"role": "user", "content": _user_msg_text},
                     {"role": "assistant", "content": full_content},
                 ]
                 if _session_id:
@@ -316,9 +345,10 @@ async def organize_rules_stream_endpoint(
                         db.commit()
                         saved_session_id = sess.id
                 if not saved_session_id:
+                    _title = f"规则整理 - {target_name}" if target_name else f"规则整理 - {source_names[0] if source_names else '无源文件'}"
                     sess = db_models.RuleSession(
                         user_id=_user_id,
-                        title=f"规则整理 - {target_name}",
+                        title=_title,
                         ai_provider=ai_provider or "deepseek",
                         source_file_names=source_names,
                         target_file_name=target_name,
@@ -549,6 +579,7 @@ async def train_model(
     monthly_standard_hours: Optional[float] = Form(None),  # 可选的当月标准工时
     force_retrain: bool = Form(False),  # 是否强制重新训练
     file_passwords: Optional[str] = Form(None),
+    accessible_tenants: list = Depends(get_operable_tenants),
 ):
     """训练AI生成数据处理脚本
 
@@ -565,6 +596,26 @@ async def train_model(
             - False: 如果历史最佳分数=100%，直接使用历史最佳代码；如果<100%，重新训练
             - True: 清除所有历史训练数据和最佳代码，从头开始全新训练
     """
+    # 租户权限 + 唯一性合并校验:
+    # - 租户已有 Script: 必须 operable;且非 force_retrain 时拒绝(避免覆盖)
+    # - 租户无 Script: 任意登录用户均可创建新租户
+    _check_db = SessionLocal()
+    try:
+        _existing = _check_db.query(db_models.Script).filter(
+            db_models.Script.tenant_id == tenant_id,
+            db_models.Script.is_active == True,
+        ).first()
+        if _existing:
+            if tenant_id not in accessible_tenants:
+                raise HTTPException(status_code=403, detail=f"无权访问租户 '{tenant_id}'")
+            if not force_retrain:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"租户 '{tenant_id}' 已存在有效训练脚本（版本 {_existing.version}）。请使用其他 tenant 名称，或在前端勾选「强制重新训练」以覆盖"
+                )
+    finally:
+        _check_db.close()
+
     try:
         logger.info(f"开始训练，租户: {tenant_id}")
 
@@ -893,6 +944,7 @@ async def train_model_stream(
     max_iterations: Optional[int] = Form(None),
     force_retrain: bool = Form(False),
     file_passwords: Optional[str] = Form(None),
+    accessible_tenants: list = Depends(get_operable_tenants),
 ):
     """流式训练AI生成数据处理脚本（支持实时日志输出）
 
@@ -911,6 +963,26 @@ async def train_model_stream(
     """
     try:
         logger.info(f"开始流式训练，租户: {tenant_id}, 模式: {mode}")
+
+        # 租户权限 + 唯一性合并校验:
+        # - 租户已有 Script: 必须 operable;且非 force_retrain 时拒绝
+        # - 租户无 Script: 任意登录用户均可创建新租户
+        _check_db = SessionLocal()
+        try:
+            _existing = _check_db.query(db_models.Script).filter(
+                db_models.Script.tenant_id == tenant_id,
+                db_models.Script.is_active == True,
+            ).first()
+            if _existing:
+                if tenant_id not in accessible_tenants:
+                    raise HTTPException(status_code=403, detail=f"无权访问租户 '{tenant_id}'")
+                if not force_retrain:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"租户 '{tenant_id}' 已存在有效训练脚本（版本 {_existing.version}）。请使用其他 tenant 名称，或在前端勾选「强制重新训练」以覆盖"
+                    )
+        finally:
+            _check_db.close()
 
         # 直接导入模式：不需要 target_file 和 rule_files
         is_direct = (mode == "direct")
@@ -1301,7 +1373,8 @@ async def calculate_data(
     data_files: List[UploadFile] = File(...),
     salary_year: Optional[int] = Form(None),  # 可选的薪资年份
     salary_month: Optional[int] = Form(None),  # 可选的薪资月份
-    monthly_standard_hours: Optional[float] = Form(None)  # 可选的当月标准工时
+    monthly_standard_hours: Optional[float] = Form(None),  # 可选的当月标准工时
+    accessible_tenants: list = Depends(get_operable_tenants),
 ):
     """使用已训练脚本处理新数据
 
@@ -1314,6 +1387,10 @@ async def calculate_data(
     """
     try:
         logger.info(f"开始计算，租户: {tenant_id}")
+
+        # 租户权限校验
+        if tenant_id not in accessible_tenants:
+            raise HTTPException(status_code=403, detail=f"无权访问租户 '{tenant_id}'")
 
         # 获取活跃脚本
         active_script = storage_manager.get_active_script(tenant_id)
@@ -1929,6 +2006,13 @@ async def _save_uploaded_files(
                     else:
                         logger.info(f"已解密文件: {filename}")
 
+        # 多区域 sheet 预处理（banner 拆分 / 头一致合并 / 头不一致 best-region）
+        try:
+            from ..utils.banner_splitter import preprocess_uploaded_files
+            preprocess_uploaded_files([fp for fp, _ in all_files])
+        except Exception as _e:
+            logger.warning(f"banner-split 预处理失败（继续）: {_e}")
+
         # 保存到存储管理器
         saved_files = storage_manager.save_training_files(
             tenant_id, rule_paths, source_paths, expected_path
@@ -2132,7 +2216,8 @@ async def calculate_data_split(
     files_part2: List[UploadFile] = File(..., description="第二部分文件"),
     salary_year: Optional[int] = Form(None),
     salary_month: Optional[int] = Form(None),
-    monthly_standard_hours: Optional[float] = Form(None)
+    monthly_standard_hours: Optional[float] = Form(None),
+    accessible_tenants: list = Depends(get_operable_tenants),
 ):
     """使用已训练脚本处理新数据（分两部分上传文件）
 
@@ -2150,6 +2235,10 @@ async def calculate_data_split(
     try:
         logger.info(f"开始计算（分离上传），租户: {tenant_id}")
         logger.info(f"第一部分文件数: {len(files_part1)}, 第二部分文件数: {len(files_part2)}")
+
+        # 租户权限校验
+        if tenant_id not in accessible_tenants:
+            raise HTTPException(status_code=403, detail=f"无权访问租户 '{tenant_id}'")
 
         # 合并两部分文件
         all_files = files_part1 + files_part2
@@ -3565,6 +3654,66 @@ def _extract_code_from_response(response: str):
 
 # ==================== 计算任务 DB 持久化辅助函数 ====================
 
+def _load_script_info_for_precheck(tenant_id: str, script_id: str) -> dict:
+    """加载脚本元数据（source_structure / manual_headers），事前校验时使用。
+
+    优先级：DB Script 表 → 文件系统 {script_id}_info.json → 当前激活脚本的 script_info
+    """
+    info: dict = {}
+    db = None
+    try:
+        db = SessionLocal()
+        try:
+            sid = int(script_id)
+            row = db.query(db_models.Script).filter_by(id=sid, is_active=True).first()
+        except (ValueError, TypeError):
+            row = db.query(db_models.Script).filter(
+                db_models.Script.tenant_id == tenant_id,
+                db_models.Script.is_active == True,
+            ).order_by(db_models.Script.created_at.desc()).first()
+        if row and (row.manual_headers or row.source_structure):
+            info = {
+                "manual_headers": row.manual_headers,
+                "source_structure": row.source_structure,
+            }
+    except Exception as e:
+        logger.warning(f"[Precheck] DB 读 script 元数据失败: {e}")
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+    if not info:
+        try:
+            info_file = storage_manager.get_tenant_dir(tenant_id) / "scripts" / f"{script_id}_info.json"
+            if info_file.exists():
+                info = json.loads(info_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    if not info:
+        try:
+            active = storage_manager.get_active_script(tenant_id)
+            info = (active or {}).get("script_info", {}) or {}
+        except Exception:
+            info = {}
+
+    # SQLite/JSON 列可能是字符串，反序列化（最多 2 层兜底）
+    for key in ("source_structure", "manual_headers"):
+        v = info.get(key)
+        for _ in range(2):
+            if isinstance(v, str):
+                try:
+                    v = json.loads(v)
+                except (json.JSONDecodeError, TypeError):
+                    v = None
+                    break
+        info[key] = v
+    return info
+
+
 def _persist_compute_start(tenant_id: str, script_id_str: str,
                            salary_year: int = None, salary_month: int = None):
     """创建计算任务记录，返回 (db_session, task_id) 或 (None, None)"""
@@ -3755,6 +3904,8 @@ async def run_compute_task(
     salary_month=None,
     standard_hours=None,
     file_passwords=None,
+    pre_validated_mapping=None,
+    precheck_auto_filled=None,
 ):
     """独立的计算任务函数，由 submit 端点触发后台运行。
 
@@ -3769,6 +3920,8 @@ async def run_compute_task(
         salary_month: 薪资月份
         standard_hours: 标准工时
         file_passwords: 文件密码 JSON 字符串
+        pre_validated_mapping: submit 阶段事前校验通过的 file_mapping（仅用于日志，不阻断重新匹配）
+        precheck_auto_filled: submit 阶段自动从基础资料补全的文件列表（仅日志展示）
     """
     from backend.compute.task_log_buffer import TaskLogBuffer
 
@@ -3809,6 +3962,21 @@ async def run_compute_task(
             "message": f"保存源文件到临时目录: {source_dir}"
         }
         buffer.push(task_id, json.dumps(log_msg, ensure_ascii=False))
+
+        # 事前校验结果回显
+        if precheck_auto_filled:
+            _af_detail = ", ".join(
+                f'{f.get("file_name")}(来自{f.get("source")}基础资料)' for f in precheck_auto_filled
+            )
+            buffer.push(task_id, json.dumps({
+                "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "level": "info", "message": f"事前校验：自动补全 {_af_detail}"
+            }, ensure_ascii=False))
+        if pre_validated_mapping:
+            buffer.push(task_id, json.dumps({
+                "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "level": "info", "message": f"事前校验通过（{len(pre_validated_mapping)} 个文件已确认映射）"
+            }, ensure_ascii=False))
 
         # 解析文件密码
         passwords_dict = {}
@@ -4035,15 +4203,15 @@ async def run_compute_task(
 
                             # 验证预加载数据是否包含训练时的所有 sheet
                             expected_keys = set()
-                            _ek_used = set()
+                            _ek_pairs = []
                             for train_file, file_data in source_structure.get("files", {}).items():
                                 if "error" in file_data:
                                     continue
                                 file_base = train_file.replace('.xlsx', '').replace('.xls', '')
                                 for sn in file_data.get("sheets", {}).keys():
-                                    key = f"{file_base}_{sn}"
-                                    key = make_unique_sheet_key(key, _ek_used)
-                                    expected_keys.add(key)
+                                    _ek_pairs.append((file_base, sn))
+                            _ek_map = assign_sheet_keys(_ek_pairs)
+                            expected_keys = set(_ek_map.values())
 
                             missing_keys = expected_keys - set(pre_loaded_source_data.keys())
                             if missing_keys:
@@ -4327,6 +4495,8 @@ async def compute_submit(
     salary_month: Optional[int] = Form(None),
     standard_hours: Optional[float] = Form(None),
     file_passwords: Optional[str] = Form(None),
+    confirmed_mapping: Optional[str] = Form(None),
+    skip_history_check: Optional[bool] = Form(False),
 ):
     """提交计算任务，立即返回 task_id，计算在后台运行。"""
     try:
@@ -4355,7 +4525,7 @@ async def compute_submit(
             except Exception:
                 pass
 
-        from backend.utils.aspose_helper import is_encrypted as _is_enc
+        from backend.utils.aspose_helper import is_encrypted as _is_enc, decrypt_excel as _dec_excel
         encrypted_files = []
         for file_path in source_dir.iterdir():
             if file_path.is_file() and file_path.suffix.lower() in ('.xlsx', '.xls', '.xlsm'):
@@ -4370,6 +4540,81 @@ async def compute_submit(
                 status_code=422,
                 content={"error_type": "encrypted_files", "encrypted_files": encrypted_files,
                          "message": f"检测到加密文件: {', '.join(encrypted_files)}"},
+            )
+
+        # 3.5 解密带密码的文件（事前校验需要读取列结构）
+        if passwords_dict:
+            for file_path in source_dir.iterdir():
+                if not file_path.is_file() or file_path.suffix.lower() not in ('.xlsx', '.xls', '.xlsm'):
+                    continue
+                pwd = passwords_dict.get(file_path.name)
+                if pwd:
+                    fp_str = str(file_path.resolve())
+                    if _is_enc(fp_str):
+                        try:
+                            decrypted = _dec_excel(fp_str, password=pwd)
+                            shutil.move(decrypted, fp_str)
+                        except Exception as _de:
+                            logger.warning(f"[compute/submit] 解密 {file_path.name} 失败: {_de}")
+
+        # 3.6 banner-split 多区域预处理
+        try:
+            from backend.utils.banner_splitter import preprocess_uploaded_files
+            preprocess_uploaded_files([
+                str(p.resolve()) for p in source_dir.iterdir()
+                if p.is_file() and p.suffix.lower() in ('.xlsx', '.xlsm')
+            ])
+        except Exception as _bs_err:
+            logger.warning(f"[compute/submit] banner-split 预处理失败（继续）: {_bs_err}")
+
+        # 3.7 事前校验（基础资料兜底 + 表头匹配 + AI 建议 + 历史数据）
+        from backend.utils.compute_precheck import precheck_compute
+        from fastapi.responses import JSONResponse
+
+        _script_info = _load_script_info_for_precheck(tenant_id, script_id)
+        _source_structure = _script_info.get("source_structure")
+        _manual_headers = _script_info.get("manual_headers")
+
+        _confirmed = None
+        if confirmed_mapping:
+            try:
+                _confirmed = json.loads(confirmed_mapping)
+            except Exception as _ce:
+                logger.warning(f"[compute/submit] confirmed_mapping 解析失败: {_ce}")
+
+        _precheck_db = SessionLocal()
+        try:
+            pc_result = precheck_compute(
+                source_dir=str(source_dir),
+                source_structure=_source_structure,
+                manual_headers=_manual_headers,
+                script_content=script_content,
+                tenant_id=tenant_id,
+                salary_year=salary_year,
+                salary_month=salary_month,
+                db_session=_precheck_db,
+                ai_provider_name=os.environ.get("AI_PROVIDER", "deepseek"),
+                confirmed_mapping=_confirmed,
+            )
+        finally:
+            try:
+                _precheck_db.close()
+            except Exception:
+                pass
+
+        # 历史数据警告：未带 skip_history_check 时也阻断（让用户确认）
+        if (not pc_result.ok) or (pc_result.history_warnings and not skip_history_check):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error_type": "precheck_failed",
+                    "missing_files": pc_result.missing_files,
+                    "auto_filled": pc_result.auto_filled,
+                    "missing_columns": pc_result.missing_columns,
+                    "ai_suggestions": pc_result.ai_suggestions,
+                    "history_warnings": pc_result.history_warnings,
+                },
             )
 
         # 4. 创建 DB 任务
@@ -4396,6 +4641,8 @@ async def compute_submit(
             salary_month=salary_month,
             standard_hours=standard_hours,
             file_passwords=file_passwords,
+            pre_validated_mapping=pc_result.file_mapping,
+            precheck_auto_filled=pc_result.auto_filled,
         ))
 
         logger.info(f"[compute/submit] 任务已提交: task_id={task_id_str}")
@@ -4811,15 +5058,15 @@ async def compute_with_script_stream(
 
                                         # 验证预加载数据是否包含训练时的所有 sheet
                                         expected_keys = set()
-                                        _ek_used2 = set()
+                                        _ek_pairs2 = []
                                         for train_file, file_data in source_structure.get("files", {}).items():
                                             if "error" in file_data:
                                                 continue
                                             file_base = train_file.replace('.xlsx', '').replace('.xls', '')
                                             for sn in file_data.get("sheets", {}).keys():
-                                                key = f"{file_base}_{sn}"
-                                                key = make_unique_sheet_key(key, _ek_used2)
-                                                expected_keys.add(key)
+                                                _ek_pairs2.append((file_base, sn))
+                                        _ek_map2 = assign_sheet_keys(_ek_pairs2)
+                                        expected_keys = set(_ek_map2.values())
 
                                         missing_keys = expected_keys - set(pre_loaded_source_data.keys())
                                         if missing_keys:
@@ -5508,6 +5755,22 @@ async def rules_page():
     raise HTTPException(status_code=404, detail="规则整理页面未找到")
 
 
+@app.get("/tools", response_class=HTMLResponse)
+async def tools_page():
+    """智能小工具页面 (Sheet拆分 / 模版管理 / 训练历史 / 计算历史 / 数据对比)"""
+    _frontend_dir = Path(__file__).resolve().parent.parent.parent / "frontend"
+    template_file = _frontend_dir / "templates" / "tools.html"
+    if template_file.exists():
+        return HTMLResponse(content=template_file.read_text(encoding="utf-8"))
+    raise HTTPException(status_code=404, detail="智能小工具页面未找到")
+
+
+@app.get("/tools/split-sheet", response_class=HTMLResponse)
+async def tools_split_sheet_redirect():
+    """旧链接兼容: 重定向到新的 /tools 页面"""
+    return RedirectResponse(url="/tools", status_code=302)
+
+
 # ==================== 前端兼容API端点 ====================
 
 @app.get("/api/download-script/{tenant_id}")
@@ -5674,7 +5937,7 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
                     "created": created or datetime.fromtimestamp(script_dir.stat().st_mtime).isoformat()
                 })
 
-        # 合并 DB 中的脚本（文件系统没有的）
+        # 合并 DB 中的脚本（按 name 去重，只取每个 name 的最新有效版本）
         try:
             db_scripts = db.query(db_models.Script).filter(
                 db_models.Script.tenant_id == tenant_id,
@@ -5684,6 +5947,8 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
                 if ds.name not in fs_script_ids:
                     scripts.append({
                         "script_id": ds.name,
+                        "name": ds.name,
+                        "version": ds.version,
                         "score": ds.accuracy,
                         "is_active": ds.name == active_script_id,
                         "created": ds.created_at.isoformat() if ds.created_at else None,
@@ -5921,11 +6186,20 @@ async def get_training_detail(
 
 
 @app.get("/api/tenants")
-async def list_tenants():
-    """获取所有租户列表及其训练状态"""
+async def list_tenants(
+    current_user=Depends(get_current_user),
+    accessible_tenants: list = Depends(get_operable_tenants),
+):
+    """获取租户列表(自己训练过的 ∪ 已授权的;admin 看全部)"""
     try:
         tenants_dir = storage_manager.base_dir
         tenants = []
+
+        is_admin = current_user.role and current_user.role.name == "admin"
+        allowed_set = set(accessible_tenants)
+
+        def _allowed(tid: str) -> bool:
+            return is_admin or (tid in allowed_set)
 
         # 从数据库获取每个租户的最佳训练会话准确率
         db_best = {}
@@ -5952,6 +6226,8 @@ async def list_tenants():
                 if not tenant_dir.is_dir():
                     continue
                 tenant_id = tenant_dir.name
+                if not _allowed(tenant_id):
+                    continue
 
                 tenant_info = {
                     "tenant_id": tenant_id,
@@ -5993,14 +6269,15 @@ async def list_tenants():
         # 补充只存在于数据库中的智训租户（没有文件系统目录）
         fs_tenant_ids = {t["tenant_id"] for t in tenants}
         for tid, acc in db_best.items():
-            if tid not in fs_tenant_ids:
-                tenants.append({
-                    "tenant_id": tid,
-                    "has_training": True,
-                    "best_score": acc,
-                    "script_id": None,
-                    "last_training": None,
-                })
+            if tid in fs_tenant_ids or not _allowed(tid):
+                continue
+            tenants.append({
+                "tenant_id": tid,
+                "has_training": True,
+                "best_score": acc,
+                "script_id": None,
+                "last_training": None,
+            })
 
         return {"tenants": tenants}
     except Exception as e:
@@ -6009,9 +6286,10 @@ async def list_tenants():
 
 @app.get("/api/training-history")
 async def get_all_training_history(
-    accessible_tenants: list = Depends(get_accessible_tenants),
+    current_user=Depends(get_current_user),
+    accessible_tenants: list = Depends(get_operable_tenants),
 ):
-    """获取当前用户有权限的租户的训练历史"""
+    """获取当前用户有权限的租户的训练历史(自己训练过的 ∪ 已授权;admin 看全部)"""
     try:
         tenants_dir = storage_manager.base_dir
         result = {}
@@ -6019,14 +6297,17 @@ async def get_all_training_history(
         if not tenants_dir.exists():
             return {"history": result}
 
-        # 只返回用户有权限的租户
+        is_admin = current_user.role and current_user.role.name == "admin"
         allowed_set = set(accessible_tenants)
+
+        def _allowed(tid: str) -> bool:
+            return is_admin or (tid in allowed_set)
 
         for tenant_dir in sorted(tenants_dir.iterdir()):
             if not tenant_dir.is_dir():
                 continue
             tenant_id = tenant_dir.name
-            if tenant_id not in allowed_set:
+            if not _allowed(tenant_id):
                 continue
             logs_dir = tenant_dir / "training_logs"
 

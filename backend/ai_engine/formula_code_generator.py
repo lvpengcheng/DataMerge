@@ -1754,8 +1754,10 @@ def load_source_data(input_folder, manual_headers):
         return _cached
 
     source_data = {}
-    _used_keys = set()
     parser = IntelligentExcelParser()
+
+    # 先采集所有 (file_base, sheet_name, merged_df, columns)，最后统一分配 key
+    _collected = []
 
     for filename in sorted(os.listdir(input_folder)):
         if not filename.endswith(('.xlsx', '.xls')) or filename.startswith('~'):
@@ -1799,40 +1801,49 @@ def load_source_data(input_folder, manual_headers):
                 else:
                     merged_df = pd.concat(dfs, ignore_index=True)
 
-                # sheet名称格式：文件名_sheet名
-                sheet_name = f"{file_base}_{sheet_data.sheet_name}"
-                # 截断到31字符（Excel sheet名限制），碰撞时追加后缀
-                if len(sheet_name) > 31:
-                    sheet_name = sheet_name[:31]
-                _base = sheet_name
-                _counter = 2
-                while sheet_name in _used_keys:
-                    _suffix = f"_{_counter}"
-                    sheet_name = _base[:31 - len(_suffix)] + _suffix
-                    _counter += 1
-                _used_keys.add(sheet_name)
-
                 # 序号列补全：如果序号/SN列存在但全为空，填充连续序号
                 # 防止清洗代码误将None转"None"后过滤掉所有行
                 for _sn_col in merged_df.columns:
                     if ('序号' in str(_sn_col) or 'S/N' in str(_sn_col).upper()) and len(merged_df) > 0:
                         if merged_df[_sn_col].isna().all():
                             merged_df[_sn_col] = range(1, len(merged_df) + 1)
-                            print(f"[序号补全] {sheet_name}: 列'{_sn_col}'全空, 已填充1~{len(merged_df)}")
 
-                source_data[sheet_name] = {
-                    "df": merged_df,
-                    "columns": columns
-                }
-                if len(merged_df) > 0:
-                    print(f"加载源数据: {sheet_name}, 列: {columns}, 行数: {len(merged_df)}")
-                else:
-                    print(f"加载源数据: {sheet_name}, 列: {columns}, 行数: 0 (只有表头)")
+                _collected.append((file_base, sheet_data.sheet_name, merged_df, columns))
 
         except Exception as e:
             print(f"[错误] 解析文件 {filename} 失败: {e}")
             import traceback
             traceback.print_exc()
+
+    # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 → 加文件名前缀
+    _name_count = {}
+    for _fb, _sn, _, _ in _collected:
+        _name_count[_sn] = _name_count.get(_sn, 0) + 1
+    _used_keys = set()
+    for file_base, sheet_name_orig, merged_df, columns in _collected:
+        if _name_count.get(sheet_name_orig, 0) <= 1:
+            _raw_key = sheet_name_orig
+        else:
+            _raw_key = f"{file_base}_{sheet_name_orig}"
+        if len(_raw_key) > 31:
+            _raw_key = _raw_key[:31]
+        _base = _raw_key
+        _counter = 2
+        sheet_name = _raw_key
+        while sheet_name in _used_keys:
+            _suffix = f"_{_counter}"
+            sheet_name = _base[:31 - len(_suffix)] + _suffix
+            _counter += 1
+        _used_keys.add(sheet_name)
+
+        source_data[sheet_name] = {
+            "df": merged_df,
+            "columns": columns
+        }
+        if len(merged_df) > 0:
+            print(f"加载源数据: {sheet_name}, 列: {columns}, 行数: {len(merged_df)}")
+        else:
+            print(f"加载源数据: {sheet_name}, 列: {columns}, 行数: 0 (只有表头)")
 
 
     if not source_data:
@@ -2700,7 +2711,8 @@ def main():
         comparison_result: str,
         rules_content: str,
         source_structure: str,
-        stream_callback: callable = None
+        stream_callback: callable = None,
+        iteration_num: int = 1
     ) -> str:
         """生成修正后的代码
 
@@ -2712,6 +2724,7 @@ def main():
             rules_content: 规则内容
             source_structure: 源数据结构描述
             stream_callback: 流式回调
+            iteration_num: 当前修正轮次（>=2 时启用"换思路"指令防止死循环）
 
         Returns:
             修正后的完整代码
@@ -2746,6 +2759,22 @@ def main():
         correction_quick_ref = PromptGenerator.CORRECTION_QUICK_REF
         correction_forbidden = PromptGenerator.CORRECTION_FORBIDDEN
 
+        # 第 2 轮起：标注"你上一轮的代码"并加入"换思路"指令，防止死循环
+        is_retry = iteration_num >= 2
+        if is_retry:
+            prev_code_label = f"## 你上一轮（第 {iteration_num - 1} 轮）生成的 fill_result_sheets 函数"
+            retry_directive = f"""
+⚠️⚠️⚠️ **本次为第 {iteration_num} 轮修正，请严格遵守以下"换思路"原则：**
+
+1. 上方代码 **就是你自己上一轮（第 {iteration_num - 1} 轮）生成并已验证为不正确的版本**——本次差异与上一轮高度相似（即上次的修正没起作用），说明上次的修改方向是错误的
+2. **禁止重复同一种修正套路**：如果上次改的是公式参数，本次请考虑换不同的公式/换不同的源列/换不同的合并方式；如果上次只动 VLOOKUP 第 N 个参数，本次请考虑是否整列逻辑就错了
+3. **对每一个 diff 中的字段**，先在心里回答："上一版的代码是用什么思路写的？为什么这个思路得不到正确结果？换什么思路能避开这个问题？"——再动笔改
+4. 如果你确认上一版思路本质正确（只是参数细节有错），请在代码注释中明确写出"// 思路与上一轮一致，仅修正：xxx"，否则默认必须换思路
+"""
+        else:
+            prev_code_label = "## 原始fill_result_sheets函数"
+            retry_directive = ""
+
         prompt = f"""你是专业Python程序员，擅长人力资源行业的薪资计算、税务处理、考勤管理，了解HR行业的各种术语,同时你也是一个EXCEL公式大师，熟悉每个公式的使用方法和使用场景。请修正fill_result_sheets函数。
 
 【任务说明】
@@ -2758,14 +2787,14 @@ def main():
 4. **对于未提到的列，直接复制粘贴原始代码** — 不要"优化"、"改进"、"简化"任何未被用户指出的列
 5. **缩进纪律** — break退出for循环后必须回退到for的缩进级别；if/else结束后后续代码必须与if同级，禁止嵌套在else内部；所有# === N. ===步骤注释必须在同一缩进级别
 
-## 原始fill_result_sheets函数
+{prev_code_label}
 ```python
 {original_fill_function}
 ```
 
 ## 与预期结果的差异（仅作参考，以用户反馈为准）
 {comparison_result}
-
+{retry_directive}
 ## 计算规则（参考）
 {rules_content[:70000]}
 
@@ -2863,7 +2892,8 @@ def main():
         source_structure: str,
         expected_structure: dict,
         stream_callback: callable = None,
-        user_feedback: str = None
+        user_feedback: str = None,
+        iteration_num: int = 1
     ) -> tuple:
         """精准列级修正：只修改有差异的列，保留正确列不变
 
@@ -2878,6 +2908,7 @@ def main():
             expected_structure: 预期输出结构
             stream_callback: 流式回调
             user_feedback: 用户的修正指示（优先于自动差异描述）
+            iteration_num: 当前修正轮次（>=2 时启用"换思路"指令防止死循环）
 
         Returns:
             (complete_code, ai_response) 或 (None, ai_response) 如果列级修正失败
@@ -2920,6 +2951,18 @@ def main():
             expected_structure=expected_structure,
             rules_content=rules_content
         )
+
+        # 第 2 轮起在 prompt 末尾追加"换思路"指令，避免 AI 重复同一种修正套路导致死循环
+        if iteration_num >= 2:
+            prompt += f"""
+
+⚠️⚠️⚠️ **本次为第 {iteration_num} 轮列级修正，请严格遵守以下"换思路"原则：**
+
+1. 上方"待修正函数"中针对这些差异列的代码，**就是你自己上一轮（第 {iteration_num - 1} 轮）生成且已验证仍有差异的版本**——本次差异与上一轮高度相似，说明上次的修正方向无效
+2. **禁止重复同一种修正套路**：如果上次改的是公式参数，本次请考虑换不同的公式/换不同的源列/换不同的合并方式；不要只在同一公式上微调参数
+3. **对每一个差异列**，先在心里回答："上一版的代码是用什么思路写的？为什么这个思路得不到正确结果？换什么思路能避开这个问题？"——再动笔改
+4. 如果你确认上一版思路本质正确（只是参数细节有错），请在代码注释中明确写出 # 思路与上一轮一致，仅修正：xxx；否则默认必须换思路
+"""
 
         if self.training_logger:
             self.training_logger.log_full_prompt(prompt, "column_correct")

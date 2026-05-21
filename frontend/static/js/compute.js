@@ -7,6 +7,7 @@ let _encryptionCheckInProgress = false;  // 加密检测进行中
 let _currentEventSource = null;  // 当前 EventSource 连接
 let _lastEventId = 0;           // 最后收到的 SSE event id
 let _currentTaskId = null;      // 当前计算任务 ID
+let _permittedTenantIds = new Set();  // 当前用户有权操作的租户
 
 /**
  * 弹出密码输入对话框，为加密文件输入密码
@@ -58,6 +59,221 @@ function _promptFilePasswords(encryptedFiles) {
         setTimeout(() => document.getElementById('_enc_pwd_0')?.focus(), 100);
     });
 }
+
+/**
+ * 事前校验失败弹窗：展示缺失文件 / 缺失列 / AI 建议 / 历史警告，
+ * 让用户调整列映射并确认是否仍计算。
+ * @param {object} data - 后端 422 返回体: {missing_files, missing_columns, ai_suggestions, history_warnings, auto_filled, file_mapping}
+ * @returns {Promise<{confirmed_mapping?: object, skip_history_check?: boolean}|null>}
+ */
+function _showPrecheckDialog(data) {
+    return new Promise((resolve) => {
+        const missingFiles = data.missing_files || [];
+        const missingColumns = data.missing_columns || [];
+        const aiSuggestions = data.ai_suggestions || [];
+        const historyWarnings = data.history_warnings || [];
+        const autoFilled = data.auto_filled || [];
+
+        // 收集 expected 路径列表（来自缺失列）和 actual 路径列表（来自 AI 建议）
+        const expectedPaths = [];
+        missingColumns.forEach(item => {
+            if (item.error || !item.expected_columns) return;
+            (item.expected_columns || []).forEach(col => {
+                expectedPaths.push(`${item.file} > ${item.sheet} > ${col}`);
+            });
+        });
+        // 提取所有候选 actual_path（出现过的 suggested_path 集合 + 让用户输入）
+        const actualPathsSet = new Set();
+        aiSuggestions.forEach(s => {
+            if (s.suggested_path) actualPathsSet.add(s.suggested_path);
+        });
+        const actualPaths = Array.from(actualPathsSet);
+
+        // AI 建议表格
+        const aiTableHtml = aiSuggestions.length === 0
+            ? '<div style="color:#999;font-size:13px;padding:8px;">无 AI 建议</div>'
+            : `<table style="width:100%;border-collapse:collapse;font-size:12px;">
+                <thead><tr style="background:#f5f5f5;">
+                    <th style="padding:6px;border:1px solid #e0e0e0;text-align:left;">训练期望列</th>
+                    <th style="padding:6px;border:1px solid #e0e0e0;text-align:left;">AI 建议对应</th>
+                    <th style="padding:6px;border:1px solid #e0e0e0;text-align:center;width:70px;">置信度</th>
+                    <th style="padding:6px;border:1px solid #e0e0e0;text-align:left;">原因</th>
+                </tr></thead>
+                <tbody>
+                ${aiSuggestions.map((s, i) => {
+                    const conf = (s.confidence ?? 0).toFixed(2);
+                    const confColor = s.confidence >= 0.8 ? '#388e3c' : (s.confidence >= 0.5 ? '#f57c00' : '#d32f2f');
+                    const options = ['<option value="">（不映射）</option>']
+                        .concat(actualPaths.map(p => `<option value="${_escapeHtml(p)}"${p === s.suggested_path ? ' selected' : ''}>${_escapeHtml(p)}</option>`))
+                        .join('');
+                    return `<tr>
+                        <td style="padding:6px;border:1px solid #e0e0e0;font-family:monospace;font-size:11px;">${_escapeHtml(s.expected_path || '')}</td>
+                        <td style="padding:4px;border:1px solid #e0e0e0;">
+                            <select data-ai-idx="${i}" style="width:100%;padding:3px;font-size:11px;font-family:monospace;">${options}</select>
+                        </td>
+                        <td style="padding:6px;border:1px solid #e0e0e0;text-align:center;color:${confColor};font-weight:bold;">${conf}</td>
+                        <td style="padding:6px;border:1px solid #e0e0e0;font-size:11px;color:#666;">${_escapeHtml(s.reason || '')}</td>
+                    </tr>`;
+                }).join('')}
+                </tbody>
+            </table>`;
+
+        // 缺失文件块
+        const missingFilesHtml = missingFiles.length === 0 ? '' : `
+            <div style="margin-bottom:14px;padding:10px 12px;border:1px solid #ffcdd2;background:#ffebee;border-radius:6px;">
+                <div style="font-weight:bold;color:#c62828;margin-bottom:6px;">⚠ 缺失文件（基础资料未能兜底）</div>
+                <ul style="margin:0;padding-left:20px;font-size:13px;color:#b71c1c;">
+                    ${missingFiles.map(f => `<li>${_escapeHtml(f)}</li>`).join('')}
+                </ul>
+                <div style="font-size:12px;color:#666;margin-top:6px;">请关闭此弹窗，补齐文件后重试。</div>
+            </div>`;
+
+        // 自动兜底块
+        const autoFilledHtml = autoFilled.length === 0 ? '' : `
+            <div style="margin-bottom:14px;padding:10px 12px;border:1px solid #c8e6c9;background:#e8f5e9;border-radius:6px;">
+                <div style="font-weight:bold;color:#2e7d32;margin-bottom:6px;">✓ 已自动从基础资料补全</div>
+                <ul style="margin:0;padding-left:20px;font-size:12px;color:#1b5e20;">
+                    ${autoFilled.map(f => `<li>${_escapeHtml(f.file || f.name || JSON.stringify(f))}</li>`).join('')}
+                </ul>
+            </div>`;
+
+        // 缺失列块
+        const missingColsHtml = missingColumns.length === 0 ? '' : `
+            <div style="margin-bottom:14px;padding:10px 12px;border:1px solid #ffe0b2;background:#fff3e0;border-radius:6px;">
+                <div style="font-weight:bold;color:#e65100;margin-bottom:6px;">⚠ 列匹配未通过</div>
+                <details><summary style="cursor:pointer;font-size:12px;color:#666;">展开详情（${missingColumns.length} 项）</summary>
+                <ul style="margin:6px 0 0;padding-left:20px;font-size:11px;color:#5d4037;max-height:120px;overflow:auto;">
+                    ${missingColumns.map(c => `<li>${_escapeHtml(c.file)} > ${_escapeHtml(c.sheet)} ${c.error ? '：' + _escapeHtml(c.error) : ''}</li>`).join('')}
+                </ul>
+                </details>
+            </div>`;
+
+        // 历史警告块
+        const historyHtml = historyWarnings.length === 0 ? '' : `
+            <div style="margin-bottom:14px;padding:10px 12px;border:1px solid #fff59d;background:#fffde7;border-radius:6px;">
+                <div style="font-weight:bold;color:#f57f17;margin-bottom:6px;">⚠ 历史数据警告</div>
+                <ul style="margin:0;padding-left:20px;font-size:13px;color:#827717;">
+                    ${historyWarnings.map(w => `<li>${_escapeHtml(w)}</li>`).join('')}
+                </ul>
+                <label style="display:flex;align-items:center;margin-top:8px;font-size:12px;color:#5d4037;cursor:pointer;">
+                    <input type="checkbox" id="_pre_skip_history" style="margin-right:6px;">
+                    我已知悉，仍要继续计算
+                </label>
+            </div>`;
+
+        // AI 建议块
+        const aiSuggestionsHtml = `
+            <div style="margin-bottom:14px;">
+                <div style="font-weight:bold;font-size:13px;margin-bottom:6px;color:#333;">AI 列映射建议（可手动调整）</div>
+                <div style="max-height:280px;overflow:auto;border:1px solid #e0e0e0;border-radius:4px;">${aiTableHtml}</div>
+                <div style="font-size:11px;color:#999;margin-top:4px;">
+                    格式：<code>文件名 > Sheet名 > 列名</code>。Sheet 名可能包含 banner 后缀（如 <code>数据-合同工</code>）。
+                </div>
+            </div>`;
+
+        const canRetry = missingFiles.length === 0;
+        const overlay = document.createElement('div');
+        overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:9999;display:flex;align-items:center;justify-content:center;';
+        overlay.innerHTML = `
+            <div style="background:#fff;border-radius:10px;padding:24px;width:780px;max-width:96vw;max-height:90vh;display:flex;flex-direction:column;box-shadow:0 4px 20px rgba(0,0,0,0.2);">
+                <h3 style="margin:0 0 6px;font-size:17px;">事前校验未通过</h3>
+                <p style="margin:0 0 14px;font-size:13px;color:#666;">系统检测到部分文件/列与训练时不一致。请查看并确认后再继续。</p>
+                <div style="overflow:auto;flex:1;padding-right:4px;">
+                    ${missingFilesHtml}
+                    ${autoFilledHtml}
+                    ${missingColsHtml}
+                    ${aiSuggestionsHtml}
+                    ${historyHtml}
+                </div>
+                <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px;border-top:1px solid #eee;padding-top:12px;">
+                    <button id="_pre_cancel" style="padding:8px 20px;border:1px solid #ddd;border-radius:4px;background:#fff;cursor:pointer;">取消</button>
+                    <button id="_pre_confirm" ${canRetry ? '' : 'disabled'} style="padding:8px 20px;border:none;border-radius:4px;background:${canRetry ? '#1976d2' : '#bdbdbd'};color:#fff;cursor:${canRetry ? 'pointer' : 'not-allowed'};">
+                        ${canRetry ? '按当前映射重试' : '请先补齐缺失文件'}
+                    </button>
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+
+        document.getElementById('_pre_cancel').onclick = () => {
+            document.body.removeChild(overlay);
+            resolve(null);
+        };
+
+        const confirmBtn = document.getElementById('_pre_confirm');
+        if (confirmBtn && !confirmBtn.disabled) {
+            confirmBtn.onclick = () => {
+                // 收集用户调整后的 AI 映射 → 转换为 file_mapping 结构
+                const fileMapping = _buildFileMappingFromAiSelections(overlay, aiSuggestions, data.file_mapping);
+                const skipHistory = document.getElementById('_pre_skip_history')?.checked || false;
+                document.body.removeChild(overlay);
+                resolve({
+                    confirmed_mapping: { file_mapping: fileMapping },
+                    skip_history_check: skipHistory,
+                });
+            };
+        }
+    });
+}
+
+/**
+ * 把 AI 建议表格的用户选择转换成 FastHeaderMatcher.file_mapping 结构。
+ * 输出格式：
+ * {
+ *   "<上传文件名>": {
+ *     "expected_file": "<训练文件名>",
+ *     "sheet_mapping": {"<上传 sheet>": "<训练 sheet>"},
+ *     "header_mapping": {"<上传列>": "<训练列>"}
+ *   }
+ * }
+ */
+function _buildFileMappingFromAiSelections(overlay, aiSuggestions, originalFileMapping) {
+    const result = {};
+    const selects = overlay.querySelectorAll('select[data-ai-idx]');
+    selects.forEach(sel => {
+        const idx = parseInt(sel.dataset.aiIdx, 10);
+        const sug = aiSuggestions[idx];
+        if (!sug || !sug.expected_path) return;
+        const actualPath = sel.value;
+        if (!actualPath) return;
+
+        const exp = _splitPath(sug.expected_path);
+        const act = _splitPath(actualPath);
+        if (!exp || !act) return;
+
+        // 以「上传文件名」为 key
+        if (!result[act.file]) {
+            result[act.file] = {
+                expected_file: exp.file,
+                sheet_mapping: {},
+                header_mapping: {},
+            };
+        }
+        result[act.file].sheet_mapping[act.sheet] = exp.sheet;
+        result[act.file].header_mapping[act.col] = exp.col;
+    });
+
+    // 合并原始 file_mapping（如果有）做兜底
+    if (originalFileMapping && typeof originalFileMapping === 'object') {
+        Object.entries(originalFileMapping).forEach(([k, v]) => {
+            if (!result[k]) result[k] = v;
+        });
+    }
+    return result;
+}
+
+function _splitPath(path) {
+    if (!path) return null;
+    const parts = path.split('>').map(s => s.trim());
+    if (parts.length < 3) return null;
+    return { file: parts[0], sheet: parts[1], col: parts.slice(2).join(' > ') };
+}
+
+function _escapeHtml(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 
 /**
  * 文件选择后，调用服务端 Aspose 检测加密，有加密则立即弹窗
@@ -179,6 +395,33 @@ async function loadTenantList() {
     } catch (e) {
         console.error('加载租户列表失败:', e);
     }
+    // 加载当前用户可访问的租户（用于按钮灰化）
+    try {
+        const resp2 = await AUTH.authFetch('/api/dashboard/tenants');
+        if (resp2.ok) {
+            const data2 = await resp2.json();
+            const items = data2.items || data2.tenants || data2 || [];
+            _permittedTenantIds = new Set(items.map(t => t.tenant_id || t.id || t.name).filter(Boolean));
+        }
+    } catch (e) {
+        console.warn('加载可访问租户失败:', e);
+    }
+    _applyTenantPermission();
+}
+
+function _applyTenantPermission() {
+    const btn = document.getElementById('compute-btn');
+    if (!btn) return;
+    const tid = currentTenantId;
+    const allowed = !tid || _permittedTenantIds.size === 0 || _permittedTenantIds.has(tid);
+    if (!allowed) {
+        btn.disabled = true;
+        btn.title = '您无权操作此租户';
+    } else {
+        btn.title = '';
+        // 实际是否可用由 checkCanCompute 决定
+        checkCanCompute();
+    }
 }
 
 function showTenantDropdown() {
@@ -218,6 +461,7 @@ function selectTenant(tenantId) {
 async function onTenantSelected(tenantId) {
     currentTenantId = tenantId;
     await loadTenantScripts(tenantId);
+    _applyTenantPermission();
     checkCanCompute();
 }
 
@@ -243,13 +487,15 @@ async function loadTenantScripts(tenantId) {
         }
 
         // 按分数排序，最高分在前
-        const scripts = data.scripts.sort((a, b) => b.score - a.score);
+        const scripts = data.scripts.sort((a, b) => (b.score || 0) - (a.score || 0));
 
-        selector.innerHTML = scripts.map(s => `
-            <option value="${s.script_id}" ${s.is_active ? 'selected' : ''}>
-                ${s.script_id} - ${(s.score * 100).toFixed(2)}% ${s.is_active ? '(当前)' : ''}
-            </option>
-        `).join('');
+        selector.innerHTML = scripts.map(s => {
+            const label = s.name || s.script_id;
+            const ver = s.version ? ` v${s.version}` : '';
+            const score = (s.score != null) ? ` · ${(s.score * 100).toFixed(1)}%` : '';
+            const cur = s.is_active ? ' (当前)' : '';
+            return `<option value="${s.script_id}" ${s.is_active ? 'selected' : ''}>${label}${ver}${score}${cur}</option>`;
+        }).join('');
 
         group.style.display = 'block';
 
@@ -303,19 +549,20 @@ function updateFileList() {
         return;
     }
 
-    let html = '<div style="margin-top: 8px; font-size: 13px; color: #666;">';
-    Array.from(input.files).forEach(file => {
-        html += `<div style="padding: 4px 0;">📄 ${file.name}</div>`;
-    });
-    html += '</div>';
-    list.innerHTML = html;
+    const arr = Array.from(input.files);
+    const first = arr[0].name;
+    const allNames = arr.map(f => f.name).join('\n');
+    const text = arr.length === 1 ? `📄 ${first}` : `📄 ${first} 等 ${arr.length} 个文件`;
+    list.innerHTML = `<div style="margin-top:8px;font-size:13px;color:#666;padding:4px 0;" title="${allNames}">${text}</div>`;
 }
 
 function checkCanCompute() {
     const btn = document.getElementById('compute-btn');
     const hasFiles = document.getElementById('source-files').files.length > 0;
     const hasTenant = currentTenantId && currentScriptId;
-    btn.disabled = !(hasFiles && hasTenant);
+    const allowed = !currentTenantId || _permittedTenantIds.size === 0 || _permittedTenantIds.has(currentTenantId);
+    btn.disabled = !(hasFiles && hasTenant && allowed);
+    if (!allowed) btn.title = '您无权操作此租户';
 }
 
 // ==================== 计算执行 ====================
@@ -392,6 +639,43 @@ async function startCompute() {
         if (!resp.ok) {
             let errorData = null;
             try { errorData = await resp.json(); } catch (e) {}
+
+            // 事前校验失败（422 + precheck_failed）
+            if (resp.status === 422 && errorData && errorData.error_type === 'precheck_failed') {
+                addLog('warning', '事前校验未通过，等待用户确认...');
+                const dialogResult = await _showPrecheckDialog(errorData);
+                if (!dialogResult) {
+                    addLog('info', '用户取消了校验确认');
+                    btn.disabled = false;
+                    btn.textContent = '开始计算';
+                    updateStatus('等待计算');
+                    updateProgress(0);
+                    return;
+                }
+                if (dialogResult.confirmed_mapping) {
+                    formData.set('confirmed_mapping', JSON.stringify(dialogResult.confirmed_mapping));
+                }
+                if (dialogResult.skip_history_check) {
+                    formData.set('skip_history_check', 'true');
+                }
+                addLog('info', '正在用确认后的映射重新提交...');
+                const retryResp2 = await AUTH.authFetch('/api/compute/submit', {
+                    method: 'POST',
+                    body: formData
+                });
+                if (!retryResp2.ok) {
+                    let retryError = '';
+                    try { retryError = (await retryResp2.json()).detail || ''; } catch (e) {}
+                    throw new Error(retryError || `HTTP error! status: ${retryResp2.status}`);
+                }
+                const retryData2 = await retryResp2.json();
+                _currentTaskId = retryData2.task_id;
+                _saveActiveTask(_currentTaskId, 0);
+                addLog('info', `任务已提交 (ID: ${_currentTaskId})，正在连接日志流...`);
+                _lastEventId = 0;
+                _connectComputeStream(_currentTaskId, 0);
+                return;
+            }
 
             // 检测是否为加密文件错误（422 + encrypted_files）
             if (resp.status === 422 && errorData && errorData.error_type === 'encrypted_files') {

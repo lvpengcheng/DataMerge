@@ -68,6 +68,48 @@ def get_accessible_tenants(
     return list(set(a.tenant_id for a in auths))
 
 
+def get_operable_tenants(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> List[str]:
+    """当前用户可"操作"的租户 = 已授权租户 ∪ 自己训练过的租户。
+
+    用于驱动前端按钮可用性 + 后端写接口权限校验。admin 仍走 TenantAuthorization 全集。
+    """
+    from ..database.models import TrainingSession
+
+    is_admin = current_user.role and current_user.role.name == "admin"
+
+    # 1) 已授权
+    if is_admin:
+        auths = db.query(TenantAuthorization).filter(
+            TenantAuthorization.revoked_at.is_(None)
+        ).all()
+    elif not current_user.org_id:
+        auths = []
+    else:
+        org_ids = _get_org_and_children_ids(db, current_user.org_id)
+        auths = db.query(TenantAuthorization).filter(
+            TenantAuthorization.org_id.in_(org_ids),
+            TenantAuthorization.revoked_at.is_(None),
+        ).all()
+    authorized = {a.tenant_id for a in auths}
+
+    if is_admin:
+        return list(authorized)
+
+    # 2) 自训(以 TrainingSession.user_id 为准)
+    own_rows = (
+        db.query(TrainingSession.tenant_id)
+        .filter(TrainingSession.user_id == current_user.id)
+        .distinct()
+        .all()
+    )
+    own = {r.tenant_id for r in own_rows}
+
+    return list(authorized | own)
+
+
 def _get_org_and_children_ids(db: Session, org_id: int) -> List[int]:
     """递归获取组织及所有子组织的 ID"""
     from ..database.models import Organization

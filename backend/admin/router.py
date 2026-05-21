@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
 from ..database.connection import get_db
-from ..database.models import User, Role, Organization, TenantAuthorization, Template, ComputeTask, DataAsset
+from ..database.models import User, Role, Organization, TenantAuthorization, Template, ComputeTask, DataAsset, Script
 from ..auth.dependencies import require_admin, get_current_user
 from ..auth.schemas import (
     UserCreate, UserUpdate, UserResponse,
@@ -660,6 +660,123 @@ _RULE_PATTERN = re.compile(r'\{([^{}]+)\}')
 _SLICE_PATTERN = re.compile(r'^(.+?)\[(-?\d*):(-?\d*)\]$')
 
 
+def _stringify_df_for_report(df):
+    """将 DataFrame 所有列强制转为文本类型，避免 NaN/#N/A/error 等导致类型冲突。
+
+    - NaN / None         → ''
+    - 数值/日期/其它      → str(val)
+    - 已是字符串(含 #N/A 等 Excel 错误码)原样保留
+    """
+    import pandas as pd
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for col in out.columns:
+        s = out[col]
+        # 先把 NaN/NaT 转为空串
+        s = s.where(s.notna(), '')
+        # 再统一转字符串（已是字符串则不变）
+        out[col] = s.astype(str).replace({'nan': '', 'NaT': '', 'None': ''})
+    return out
+
+
+def _col_idx_to_letter(idx: int) -> str:
+    """0-indexed 列下标 → Excel 列字母 (0→A, 25→Z, 26→AA...)"""
+    letters = ""
+    n = idx
+    while True:
+        letters = chr(65 + n % 26) + letters
+        n = n // 26 - 1
+        if n < 0:
+            break
+    return letters
+
+
+def _read_sheets_with_letter_columns(file_path: str):
+    """用 excel_parser 解析文件，返回:
+       sheets: {sheet_name: DataFrame(列名为 Excel 列字母 A/B/.../AA)}
+       header_map: {sheet_name: {letter: 拼接表头文本}}
+
+    数据起始行由 excel_parser 智能识别（跳过 title 行 + 多行表头）。
+    """
+    import pandas as pd
+    from excel_parser import IntelligentExcelParser
+
+    parser = IntelligentExcelParser()
+    sheet_data_list = parser.parse_excel_file(file_path, read_formulas=False)
+
+    sheets: dict = {}
+    header_map: dict = {}
+    for sd in sheet_data_list:
+        sheet_name = sd.sheet_name
+        if not sd.regions:
+            continue
+        # 取该 sheet 的第一个数据区域（计算结果文件通常只有一个）
+        region = sd.regions[0]
+        # head_data: {header_text: col_letter}  → 反转为 {letter: header}
+        letter_to_header = {v: k for k, v in (region.head_data or {}).items()}
+        # 数据行已是 {letter: value}
+        data_rows = region.data or []
+        if not data_rows:
+            continue
+        df = pd.DataFrame(data_rows)
+        # 列名规范化为大写字母
+        df.columns = [str(c).upper() for c in df.columns]
+        # 按字母自然顺序排列
+        df = df.reindex(columns=sorted(df.columns, key=lambda x: (len(x), x)))
+        sheets[sheet_name] = df
+        header_map[sheet_name] = {str(k).upper(): v for k, v in letter_to_header.items()}
+    return sheets, header_map
+
+
+def _build_header_map_from_parsed(parsed_data) -> dict:
+    """从 DataAsset.parsed_data 中提取 {sheet_name: {letter: header_text}}"""
+    result: dict = {}
+    for sheet_info in (parsed_data or []):
+        sheet_name = sheet_info.get("sheet_name", "Sheet1")
+        if sheet_name in ("参数", "历史数据"):
+            continue
+        for region in (sheet_info.get("regions") or []):
+            head_data = region.get("head_data") or {}
+            if not head_data:
+                continue
+            letter_to_header = {str(v).upper(): k for k, v in head_data.items()}
+            # 同 sheet 多 region 时合并（后者不覆盖前者）
+            existing = result.setdefault(sheet_name, {})
+            for letter, header in letter_to_header.items():
+                existing.setdefault(letter, header)
+            break  # 取第一个 region
+    return result
+
+
+def _alias_letter_columns_with_headers(df, sheet_header_map: dict):
+    """给 DataFrame 增加"原始拼接表头"作为别名列(指向同一列字母的数据)。
+
+    使 SmartMarker 模板可以同时用 &=DT.A 和 &=DT.原始表头 两种写法。
+    冲突规则:
+      - 别名与已有列名(尤其是其他字母列)同名时跳过,以字母列优先
+      - 别名为空/None 跳过
+    """
+    if df is None or df.empty or not sheet_header_map:
+        return df
+    out = df.copy()
+    existing_cols = set(out.columns)
+    for letter, header in sheet_header_map.items():
+        letter_u = str(letter).upper()
+        if not header:
+            continue
+        header_str = str(header).strip()
+        if not header_str:
+            continue
+        if header_str in existing_cols:
+            continue
+        if letter_u not in out.columns:
+            continue
+        out[header_str] = out[letter_u]
+        existing_cols.add(header_str)
+    return out
+
+
 def _resolve_rule_pattern(pattern: str, data_row: dict, system_vars: dict) -> str:
     """解析规则表达式，替换 {变量} 为实际值。
 
@@ -796,12 +913,15 @@ async def generate_report(
     # 4. 从 DB parsed_data 读取数据（优先），无 parsed_data 时回退到读文件
     #    读取所有 sheet，按 sheet 名分组，每个 sheet 作为独立数据源
     #    use_history 模式下自动补 salary_year / salary_month / 月份 列
+    #    【列字母方案】DataFrame 列名统一为 Excel 列字母（A/B/.../AA），原表头作为 header_map 返回
     is_multi_month = use_history and period_from and period_to
     all_sheet_dfs: dict[str, list] = {}  # {sheet_name: [df1, df2, ...]}
+    header_map: dict[str, dict] = {}      # {sheet_name: {letter: 拼接表头}}
     for asset in assets:
         asset_sheet_dfs: dict[str, list] = {}
         if asset.parsed_data:
             # parsed_data: [{"sheet_name": "...", "regions": [...]}, ...]
+            # head_data = {header_text: col_letter}, region.data 已按 col_letter 索引
             for sheet_info in asset.parsed_data:
                 sheet_name = sheet_info.get("sheet_name", "Sheet1")
                 if sheet_name in ("参数", "历史数据"):
@@ -811,24 +931,33 @@ async def generate_report(
                     data_rows = region.get("data") or []
                     if not head_data or not data_rows:
                         continue
-                    col_map = {v: k for k, v in head_data.items()}
-                    mapped_rows = [{col_map.get(c, c): val for c, val in row.items()} for row in data_rows]
-                    df = pd.DataFrame(mapped_rows)
+                    # 直接用 col_letter 作为列名（大写），不再映射回中文表头
+                    norm_rows = [
+                        {str(c).upper(): val for c, val in row.items()}
+                        for row in data_rows
+                    ]
+                    df = pd.DataFrame(norm_rows)
+                    df = df.reindex(columns=sorted(df.columns, key=lambda x: (len(x), x)))
                     if not df.empty:
                         asset_sheet_dfs.setdefault(sheet_name, []).append(df)
+            # 收集 header_map（同 sheet 取第一个 asset 的即可）
+            for sn, m in _build_header_map_from_parsed(asset.parsed_data).items():
+                header_map.setdefault(sn, m)
         elif os.path.exists(asset.file_path):
-            # 回退：从文件读取所有 sheet
+            # 回退：用 excel_parser 解析文件，返回字母列 DataFrame + header_map
             try:
-                sheets = aspose_helper.read_all_sheets_calculated(asset.file_path)
+                sheets, hm = _read_sheets_with_letter_columns(asset.file_path)
                 for sheet_name, df in sheets.items():
                     if sheet_name in ("参数", "历史数据"):
                         continue
                     if not df.empty:
                         asset_sheet_dfs.setdefault(sheet_name, []).append(df)
+                for sn, m in hm.items():
+                    header_map.setdefault(sn, m)
             except Exception as e:
                 logger.warning(f"读取结果文件失败 {asset.file_path}: {e}")
 
-        # 多月合并时，自动补 salary_year / salary_month / 月份 列
+        # 多月合并时，自动补 salary_year / salary_month / 月份 列（命名列，保留原名）
         if is_multi_month and asset_sheet_dfs and asset.source_task_id in task_ym_map:
             y, m = task_ym_map[asset.source_task_id]
             for dfs in asset_sheet_dfs.values():
@@ -899,8 +1028,51 @@ async def generate_report(
     template_data["$date"] = system_vars["date"]
     template_data["$tenant"] = tenant_id
 
+    # 【Step 1】所有 DataFrame 强制文本化，避免 NaN/#N/A/error 等 Excel 错误码触发类型冲突
+    for k in list(template_data.keys()):
+        v = template_data[k]
+        if isinstance(v, pd.DataFrame):
+            template_data[k] = _stringify_df_for_report(v)
+
+    # 【Step 2 - 双别名】给每个 sheet 的字母列追加"原始拼接表头"为别名列
+    # 模板可同时用 &=DT.A 和 &=DT.原始表头 两种写法
+    if header_map:
+        # DT 对应 first_sheet_name 的 header_map
+        if first_sheet_name and first_sheet_name in header_map and "DT" in template_data:
+            template_data["DT"] = _alias_letter_columns_with_headers(
+                template_data["DT"], header_map[first_sheet_name]
+            )
+        for sheet_name in list(template_data.keys()):
+            if sheet_name in ("DT",) or sheet_name.startswith("$"):
+                continue
+            if sheet_name in header_map and isinstance(template_data[sheet_name], pd.DataFrame):
+                template_data[sheet_name] = _alias_letter_columns_with_headers(
+                    template_data[sheet_name], header_map[sheet_name]
+                )
+
+    # 同步刷新 dataset/template_sheets 引用
+    dataset = template_data.get("DT", dataset)
+    for sheet_name in list(template_sheets.keys()):
+        if sheet_name == first_sheet_name:
+            template_sheets[sheet_name] = template_data["DT"]
+        elif sheet_name in template_data:
+            template_sheets[sheet_name] = template_data[sheet_name]
+
+    # 【Step 2】header_map 用于调试和模板设计预览
+    if header_map:
+        logger.info("=== header_map（列字母 → 原始拼接表头）===")
+        for sn, m in header_map.items():
+            preview = ", ".join(f"{k}={v}" for k, v in list(m.items())[:10])
+            logger.info(f"[{sn}] {preview}{' ...' if len(m) > 10 else ''}")
+
     # 6. 用数据集第一行来解析文件名和加密规则
+    #    同时把"原始表头 → 值"也加进 first_row，使 {工号}/{身份证号} 等基于中文名的规则仍可解析
     first_row = dataset.iloc[0].to_dict() if len(dataset) > 0 else {}
+    if first_row and first_sheet_name:
+        sheet_hm = header_map.get(first_sheet_name, {})
+        for letter, original_header in sheet_hm.items():
+            if letter in first_row and original_header and original_header not in first_row:
+                first_row[original_header] = first_row[letter]
 
     if tpl.file_name_rule:
         output_name = _resolve_rule_pattern(tpl.file_name_rule, first_row, system_vars)
@@ -947,13 +1119,19 @@ async def generate_report(
                 detail=f"报表模式为 {report_mode}，但模版未配置分组字段(group_by)，请在模版设置中指定分组列名",
             )
         available_cols = list(dataset.columns)
-        # 模糊匹配：去空格、忽略大小写
+        # 模糊匹配：去空格、忽略大小写；若失败再尝试通过 header_map 反查（中文表头 → 列字母）
         matched_col = None
         target = group_by_field.strip().lower()
         for col in available_cols:
             if str(col).strip().lower() == target:
                 matched_col = col
                 break
+        if not matched_col:
+            sheet_hm = header_map.get(first_sheet_name, {}) if first_sheet_name else {}
+            for letter, original_header in sheet_hm.items():
+                if str(original_header).strip().lower() == target and letter in available_cols:
+                    matched_col = letter
+                    break
         if not matched_col:
             raise HTTPException(
                 status_code=400,
@@ -1034,3 +1212,149 @@ async def generate_report(
         filename=actual_filename,
         media_type=media,
     )
+
+
+@router.get("/templates/{template_id}/headers-preview")
+async def preview_template_headers(
+    template_id: int,
+    task_id: int = Query(..., description="计算任务 ID（取该任务的结果文件做表头预览）"),
+    sheet: Optional[str] = Query(None, description="只返回指定 sheet"),
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    """根据指定计算任务的结果文件，返回各 sheet 的「列字母 → 原始拼接表头」对照。
+    用于模板设计者编辑模板前确认应该写 &=DT.A 还是 &=DT.B 等。
+    每次实时计算，不缓存。
+    """
+    tpl = db.query(Template).filter(Template.id == template_id).first()
+    if not tpl:
+        raise HTTPException(status_code=404, detail="模版不存在")
+
+    task = db.query(ComputeTask).filter(ComputeTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="计算任务不存在")
+
+    assets = (
+        db.query(DataAsset)
+        .filter(
+            DataAsset.source_task_id == task_id,
+            DataAsset.asset_type == "result",
+            DataAsset.is_active == True,
+        )
+        .all()
+    )
+    if not assets:
+        raise HTTPException(status_code=400, detail="该任务没有结果文件，无法预览表头")
+
+    merged: dict = {}
+    for asset in assets:
+        partial: dict = {}
+        if asset.parsed_data:
+            partial = _build_header_map_from_parsed(asset.parsed_data)
+        elif os.path.exists(asset.file_path):
+            try:
+                _, partial = _read_sheets_with_letter_columns(asset.file_path)
+            except Exception as e:
+                logger.warning(f"预览解析失败 {asset.file_path}: {e}")
+                continue
+        for sn, m in partial.items():
+            existing = merged.setdefault(sn, {})
+            for letter, header in m.items():
+                existing.setdefault(letter, header)
+
+    if sheet:
+        merged = {sheet: merged.get(sheet, {})}
+
+    sheets_out = []
+    for idx, (sn, mapping) in enumerate(merged.items()):
+        items = sorted(mapping.items(), key=lambda kv: (len(kv[0]), kv[0]))
+        sheets_out.append({
+            "sheet_name": sn,
+            "is_primary": idx == 0,
+            "alias": "DT" if idx == 0 else sn,
+            "columns": [{"letter": k, "header": v} for k, v in items],
+        })
+    return {"template_id": template_id, "task_id": task_id, "sheets": sheets_out}
+
+
+# ========================= 脚本管理 =========================
+
+@router.get("/scripts")
+async def list_scripts(
+    tenant_id: Optional[str] = Query(None, description="租户ID模糊匹配"),
+    include_inactive: bool = Query(False, description="是否包含已停用脚本"),
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    """列出所有脚本（管理员视图）"""
+    q = db.query(Script)
+    if tenant_id:
+        q = q.filter(Script.tenant_id.like(f"%{tenant_id}%"))
+    if not include_inactive:
+        q = q.filter(Script.is_active == True)
+    scripts = q.order_by(Script.tenant_id, Script.name, Script.version.desc()).all()
+    result = []
+    for s in scripts:
+        result.append({
+            "id": s.id,
+            "tenant_id": s.tenant_id,
+            "name": s.name,
+            "description": s.description or "",
+            "mode": s.mode,
+            "version": s.version,
+            "accuracy": s.accuracy,
+            "is_active": bool(s.is_active),
+            "source_session_id": s.source_session_id,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+            "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+        })
+    return {"total": len(result), "items": result}
+
+
+@router.post("/scripts/{script_id}/disable")
+async def disable_script(
+    script_id: int,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    """停用脚本（软删除，智训和智算不再可见）"""
+    s = db.query(Script).filter(Script.id == script_id).first()
+    if not s:
+        raise HTTPException(status_code=404, detail="脚本不存在")
+    if not s.is_active:
+        return {"success": True, "message": "脚本已是停用状态", "script_id": script_id}
+    s.is_active = False
+    s.updated_at = datetime.utcnow()
+    db.commit()
+    return {"success": True, "message": f"已停用脚本「{s.name}」(v{s.version})", "script_id": script_id}
+
+
+@router.post("/scripts/{script_id}/enable")
+async def enable_script(
+    script_id: int,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    """恢复脚本"""
+    s = db.query(Script).filter(Script.id == script_id).first()
+    if not s:
+        raise HTTPException(status_code=404, detail="脚本不存在")
+    if s.is_active:
+        return {"success": True, "message": "脚本已是启用状态", "script_id": script_id}
+    # 检查同租户同名脚本是否已有启用版本，避免冲突
+    existing = db.query(Script).filter(
+        Script.tenant_id == s.tenant_id,
+        Script.name == s.name,
+        Script.is_active == True,
+        Script.id != script_id,
+    ).first()
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"租户「{s.tenant_id}」已存在启用中的同名脚本「{s.name}」(v{existing.version})，请先停用后再恢复"
+        )
+    s.is_active = True
+    s.updated_at = datetime.utcnow()
+    db.commit()
+    return {"success": True, "message": f"已启用脚本「{s.name}」(v{s.version})", "script_id": script_id}
+

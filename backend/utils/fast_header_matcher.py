@@ -12,7 +12,7 @@ import logging
 import concurrent.futures
 from typing import Dict, List, Any, Tuple, Optional
 from difflib import SequenceMatcher
-from .data_helpers import make_unique_sheet_key
+from .data_helpers import assign_sheet_keys
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,21 @@ class FastHeaderMatcher:
         if s.startswith('Unnamed:') or s.startswith('Unnamed：'):
             return False
         return True
+
+    @staticmethod
+    def _infer_multi_sheet_source(source_structure: Dict[str, Any]) -> bool:
+        """读取或反推 multi_sheet_source 标记。
+
+        优先读 source_structure["multi_sheet_source"]（新训练记录直接带标记）；
+        旧记录无标记时，从结构反推：任一文件含 >=2 个 sheet 即视为 multi_sheet。
+        """
+        if "multi_sheet_source" in source_structure:
+            return bool(source_structure["multi_sheet_source"])
+        files = source_structure.get("files") or {}
+        for fdata in files.values():
+            if isinstance(fdata, dict) and len(fdata.get("sheets") or {}) >= 2:
+                return True
+        return False
 
     # ==================== 主入口 ====================
 
@@ -67,6 +82,7 @@ class FastHeaderMatcher:
             # 步骤1: 从source_structure提取训练基准
             logger.info("[匹配] ===== 步骤1: 提取训练基准 =====")
             train_sheets = self._build_training_sheets(source_structure)
+            multi_sheet_source = self._infer_multi_sheet_source(source_structure)
             if not train_sheets:
                 logger.warning("[匹配] 训练时的source_structure为空或格式异常，将尝试基于文件名兜底匹配")
             else:
@@ -74,9 +90,9 @@ class FastHeaderMatcher:
                     logger.info(f"[匹配] 训练基准: {ts['file_name']}/{ts['sheet_name']} - {len(ts['headers'])}列")
 
             # 步骤2: 【优化】解析所有文件表头（headers_only，并行）
-            logger.info("[匹配] ===== 步骤2: 解析上传文件表头（并行） =====")
+            logger.info(f"[匹配] ===== 步骤2: 解析上传文件表头（并行, multi_sheet_source={multi_sheet_source}） =====")
             input_sheets = self._parse_all_files_with_headers(
-                input_files, manual_headers
+                input_files, manual_headers, multi_sheet_source=multi_sheet_source
             )
             if not input_sheets:
                 return False, "上传的文件无法读取或为空", None
@@ -125,7 +141,8 @@ class FastHeaderMatcher:
     # ==================== 步骤2: 解析所有文件表头（并行） ====================
 
     def _parse_all_files_with_headers(
-        self, file_paths: List[str], manual_headers: Optional[Dict[str, Any]] = None
+        self, file_paths: List[str], manual_headers: Optional[Dict[str, Any]] = None,
+        multi_sheet_source: bool = False
     ) -> List[Dict[str, Any]]:
         """解析所有文件的表头（headers_only=True，并行）
 
@@ -146,9 +163,11 @@ class FastHeaderMatcher:
             parser = IntelligentExcelParser()
             # 【性能优化】匹配表头阶段开启 headers_only=True，避免全量解析50MB大文件
             # 这能将匹配过程从分钟级提速至秒级
+            # multi_sheet_source 跟随训练侧设置：训练用激活表则智算也用，训练用多表则智算也多表
             sheet_list = parser.parse_excel_file(
                 file_path, manual_headers=file_manual_headers,
-                active_sheet_only=True, best_region_only=True,
+                active_sheet_only=not multi_sheet_source,
+                best_region_only=not multi_sheet_source,
                 headers_only=True, read_formulas=False
             )
             return file_path, file_name, sheet_list
@@ -513,6 +532,7 @@ class FastHeaderMatcher:
             # 步骤1: 从 source_structure 提取训练基准
             logger.info("[单次解析] ===== 步骤1: 提取训练基准 =====")
             train_sheets = self._build_training_sheets(source_structure)
+            multi_sheet_source = self._infer_multi_sheet_source(source_structure)
             if not train_sheets:
                 logger.warning("[单次解析] source_structure 为空或格式异常，将基于文件名兜底匹配")
             else:
@@ -520,8 +540,10 @@ class FastHeaderMatcher:
                     logger.info(f"[单次解析] 训练基准: {ts['file_name']}/{ts['sheet_name']} - {len(ts['headers'])}列")
 
             # 步骤2: 全量解析所有上传文件（每文件仅 1 次 Aspose，read_formulas=False + ExportArray）
-            logger.info("[单次解析] ===== 步骤2: 全量解析上传文件（并行） =====")
-            input_sheets, parsed_sheets_map = self._parse_all_files_full(input_files, manual_headers)
+            logger.info(f"[单次解析] ===== 步骤2: 全量解析上传文件（并行, multi_sheet_source={multi_sheet_source}） =====")
+            input_sheets, parsed_sheets_map = self._parse_all_files_full(
+                input_files, manual_headers, multi_sheet_source=multi_sheet_source
+            )
             if not input_sheets:
                 return False, "上传的文件无法读取或为空", None, None
             for si in input_sheets:
@@ -556,7 +578,8 @@ class FastHeaderMatcher:
             return False, f"单次解析失败: {str(e)}", None, None
 
     def _parse_all_files_full(
-        self, file_paths: List[str], manual_headers: Optional[Dict[str, Any]] = None
+        self, file_paths: List[str], manual_headers: Optional[Dict[str, Any]] = None,
+        multi_sheet_source: bool = False
     ) -> Tuple[List[Dict[str, Any]], Dict[tuple, Any]]:
         """全量解析所有文件（含数据），返回 (header_info_list, parsed_sheets_map)
 
@@ -581,9 +604,11 @@ class FastHeaderMatcher:
 
             parser = IntelligentExcelParser()
             # 全量解析（含数据），read_formulas=False → ExportArray 快速路径
+            # multi_sheet_source 跟随训练侧设置：训练用激活表则智算也用，训练用多表则智算也多表
             sheet_list = parser.parse_excel_file(
                 file_path, manual_headers=file_manual_headers,
-                active_sheet_only=True, best_region_only=True,
+                active_sheet_only=not multi_sheet_source,
+                best_region_only=not multi_sheet_source,
                 read_formulas=False
             )
             return file_path, file_name, sheet_list
@@ -639,7 +664,9 @@ class FastHeaderMatcher:
         import pandas as pd
 
         source_data = {}
-        _used_keys = set()
+
+        # 先采集所有 (file_base, train_sheet, merged_df, columns)，最后统一分配 key
+        _collected = []
 
         for input_file_name, mapping_info in file_mapping.items():
             expected_file = mapping_info.get("expected_file", input_file_name)
@@ -688,14 +715,17 @@ class FastHeaderMatcher:
                 else:
                     merged_df = pd.concat(dfs, ignore_index=True)
 
-                key = f"{file_base}_{train_sheet}"
-                key = make_unique_sheet_key(key, _used_keys)
+                _collected.append((file_base, train_sheet, merged_df, first_columns))
 
-                source_data[key] = {
-                    "df": merged_df,
-                    "columns": first_columns
-                }
-                logger.info(f"[预加载] {key}: {len(merged_df)}行 × {len(first_columns)}列")
+        # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 → 加文件名前缀
+        key_map = assign_sheet_keys((fb, sn) for fb, sn, _, _ in _collected)
+        for file_base, train_sheet, merged_df, first_columns in _collected:
+            key = key_map[(file_base, train_sheet)]
+            source_data[key] = {
+                "df": merged_df,
+                "columns": first_columns
+            }
+            logger.info(f"[预加载] {key}: {len(merged_df)}行 × {len(first_columns)}列")
 
         return source_data
 

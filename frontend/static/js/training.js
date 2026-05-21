@@ -13,6 +13,7 @@ let _currentCode = null;
 let _filePasswordsMap = {};
 let _chatStreamEl = null;   // AI 对话流式输出的 DOM 元素
 let _chatStreamBuf = '';    // AI 对话流式输出的文本缓冲
+let _pendingScriptName = null;  // 新建训练时由用户命名的脚本名（仅新建会话首次提交时使用）
 
 // ==================== 初始化 ====================
 document.addEventListener('DOMContentLoaded', function () {
@@ -30,6 +31,7 @@ document.addEventListener('DOMContentLoaded', function () {
         _filterTenantDropdown();
         // 同步手动输入的值到 _currentTenantId
         _currentTenantId = tenantInput.value.trim() || null;
+        _applyTenantPermission();
     });
     document.addEventListener('click', (e) => {
         const combo = document.getElementById('tenant-combo');
@@ -60,16 +62,39 @@ document.addEventListener('DOMContentLoaded', function () {
 
 // ==================== 租户列表 ====================
 let _tenantList = [];
+let _permittedTenantIds = new Set();   // 当前用户有权操作的租户
 
 async function _loadTenants() {
     try {
         const resp = await AUTH.authFetch('/api/tenants');
-        if (!resp.ok) return;
-        const data = await resp.json();
-        _tenantList = data.tenants || data || [];
+        if (resp.ok) {
+            const data = await resp.json();
+            _tenantList = data.tenants || data || [];
+        }
     } catch (e) {
         console.warn('加载租户列表失败:', e);
     }
+    // 加载当前用户可访问的租户（用于按钮灰化）
+    try {
+        const resp2 = await AUTH.authFetch('/api/dashboard/tenants');
+        if (resp2.ok) {
+            const data2 = await resp2.json();
+            const items = data2.items || data2.tenants || data2 || [];
+            _permittedTenantIds = new Set(items.map(t => t.tenant_id || t.id || t.name).filter(Boolean));
+        }
+    } catch (e) {
+        console.warn('加载可访问租户失败:', e);
+    }
+    _applyTenantPermission();
+}
+
+function _applyTenantPermission() {
+    // 智训页允许为新租户起名(后端在租户已有 Script 时才校验 operable),
+    // 故前端不做灰化,避免误把"全新租户名"判定为无权。
+    const sendBtn = document.getElementById('send-btn');
+    const genBtn = document.getElementById('generate-btn');
+    if (sendBtn && !_isStreaming) { sendBtn.disabled = false; sendBtn.title = ''; }
+    if (genBtn && !_isStreaming) { genBtn.disabled = false; genBtn.title = ''; }
 }
 
 function _showTenantDropdown() {
@@ -115,6 +140,7 @@ function _selectTenant(tenantId) {
     _currentCode = null;
     _clearChatUI();
     _hideActionButtons();
+    _applyTenantPermission();
     loadSessions();
 }
 
@@ -156,11 +182,12 @@ function _renderSessionList() {
 
         const title = document.createElement('div');
         title.className = 'session-item-title';
-        // 显示版本号（session_key，格式 {tenant_id}_yyyyMMddHHmmss 或自定义名称）
+        // 优先展示用户命名的脚本名 + 时间，没有则退回 session_key
         const versionLabel = s.session_key || '';
         const time = s.started_at ? new Date(s.started_at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
-        title.textContent = versionLabel || `${s.mode || 'formula'} - ${time}`;
-        title.title = `版本: ${versionLabel} | 会话 #${s.id}`;
+        const scriptLabel = s.script_name && !s.script_name.startsWith('script_') ? s.script_name : '';
+        title.textContent = scriptLabel ? `${scriptLabel} · ${time}` : (versionLabel || `${s.mode || 'formula'} - ${time}`);
+        title.title = `脚本: ${scriptLabel || '(默认)'} | 版本: ${versionLabel} | 会话 #${s.id}`;
 
         // 重命名按钮
         const renameBtn = document.createElement('button');
@@ -223,23 +250,85 @@ function createNewSession() {
             return;
         }
     }
-    _currentSessionId = null;
-    _chatMessages = [];
-    _currentAccuracy = null;
-    _currentCode = null;
-    _clearChatUI();
-    _hideActionButtons();
-    _highlightActiveSession();
-    document.getElementById('chat-title').textContent = '新训练';
-    document.getElementById('chat-status').textContent = '';
-    document.getElementById('chat-status').className = 'chat-status';
+    _promptScriptName(_currentTenantId).then(scriptName => {
+        if (!scriptName) return;  // 用户取消
+        _pendingScriptName = scriptName;
 
-    // 提示用户上传文件
-    _addSystemMessage('请通过左下角 📎 上传源文件和目标文件，然后发送消息开始训练。');
+        _currentSessionId = null;
+        _chatMessages = [];
+        _currentAccuracy = null;
+        _currentCode = null;
+        _clearChatUI();
+        _hideActionButtons();
+        _highlightActiveSession();
+        document.getElementById('chat-title').textContent = `新训练 · ${scriptName}`;
+        document.getElementById('chat-status').textContent = '';
+        document.getElementById('chat-status').className = 'chat-status';
+
+        // 提示用户上传文件
+        _addSystemMessage(`脚本名称：${scriptName}\n请通过左下角 📎 上传源文件和目标文件，然后发送消息开始训练。`);
+    });
+}
+
+// 弹出小模态框让用户输入脚本名（也展示当前租户已有名称作为参考/选择）
+async function _promptScriptName(tenantId) {
+    let existingNames = [];
+    try {
+        const resp = await AUTH.authFetch(`/api/tenant-scripts/${encodeURIComponent(tenantId)}`);
+        if (resp.ok) {
+            const data = await resp.json();
+            existingNames = (data.scripts || [])
+                .map(s => s.name || s.script_id)
+                .filter(Boolean)
+                .filter((v, i, a) => a.indexOf(v) === i);
+        }
+    } catch (_) {}
+
+    return new Promise((resolve) => {
+        const overlay = document.createElement('div');
+        overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:9999;display:flex;align-items:center;justify-content:center;';
+        const existingHtml = existingNames.length
+            ? `<div style="margin-top:10px;font-size:12px;color:#666;">租户已有脚本（点击复用同名训练，将覆盖原版本）：</div>
+               <div id="_sn_existing" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;">
+                   ${existingNames.map(n => `<span class="_sn-chip" style="padding:3px 10px;border:1px solid #cfd8dc;border-radius:14px;cursor:pointer;font-size:12px;background:#f5f7fa;">${n.replace(/</g,'&lt;')}</span>`).join('')}
+               </div>`
+            : '';
+        overlay.innerHTML = `
+            <div style="background:#fff;border-radius:10px;padding:22px 24px;width:420px;max-width:90vw;box-shadow:0 4px 18px rgba(0,0,0,0.18);">
+                <h3 style="margin:0 0 4px;font-size:16px;color:#333;">为本次训练命名</h3>
+                <div style="font-size:12px;color:#888;margin-bottom:14px;">租户「${tenantId}」可同时拥有多个脚本（如：基础数据整合 / 考勤整合 / 算薪）</div>
+                <input id="_sn_input" type="text" placeholder="例如：考勤整合" maxlength="80"
+                       style="width:100%;box-sizing:border-box;padding:8px 10px;border:1.5px solid #d0d7de;border-radius:6px;font-size:14px;">
+                ${existingHtml}
+                <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:18px;">
+                    <button id="_sn_cancel" style="padding:6px 16px;border:1px solid #ccc;background:#fff;border-radius:6px;cursor:pointer;">取消</button>
+                    <button id="_sn_ok" style="padding:6px 16px;border:none;background:#1976d2;color:#fff;border-radius:6px;cursor:pointer;">确定</button>
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+        const input = overlay.querySelector('#_sn_input');
+        input.focus();
+
+        overlay.querySelectorAll('._sn-chip').forEach(el => {
+            el.addEventListener('click', () => { input.value = el.textContent; input.focus(); });
+        });
+        const close = (val) => { document.body.removeChild(overlay); resolve(val); };
+        overlay.querySelector('#_sn_cancel').onclick = () => close(null);
+        overlay.querySelector('#_sn_ok').onclick = () => {
+            const v = input.value.trim();
+            if (!v) { input.style.borderColor = '#e53935'; return; }
+            close(v);
+        };
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') overlay.querySelector('#_sn_ok').click();
+            if (e.key === 'Escape') close(null);
+        });
+    });
 }
 
 async function selectSession(sessionId) {
     if (_isStreaming) return;
+    _pendingScriptName = null;  // 切换到已存在会话，不再需要新建命名
     try {
         const resp = await AUTH.authFetch(`/api/training/chat/sessions/${sessionId}/messages`);
         if (!resp.ok) return;
@@ -279,7 +368,8 @@ async function selectSession(sessionId) {
         }
 
         // 更新头部
-        document.getElementById('chat-title').textContent = `训练 #${data.session.id}`;
+        const _scriptLabel = data.session.script_name ? ` · ${data.session.script_name}` : '';
+        document.getElementById('chat-title').textContent = `训练 #${data.session.id}${_scriptLabel}`;
         _updateChatStatus(data.session.status);
         _updateActionButtons(data.session);
 
@@ -351,9 +441,14 @@ function _renderFileList(containerId, files) {
         container.innerHTML = '';
         return;
     }
-    container.innerHTML = Array.from(files)
-        .map(f => `<span class="file-item">${f.name}</span>`)
-        .join('');
+    const arr = Array.from(files);
+    const first = arr[0].name;
+    const allNames = arr.map(f => f.name).join('\n');
+    if (arr.length === 1) {
+        container.innerHTML = `<span class="file-item" title="${allNames}">${first}</span>`;
+    } else {
+        container.innerHTML = `<span class="file-item" title="${allNames}">${first} 等 ${arr.length} 个文件</span>`;
+    }
 }
 
 // ==================== 加密检测 ====================
@@ -664,6 +759,7 @@ function _startTraining(userText) {
 
     const formData = new FormData();
     formData.append('tenant_id', _currentTenantId);
+    if (_pendingScriptName) formData.append('script_name', _pendingScriptName);
     formData.append('ai_provider', aiProvider);
     formData.append('mode', mode);
     if (salaryMonth) formData.append('salary_year_month', salaryMonth);
@@ -1280,6 +1376,8 @@ function _setUIStreaming(streaming) {
         // 对话流式状态也要重置
         _chatStreamEl = null;
         _chatStreamBuf = '';
+        // 流式结束后，重新应用租户权限灰化
+        _applyTenantPermission();
     }
 }
 

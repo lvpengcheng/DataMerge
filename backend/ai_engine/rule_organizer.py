@@ -173,16 +173,17 @@ class RuleOrganizer:
     def organize_rules(
         self,
         source_files: List[str],
-        target_file: str,
-        design_doc_files: List[str],
+        target_file: Optional[str] = None,
+        design_doc_files: Optional[List[str]] = None,
         file_passwords: Optional[Dict[str, str]] = None,
+        user_message: Optional[str] = None,
     ) -> str:
         """主入口：返回生成的 Markdown 字符串"""
         source_info = self._extract_source_structures(source_files, file_passwords)
         target_info = self._extract_target_structure(target_file, file_passwords)
-        design_info = self._extract_design_docs(design_doc_files)
+        design_info = self._extract_design_docs(design_doc_files or [])
 
-        messages = self._build_messages(source_info, target_info, design_info)
+        messages = self._build_messages(source_info, target_info, design_info, user_message)
         total_len = sum(len(m["content"]) for m in messages)
         logger.info(f"[规则整理] 开始调用 AI, 消息总长度: {total_len}")
 
@@ -197,17 +198,18 @@ class RuleOrganizer:
     def organize_rules_stream(
         self,
         source_files: List[str],
-        target_file: str,
-        design_doc_files: List[str],
+        target_file: Optional[str] = None,
+        design_doc_files: Optional[List[str]] = None,
         file_passwords: Optional[Dict[str, str]] = None,
+        user_message: Optional[str] = None,
         chunk_callback: Any = None,
     ) -> str:
         """流式整理规则：逐块回调 + 返回完整结果"""
         source_info = self._extract_source_structures(source_files, file_passwords)
         target_info = self._extract_target_structure(target_file, file_passwords)
-        design_info = self._extract_design_docs(design_doc_files)
+        design_info = self._extract_design_docs(design_doc_files or [])
 
-        messages = self._build_messages(source_info, target_info, design_info)
+        messages = self._build_messages(source_info, target_info, design_info, user_message)
         total_len = sum(len(m["content"]) for m in messages)
         logger.info(f"[规则整理-流式] 开始调用 AI, 消息总长度: {total_len}")
 
@@ -251,8 +253,8 @@ class RuleOrganizer:
                 parsed_data = self.excel_parser.parse_excel_file(
                     file_path,
                     max_data_rows=1,
-                    active_sheet_only=True,
-                    best_region_only=True,
+                    active_sheet_only=False,
+                    best_region_only=False,
                     password=passwords.get(file_name),
                     read_formulas=False,
                 )
@@ -278,10 +280,16 @@ class RuleOrganizer:
 
     def _extract_target_structure(
         self,
-        target_file: str,
+        target_file: Optional[str],
         file_passwords: Optional[Dict[str, str]] = None,
     ) -> str:
-        """解析目标文件，提取表头 + 1 行数据样本 + 公式"""
+        """解析目标文件，提取表头 + 1 行数据样本 + 公式。target_file 为 None 时返回占位说明。"""
+        if not target_file:
+            return (
+                "（用户未提供目标文件，请根据源文件结构和设计文档自由设计输出格式：\n"
+                "  - 自行规划目标列名、类型、来源、计算逻辑\n"
+                "  - 在规则文档中明确说明你设计的输出表结构）\n"
+            )
         passwords = file_passwords or {}
         file_name = Path(target_file).name
 
@@ -289,8 +297,8 @@ class RuleOrganizer:
             parsed_data = self.excel_parser.parse_excel_file(
                 target_file,
                 max_data_rows=1,
-                active_sheet_only=True,
-                best_region_only=True,
+                active_sheet_only=False,
+                best_region_only=False,
                 password=passwords.get(file_name),
             )
             result = f"=== 目标文件: {file_name} ===\n"
@@ -341,12 +349,22 @@ class RuleOrganizer:
         return "\n".join(parts)
 
     def _build_messages(
-        self, source_info: str, target_info: str, design_info: str
+        self, source_info: str, target_info: str, design_info: str,
+        user_message: Optional[str] = None,
     ) -> List[Dict[str, str]]:
         """构建发送给 AI 的消息列表"""
+        user_req_section = ""
+        if user_message and user_message.strip():
+            user_req_section = (
+                "\n## 用户额外需求（最高优先级）\n"
+                "以下是用户在对话中明确提出的需求，请在生成规则文档时严格遵守，"
+                "不得遗漏；如与设计文档冲突，以用户需求为准。\n\n"
+                f"{user_message.strip()}\n"
+            )
+
         user_content = f"""\
 以下是需要分析的数据文件结构和设计文档。
-
+{user_req_section}
 ## 源文件结构
 {source_info}
 

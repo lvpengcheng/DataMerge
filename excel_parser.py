@@ -1147,19 +1147,34 @@ class IntelligentExcelParser:
     HEADER_KEYWORDS = HeaderRuleEngine.HEADER_KEYWORDS
     
     TITLE_KEYWORDS = {
+        # 通用表名/报表
         "公司名称", "公司", "单位", "企业", "报表", "明细表", "汇总表", "统计表",
         "报告", "清单", "名称：", "标题", "主题", "年度", "月度", "季度", "表名",
         "制表", "编制", "审核", "日期：", "时间：", "部门：", "备注：",
         "备忘录", "工资调整", "薪资", "调整项", "说明", "通知", "表格",
+        # 抬头/账单/票据类
+        "账单", "账单号", "对账单", "应收", "结算单", "通知单", "邮编",
+        "开户行", "户名", "纳税人", "统一社会信用代码", "客户编号", "客户编码", "客户名称",
+        "代扣", "代缴", "开票", "发票",
+        # 在职/入离职类（HC sheet 顶部横幅常见）
+        "在职", "入职", "离职", "新员工", "离职员工", "在册", "花名册",
+        "on board", "off board", "headcount", "hc",
+        # 浮动/调整/小计补发等模块横幅
+        "垫付", "补发", "扣回", "调整", "变动", "差异",
+        # 英文
         "company", "corporation", "enterprise", "report", "summary", "statement",
-        "title", "subject", "annual", "monthly", "quarterly", "department", "memo"
+        "title", "subject", "annual", "monthly", "quarterly", "department", "memo",
+        "invoice", "bill", "notice", "payment", "service",
     }
 
     # 说明区域关键字（用于识别说明行的开头）
     INSTRUCTION_KEYWORDS = {
         "填写说明", "说明：", "注意事项", "项目注意", "备注说明", "使用说明",
         "操作说明", "重要提示", "温馨提示", "注：", "手工填写", "下拉选项",
-        "instructions", "notes", "remarks", "tips"
+        # 祈使开头的说明文字
+        "请于", "请将", "请按", "请务必", "请填写", "请确认", "请勿", "请在",
+        "本表", "本工作表", "如下：", "如下:", "以下：", "以下:",
+        "instructions", "notes", "remarks", "tips", "please ",
     }
 
     # 表头必填标记（这些符号在表头中表示必填项，不应该被当作说明行）
@@ -1445,7 +1460,7 @@ class IntelligentExcelParser:
                 if region:
                     sheet_data.regions.append(region)
                     
-                    if region.data_row_end >= region.data_row_start:
+                    if region.data_row_start > 0 and region.data_row_end >= region.data_row_start:
                         current_row = region.data_row_end + 1
                     else:
                         current_row = region.head_row_end + 1
@@ -1459,9 +1474,104 @@ class IntelligentExcelParser:
                     current_row = header_info.end_row + 1
             else:
                 current_row += 1
-        
+
+        # 【后处理】sheet 内多区域归一化：识别"数据行被误识为表头"的区域，
+        # 用 primary 区域的真实表头替换，避免输出脏 head_data
+        self._normalize_sheet_regions(sheet_data.regions)
+
         return sheet_data
-    
+
+    @staticmethod
+    def _is_fake_merged_header(head_data: Dict[str, str]) -> bool:
+        """识别"伪表头"区域：列被合并展开成同一名+列字母后缀，或大量 Column_* 占位"""
+        if not head_data or len(head_data) < 3:
+            return False
+        real_names = [k for k in head_data.keys() if not k.startswith('Column_')]
+        if not real_names:
+            return False
+        column_x_ratio = (len(head_data) - len(real_names)) / len(head_data)
+        if column_x_ratio >= 0.6 and len(real_names) <= 2:
+            return True
+        suffix_re = re.compile(r'_([A-Z]+|\d+)$')
+        roots = {suffix_re.sub('', k) for k in real_names}
+        if len(roots) > 1:
+            return False
+        same_root_ratio = len(real_names) / len(head_data)
+        return same_root_ratio >= 0.6
+
+    @staticmethod
+    def _looks_like_data_row_keys(keys: List[str]) -> bool:
+        """判断 head_data 的键集合是否更像"被误识为表头的数据行"。
+
+        任一强信号即触发：
+        - 纯数字键（≥3 位整数 或 浮点）
+        - ID 码键（如 MNCN00733）
+        - 日期/年月模式
+        - 三段及以上 "X-Y-Z" 拼接（多行表头副产物）
+        """
+        if not keys:
+            return False
+        for k in keys:
+            if not k:
+                continue
+            s = str(k).strip()
+            if s.startswith('Column_'):
+                continue
+            try:
+                num = float(s)
+                if abs(num) >= 100 or '.' in s:
+                    return True
+            except ValueError:
+                pass
+            if re.match(r'^[A-Z]{2,}\d{3,}$', s):
+                return True
+            if re.search(r'\d{4}[年/.\-]\d{1,2}|\d{1,2}\.\d{1,2}\s*[-~至]', s):
+                return True
+            if re.search(r'[\u4e00-\u9fff\w]+-[\u4e00-\u9fff\w]+-[\u4e00-\u9fff\w]+', s):
+                return True
+        return False
+
+    def _normalize_sheet_regions(self, regions: List[ExcelRegion]) -> None:
+        """同 sheet 内多区域后处理：仅当后续区域的 head_data 明显是"数据行被误识为表头"
+        （键集合包含纯数字/ID码/日期/层级拼接副产物）时，回退到 primary 的 head_data。
+
+        保护场景：相邻区域真实列名不同（如 "On-Board Date" 对 "Terminated Date"），
+        虽然列字母签名一致，但都是合法独立表头，不应被合并。
+        """
+        if len(regions) < 2:
+            return
+
+        primary = None
+        for r in regions:
+            if self._is_fake_merged_header(r.head_data):
+                continue
+            if r.head_row_start == r.head_row_end:
+                primary = r
+                break
+        if primary is None:
+            return
+
+        primary_sig = tuple(sorted(primary.head_data.values()))
+        primary_head = dict(primary.head_data)
+        primary_keys = set(primary_head.keys())
+
+        for r in regions:
+            if r is primary or self._is_fake_merged_header(r.head_data):
+                continue
+            if tuple(sorted(r.head_data.values())) != primary_sig:
+                continue
+            if set(r.head_data.keys()) == primary_keys:
+                continue
+            if not self._looks_like_data_row_keys(list(r.head_data.keys())):
+                continue
+
+            r.head_data = dict(primary_head)
+            new_data_start = r.head_row_start
+            r.data_row_start = new_data_start
+            r.head_row_end = new_data_start
+            if r.data_row_end < new_data_start:
+                r.data_row_end = new_data_start
+
     def _analyze_header_range(self, worksheet: Any, start_row: int, max_row: int, max_col: int) -> Optional[HeaderInfo]:
         """分析表头范围（增强版 - 多候选方案评分）
 
@@ -1514,6 +1624,31 @@ class IntelligentExcelParser:
         # 如果没有候选方案，返回None
         if not candidates:
             return None
+
+        # 候选方案过滤：如果某候选的 header_start 跨越了 start_row 之后的 title 行，
+        # 说明该候选属于"另一个 section"，不应在当前扫描位置返回。这避免相邻多个
+        # 子区域中数据多的那个抢走 header（小区域被吞掉）。
+        if len(candidates) > 1:
+            min_header_start = min(c.header_start for c in candidates)
+            filtered = []
+            for c in candidates:
+                if c.header_start <= min_header_start:
+                    filtered.append(c)
+                    continue
+                # 检查 [min_header_start, c.header_start) 之间是否存在 title 行
+                crosses_title = False
+                for chk_row in range(min_header_start, c.header_start):
+                    if chk_row < 1 or chk_row > max_row:
+                        continue
+                    if self._is_title_row(worksheet, chk_row, max_col):
+                        crosses_title = True
+                        break
+                if not crosses_title:
+                    filtered.append(c)
+                else:
+                    self.logger.debug(f"候选方案[{c.method}] 表头:{c.header_start}-{c.header_end} 跨越 title 行，已过滤")
+            if filtered:
+                candidates = filtered
 
         # 使用评估器选择最优方案
         best_candidate = self.boundary_evaluator.evaluate_candidates(worksheet, candidates, max_col)
@@ -2104,8 +2239,14 @@ class IntelligentExcelParser:
             if self._is_empty_row(worksheet, row, max_col):
                 continue
 
+            # 表头之后遇到标题/横幅行（如分组横幅 "社保"），应当立即终止表头识别，
+            # 否则会把横幅行误并入多级表头，污染列名。
             if self._is_title_row(worksheet, row, max_col):
-                continue
+                if row == start_row:
+                    # start_row 本身就是 title（极罕见），跳过让外层重定位
+                    continue
+                self.logger.debug(f"Row {row}: 遇到标题/横幅行，表头结束于 {current_header_end}")
+                return current_header_end
 
             # === 策略1: 序号列检测 ===
             # 检查从当前行开始是否有序号列（1,2,3...）
@@ -2286,8 +2427,9 @@ class IntelligentExcelParser:
         potential_data_end_row = self._find_data_end_row(worksheet, region.data_row_start, max_row, max_col)
 
         if potential_data_end_row < region.data_row_start:
-            # 只有表头没有数据的情况，这是正常的
-            region.data_row_end = region.data_row_start - 1
+            # 只有表头没有数据的情况，这是正常的；用 0/0 作为"无数据"哨兵，避免 start>end
+            region.data_row_start = 0
+            region.data_row_end = 0
             self.logger.info(f"区域只有表头没有数据：表头行 {region.head_row_start}-{region.head_row_end}，表头数量 {len(region.head_data)}")
             return region
 
@@ -2344,8 +2486,9 @@ class IntelligentExcelParser:
         potential_data_end_row = self._find_data_end_row(worksheet, region.data_row_start, max_row, max_col)
 
         if potential_data_end_row < region.data_row_start:
-            # 只有表头没有数据的情况，这是正常的
-            region.data_row_end = region.data_row_start - 1
+            # 只有表头没有数据的情况，这是正常的；用 0/0 作为"无数据"哨兵，避免 start>end
+            region.data_row_start = 0
+            region.data_row_end = 0
             self.logger.info(f"手动指定的区域只有表头没有数据：表头行 {region.head_row_start}-{region.head_row_end}，表头数量 {len(region.head_data)}")
             return region
         
@@ -2694,12 +2837,14 @@ class IntelligentExcelParser:
         first_value = None
         second_value = None
         has_required_marker = False
+        distinct_values: set = set()
 
         for i in range(min(max_col, len(row_values))):
             val = row_values[i]
             if val is not None and str(val).strip():
                 non_empty_cells += 1
                 str_val = str(val).strip()
+                distinct_values.add(str_val)
 
                 for marker in self.REQUIRED_FIELD_MARKERS:
                     if marker in str_val:
@@ -2711,7 +2856,8 @@ class IntelligentExcelParser:
                 elif second_value is None:
                     second_value = val
 
-                if non_empty_cells > 3 and not has_required_marker:
+                # 合并展开导致的虚高 non_empty 不应早退
+                if non_empty_cells > 4 and not has_required_marker and len(distinct_values) > 1:
                     return False
 
         if has_required_marker and non_empty_cells >= 3:
@@ -2722,12 +2868,25 @@ class IntelligentExcelParser:
 
         first_value_str = str(first_value).strip()
 
-        if non_empty_cells == 1:
+        is_merged_banner = non_empty_cells >= 2 and len(distinct_values) == 1
+
+        if non_empty_cells == 1 or is_merged_banner:
             garbage_keywords = ["示例", "样例", "例子", "example", "sample", "demo"]
             if any(keyword.lower() in first_value_str.lower() for keyword in self.TITLE_KEYWORDS):
                 return True
             if any(keyword in first_value_str for keyword in garbage_keywords):
                 return True
+            # 横向合并展开成 ≥3 列同值，等同于横幅
+            if is_merged_banner and non_empty_cells >= 3:
+                return True
+            # 1c: 单非空 + 包含日期/月份/期间模式
+            if re.search(r'\d{4}[.\-/年]\d{1,2}|\d{1,2}\.\d{1,2}\s*[-~至]\s*\d{1,2}\.\d{1,2}', first_value_str):
+                return True
+            # 1d: 单非空 + 文本较长（>=6 字符）且不是 HEADER_KEYWORDS 精确匹配
+            if len(first_value_str) >= 6 and first_value_str not in self.HEADER_KEYWORDS:
+                if not (first_value_str.endswith(':') or first_value_str.endswith('：')):
+                    if not any(m in first_value_str for m in self.REQUIRED_FIELD_MARKERS):
+                        return True
 
         # 情况1.5: 只有2个非空单元格，第一个含标题关键字
         if non_empty_cells == 2:
@@ -2747,6 +2906,18 @@ class IntelligentExcelParser:
                     return False
             return True
 
+        # 情况2.5: 编号小节标题（如 "3. Changes"、"一. Promotion"），即使行内还有
+        # 其他非空单元格（分组提示），只要 C1 是编号开头且 C2/C3 都为空，视为 title
+        if non_empty_cells <= 8 and re.match(
+            r'^[一二三四五六七八九十0-9①②③④⑤⑥⑦⑧⑨\u2160-\u216F]+\s*[\.、\u3001]\s*\S',
+            first_value_str
+        ):
+            second_col_val = row_values[1] if len(row_values) > 1 else None
+            third_col_val = row_values[2] if len(row_values) > 2 else None
+            if (not second_col_val or not str(second_col_val).strip()) and \
+               (not third_col_val or not str(third_col_val).strip()):
+                return True
+
         if non_empty_cells <= 2:
             if first_value_str.endswith('：') or first_value_str.endswith(':'):
                 return True
@@ -2754,6 +2925,11 @@ class IntelligentExcelParser:
         if second_value and isinstance(second_value, str):
             second_str = str(second_value).strip()
             if len(second_str) > 2 and second_str[0].isdigit() and second_str[1] in '、.．)）':
+                return True
+
+        # 长说明文字兜底：1-2 个非空单元格 + 文本 > 30 字符 + 不含表头关键字
+        if non_empty_cells <= 2 and len(first_value_str) > 30:
+            if not any(keyword.lower() in first_value_str.lower() for keyword in self.HEADER_KEYWORDS):
                 return True
 
         return False
@@ -2834,12 +3010,16 @@ class IntelligentExcelParser:
         first_value_col = None
         second_value = None
         has_required_marker = False  # 是否包含必填标记
+        # Aspose 视图下，被横向合并的单元格会"展开"成多个相同值。
+        # 用 distinct 值集合去重，避免 non_empty_cells 因合并被虚高、误退出 title 检测。
+        distinct_values: set = set()
 
         for col in range(1, max_col + 1):
             value = self._get_cell_value(worksheet.cell(row, col))
             if value is not None and str(value).strip():
                 non_empty_cells += 1
                 str_val = str(value).strip()
+                distinct_values.add(str_val)
 
                 # 检查是否包含必填标记（※、*等），如果有多个这样的单元格，很可能是表头
                 for marker in self.REQUIRED_FIELD_MARKERS:
@@ -2854,8 +3034,9 @@ class IntelligentExcelParser:
                     second_value = value
 
                 # 【性能优化】标题行最多1-2个非空单元格
-                # 超过3个非空且无必填标记时，不可能是标题行，提前退出
-                if non_empty_cells > 3 and not has_required_marker:
+                # 超过 4 个非空且无必填标记时，通常不是标题行；但若所有非空值都相同
+                # （横向合并展开），仍按"单值横幅"继续后续 1a/1b 判定，不能提前退出
+                if non_empty_cells > 4 and not has_required_marker and len(distinct_values) > 1:
                     return False
 
         # 如果行中有多个非空单元格且包含必填标记，很可能是表头，不是标题行
@@ -2867,8 +3048,11 @@ class IntelligentExcelParser:
 
         first_value_str = str(first_value).strip()
 
-        # 情况1: 只有1个非空单元格
-        if non_empty_cells == 1:
+        # 合并展开：所有非空 cell 值相同时，等效为单值横幅，按 1 个非空走 case 1
+        is_merged_banner = non_empty_cells >= 2 and len(distinct_values) == 1
+
+        # 情况1: 只有1个非空单元格，或合并展开成一个单值横幅
+        if non_empty_cells == 1 or is_merged_banner:
             # 1a: 单元格跨越多列合并（>=3列），视为标题行
             if first_value_col:
                 merged_range = self._get_physical_merged_cell_range(worksheet, row, first_value_col)
@@ -2876,6 +3060,9 @@ class IntelligentExcelParser:
                     col_span = merged_range.max_col - merged_range.min_col + 1
                     if col_span >= 3:
                         return True
+            # 合并展开但没有物理合并范围（罕见）：只要 distinct 唯一且跨 ≥3 列也算横幅
+            if is_merged_banner and non_empty_cells >= 3:
+                return True
             # 1b: 包含标题关键字或示例关键字
             garbage_keywords = ["示例", "样例", "例子", "example", "sample", "demo"]
             if any(keyword.lower() in first_value_str.lower() for keyword in self.TITLE_KEYWORDS):
@@ -2889,6 +3076,21 @@ class IntelligentExcelParser:
         if non_empty_cells == 2:
             if any(keyword.lower() in first_value_str.lower() for keyword in self.TITLE_KEYWORDS):
                 return True
+
+        # 情况1c/1d 兜底（适用于 1-2 个非空单元格）：
+        # 因为 Aspose 在合并单元格内会把同一值"展开"到多列，单个标题文本会被算作 2 个非空，
+        # 所以这两条规则需要覆盖 1 和 2 两种情况。
+        if non_empty_cells <= 2:
+            # 1c: 包含日期/月份/期间模式（如 "2026.04月04.01-04.30"、"2026年4月"）
+            if re.search(r'\d{4}[.\-/年]\d{1,2}|\d{1,2}\.\d{1,2}\s*[-~至]\s*\d{1,2}\.\d{1,2}', first_value_str):
+                return True
+            # 1d: 文本较长（>=6 字符）且不是 HEADER_KEYWORDS 的精确匹配
+            # 用于捕获 "On board in Apr."、"苏日娜社保个人部分垫付" 等横幅/小区域标题
+            if len(first_value_str) >= 6 and first_value_str not in self.HEADER_KEYWORDS:
+                if not (first_value_str.endswith(':') or first_value_str.endswith('：')):
+                    if not any(m in first_value_str for m in self.REQUIRED_FIELD_MARKERS):
+                        return True
+                        return True
 
         # 情况2: 第一个单元格包含说明区域关键字（但不是只有必填标记开头）
         # 排除 "※ 员工编号" 这种表头格式
@@ -2906,6 +3108,20 @@ class IntelligentExcelParser:
                     return False
             return True
 
+        # 情况2.5: 编号小节标题（如 "3. Changes"、"一. Promotion"、"② 调薪"）
+        # 即使行内还有其他单元格（分组提示如 "Before Change"、"Current Status"），
+        # 只要 C1 是"编号 + 文字"且 C2/C3 同时为空（数据行的 ID/姓名列），
+        # 就视为子区域分隔标题。
+        if non_empty_cells <= 8 and re.match(
+            r'^[一二三四五六七八九十0-9①②③④⑤⑥⑦⑧⑨\u2160-\u216F]+\s*[\.、\u3001]\s*\S',
+            first_value_str
+        ):
+            second_col = self._get_cell_value(worksheet.cell(row, 2))
+            third_col = self._get_cell_value(worksheet.cell(row, 3))
+            if (not second_col or not str(second_col).strip()) and \
+               (not third_col or not str(third_col).strip()):
+                return True
+
         # 情况3: 只有1-2个单元格，第一个单元格是"填写说明："类似格式
         if non_empty_cells <= 2:
             if first_value_str.endswith('：') or first_value_str.endswith(':'):
@@ -2917,8 +3133,9 @@ class IntelligentExcelParser:
             if re.match(r'^\d+[、.,]\s*.+', second_str):
                 return True
 
-        # 情况5: 包含长说明文字（超过50字符且只有1-2个非空单元格）
-        if non_empty_cells <= 2 and len(first_value_str) > 50:
+        # 情况5: 包含较长说明文字（超过30字符且只有1-2个非空单元格）
+        # 阈值由 50 调整为 30，覆盖 "请将以上数据加进当日给薪并核算个税金额即可" 这类短指示语
+        if non_empty_cells <= 2 and len(first_value_str) > 30:
             # 但不能是表头关键字
             if not any(keyword.lower() in first_value_str.lower() for keyword in self.HEADER_KEYWORDS):
                 return True
@@ -3504,13 +3721,62 @@ class IntelligentExcelParser:
             def _is_real_header(k):
                 return bool(k and k.strip() and not k.startswith('Column_'))
 
-            # 有效列头数量
-            def _real_col_count(region):
-                return sum(1 for k in region.head_data if _is_real_header(k))
+            # 伪列头模式：<前缀>_<单/双字母> 或 <前缀>_<1-3位数字>
+            # 示例：金额_a / amount-b / field_1 / col_28
+            _suspicious_re = re.compile(r'^(.+?)[_\-]([a-zA-Z]{1,2}|\d{1,3})$')
 
-            # 有效列头名称集合（用于合并判断）
+            def _suspicious_prefix(k):
+                if not k:
+                    return None
+                m = _suspicious_re.match(str(k).strip())
+                return m.group(1) if m else None
+
+            # 缓存：避免对同一 region 反复计算伪列头集合
+            _penalty_cache = {}
+
+            def _penalty(region):
+                rid = id(region)
+                if rid in _penalty_cache:
+                    return _penalty_cache[rid]
+                # 1) 同前缀聚集：>5 个共享前缀的伪列头才视为一组
+                groups = {}
+                for k in region.head_data:
+                    if not _is_real_header(k):
+                        continue
+                    p = _suspicious_prefix(k)
+                    if p:
+                        groups.setdefault(p, []).append(k)
+                susp = set()
+                for headers in groups.values():
+                    if len(headers) > 5:
+                        susp.update(headers)
+                if not susp:
+                    _penalty_cache[rid] = set()
+                    return _penalty_cache[rid]
+                # 2) 数据稀疏率：空单元格 / (数据行数 * 真实列数) > 0.7
+                real_cols = [k for k in region.head_data if _is_real_header(k)]
+                if not region.data or not real_cols:
+                    _penalty_cache[rid] = susp  # 无数据视为稀疏
+                    return susp
+                total = len(region.data) * len(real_cols)
+                empty = 0
+                for row in region.data:
+                    for col in real_cols:
+                        v = row.get(col)
+                        if v is None or (isinstance(v, str) and not v.strip()):
+                            empty += 1
+                _penalty_cache[rid] = susp if (empty / total) > 0.7 else set()
+                return _penalty_cache[rid]
+
+            # 有效列头数量（扣除"同前缀聚集 + 数据稀疏"命中的伪列头）
+            def _real_col_count(region):
+                p = _penalty(region)
+                return sum(1 for k in region.head_data if _is_real_header(k) and k not in p)
+
+            # 有效列头名称集合（用于合并判断；同样剔除伪列头，避免错误合并）
             def _real_headers(region):
-                return {k for k in region.head_data if _is_real_header(k)}
+                p = _penalty(region)
+                return {k for k in region.head_data if _is_real_header(k) and k not in p}
 
             # 收集所有区域（保持从上到下的原始顺序）
             all_regions = []
@@ -3796,7 +4062,7 @@ class IntelligentExcelParser:
                 # -- 单独复制数据（不含表头，避免合并单元格干扰） --
                 data_start = first_region.data_row_start - 1
                 data_rows = first_region.data_row_end - first_region.data_row_start + 1
-                if data_rows > 0:
+                if first_region.data_row_start > 0 and data_rows > 0:
                     source_range = src_ws.Cells.CreateRange(
                         data_start, 0, data_rows, total_cols)
                     dest_range = new_ws.Cells.CreateRange(
@@ -3830,7 +4096,7 @@ class IntelligentExcelParser:
                 for region in regions:
                     data_start = region.data_row_start - 1
                     data_rows = region.data_row_end - region.data_row_start + 1
-                    if data_rows <= 0:
+                    if region.data_row_start <= 0 or data_rows <= 0:
                         continue
 
                     source_range = src_ws.Cells.CreateRange(

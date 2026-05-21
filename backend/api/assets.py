@@ -282,6 +282,14 @@ async def upload_asset(
     with open(file_path, "wb") as f:
         f.write(content)
 
+    # 多区域 sheet 预处理（banner 拆分 / 头一致合并 / 头不一致 best-region）
+    try:
+        from ..utils.banner_splitter import preprocess_excel_inplace
+        preprocess_excel_inplace(str(file_path))
+    except Exception as _e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(f"banner-split 预处理失败（继续）: {_e}")
+
     # 解析 sheet 结构
     sheet_summary = _parse_sheet_summary(str(file_path))
 
@@ -519,6 +527,14 @@ async def upload_new_version(
     content = await file.read()
     with open(file_path, "wb") as f:
         f.write(content)
+
+    # 多区域 sheet 预处理
+    try:
+        from ..utils.banner_splitter import preprocess_excel_inplace
+        preprocess_excel_inplace(str(file_path))
+    except Exception as _e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(f"banner-split 预处理失败（继续）: {_e}")
 
     # 创建新版本记录
     new_parsed_data = _parse_full_data(str(file_path)) if asset.asset_type == "reference" else None

@@ -25,7 +25,7 @@ from ..database.connection import get_db, SessionLocal
 from ..database.models import (
     TrainingSession, TrainingIteration, TrainingMessage, Script, DataAsset,
 )
-from ..auth.dependencies import get_current_user
+from ..auth.dependencies import get_current_user, get_accessible_tenants, get_operable_tenants
 from ..utils.data_helpers import make_unique_sheet_key
 
 logger = logging.getLogger(__name__)
@@ -149,7 +149,8 @@ def _build_source_structure_from_dir(source_dir: str, manual_headers: Dict = Non
     """从源文件目录直接构建 source_structure（用于直接导入等无 generator 的场景）。"""
     from excel_parser import IntelligentExcelParser
 
-    structure = {"files": {}, "total_sheets": 0, "total_regions": 0}
+    structure = {"files": {}, "total_sheets": 0, "total_regions": 0,
+                 "multi_sheet_source": multi_sheet_source}
     parser = IntelligentExcelParser()
 
     for filename in sorted(os.listdir(source_dir)):
@@ -237,9 +238,9 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None,
     from excel_parser import IntelligentExcelParser
 
     source_data = {}
-    _used_keys = set()
     parser = IntelligentExcelParser()
     _passwords = file_passwords or {}
+    _collected: list = []  # [(file_base, sheet_name, merged_df, columns)]
 
     for filename in sorted(os.listdir(source_dir)):
         if not filename.endswith(('.xlsx', '.xls')) or filename.startswith('~'):
@@ -307,13 +308,18 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None,
                         merged_df[_sn_col] = range(1, len(merged_df) + 1)
                         logger.info(f"[序号补全] {file_base}: 列'{_sn_col}'全空, 已填充1~{len(merged_df)}")
 
-                sheet_name = f"{file_base}_{sheet_data.sheet_name}"
-                sheet_name = make_unique_sheet_key(sheet_name, _used_keys)
-                source_data[sheet_name] = {"df": merged_df, "columns": columns}
-                logger.info(f"[后台全量加载] {sheet_name}: {len(merged_df)} 行")
+                _collected.append((file_base, sheet_data.sheet_name, merged_df, columns))
 
         except Exception as e:
             logger.warning(f"[后台全量加载] 解析 {filename} 失败: {e}")
+
+    # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 → 加文件名前缀
+    from backend.utils.data_helpers import assign_sheet_keys
+    key_map = assign_sheet_keys((fb, sn) for fb, sn, _, _ in _collected)
+    for file_base, sheet_name, merged_df, columns in _collected:
+        final_key = key_map[(file_base, sheet_name)]
+        source_data[final_key] = {"df": merged_df, "columns": columns}
+        logger.info(f"[后台全量加载] {final_key}: {len(merged_df)} 行")
 
     return source_data
 
@@ -691,6 +697,7 @@ def list_chat_sessions(
         result.append({
             "id": s.id,
             "session_key": s.session_key,
+            "script_name": cfg.get("script_name") or (script.name if script else None),
             "mode": s.mode,
             "status": s.status,
             "total_iterations": s.total_iterations or 0,
@@ -769,6 +776,7 @@ def get_session_messages(
         "session": {
             "id": session.id,
             "tenant_id": session.tenant_id,
+            "script_name": cfg.get("script_name"),
             "mode": session.mode,
             "status": session.status,
             "best_accuracy": session.best_accuracy,
@@ -834,9 +842,34 @@ async def start_training(
     session_id: Optional[int] = Form(None),  # 传入已有 session_id 则继续
     multi_sheet_source: Optional[str] = Form(None),  # "true" 启用数据源多Sheet读取
     file_passwords: Optional[str] = Form(None),  # JSON: {"文件名": "密码"}
+    script_name: Optional[str] = Form(None),  # 用户为本次训练命名的脚本名
     current_user=Depends(get_current_user),
+    accessible_tenants: list = Depends(get_operable_tenants),
 ):
     """开始训练（首轮），返回 SSE 流"""
+
+    # 租户权限 + 唯一性合并校验:
+    # - 租户已有同名 Script: 必须 operable;且非 force_retrain / 非继续 session 时拒绝
+    # - 租户无同名 Script: 任意登录用户均可创建新脚本
+    if not session_id:
+        _check_db = SessionLocal()
+        try:
+            _check_name = (script_name or "").strip() or f"script_{tenant_id}"
+            _existing = _check_db.query(Script).filter(
+                Script.tenant_id == tenant_id,
+                Script.name == _check_name,
+                Script.is_active == True,
+            ).first()
+            if _existing:
+                if tenant_id not in accessible_tenants:
+                    raise HTTPException(status_code=403, detail=f"无权访问租户 '{tenant_id}'")
+                if not force_retrain:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"租户 '{tenant_id}' 已存在同名脚本「{_check_name}」（版本 {_existing.version}）。请改用其他脚本名称，或勾选「强制重新训练」覆盖该脚本"
+                    )
+        finally:
+            _check_db.close()
 
     # 保存上传文件到临时目录
     work_dir = tempfile.mkdtemp(prefix=f"train_{tenant_id}_")
@@ -918,6 +951,13 @@ async def start_training(
             detail=f"检测到加密文件但未提供密码（或密码不匹配）: {', '.join(encrypted_remaining)}。"
                    f"提供的密码文件名: {list(passwords.keys()) if passwords else '无'}。请检查文件名是否匹配。"
         )
+
+    # 第三步：多区域 sheet 预处理（banner 拆分 / 头一致合并 / 头不一致 best-region）
+    try:
+        from ..utils.banner_splitter import preprocess_uploaded_files
+        preprocess_uploaded_files([fp for fp, _ in all_excel_files])
+    except Exception as e:
+        logger.warning(f"[chat训练] banner-split 预处理整体失败（继续）: {e}")
 
     # 保存规则文件到磁盘，然后用 document_parser 解析（支持 docx/xlsx/pdf 等格式）
     rules_content = ""
@@ -1019,6 +1059,7 @@ async def start_training(
                     "manual_headers": manual_headers_dict,
                     "multi_sheet_source": multi_sheet_source == "true",
                     "file_passwords": passwords,
+                    "script_name": (script_name or "").strip() or f"script_{tenant_id}",
                 }
                 ts = persistence.create_session(
                     tenant_id=tenant_id,
@@ -1158,9 +1199,10 @@ def main(source_dir, output_dir, **kwargs):
 
                 # 保存脚本到 DB（正式列）
                 try:
+                    _script_name_db = (config.get("script_name") or "").strip() or f"script_{tenant_id}"
                     persistence.save_script(
                         tenant_id=tenant_id,
-                        name=f"script_{tenant_id}",
+                        name=_script_name_db,
                         code=passthrough_code,
                         mode="direct",
                         source_session_id=sid,
@@ -1372,9 +1414,10 @@ def main(source_dir, output_dir, **kwargs):
 
             # 保存脚本到 DB（正式列）
             try:
+                _script_name_db = (config.get("script_name") or "").strip() or f"script_{tenant_id}"
                 persistence.save_script(
                     tenant_id=tenant_id,
-                    name=f"script_{tenant_id}",
+                    name=_script_name_db,
                     code=code,
                     mode=mode,
                     source_session_id=sid,
@@ -1456,8 +1499,20 @@ async def send_message(
     action: str = Form("chat"),  # "chat" = 对话讨论, "generate" = 触发代码修正
     rule_files: List[UploadFile] = File(default=[]),
     current_user=Depends(get_current_user),
+    accessible_tenants: list = Depends(get_operable_tenants),
 ):
     """用户发送消息。action=chat 进行对话讨论，action=generate 触发代码修正+执行"""
+
+    # 租户权限校验：从 session 反查 tenant_id
+    _check_db = SessionLocal()
+    try:
+        _session = _check_db.query(TrainingSession).filter_by(id=session_id).first()
+        if not _session:
+            raise HTTPException(status_code=404, detail=f"训练会话 {session_id} 不存在")
+        if _session.tenant_id not in accessible_tenants:
+            raise HTTPException(status_code=403, detail=f"无权访问租户 '{_session.tenant_id}'")
+    finally:
+        _check_db.close()
 
     # 读取新的规则文件内容（用 document_parser 支持各种格式）
     new_rules = ""
@@ -1802,9 +1857,10 @@ async def send_message(
 
             # 保存脚本到 DB（正式列）
             try:
+                _script_name_db = (config.get("script_name") or "").strip() or f"script_{session.tenant_id}"
                 persistence.save_script(
                     tenant_id=session.tenant_id,
-                    name=f"script_{session.tenant_id}",
+                    name=_script_name_db,
                     code=code,
                     mode=session.mode or "formula",
                     source_session_id=session_id,
@@ -2057,9 +2113,10 @@ async def upload_code(
         logger.warning(f"[upload-code] 保存脚本到磁盘失败: {e}")
 
     try:
+        _script_name_db = (config.get("script_name") or "").strip() or f"script_{session.tenant_id}"
         persistence.save_script(
             tenant_id=session.tenant_id,
-            name=f"script_{session.tenant_id}",
+            name=_script_name_db,
             code=code_content,
             mode=mode,
             source_session_id=session_id,

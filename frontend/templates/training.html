@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>DataMerge - 智训</title>
-    <link rel="stylesheet" href="/static/css/training.css?v=20260326a">
+    <link rel="stylesheet" href="/static/css/training.css?v=20260521j">
 </head>
 <body>
     <div class="container">
@@ -15,6 +15,7 @@
                     <a href="/rules">规则</a>
                     <a href="/training" class="active">智训</a>
                     <a href="/compute">智算</a>
+                    <a href="/tools">智能小工具</a>
                     <a href="/admin" id="nav-admin" style="display:none;">管理</a>
                 </nav>
             </div>
@@ -96,12 +97,12 @@
                             </div>
                             <div class="form-row">
                                 <div class="form-group">
-                                    <label>规则文件 (可选):</label>
+                                    <label>规则文件:</label>
                                     <input type="file" id="rule-files" multiple accept=".md,.txt,.pdf,.docx">
                                     <div class="file-list" id="rule-file-list"></div>
                                 </div>
                                 <div class="form-group">
-                                    <label>薪资年月 (可选):</label>
+                                    <label>薪资年月:</label>
                                     <input type="text" id="salary-month" placeholder="例如: 2026-03">
                                 </div>
                             </div>
@@ -124,18 +125,18 @@
                                     </select>
                                 </div>
                                 <div class="form-group">
-                                    <label>标准工时 (可选):</label>
+                                    <label>标准工时:</label>
                                     <input type="number" id="standard-hours" placeholder="例如: 174" step="0.1">
                                 </div>
-                                <div class="form-group" style="display:flex;align-items:center;gap:8px;margin-top:22px;">
-                                    <input type="checkbox" id="multi-sheet-source" style="width:auto;">
-                                    <label for="multi-sheet-source" style="margin:0;cursor:pointer;" title="启用后读取数据源所有Sheet，按Sheet名称和表头结构优先匹配">数据源多Sheet读取</label>
+                                <div class="form-group" style="display:flex;align-items:center;gap:8px;">
+                                    <input type="checkbox" id="multi-sheet-source" style="width:auto;flex:0 0 auto;">
+                                    <label for="multi-sheet-source" style="margin:0;cursor:pointer;width:auto;text-align:left;" title="启用后读取数据源所有Sheet，按Sheet名称和表头结构优先匹配">数据源多Sheet读取</label>
                                 </div>
                             </div>
                             <div class="form-row form-row-full">
                                 <div class="form-group">
                                     <label>手动表头 (可选，复杂表头时使用):</label>
-                                    <textarea id="manual-headers" rows="2" placeholder='{"文件名.xlsx": {"Sheet1": [3, 3]}}  — 指定表头所在行号'></textarea>
+                                    <textarea id="manual-headers" rows="3" placeholder='{"文件名.xlsx": {"Sheet1": [3, 3]}}  — 指定表头所在行号'></textarea>
                                 </div>
                             </div>
                         </div>
@@ -149,6 +150,6 @@
     <input type="file" id="upload-code-input" accept=".py" style="display:none;" onchange="handleUploadCode(event)">
 
     <script src="/static/js/auth.js"></script>
-    <script src="/static/js/training.js?v=20260414a"></script>
+    <script src="/static/js/training.js?v=20260521c"></script>
 </body>
 </html>

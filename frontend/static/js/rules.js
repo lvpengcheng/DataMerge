@@ -173,9 +173,14 @@ function _renderFileList(containerId, files) {
         container.innerHTML = '';
         return;
     }
-    container.innerHTML = Array.from(files)
-        .map(f => `<span class="file-item">${f.name}</span>`)
-        .join('');
+    const arr = Array.from(files);
+    const first = arr[0].name;
+    const allNames = arr.map(f => f.name).join('\n');
+    if (arr.length === 1) {
+        container.innerHTML = `<span class="file-item" title="${allNames}">${first}</span>`;
+    } else {
+        container.innerHTML = `<span class="file-item" title="${allNames}">${first} 等 ${arr.length} 个文件</span>`;
+    }
 }
 
 // ==================== 加密检测 ====================
@@ -317,14 +322,14 @@ function sendMessage() {
 
     const sourceFiles = document.getElementById('source-files').files;
     const targetFile = document.getElementById('target-file').files[0];
-    const isFirstOrganize = sourceFiles.length > 0 && targetFile && _chatMessages.length === 0;
+    const isFirstOrganize = sourceFiles.length > 0 && _chatMessages.length === 0;
 
     if (isFirstOrganize) {
         _startOrganizeWithMessage(text, sourceFiles, targetFile);
     } else if (_chatMessages.length > 0 || _currentSessionId) {
         _sendChatMessage(text);
     } else {
-        alert('请先通过左下角📎上传源文件和目标文件');
+        alert('请先通过左下角📎上传源文件');
         return;
     }
     input.value = '';
@@ -337,11 +342,14 @@ function _startOrganizeWithMessage(userText, sourceFiles, targetFile) {
 
     const formData = new FormData();
     Array.from(sourceFiles).forEach(f => formData.append('source_files', f));
-    formData.append('target_file', targetFile);
+    if (targetFile) {
+        formData.append('target_file', targetFile);
+    }
     if (designDocs.length > 0) {
         Array.from(designDocs).forEach(f => formData.append('design_docs', f));
     }
     formData.append('ai_provider', aiProvider);
+    formData.append('user_message', userText);
     if (Object.keys(_filePasswordsMap).length > 0) {
         formData.append('file_passwords', JSON.stringify(_filePasswordsMap));
     }
@@ -362,8 +370,8 @@ function _startOrganizeWithMessage(userText, sourceFiles, targetFile) {
 function startOrganize() {
     const sourceFiles = document.getElementById('source-files').files;
     const targetFile = document.getElementById('target-file').files[0];
-    if (!sourceFiles.length || !targetFile) {
-        alert('请先通过📎选择源文件和目标文件');
+    if (!sourceFiles.length) {
+        alert('请先通过📎选择源文件');
         return;
     }
     if (_isStreaming) return;
@@ -496,5 +504,5 @@ function handleInputKeydown(event) {
 }
 
 function _getSystemPromptSummary() {
-    return '你是一位专业的数据处理规则分析师。用户已经上传了源文件和目标文件的结构信息。请根据用户的追问继续调整和完善规则文档。保持 Markdown 格式输出。';
+    return '你是一位专业的数据处理规则分析师。用户已经上传了源文件结构信息（目标文件可选，未提供则由你自由设计输出格式）。请根据用户的追问继续调整和完善规则文档。保持 Markdown 格式输出。';
 }

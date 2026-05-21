@@ -18,7 +18,7 @@ from openpyxl.comments import Comment
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
-from backend.utils.data_helpers import make_unique_sheet_key
+from backend.utils.data_helpers import make_unique_sheet_key, assign_sheet_keys
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +76,9 @@ class ExcelFormulaBuilder:
             "all_columns": {}
         }
 
+        # 先采集所有 (file_base, sheet_name, merged_df, columns, filename)，最后统一分配 key
+        _collected = []
+
         for filename in os.listdir(input_folder):
             if not filename.endswith(('.xlsx', '.xls')) or filename.startswith('~'):
                 continue
@@ -113,30 +116,34 @@ class ExcelFormulaBuilder:
                     else:
                         merged_df = pd.concat(dfs, ignore_index=True)
 
-                    # 生成sheet名称：文件名_sheet名（统一格式）
-                    sheet_name = f"{file_base}_{sheet_data.sheet_name}"
-
-                    # 确保sheet名不超过31个字符（Excel限制），碰撞时追加后缀
-                    sheet_name = make_unique_sheet_key(sheet_name, self._used_sheet_keys)
-
-                    self.source_sheets[sheet_name] = {
-                        "df": merged_df,
-                        "columns": first_columns,
-                        "source_file": filename,
-                        "source_sheet": sheet_data.sheet_name
-                    }
-
-                    source_info["sheets"][sheet_name] = {
-                        "columns": first_columns,
-                        "row_count": len(merged_df),
-                        "source_file": filename
-                    }
-                    source_info["all_columns"][sheet_name] = first_columns
-
-                    logger.info(f"加载源数据: {sheet_name}, 列: {first_columns}, 行数: {len(merged_df)}")
+                    _collected.append((file_base, sheet_data.sheet_name, merged_df, first_columns, filename))
 
             except Exception as e:
                 logger.error(f"加载文件失败 {filename}: {e}")
+
+        # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 → 加文件名前缀
+        key_map = assign_sheet_keys((fb, sn) for fb, sn, _, _, _ in _collected)
+        # 已分配的 key 同步给实例集合，便于后续可能的扩展
+        self._used_sheet_keys.update(key_map.values())
+
+        for file_base, sheet_name, merged_df, first_columns, filename in _collected:
+            final_key = key_map[(file_base, sheet_name)]
+
+            self.source_sheets[final_key] = {
+                "df": merged_df,
+                "columns": first_columns,
+                "source_file": filename,
+                "source_sheet": sheet_name
+            }
+
+            source_info["sheets"][final_key] = {
+                "columns": first_columns,
+                "row_count": len(merged_df),
+                "source_file": filename
+            }
+            source_info["all_columns"][final_key] = first_columns
+
+            logger.info(f"加载源数据: {final_key}, 列: {first_columns}, 行数: {len(merged_df)}")
 
         return source_info
 

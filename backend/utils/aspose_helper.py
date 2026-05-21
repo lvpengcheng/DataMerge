@@ -667,6 +667,20 @@ def _dataframe_to_datatable(df: pd.DataFrame, table_name: str):
     n_rows = len(df)
     n_cols = len(df.columns)
 
+    # 检测是否全部为 object/string 类型 → 数据区强制文本格式 + PutValue 禁止自动转换
+    is_all_text = n_rows > 0 and all(str(d) == 'object' for d in df.dtypes)
+    if is_all_text:
+        try:
+            from Aspose.Cells import StyleFlag
+            text_style = temp_wb.CreateStyle()
+            text_style.Number = 49
+            flag = StyleFlag()
+            flag.NumberFormat = True
+            data_range = cells.CreateRange(1, 0, n_rows, n_cols)
+            data_range.ApplyStyle(text_style, flag)
+        except Exception as e:
+            logger.warning(f"[DataTable] 设置文本格式失败（不影响数据）: {e}")
+
     # 第 0 行: 表头
     for c, col_name in enumerate(df.columns):
         cells[0, c].PutValue(str(col_name))
@@ -682,7 +696,14 @@ def _dataframe_to_datatable(df: pd.DataFrame, table_name: str):
                 except (TypeError, ValueError):
                     is_null = False
             if not is_null:
-                cells[r + 1, c].PutValue(val)
+                if is_all_text and isinstance(val, str):
+                    # 全文本模式：禁用自动类型转换，"123.45" 不会被转回数字
+                    try:
+                        cells[r + 1, c].PutValue(val, False)
+                    except Exception:
+                        cells[r + 1, c].PutValue(val)
+                else:
+                    cells[r + 1, c].PutValue(val)
 
     # 用 Aspose 原生方法导出 DataTable（类型完全兼容 WorkbookDesigner）
     dt = cells.ExportDataTable(0, 0, n_rows + 1, n_cols, True)

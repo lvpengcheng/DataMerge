@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from ..database.connection import get_db
 from ..database.models import ComputeTask
-from ..auth.dependencies import get_current_user, get_accessible_tenants
+from ..auth.dependencies import get_current_user, get_accessible_tenants, get_operable_tenants
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +19,7 @@ router = APIRouter(prefix="/api/dashboard", tags=["首页"])
 
 @router.get("/tenants")
 def get_dashboard_tenants(
-    tenant_ids: list = Depends(get_accessible_tenants),
+    tenant_ids: list = Depends(get_operable_tenants),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):

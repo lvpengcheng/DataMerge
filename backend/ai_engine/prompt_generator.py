@@ -1712,8 +1712,8 @@ input_folder, output_folder, manual_headers: {manual_headers_json}
 
 ## 已有变量
 - wb: openpyxl Workbook
-- source_data: {"文件名_sheet名": {"df": DataFrame, "columns": [列名]}} （清洗前）
-- source_sheets: {"文件名_sheet名": {"df": DataFrame, "ws": worksheet}} （清洗后，写入Excel）
+- source_data: {"sheet名": {"df": DataFrame, "columns": [列名]}} （清洗前；sheet名跨文件不冲突时即为原 sheet 名，冲突时形如 文件名_sheet名）
+- source_sheets: {"sheet名": {"df": DataFrame, "ws": worksheet}} （清洗后，写入Excel；命名规则同上）
 - 已导入模块：os, pandas(pd), openpyxl(Workbook, Comment, PatternFill, Font, CellIsRule, FormulaRule, get_column_letter, column_index_from_string)
 - 已定义常量：EMPTY = Excel空字符串""
 - 已定义函数：excel_text('文本') = Excel文本值"文本"
@@ -1754,7 +1754,7 @@ __RULES__
 3. **禁止猜测**：如果无法确定匹配关系，使用find_source_sheet()的返回值，不要硬编码Sheet名称
 
 注意事项：
-- 同一源文件的不同Sheet会被命名为 "文件名_Sheet名"，例如 "人员信息_基本信息", "人员信息_社保明细"
+- 同一源文件的不同 Sheet 跨文件不冲突时直接使用原 sheet 名（如 "基本信息"、"社保明细"）；只有当多个文件出现同名 sheet（如都叫 "Sheet1"）时，才会带上文件名前缀（"人员信息_Sheet1"、"考勤表_Sheet1"）
 - VLOOKUP公式引用的Sheet名称必须与实际写入的Sheet名称完全一致
 - 使用find_source_sheet()查找时，传入准确的 sheet_name_hint（如规则中提到的表名）和 target_columns（需要的列名列表）
 - 如果数据源有YYYYMM格式的sheet名（如202501、202502），调用find_source_sheet时传入salary_year和salary_month参数，函数会自动匹配当前月份的sheet
@@ -1840,7 +1840,7 @@ __RULES__
 
 ## 已有变量
 - wb: openpyxl Workbook
-- source_sheets: {{"文件名_sheet名": {{"df": DataFrame, "ws": worksheet}}}}
+- source_sheets: {{"sheet名": {{"df": DataFrame, "ws": worksheet}}}}（sheet 名跨文件不冲突时即为原 sheet 名，冲突时形如 文件名_sheet名）
 
 {source_structure}
 
@@ -2069,8 +2069,8 @@ def fill_columns_batch_{batch_index + 1}(ws, r, source_sheets):
 
 ## 已有变量
 - wb: openpyxl Workbook
-- source_data: {{"文件名_sheet名": {{"df": DataFrame, "columns": [列名]}}}} （清洗前）
-- source_sheets: {{"文件名_sheet名": {{"df": DataFrame, "ws": worksheet}}}} （清洗后，写入Excel）
+- source_data: {{"sheet名": {{"df": DataFrame, "columns": [列名]}}}} （清洗前；sheet 名跨文件不冲突时即为原 sheet 名，冲突时形如 文件名_sheet名）
+- source_sheets: {{"sheet名": {{"df": DataFrame, "ws": worksheet}}}} （清洗后，写入Excel；命名规则同上）
 - 已导入模块：os, pandas(pd), openpyxl(Workbook, Comment, PatternFill, Font, CellIsRule, FormulaRule, get_column_letter, column_index_from_string)
 - 已定义常量：EMPTY = Excel空字符串""
 - 已定义函数：excel_text('文本') = Excel文本值"文本"
