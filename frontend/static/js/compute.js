@@ -73,6 +73,8 @@ function _showPrecheckDialog(data) {
         const aiSuggestions = data.ai_suggestions || [];
         const historyWarnings = data.history_warnings || [];
         const autoFilled = data.auto_filled || [];
+        const autoRenamed = data.auto_renamed || [];
+        const renameCandidates = data.rename_candidates || [];
 
         // 收集 expected 路径列表（来自缺失列）和 actual 路径列表（来自 AI 建议）
         const expectedPaths = [];
@@ -137,6 +139,57 @@ function _showPrecheckDialog(data) {
                 </ul>
             </div>`;
 
+        // 自动改名块（高置信度组合评分匹配）
+        const autoRenamedHtml = autoRenamed.length === 0 ? '' : `
+            <div style="margin-bottom:14px;padding:10px 12px;border:1px solid #c8e6c9;background:#e8f5e9;border-radius:6px;">
+                <div style="font-weight:bold;color:#2e7d32;margin-bottom:6px;">✓ 已自动识别改名上传文件</div>
+                <ul style="margin:0;padding-left:20px;font-size:12px;color:#1b5e20;">
+                    ${autoRenamed.map(r => `<li>${_escapeHtml(r.from)} → <b>${_escapeHtml(r.to)}</b>${r.score != null ? ` <span style="color:#666;">(score=${r.score})</span>` : ''}</li>`).join('')}
+                </ul>
+            </div>`;
+
+        // 改名候选块（模糊场景，需要用户选择）
+        const hasRenameCandidates = renameCandidates.length > 0;
+        const renameCandidatesHtml = !hasRenameCandidates ? '' : `
+            <div style="margin-bottom:14px;padding:10px 12px;border:1px solid #ffe0b2;background:#fff3e0;border-radius:6px;">
+                <div style="font-weight:bold;color:#e65100;margin-bottom:6px;">⚠ 上传文件名与训练期望不一致，请确认对应关系</div>
+                <div style="font-size:12px;color:#5d4037;margin-bottom:8px;">
+                    系统按"列头 + 文件名"组合评分给出候选；当多候选难以决断时，AI 会语义判断并标记 ✨ 推荐项（已默认选中），请核对或修改后确认。
+                </div>
+                <table style="width:100%;border-collapse:collapse;font-size:12px;">
+                    <thead><tr style="background:#fff8e1;">
+                        <th style="padding:6px;border:1px solid #ffe0b2;text-align:left;">上传文件</th>
+                        <th style="padding:6px;border:1px solid #ffe0b2;text-align:left;">候选（按分数排序）</th>
+                        <th style="padding:6px;border:1px solid #ffe0b2;text-align:left;">AI 推荐</th>
+                    </tr></thead>
+                    <tbody>
+                    ${renameCandidates.map((rc) => {
+                        const aiRec = rc.ai_recommended || '';
+                        const aiConf = rc.ai_confidence != null ? Number(rc.ai_confidence).toFixed(2) : '';
+                        const aiReason = rc.ai_reason || '';
+                        const opts = ['<option value="">（不映射）</option>']
+                            .concat((rc.candidates || []).map(c => {
+                                const isAi = aiRec && c.expected === aiRec;
+                                const selected = isAi ? ' selected' : '';
+                                const star = isAi ? '✨ ' : '';
+                                return `<option value="${_escapeHtml(c.expected)}"${selected}>${star}${_escapeHtml(c.expected)} — score=${c.score}（列头=${c.header_jaccard}, 文件名=${c.name_similarity}）</option>`;
+                            }))
+                            .join('');
+                        const aiCell = aiRec
+                            ? `<div style="font-size:11px;color:#2e7d32;"><b>✨ ${_escapeHtml(aiRec)}</b>${aiConf ? ` (置信度 ${aiConf})` : ''}</div>${aiReason ? `<div style="font-size:11px;color:#666;margin-top:2px;">${_escapeHtml(aiReason)}</div>` : ''}`
+                            : '<span style="color:#999;font-size:11px;">无</span>';
+                        return `<tr>
+                            <td style="padding:6px;border:1px solid #ffe0b2;font-family:monospace;font-size:12px;vertical-align:top;">${_escapeHtml(rc.uploaded)}</td>
+                            <td style="padding:4px;border:1px solid #ffe0b2;vertical-align:top;">
+                                <select data-rename-uploaded="${_escapeHtml(rc.uploaded)}" style="width:100%;padding:4px;font-size:11px;font-family:monospace;">${opts}</select>
+                            </td>
+                            <td style="padding:6px;border:1px solid #ffe0b2;vertical-align:top;">${aiCell}</td>
+                        </tr>`;
+                    }).join('')}
+                    </tbody>
+                </table>
+            </div>`;
+
         // 缺失列块
         const missingColsHtml = missingColumns.length === 0 ? '' : `
             <div style="margin-bottom:14px;padding:10px 12px;border:1px solid #ffe0b2;background:#fff3e0;border-radius:6px;">
@@ -172,6 +225,7 @@ function _showPrecheckDialog(data) {
             </div>`;
 
         const canRetry = missingFiles.length === 0;
+        // 改名候选场景下，要求至少为一个上传文件选了目标，才允许重试
         const overlay = document.createElement('div');
         overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:9999;display:flex;align-items:center;justify-content:center;';
         overlay.innerHTML = `
@@ -181,6 +235,8 @@ function _showPrecheckDialog(data) {
                 <div style="overflow:auto;flex:1;padding-right:4px;">
                     ${missingFilesHtml}
                     ${autoFilledHtml}
+                    ${autoRenamedHtml}
+                    ${renameCandidatesHtml}
                     ${missingColsHtml}
                     ${aiSuggestionsHtml}
                     ${historyHtml}
@@ -188,7 +244,7 @@ function _showPrecheckDialog(data) {
                 <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px;border-top:1px solid #eee;padding-top:12px;">
                     <button id="_pre_cancel" style="padding:8px 20px;border:1px solid #ddd;border-radius:4px;background:#fff;cursor:pointer;">取消</button>
                     <button id="_pre_confirm" ${canRetry ? '' : 'disabled'} style="padding:8px 20px;border:none;border-radius:4px;background:${canRetry ? '#1976d2' : '#bdbdbd'};color:#fff;cursor:${canRetry ? 'pointer' : 'not-allowed'};">
-                        ${canRetry ? '按当前映射重试' : '请先补齐缺失文件'}
+                        ${canRetry ? (hasRenameCandidates ? '按已选映射重试' : '按当前映射重试') : '请先补齐缺失文件'}
                     </button>
                 </div>
             </div>`;
@@ -204,15 +260,38 @@ function _showPrecheckDialog(data) {
             confirmBtn.onclick = () => {
                 // 收集用户调整后的 AI 映射 → 转换为 file_mapping 结构
                 const fileMapping = _buildFileMappingFromAiSelections(overlay, aiSuggestions, data.file_mapping);
+                // 收集用户对改名候选的选择
+                const confirmedRenames = _collectConfirmedRenames(overlay);
                 const skipHistory = document.getElementById('_pre_skip_history')?.checked || false;
                 document.body.removeChild(overlay);
-                resolve({
+                const out = {
                     confirmed_mapping: { file_mapping: fileMapping },
                     skip_history_check: skipHistory,
-                });
+                };
+                if (Object.keys(confirmedRenames).length > 0) {
+                    out.confirmed_renames = confirmedRenames;
+                }
+                resolve(out);
             };
         }
     });
+}
+
+/**
+ * 收集改名候选下拉框的用户选择
+ * 返回：{"上传文件名": "目标期望文件名", ...}（不含被选择"不映射"的项）
+ */
+function _collectConfirmedRenames(overlay) {
+    const result = {};
+    const selects = overlay.querySelectorAll('select[data-rename-uploaded]');
+    selects.forEach(sel => {
+        const uploaded = sel.dataset.renameUploaded;
+        const target = sel.value;
+        if (uploaded && target) {
+            result[uploaded] = target;
+        }
+    });
+    return result;
 }
 
 /**
@@ -630,13 +709,19 @@ async function startCompute() {
         updateProgress(20);
         addLog('info', '正在提交计算任务...');
 
-        // Step 1: 提交任务
-        const resp = await AUTH.authFetch('/api/compute/submit', {
-            method: 'POST',
-            body: formData
-        });
+        // 提交循环：每次 422 + precheck_failed / encrypted_files 都弹窗补料后重试
+        const MAX_RETRY = 6;
+        let resp = null;
+        let attempt = 0;
+        let cancelled = false;
+        while (attempt < MAX_RETRY) {
+            attempt += 1;
+            resp = await AUTH.authFetch('/api/compute/submit', {
+                method: 'POST',
+                body: formData,
+            });
+            if (resp.ok) break;
 
-        if (!resp.ok) {
             let errorData = null;
             try { errorData = await resp.json(); } catch (e) {}
 
@@ -646,75 +731,55 @@ async function startCompute() {
                 const dialogResult = await _showPrecheckDialog(errorData);
                 if (!dialogResult) {
                     addLog('info', '用户取消了校验确认');
-                    btn.disabled = false;
-                    btn.textContent = '开始计算';
-                    updateStatus('等待计算');
-                    updateProgress(0);
-                    return;
+                    cancelled = true;
+                    break;
                 }
                 if (dialogResult.confirmed_mapping) {
                     formData.set('confirmed_mapping', JSON.stringify(dialogResult.confirmed_mapping));
                 }
+                if (dialogResult.confirmed_renames && Object.keys(dialogResult.confirmed_renames).length > 0) {
+                    formData.set('confirmed_renames', JSON.stringify(dialogResult.confirmed_renames));
+                }
                 if (dialogResult.skip_history_check) {
                     formData.set('skip_history_check', 'true');
                 }
-                addLog('info', '正在用确认后的映射重新提交...');
-                const retryResp2 = await AUTH.authFetch('/api/compute/submit', {
-                    method: 'POST',
-                    body: formData
-                });
-                if (!retryResp2.ok) {
-                    let retryError = '';
-                    try { retryError = (await retryResp2.json()).detail || ''; } catch (e) {}
-                    throw new Error(retryError || `HTTP error! status: ${retryResp2.status}`);
-                }
-                const retryData2 = await retryResp2.json();
-                _currentTaskId = retryData2.task_id;
-                _saveActiveTask(_currentTaskId, 0);
-                addLog('info', `任务已提交 (ID: ${_currentTaskId})，正在连接日志流...`);
-                _lastEventId = 0;
-                _connectComputeStream(_currentTaskId, 0);
-                return;
+                addLog('info', '正在用确认后的参数重新提交...');
+                continue;
             }
 
-            // 检测是否为加密文件错误（422 + encrypted_files）
+            // 加密文件（422 + encrypted_files）
             if (resp.status === 422 && errorData && errorData.error_type === 'encrypted_files') {
                 addLog('warning', `检测到加密文件: ${errorData.encrypted_files.join(', ')}`);
                 const passwords = await _promptFilePasswords(errorData.encrypted_files);
                 if (!passwords) {
                     addLog('info', '用户取消了密码输入');
-                    btn.disabled = false;
-                    btn.textContent = '开始计算';
-                    updateStatus('等待计算');
-                    updateProgress(0);
-                    return;
+                    cancelled = true;
+                    break;
                 }
-                addLog('info', '正在使用密码重新提交...');
                 _filePasswordsMap = passwords;
                 formData.set('file_passwords', JSON.stringify(passwords));
-                const retryResp = await AUTH.authFetch('/api/compute/submit', {
-                    method: 'POST',
-                    body: formData
-                });
-                if (!retryResp.ok) {
-                    let retryError = '';
-                    try { retryError = (await retryResp.json()).detail || ''; } catch (e) {}
-                    throw new Error(retryError || `HTTP error! status: ${retryResp.status}`);
-                }
-                const retryData = await retryResp.json();
-                _currentTaskId = retryData.task_id;
-                _saveActiveTask(_currentTaskId, 0);
-                addLog('info', `任务已提交 (ID: ${_currentTaskId})，正在连接日志流...`);
-                _lastEventId = 0;
-                _connectComputeStream(_currentTaskId, 0);
-                return;
+                addLog('info', '正在使用密码重新提交...');
+                continue;
             }
 
+            // 其他错误：直接抛
             const errorMsg = errorData?.detail || errorData?.message || `HTTP error! status: ${resp.status}`;
             throw new Error(typeof errorMsg === 'string' ? errorMsg : JSON.stringify(errorMsg));
         }
 
-        // Step 2: 获取 task_id，连接 SSE 流
+        if (cancelled) {
+            btn.disabled = false;
+            btn.textContent = '开始计算';
+            updateStatus('等待计算');
+            updateProgress(0);
+            return;
+        }
+
+        if (!resp || !resp.ok) {
+            throw new Error('事前校验多次未通过，已停止重试');
+        }
+
+        // 成功：获取 task_id，连接 SSE 流
         const data = await resp.json();
         _currentTaskId = data.task_id;
         _saveActiveTask(_currentTaskId, 0);

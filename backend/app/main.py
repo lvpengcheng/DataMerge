@@ -4496,6 +4496,7 @@ async def compute_submit(
     standard_hours: Optional[float] = Form(None),
     file_passwords: Optional[str] = Form(None),
     confirmed_mapping: Optional[str] = Form(None),
+    confirmed_renames: Optional[str] = Form(None),
     skip_history_check: Optional[bool] = Form(False),
 ):
     """提交计算任务，立即返回 task_id，计算在后台运行。"""
@@ -4582,6 +4583,15 @@ async def compute_submit(
             except Exception as _ce:
                 logger.warning(f"[compute/submit] confirmed_mapping 解析失败: {_ce}")
 
+        _confirmed_renames = None
+        if confirmed_renames:
+            try:
+                _parsed = json.loads(confirmed_renames)
+                if isinstance(_parsed, dict):
+                    _confirmed_renames = {str(k): str(v) for k, v in _parsed.items() if k and v}
+            except Exception as _cr:
+                logger.warning(f"[compute/submit] confirmed_renames 解析失败: {_cr}")
+
         _precheck_db = SessionLocal()
         try:
             pc_result = precheck_compute(
@@ -4595,6 +4605,7 @@ async def compute_submit(
                 db_session=_precheck_db,
                 ai_provider_name=os.environ.get("AI_PROVIDER", "deepseek"),
                 confirmed_mapping=_confirmed,
+                confirmed_renames=_confirmed_renames,
             )
         finally:
             try:
@@ -4611,6 +4622,8 @@ async def compute_submit(
                     "error_type": "precheck_failed",
                     "missing_files": pc_result.missing_files,
                     "auto_filled": pc_result.auto_filled,
+                    "auto_renamed": pc_result.auto_renamed,
+                    "rename_candidates": pc_result.rename_candidates,
                     "missing_columns": pc_result.missing_columns,
                     "ai_suggestions": pc_result.ai_suggestions,
                     "history_warnings": pc_result.history_warnings,

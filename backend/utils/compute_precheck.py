@@ -38,6 +38,8 @@ class PrecheckResult:
     ok: bool = True
     missing_files: List[str] = field(default_factory=list)
     auto_filled: List[Dict[str, Any]] = field(default_factory=list)
+    auto_renamed: List[Dict[str, Any]] = field(default_factory=list)
+    rename_candidates: List[Dict[str, Any]] = field(default_factory=list)
     missing_columns: List[Dict[str, Any]] = field(default_factory=list)
     ai_suggestions: List[Dict[str, Any]] = field(default_factory=list)
     history_warnings: List[str] = field(default_factory=list)
@@ -58,6 +60,7 @@ def precheck_compute(
     db_session,
     ai_provider_name: Optional[str] = None,
     confirmed_mapping: Optional[Dict[str, Any]] = None,
+    confirmed_renames: Optional[Dict[str, str]] = None,
 ) -> PrecheckResult:
     """智算事前校验主入口"""
     result = PrecheckResult()
@@ -66,6 +69,45 @@ def precheck_compute(
         # 老脚本可能没存 source_structure，无法校验，直接放行
         logger.info("[Precheck] 缺少 source_structure，跳过校验")
         return result
+
+    # 步骤 0：用户已确认的改名映射先落地
+    if confirmed_renames:
+        try:
+            from .source_auto_filler import apply_confirmed_renames
+            applied = apply_confirmed_renames(source_dir, confirmed_renames)
+            if applied:
+                result.auto_renamed.extend(applied)
+                logger.info(f"[Precheck] 应用用户确认改名: {applied}")
+        except Exception as e:
+            logger.warning(f"[Precheck] 应用 confirmed_renames 失败: {e}", exc_info=True)
+
+    # 步骤 0.5：列头+文件名组合评分自动改名（处理用户改名上传场景）
+    try:
+        from .source_auto_filler import auto_rename_uploaded_by_combined_score, ai_disambiguate_rename_candidates
+        renamed, ambiguous, uploaded_headers_map = auto_rename_uploaded_by_combined_score(
+            source_dir=source_dir,
+            source_structure=source_structure,
+        )
+        if renamed:
+            result.auto_renamed.extend(renamed)
+        if ambiguous:
+            # 程序无法决断 → 调 AI 给语义裁决，但仍交由前端弹窗确认
+            if ai_provider_name:
+                try:
+                    ambiguous = ai_disambiguate_rename_candidates(
+                        ambiguous=ambiguous,
+                        source_structure=source_structure,
+                        uploaded_headers_map=uploaded_headers_map,
+                        ai_provider_name=ai_provider_name,
+                    )
+                except Exception as ai_err:
+                    logger.warning(f"[Precheck] AI 改名裁决失败（不阻断）: {ai_err}", exc_info=True)
+            result.ok = False
+            result.rename_candidates = ambiguous
+            logger.warning(f"[Precheck] 改名候选需用户确认: {[c['uploaded'] for c in ambiguous]}")
+            return result
+    except Exception as e:
+        logger.warning(f"[Precheck] 自动改名评分异常: {e}", exc_info=True)
 
     # 步骤 1：基础资料兜底
     try:
