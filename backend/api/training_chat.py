@@ -94,14 +94,15 @@ def _create_formula_generator(ai_provider_name: str, stream_callback=None):
     return generator, provider
 
 
-def _build_source_structure_from_generator(generator) -> Dict[str, Any]:
+def _build_source_structure_from_generator(generator, multi_sheet_source: bool = False) -> Dict[str, Any]:
     """从 FormulaCodeGenerator 的已加载数据构建 source_structure。
 
     返回格式与 TrainingEngine._analyze_source_structure 一致：
     {"files": {"文件名.xlsx": {"sheets": {"Sheet1": {"headers": {"列名": "A", ...}}}}}}
     这是 FastHeaderMatcher 计算时进行表头匹配的依据。
     """
-    structure = {"files": {}, "total_sheets": 0, "total_regions": 0}
+    structure = {"files": {}, "total_sheets": 0, "total_regions": 0,
+                 "multi_sheet_source": multi_sheet_source}
 
     source_sheets = getattr(getattr(generator, 'formula_builder', None), 'source_sheets', None)
     if not source_sheets:
@@ -1334,7 +1335,9 @@ def main(source_dir, output_dir, **kwargs):
                 ts.config = config
 
                 # 构建真正的 source_structure（供计算时 FastHeaderMatcher 使用）
-                real_source_structure = _build_source_structure_from_generator(generator)
+                real_source_structure = _build_source_structure_from_generator(
+                    generator, multi_sheet_source=config.get("multi_sheet_source", False)
+                )
                 ts.source_structure = real_source_structure
                 db.commit()
             except Exception as e:

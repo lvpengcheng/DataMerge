@@ -57,7 +57,7 @@ RUN cp /app/libs/libSkiaSharp.so /usr/lib/libSkiaSharp.so \
 # 生成 Linux 专用 runtimeconfig.json（含 additionalProbingPaths）
 RUN printf '{\n  "runtimeOptions": {\n    "tfm": "net9.0",\n    "framework": {\n      "name": "Microsoft.NETCore.App",\n      "version": "9.0.11"\n    },\n    "additionalProbingPaths": ["/app/libs"]\n  }\n}\n' > /app/libs/runtimeconfig.json
 
-COPY excel_parser.py aspose_init.py run.py ./
+COPY excel_parser.py aspose_init.py run.py split_by_banner.py ./
 COPY backend/ ./backend/
 COPY frontend/ ./frontend/
 COPY global_assets/ ./global_assets/

@@ -69,7 +69,7 @@ if exist fonts (
 )
 
 echo [5/6] 复制配置文件...
-for %%f in (excel_parser.py aspose_init.py run.py requirements.txt) do (
+for %%f in (excel_parser.py aspose_init.py run.py split_by_banner.py requirements.txt) do (
     copy /Y "%%f" "%DOCKER_DIR%\" >nul
 )
 copy /Y Dockerfile "%DOCKER_DIR%\" >nul
@@ -131,7 +131,7 @@ echo [3/6] 复制 libs (Aspose.Cells .NET DLL)...
 xcopy /E /I /Q /Y libs "%IIS_DIR%\libs" >nul
 
 echo [4/6] 复制核心文件...
-for %%f in (excel_parser.py aspose_init.py run.py requirements.txt) do (
+for %%f in (excel_parser.py aspose_init.py run.py split_by_banner.py requirements.txt) do (
     copy /Y "%%f" "%IIS_DIR%\" >nul
 )
 if exist web.config copy /Y web.config "%IIS_DIR%\" >nul
