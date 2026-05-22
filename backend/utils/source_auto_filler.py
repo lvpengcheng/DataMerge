@@ -26,8 +26,10 @@ logger = logging.getLogger(__name__)
 HEADER_MATCH_THRESHOLD = 0.7
 
 # 组合评分自动改名阈值
-RENAME_AUTO_SCORE = 0.85       # 第一名分数门槛
-RENAME_AUTO_LEAD = 0.15        # 第一名领先第二名的差距
+RENAME_AUTO_SCORE = 0.85       # 综合分门槛（列头+文件名加权）
+RENAME_AUTO_LEAD = 0.15        # 综合分领先第二名的差距
+RENAME_JACCARD_AUTO = 0.85     # 列头主导判定：jaccard 单独门槛（不依赖文件名）
+RENAME_JACCARD_LEAD = 0.20     # 列头主导判定：jaccard 领先第二名的差距
 RENAME_CANDIDATE_FLOOR = 0.30  # 候选展示最低分（低于此分根本不算候选）
 RENAME_HEADER_WEIGHT = 0.7
 RENAME_NAME_WEIGHT = 0.3
@@ -346,38 +348,61 @@ def auto_rename_uploaded_by_combined_score(
     for u_name, ranked in top_by_uploaded.items():
         if not ranked:
             continue
-        ranked = ranked[:3]  # 已按分降序
+        ranked = ranked[:5]  # 已按分降序
+
+        # 综合分（列头+文件名加权）的第一/二名
         first_score, first_expected, first_j, first_n = ranked[0]
         second_score = ranked[1][0] if len(ranked) >= 2 else 0.0
-        lead = first_score - second_score
+        score_lead = first_score - second_score
+
+        # 列头主导判定：单独按 jaccard 排，找 top-1 / top-2
+        by_j = sorted(ranked, key=lambda r: -r[2])
+        j_first_score, j_first_expected, j_first_j, j_first_n = by_j[0]
+        j_second_j = by_j[1][2] if len(by_j) >= 2 else 0.0
+        j_lead = j_first_j - j_second_j
+
+        # 决策：列头主导优先（列头是真凭实据），综合分作兜底
+        auto_target = None
+        auto_meta = None
+        decision = None
+        if j_first_j >= RENAME_JACCARD_AUTO and j_lead >= RENAME_JACCARD_LEAD:
+            auto_target = j_first_expected
+            auto_meta = (j_first_score, j_first_j, j_first_n)
+            decision = "header"
+        elif first_score >= RENAME_AUTO_SCORE and score_lead >= RENAME_AUTO_LEAD:
+            auto_target = first_expected
+            auto_meta = (first_score, first_j, first_n)
+            decision = "combined"
 
         if (
-            first_score >= RENAME_AUTO_SCORE
-            and lead >= RENAME_AUTO_LEAD
-            and first_expected not in consumed_expected
+            auto_target
+            and auto_target not in consumed_expected
             and u_name not in consumed_uploaded
         ):
+            picked_score, picked_j, picked_n = auto_meta
             try:
                 old = src_path / u_name
-                new = src_path / first_expected
+                new = src_path / auto_target
                 if new.exists():
-                    new.unlink()  # 不应该出现，因为 first_expected 在 missing 里，但稳妥起见
+                    new.unlink()
                 old.rename(new)
                 consumed_uploaded.add(u_name)
-                consumed_expected.add(first_expected)
+                consumed_expected.add(auto_target)
                 renamed_list.append({
                     "from": u_name,
-                    "to": first_expected,
-                    "score": round(first_score, 3),
-                    "header_jaccard": round(first_j, 3),
-                    "name_similarity": round(first_n, 3),
+                    "to": auto_target,
+                    "score": round(picked_score, 3),
+                    "header_jaccard": round(picked_j, 3),
+                    "name_similarity": round(picked_n, 3),
+                    "decision": decision,
                 })
                 logger.info(
-                    f"[Rename] 自动改名 '{u_name}' → '{first_expected}' "
-                    f"(score={first_score:.2f}, jaccard={first_j:.2f}, name_sim={first_n:.2f}, lead={lead:.2f})"
+                    f"[Rename] 自动改名 '{u_name}' → '{auto_target}' "
+                    f"(decision={decision}, score={picked_score:.2f}, jaccard={picked_j:.2f}, "
+                    f"name_sim={picked_n:.2f}, score_lead={score_lead:.2f}, j_lead={j_lead:.2f})"
                 )
             except Exception as e:
-                logger.warning(f"[Rename] 改名失败 '{u_name}' → '{first_expected}': {e}")
+                logger.warning(f"[Rename] 改名失败 '{u_name}' → '{auto_target}': {e}")
 
     # 第二遍：剩下的算候选
     ambiguous: List[Dict[str, object]] = []
