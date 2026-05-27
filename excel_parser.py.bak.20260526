@@ -49,35 +49,6 @@ def _licensed_workbook(*args, **kwargs):
     return _AsposeWorkbook(*args, **kwargs)
 
 
-def _should_skip_hidden_sheets() -> bool:
-    """读取 .env 中 EXCEL_SKIP_HIDDEN_SHEETS（默认 true=跳过隐藏sheet）"""
-    val = os.getenv("EXCEL_SKIP_HIDDEN_SHEETS", "true").strip().lower()
-    return val not in ("false", "0", "no", "off", "")
-
-
-def _filter_visible_sheets(sheets, skip_hidden: bool):
-    """从 Aspose 工作表列表中过滤掉隐藏 sheet（VisibilityType != Visible）
-
-    Args:
-        sheets: Aspose 工作表对象列表
-        skip_hidden: True=跳过隐藏sheet，False=保留全部
-    Returns:
-        过滤后的工作表列表
-    """
-    if not skip_hidden:
-        return list(sheets)
-    visible = []
-    for ws in sheets:
-        try:
-            if ws.IsVisible:
-                visible.append(ws)
-            else:
-                logger.info(f"跳过隐藏sheet: '{ws.Name}'")
-        except Exception:
-            visible.append(ws)
-    return visible
-
-
 # ==================== Aspose.Cells 适配器层 ====================
 # 将 Aspose Worksheet 包装为兼容原有业务逻辑的接口（1-indexed row/col）
 
@@ -1322,8 +1293,7 @@ class IntelligentExcelParser:
                         active_sheet_only: bool = False,
                         best_region_only: bool = False,
                         password: str = None,
-                        read_formulas: bool = True,
-                        skip_hidden_sheets: bool = None) -> List[SheetData]:
+                        read_formulas: bool = True) -> List[SheetData]:
         """读取并解析Excel文件
 
         Args:
@@ -1339,7 +1309,6 @@ class IntelligentExcelParser:
                             True时每个sheet最多保留1个最优区域（或合并后的区域组）
             password: 文件打开密码（加密文件需要）
             read_formulas: 是否读取公式，False时使用ExportArray批量读取大幅提升性能
-            skip_hidden_sheets: 是否跳过隐藏sheet。None=读取 .env 的 EXCEL_SKIP_HIDDEN_SHEETS（默认true）
 
         Returns:
             解析后的Sheet数据列表
@@ -1372,14 +1341,11 @@ class IntelligentExcelParser:
             file_manual_headers = self._extract_file_manual_headers(file_path, manual_headers)
 
             # 确定要处理的 sheet 列表
-            _skip_hidden = _should_skip_hidden_sheets() if skip_hidden_sheets is None else skip_hidden_sheets
             if active_sheet_only:
                 active_idx = aspose_wb.Worksheets.ActiveSheetIndex
                 sheets_to_parse = [aspose_wb.Worksheets[active_idx]]
-                # 激活sheet本身就是隐藏的话仍然解析（用户显式指定）
             else:
-                all_sheets = [aspose_wb.Worksheets[i] for i in range(aspose_wb.Worksheets.Count)]
-                sheets_to_parse = _filter_visible_sheets(all_sheets, _skip_hidden)
+                sheets_to_parse = [aspose_wb.Worksheets[i] for i in range(aspose_wb.Worksheets.Count)]
 
             for aspose_ws in sheets_to_parse:
                 # 包装为兼容适配器
@@ -1522,7 +1488,7 @@ class IntelligentExcelParser:
             return False
         real_names = [k for k in head_data.keys() if not k.startswith('Column_')]
         if not real_names:
-            return True  # 全部是 Column_* 占位 → 退化表头
+            return False
         column_x_ratio = (len(head_data) - len(real_names)) / len(head_data)
         if column_x_ratio >= 0.6 and len(real_names) <= 2:
             return True
@@ -1537,17 +1503,14 @@ class IntelligentExcelParser:
     def _looks_like_data_row_keys(keys: List[str]) -> bool:
         """判断 head_data 的键集合是否更像"被误识为表头的数据行"。
 
-        强信号：
+        任一强信号即触发：
         - 纯数字键（≥3 位整数 或 浮点）
         - ID 码键（如 MNCN00733）
         - 日期/年月模式
-        - 三段及以上 "X-Y-Z" 拼接，且每段都包含数字（避免 YYYY-MM-DD 等格式占位符）
-
-        需要 ≥2 个不同 key 命中才返回 True，避免单 key 偶发性误判。
+        - 三段及以上 "X-Y-Z" 拼接（多行表头副产物）
         """
         if not keys:
             return False
-        triggered = set()
         for k in keys:
             if not k:
                 continue
@@ -1557,17 +1520,16 @@ class IntelligentExcelParser:
             try:
                 num = float(s)
                 if abs(num) >= 100 or '.' in s:
-                    triggered.add(s); continue
+                    return True
             except ValueError:
                 pass
             if re.match(r'^[A-Z]{2,}\d{3,}$', s):
-                triggered.add(s); continue
+                return True
             if re.search(r'\d{4}[年/.\-]\d{1,2}|\d{1,2}\.\d{1,2}\s*[-~至]', s):
-                triggered.add(s); continue
-            m = re.search(r'([\u4e00-\u9fff\w]+)-([\u4e00-\u9fff\w]+)-([\u4e00-\u9fff\w]+)', s)
-            if m and all(re.search(r'\d', g) for g in m.groups()):
-                triggered.add(s); continue
-        return len(triggered) >= 2
+                return True
+            if re.search(r'[\u4e00-\u9fff\w]+-[\u4e00-\u9fff\w]+-[\u4e00-\u9fff\w]+', s):
+                return True
+        return False
 
     def _normalize_sheet_regions(self, regions: List[ExcelRegion]) -> None:
         """同 sheet 内多区域后处理：仅当后续区域的 head_data 明显是"数据行被误识为表头"
@@ -1576,28 +1538,6 @@ class IntelligentExcelParser:
         保护场景：相邻区域真实列名不同（如 "On-Board Date" 对 "Terminated Date"），
         虽然列字母签名一致，但都是合法独立表头，不应被合并。
         """
-        # 【剪除退化区域】孤儿单行 / 全 Column_* 幻影 / 仅有 1 行数据的伪头
-        pruned = []
-        for r in regions:
-            keys = list(r.head_data.keys()) if r.head_data else []
-            no_data = (r.data_row_start == 0 and r.data_row_end == 0)
-            data_rows = (r.data_row_end - r.data_row_start + 1) if r.data_row_start > 0 else 0
-
-            is_orphan = no_data and self._looks_like_data_row_keys(keys)
-            is_phantom = bool(keys) and all(k.startswith('Column_') for k in keys)
-            # 伪头(_is_fake_merged_header)代表整个 head 是退化结构(全占位/合并展开),
-            # 数据再多也不是真正的表格,直接剪除
-            is_degen_fake = self._is_fake_merged_header(r.head_data)
-
-            if is_orphan or is_phantom or is_degen_fake:
-                self.logger.info(
-                    f"剪除退化区域 head {r.head_row_start}-{r.head_row_end} "
-                    f"data {r.data_row_start}-{r.data_row_end}"
-                )
-                continue
-            pruned.append(r)
-        regions[:] = pruned
-
         if len(regions) < 2:
             return
 
@@ -2073,14 +2013,6 @@ class IntelligentExcelParser:
                 if features.non_empty_count > 0 and features.text_ratio > 0.5:
                     should_continue = True
 
-            # 【Fix D】稀疏分组行：上层 ≥2 个文本格、且全部位置是下层非空列的子集
-            #   场景：r11=['','','','','','税前','税前','税前',...] 在 r12=字段名上方
-            elif features.text_ratio >= 0.8 and features.non_empty_count >= 2:
-                upper_cols = self._row_non_empty_cols(worksheet, row, max_col)
-                lower_cols = self._row_non_empty_cols(worksheet, prev_row, max_col)
-                if upper_cols and upper_cols.issubset(lower_cols):
-                    should_continue = True
-
             # ==================== 原有逻辑（无合并格的行） ====================
 
             if not should_continue:
@@ -2109,15 +2041,6 @@ class IntelligentExcelParser:
                 break
 
         return header_start
-
-    def _row_non_empty_cols(self, worksheet: Any, row: int, max_col: int) -> set:
-        """返回该行非空单元格的列号集合"""
-        cols = set()
-        for c in range(1, max_col + 1):
-            v = worksheet.cell(row, c).value
-            if v is not None and str(v).strip() != '':
-                cols.add(c)
-        return cols
 
     def _has_format_break(self, worksheet: Any, row1: int, row2: int, max_col: int) -> bool:
         """检测两行之间是否有明显的格式突变
@@ -2311,30 +2234,6 @@ class IntelligentExcelParser:
         """
         current_header_end = start_row
         MAX_HEADER_ROWS = 8  # 增加表头最大行数限制
-
-        # 【Fix E】数据透视表多行表头：start_row 含 '列标签'/'行标签' → 向下吞并 pivot 关键字行
-        pivot_keywords = ('求和项', '计数项', '平均值', '最大值', '最小值', '行标签', '列标签')
-
-        def _row_text(r: int) -> str:
-            return ' '.join(
-                str(worksheet.cell(r, c).value or '') for c in range(1, max_col + 1)
-            )
-
-        start_text = _row_text(start_row)
-        if '列标签' in start_text or '行标签' in start_text:
-            r = start_row + 1
-            while r <= min(start_row + MAX_HEADER_ROWS, max_row):
-                if self._is_empty_row(worksheet, r, max_col):
-                    break
-                row_text = _row_text(r)
-                has_pivot = any(kw in row_text for kw in pivot_keywords)
-                # 只有含 pivot 关键字的行才视作表头延伸；否则停止（避免吞数据行）
-                if has_pivot:
-                    current_header_end = r
-                    r += 1
-                    continue
-                break
-            return current_header_end  # 直接返回，避免主循环重新评估
 
         for row in range(start_row, min(start_row + MAX_HEADER_ROWS + 1, max_row + 1)):
             if self._is_empty_row(worksheet, row, max_col):
@@ -2614,20 +2513,12 @@ class IntelligentExcelParser:
         confirmed_data_rows = 0
         check_interval = 1  # 初始每行检查
 
-        # 【Fix G】捕获 start_row 特征,用于在 ≥3 空行后判断是否还有同形数据(支持稀疏数据末尾)
-        start_features = self.row_analyzer.analyze_row_features(worksheet, start_row, max_col)
-
         for row in range(start_row, max_row + 1):
             if self._is_empty_row(worksheet, row, max_col):
                 consecutive_empty_rows += 1
-                # 【Fix G】30 个连续空行硬停;3 个空行触发前瞻,有同形数据则继续扫描
-                if consecutive_empty_rows >= 30:
+                # 连续3个空行，数据区域结束
+                if consecutive_empty_rows >= 3:
                     break
-                if consecutive_empty_rows == 3:
-                    if not self._has_data_continuation_after_gap(
-                        worksheet, row, max_row, max_col, start_features
-                    ):
-                        break
                 continue
 
             consecutive_empty_rows = 0
@@ -2679,35 +2570,7 @@ class IntelligentExcelParser:
                 confirmed_data_rows += 1
 
         return last_valid_data_row
-
-    def _has_data_continuation_after_gap(self, worksheet: Any, current_row: int,
-                                         max_row: int, max_col: int,
-                                         start_features: 'RowFeatures') -> bool:
-        """【Fix G】3 个连续空行后,前瞻最多 LOOKAHEAD 行,判断是否还有同形数据。
-
-        判断标准: 区间内首个非空行不是 title/summary,且其 non_empty_count
-        与 start_row 的 non_empty_count 相似(≥40% 比值或差 ≤2)。
-        用于支持「数据末尾有空行间隔再出现真实数据」的稀疏数据场景。
-        """
-        LOOKAHEAD = 20
-        look_limit = min(current_row + LOOKAHEAD, max_row)
-        for r in range(current_row + 1, look_limit + 1):
-            if self._is_empty_row(worksheet, r, max_col):
-                continue
-            # 找到首个非空行
-            if self._is_title_row(worksheet, r, max_col):
-                return False
-            if self._is_summary_row(worksheet, r, max_col):
-                return False
-            feats = self.row_analyzer.analyze_row_features(worksheet, r, max_col)
-            if start_features.non_empty_count > 0 and feats.non_empty_count > 0:
-                hi = max(feats.non_empty_count, start_features.non_empty_count)
-                lo = min(feats.non_empty_count, start_features.non_empty_count)
-                if (lo / hi >= 0.4) or (hi - lo <= 2):
-                    return True
-            return False
-        return False
-
+    
     def _build_header_mapping(self, worksheet: Any, start_row: int, end_row: int, max_col: int) -> Dict[str, str]:
         """构建表头映射（增强版 - 支持多行表头、复合表头、合并单元格）
 
@@ -3214,23 +3077,19 @@ class IntelligentExcelParser:
             if any(keyword.lower() in first_value_str.lower() for keyword in self.TITLE_KEYWORDS):
                 return True
 
-        # 情况1c/1d 兜底：
-        # 因为 Aspose 在合并单元格内会把同一值"展开"到多列，单个标题文本会被算作多个非空。
-        # 1c (日期模式) 仍允许 1-2 个非空,因为日期 banner 可能拆成两格;
-        # 1d (长文本横幅) 仅限单 cell 或合并展开的横幅,避免把 2 列真实表头(如
-        # ['新成本中心编号','新成本中心名称'])或 2 列重复值的真实数据行(如
-        # ['5000-产品-产品市场部','5000-产品-产品市场部'])误判为标题。
+        # 情况1c/1d 兜底（适用于 1-2 个非空单元格）：
+        # 因为 Aspose 在合并单元格内会把同一值"展开"到多列，单个标题文本会被算作 2 个非空，
+        # 所以这两条规则需要覆盖 1 和 2 两种情况。
         if non_empty_cells <= 2:
             # 1c: 包含日期/月份/期间模式（如 "2026.04月04.01-04.30"、"2026年4月"）
             if re.search(r'\d{4}[.\-/年]\d{1,2}|\d{1,2}\.\d{1,2}\s*[-~至]\s*\d{1,2}\.\d{1,2}', first_value_str):
                 return True
-        # 1d: 文本较长（>=6 字符）且不是 HEADER_KEYWORDS 的精确匹配
-        # 限制为 (单 cell) 或 (合并展开横幅,要求 distinct=1 且 non_empty>=3),
-        # 用于捕获 "On board in Apr."、"苏日娜社保个人部分垫付" 等单 cell 横幅
-        if non_empty_cells == 1 or (is_merged_banner and non_empty_cells >= 3):
+            # 1d: 文本较长（>=6 字符）且不是 HEADER_KEYWORDS 的精确匹配
+            # 用于捕获 "On board in Apr."、"苏日娜社保个人部分垫付" 等横幅/小区域标题
             if len(first_value_str) >= 6 and first_value_str not in self.HEADER_KEYWORDS:
                 if not (first_value_str.endswith(':') or first_value_str.endswith('：')):
                     if not any(m in first_value_str for m in self.REQUIRED_FIELD_MARKERS):
+                        return True
                         return True
 
         # 情况2: 第一个单元格包含说明区域关键字（但不是只有必填标记开头）
@@ -4063,12 +3922,9 @@ class IntelligentExcelParser:
                                  sheet_data.sheet_name, regions)
                             )
                 else:
-                    # 每个sheet各自取最优区域（默认跳过隐藏sheet）
-                    _skip_hidden = _should_skip_hidden_sheets()
-                    all_sheets = [aspose_wb.Worksheets[i] for i in range(aspose_wb.Worksheets.Count)]
-                    visible_sheets = _filter_visible_sheets(all_sheets, _skip_hidden)
-                    for aspose_ws in visible_sheets:
-                        ws = _AsposeWorksheet(aspose_ws)
+                    # 每个sheet各自取最优区域
+                    for i in range(aspose_wb.Worksheets.Count):
+                        ws = _AsposeWorksheet(aspose_wb.Worksheets[i])
                         sheet_data = self._parse_sheet(ws, max_data_rows=2)
                         if sheet_data and sheet_data.regions:
                             _, regions = self._find_valid_region([sheet_data])
@@ -4092,10 +3948,8 @@ class IntelligentExcelParser:
         if active_sheet_only:
             exp_sheets = [expected_wb.Worksheets[exp_active_idx]]
         else:
-            _skip_hidden = _should_skip_hidden_sheets()
-            all_exp_sheets = [expected_wb.Worksheets[i]
-                              for i in range(expected_wb.Worksheets.Count)]
-            exp_sheets = _filter_visible_sheets(all_exp_sheets, _skip_hidden)
+            exp_sheets = [expected_wb.Worksheets[i]
+                          for i in range(expected_wb.Worksheets.Count)]
 
         expected_data_list = []
         for aspose_ws in exp_sheets:

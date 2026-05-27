@@ -373,6 +373,10 @@ async function selectSession(sessionId) {
         _updateChatStatus(data.session.status);
         _updateActionButtons(data.session);
 
+        // 显示"重新生成"按钮（已进入会话且非流式中）
+        const regenBtn = document.getElementById('regenerate-btn');
+        if (regenBtn) regenBtn.style.display = '';
+
         _highlightActiveSession();
     } catch (e) {
         console.error('加载会话失败:', e);
@@ -386,6 +390,8 @@ async function deleteSession(sessionId) {
         _chatMessages = [];
         _clearChatUI();
         _hideActionButtons();
+        const regenBtn = document.getElementById('regenerate-btn');
+        if (regenBtn) regenBtn.style.display = 'none';
     }
     _sessions = _sessions.filter(s => s.id !== sessionId);
     _renderSessionList();
@@ -709,11 +715,17 @@ function sendMessage(action) {
     const text = input.value.trim();
     if (_isStreaming) return;
 
-    // action: undefined/'chat' = 对话讨论, 'generate' = 执行代码修正
+    // action: undefined/'chat' = 对话讨论, 'generate' = 执行代码修正, 'regenerate' = 上传新文件后重新生成
     action = action || 'chat';
 
     // 已在会话中 → 直接发消息，无需再选租户
     if (_currentSessionId) {
+        if (action === 'regenerate') {
+            _sendRegenerateMessage(text);
+            input.value = '';
+            input.style.height = '';
+            return;
+        }
         if (!text && action === 'chat') return;
         _sendChatMessage(text || '请根据之前的讨论修正代码', action);
         input.value = '';
@@ -800,6 +812,50 @@ function _sendChatMessage(text, action) {
     _addMessage('user', text);
     _setUIStreaming(true);
 
+    _fetchTrainingSSE(`/api/training/chat/sessions/${_currentSessionId}/message`, {
+        method: 'POST',
+        body: formData,
+    });
+}
+
+function _sendRegenerateMessage(text) {
+    const sourceFiles = document.getElementById('source-files').files;
+    const targetFile = document.getElementById('target-file').files[0];
+    const ruleFiles = document.getElementById('rule-files').files;
+
+    const hasAny = (sourceFiles && sourceFiles.length > 0) || !!targetFile || (ruleFiles && ruleFiles.length > 0);
+    if (!hasAny) {
+        const ok = confirm('未选择新文件。继续将使用原有文件重新生成代码（追加为新一轮迭代）。是否继续？');
+        if (!ok) return;
+    }
+
+    const formData = new FormData();
+    formData.append('message', text || '使用新文件重新生成');
+    formData.append('action', 'regenerate');
+
+    if (sourceFiles && sourceFiles.length > 0) {
+        Array.from(sourceFiles).forEach(f => formData.append('source_files', f));
+    }
+    if (targetFile) {
+        formData.append('expected_result', targetFile);
+    }
+    if (ruleFiles && ruleFiles.length > 0) {
+        Array.from(ruleFiles).forEach(f => formData.append('rule_files', f));
+    }
+
+    // 描述文本带上文件标签，方便用户在历史中识别这一轮
+    const tagParts = [];
+    if (sourceFiles && sourceFiles.length > 0) tagParts.push(`源文件×${sourceFiles.length}`);
+    if (targetFile) tagParts.push(`目标=${targetFile.name}`);
+    if (ruleFiles && ruleFiles.length > 0) tagParts.push(`规则×${ruleFiles.length}`);
+    const tag = tagParts.length > 0 ? `\n[新文件: ${tagParts.join(', ')}]` : '\n[未上传新文件]';
+    _addMessage('user', (text || '使用新文件重新生成') + tag);
+
+    // 关闭附件 popover
+    const pop = document.getElementById('attach-popover');
+    if (pop) pop.style.display = 'none';
+
+    _setUIStreaming(true);
     _fetchTrainingSSE(`/api/training/chat/sessions/${_currentSessionId}/message`, {
         method: 'POST',
         body: formData,
@@ -1367,8 +1423,10 @@ function _setUIStreaming(streaming) {
     _isStreaming = streaming;
     const sendBtn = document.getElementById('send-btn');
     const genBtn = document.getElementById('generate-btn');
+    const regenBtn = document.getElementById('regenerate-btn');
     sendBtn.disabled = streaming;
     if (genBtn) genBtn.disabled = streaming;
+    if (regenBtn) regenBtn.disabled = streaming;
     if (streaming) {
         sendBtn.textContent = '处理中...';
     } else {
@@ -1378,6 +1436,8 @@ function _setUIStreaming(streaming) {
         _chatStreamBuf = '';
         // 流式结束后，重新应用租户权限灰化
         _applyTenantPermission();
+        // 已进入会话时，显示"重新生成"按钮
+        if (regenBtn) regenBtn.style.display = _currentSessionId ? '' : 'none';
     }
 }
 

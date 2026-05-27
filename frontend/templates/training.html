@@ -73,6 +73,7 @@
                     <textarea id="chat-input" placeholder="分析讨论或描述修改方案..." rows="2" onkeydown="handleInputKeydown(event)"></textarea>
                     <button id="send-btn" class="btn btn-send" onclick="sendMessage()" title="发送对话（分析/讨论）">发送</button>
                     <button id="generate-btn" class="btn btn-generate" onclick="sendMessage('generate')" title="根据讨论结果修正代码并执行验证">执行修正</button>
+                    <button id="regenerate-btn" class="btn btn-generate" onclick="sendMessage('regenerate')" title="使用附件中已选的新文件（源/目标/规则）从头重新生成代码（已上传的字段才会替换，未上传的保留原值）" style="display:none;">重新生成</button>
                 </div>
 
                 <!-- 文件与配置 - 居中模态弹窗 -->
@@ -150,6 +151,6 @@
     <input type="file" id="upload-code-input" accept=".py" style="display:none;" onchange="handleUploadCode(event)">
 
     <script src="/static/js/auth.js"></script>
-    <script src="/static/js/training.js?v=20260521c"></script>
+    <script src="/static/js/training.js?v=20260527a"></script>
 </body>
 </html>

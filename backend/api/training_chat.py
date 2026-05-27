@@ -1498,13 +1498,15 @@ def main(source_dir, output_dir, **kwargs):
 @router.post("/sessions/{session_id}/message")
 async def send_message(
     session_id: int,
-    message: str = Form(...),
-    action: str = Form("chat"),  # "chat" = 对话讨论, "generate" = 触发代码修正
+    message: str = Form(""),
+    action: str = Form("chat"),  # "chat" = 对话讨论, "generate" = 触发代码修正, "regenerate" = 上传新文件并重新生成
     rule_files: List[UploadFile] = File(default=[]),
+    source_files: List[UploadFile] = File(default=[]),
+    expected_result: UploadFile = File(None),
     current_user=Depends(get_current_user),
     accessible_tenants: list = Depends(get_operable_tenants),
 ):
-    """用户发送消息。action=chat 进行对话讨论，action=generate 触发代码修正+执行"""
+    """用户发送消息。action=chat 对话讨论；action=generate 触发代码修正+执行；action=regenerate 上传新源/目标/规则文件后从头重新生成"""
 
     # 租户权限校验：从 session 反查 tenant_id
     _check_db = SessionLocal()
@@ -1536,6 +1538,24 @@ async def send_message(
                     new_rules += content.decode("utf-8", errors="replace") + "\n"
                 except Exception:
                     pass
+
+    # 读取新上传的源/目标文件并暂存到临时目录（仅 regenerate 用到）
+    staged_source_dir = None
+    staged_expected_path = None
+    if source_files and any(getattr(sf, "filename", None) for sf in source_files):
+        staged_source_dir = tempfile.mkdtemp(prefix="chat_regen_src_")
+        for sf in source_files:
+            if not getattr(sf, "filename", None):
+                continue
+            content = await sf.read()
+            with open(os.path.join(staged_source_dir, sf.filename), "wb") as fp:
+                fp.write(content)
+    if expected_result and getattr(expected_result, "filename", None):
+        staged_exp_dir = tempfile.mkdtemp(prefix="chat_regen_exp_")
+        staged_expected_path = os.path.join(staged_exp_dir, expected_result.filename)
+        content = await expected_result.read()
+        with open(staged_expected_path, "wb") as fp:
+            fp.write(content)
 
     loop = asyncio.get_event_loop()
     queue, _emit, sse_generator = _create_sse_stream(loop)
@@ -1926,7 +1946,363 @@ async def send_message(
             db.close()
             _emit(None)
 
-    if action == "generate":
+    def _run_regenerate():
+        """上传新文件后从头重新生成代码（追加为新 iteration，保留对话历史）"""
+        db = SessionLocal()
+        try:
+            from ..api.training_persistence import TrainingPersistence
+            persistence = TrainingPersistence(db)
+
+            session = persistence.get_session(session_id)
+            if not session:
+                _emit({"type": "error", "message": "会话不存在"})
+                return
+
+            tenant_id = session.tenant_id
+            config = dict(session.config) if session.config else {}
+
+            # 持久化目录
+            from ..storage.storage_manager import StorageManager
+            _sm = StorageManager()
+            session_persist_dir = Path(_sm.get_tenant_dir(tenant_id)) / "training_chat" / str(session_id)
+            session_persist_dir.mkdir(parents=True, exist_ok=True)
+
+            had_new_source = bool(staged_source_dir)
+            had_new_expected = bool(staged_expected_path)
+            had_new_rules = bool(new_rules)
+
+            # 保存用户消息
+            user_msg = message or ""
+            tag_parts = []
+            if had_new_source:
+                tag_parts.append(f"src={len(os.listdir(staged_source_dir))}")
+            if had_new_expected:
+                tag_parts.append(f"exp={os.path.basename(staged_expected_path)}")
+            if had_new_rules:
+                tag_parts.append("rules=Y")
+            file_tag = f"[已上传新文件: {', '.join(tag_parts)}]" if tag_parts else "[未上传新文件]"
+            user_display = (user_msg + ("\n" if user_msg else "") + file_tag) if file_tag else user_msg
+            _add_message(db, session_id, "user", user_display, "regenerate")
+
+            _emit({"type": "status", "message": "正在处理上传文件..."})
+
+            # 1) 替换 source
+            if had_new_source:
+                p_source = session_persist_dir / "source"
+                if p_source.exists():
+                    shutil.rmtree(str(p_source), ignore_errors=True)
+                p_source.mkdir(parents=True, exist_ok=True)
+                for fn in os.listdir(staged_source_dir):
+                    fp_src = os.path.join(staged_source_dir, fn)
+                    if os.path.isfile(fp_src):
+                        shutil.copy2(fp_src, str(p_source / fn))
+
+                # 解密 + banner 预处理（与 /start 一致）
+                _passwords = config.get("file_passwords") or {}
+                try:
+                    from ..utils.aspose_helper import is_encrypted, decrypt_excel
+                    for fn in os.listdir(str(p_source)):
+                        if not fn.endswith((".xlsx", ".xls")) or fn.startswith("~"):
+                            continue
+                        fp = str(p_source / fn)
+                        if is_encrypted(fp) and _passwords.get(fn):
+                            try:
+                                _dec = decrypt_excel(fp, password=_passwords[fn])
+                                shutil.move(_dec, fp)
+                                logger.info(f"[regenerate] 已解密: {fn}")
+                            except Exception as e:
+                                logger.warning(f"[regenerate] 解密失败 {fn}: {e}")
+                except Exception as e:
+                    logger.warning(f"[regenerate] 解密阶段异常: {e}")
+
+                try:
+                    from ..utils.banner_splitter import preprocess_uploaded_files
+                    preprocess_uploaded_files([str(p_source / fn) for fn in os.listdir(str(p_source))
+                                               if fn.endswith((".xlsx", ".xls")) and not fn.startswith("~")])
+                except Exception as e:
+                    logger.warning(f"[regenerate] banner-split 预处理失败（继续）: {e}")
+
+                config["source_dir"] = str(p_source)
+
+            # 2) 替换 expected
+            if had_new_expected:
+                old_exp = config.get("expected_file") or ""
+                new_exp_name = os.path.basename(staged_expected_path)
+                # 删除旧 expected（如果文件名不同且在持久化目录下）
+                if old_exp and os.path.exists(old_exp) and os.path.basename(old_exp) != new_exp_name:
+                    try:
+                        if str(session_persist_dir) in old_exp:
+                            os.remove(old_exp)
+                    except Exception as e:
+                        logger.warning(f"[regenerate] 删除旧 expected 失败: {e}")
+
+                new_exp_path = str(session_persist_dir / new_exp_name)
+                shutil.copy2(staged_expected_path, new_exp_path)
+
+                # 解密新 expected
+                _passwords = config.get("file_passwords") or {}
+                try:
+                    from ..utils.aspose_helper import is_encrypted, decrypt_excel
+                    if is_encrypted(new_exp_path) and _passwords.get(new_exp_name):
+                        try:
+                            _dec = decrypt_excel(new_exp_path, password=_passwords[new_exp_name])
+                            shutil.move(_dec, new_exp_path)
+                        except Exception as e:
+                            logger.warning(f"[regenerate] 新 expected 解密失败: {e}")
+                except Exception as e:
+                    logger.warning(f"[regenerate] expected 解密阶段异常: {e}")
+
+                config["expected_file"] = new_exp_path
+
+                # 重新分析结构
+                try:
+                    config["expected_structure"] = _analyze_expected_structure(new_exp_path) or {}
+                except Exception as e:
+                    logger.warning(f"[regenerate] expected 结构分析失败: {e}")
+
+            # 3) 合并规则
+            if had_new_rules:
+                old_rules = config.get("rules_content", "")
+                merged = (new_rules + "\n" + old_rules) if old_rules else new_rules
+                config["rules_content"] = merged[:70000]
+                # 同步规则文件
+                try:
+                    (session_persist_dir / "rules.txt").write_text(config["rules_content"], encoding="utf-8")
+                except Exception as e:
+                    logger.warning(f"[regenerate] 写 rules.txt 失败: {e}")
+
+            # 写回 session config
+            session.config = config
+            flag_modified(session, "config")
+            if config.get("rules_content") is not None:
+                session.rules_content = config["rules_content"]
+            if had_new_expected and config.get("expected_structure"):
+                session.expected_structure = config["expected_structure"]
+            db.commit()
+
+            # 系统消息：说明本次重新生成
+            _add_message(
+                db, session_id, "system",
+                f"已上传新文件 [{', '.join(tag_parts) if tag_parts else '无新文件'}]，重新生成代码...",
+                "status",
+                {"regenerate": True,
+                 "src_changed": had_new_source,
+                 "exp_changed": had_new_expected,
+                 "rules_changed": had_new_rules},
+            )
+
+            # ========== 调用首次生成流程 ==========
+            ai_provider = config.get("ai_provider", "deepseek")
+            mode = session.mode or "formula"
+
+            def stream_cb(msg):
+                _emit({"type": "log", "message": msg})
+
+            _emit({"type": "status", "message": "正在调用 AI 重新生成代码..."})
+
+            generator, _provider = _create_formula_generator(ai_provider, stream_callback=stream_cb)
+
+            src_dir = config.get("source_dir", "")
+            expected_struct = config.get("expected_structure", {})
+            rules = config.get("rules_content", "")
+
+            if not src_dir or not os.path.isdir(src_dir):
+                _emit({"type": "error", "message": "源文件目录不存在"})
+                return
+            if not config.get("expected_file") or not os.path.exists(config.get("expected_file", "")):
+                _emit({"type": "error", "message": "目标文件不存在"})
+                return
+
+            # 后台全量加载
+            _full_data_future = _executor.submit(
+                _load_full_source_data, src_dir, config.get("manual_headers"),
+                multi_sheet_source=config.get("multi_sheet_source", False),
+                file_passwords=config.get("file_passwords"),
+            )
+
+            _emit({"type": "status", "message": "AI 正在生成代码（公式模式）..."})
+
+            code, ai_response = generator.generate_code(
+                input_folder=src_dir,
+                rules_content=rules,
+                expected_structure=expected_struct,
+                manual_headers=config.get("manual_headers"),
+                stream_callback=stream_cb,
+                multi_sheet_source=config.get("multi_sheet_source", False),
+            )
+
+            if not code:
+                _add_message(db, session_id, "system", "AI 未能生成有效代码", "status",
+                             {"error": "no_code"})
+                _emit({"type": "error", "message": "AI 未能生成有效代码"})
+                return
+
+            code_lines = code.strip().split("\n")
+            _add_message(db, session_id, "assistant",
+                         f"已重新生成代码（{len(code_lines)} 行），正在执行验证...", "code",
+                         {"has_code": True, "regenerate": True})
+
+            # 保存 source_structure_desc
+            try:
+                source_structure_desc = generator.formula_builder.get_source_structure_for_prompt()
+                config["source_structure_desc"] = source_structure_desc[:70000]
+                real_source_structure = _build_source_structure_from_generator(
+                    generator, multi_sheet_source=config.get("multi_sheet_source", False)
+                )
+                session.source_structure = real_source_structure
+                session.config = config
+                flag_modified(session, "config")
+                db.commit()
+            except Exception as e:
+                logger.warning(f"[regenerate] 获取源结构失败: {e}")
+
+            _emit({"type": "status", "message": "代码生成完成，正在执行验证..."})
+
+            _full_source_data = None
+            try:
+                _full_source_data = _full_data_future.result(timeout=300)
+            except Exception as e:
+                logger.warning(f"[regenerate] 后台全量加载失败: {e}")
+
+            iteration_num = (session.total_iterations or 0) + 1
+            run_result = _run_single_iteration(
+                session_id, code, tenant_id,
+                src_dir,
+                config.get("expected_file", ""),
+                iteration_num,
+                salary_year=config.get("salary_year"),
+                salary_month=config.get("salary_month"),
+                monthly_standard_hours=config.get("monthly_standard_hours"),
+                file_passwords=config.get("file_passwords"),
+                pre_loaded_source_data=_full_source_data,
+                rules_content=config.get("rules_content", ""),
+                expected_structure=config.get("expected_structure"),
+            )
+
+            accuracy = run_result.get("accuracy", 0)
+
+            persistence.record_iteration(
+                session_id=session_id,
+                iteration_num=iteration_num,
+                prompt_text=(getattr(generator, 'last_prompt', None) or "[FormulaCodeGenerator.generate_code/regenerate]")[:70000],
+                ai_response=(ai_response or "")[:70000],
+                generated_code=code,
+                accuracy=accuracy,
+                execution_result={"success": run_result.get("success"),
+                                  "total_cells": run_result.get("total_cells"),
+                                  "matched_cells": run_result.get("matched_cells")},
+                error_details=run_result.get("diff_details") if not run_result.get("success") or accuracy < 1.0 else None,
+                status="completed" if run_result.get("success") else "failed",
+            )
+
+            if run_result.get("detailed_diff"):
+                config["latest_detailed_diff"] = run_result["detailed_diff"][:70000]
+                session.config = config
+                flag_modified(session, "config")
+                db.commit()
+
+            persistence.update_session_best(session_id, accuracy, iteration_num)
+
+            # 保存脚本到 storage
+            try:
+                _sm.save_script(
+                    tenant_id, code,
+                    {"success": run_result.get("success", False),
+                     "best_score": accuracy,
+                     "total_iterations": iteration_num,
+                     "best_code": code, "mode": mode,
+                     "manual_headers": config.get("manual_headers"),
+                     "source_structure": session.source_structure or {},
+                     "rules_content": config.get("rules_content", ""),
+                     "expected_structure": config.get("expected_structure", {})},
+                    {}
+                )
+            except Exception as e:
+                logger.warning(f"[regenerate] save_script 失败: {e}")
+
+            try:
+                _script_name_db = (config.get("script_name") or "").strip() or f"script_{tenant_id}"
+                persistence.save_script(
+                    tenant_id=tenant_id,
+                    name=_script_name_db,
+                    code=code,
+                    mode=mode,
+                    source_session_id=session_id,
+                    accuracy=accuracy,
+                    created_by=current_user.id if current_user else None,
+                    config={"manual_headers": config.get("manual_headers"),
+                            "source_structure": config.get("source_structure_desc", ""),
+                            "rules_content": config.get("rules_content", "")},
+                    manual_headers=config.get("manual_headers"),
+                    source_structure=session.source_structure,
+                    rules_content=config.get("rules_content", ""),
+                    expected_structure=config.get("expected_structure"),
+                )
+            except Exception as e:
+                logger.warning(f"[regenerate] DB save_script 失败: {e}")
+
+            saved_files = _persist_iteration_files(tenant_id, session_id, iteration_num, code, run_result)
+            saved_files["has_rules"] = bool(config.get("rules_content"))
+            if saved_files:
+                config["latest_files"] = saved_files
+                session.config = config
+                flag_modified(session, "config")
+                db.commit()
+
+            if run_result.get("success"):
+                acc_pct = f"{accuracy * 100:.1f}%"
+                if accuracy >= 1.0:
+                    msg_content = f"重新生成第 {iteration_num} 轮完成，准确率 {acc_pct}，所有数据匹配！"
+                    _add_message(db, session_id, "system", msg_content, "status",
+                                 {"iteration": iteration_num, "accuracy": accuracy, "regenerate": True})
+                else:
+                    diff_text = _format_diff_for_chat(
+                        run_result.get("diff_details", {}),
+                        per_sheet=run_result.get("per_sheet"),
+                        missing_sheets=run_result.get("missing_sheets"),
+                        extra_sheets=run_result.get("extra_sheets"))
+                    msg_content = f"重新生成第 {iteration_num} 轮完成，准确率 {acc_pct}\n\n差异详情:\n{diff_text}"
+                    _add_message(db, session_id, "system", msg_content, "diff",
+                                 {"iteration": iteration_num, "accuracy": accuracy,
+                                  "diff_details": run_result.get("diff_details"), "regenerate": True})
+            else:
+                error = run_result.get("error", "未知错误")
+                msg_content = f"重新生成第 {iteration_num} 轮执行失败: {error}"
+                _add_message(db, session_id, "system", msg_content, "status",
+                             {"iteration": iteration_num, "error": error, "regenerate": True})
+
+            _emit({
+                "type": "iteration_complete",
+                "session_id": session_id,
+                "iteration": iteration_num,
+                "accuracy": accuracy,
+                "success": run_result.get("success", False),
+                "diff_details": run_result.get("diff_details"),
+                "error": run_result.get("error"),
+                "files": saved_files,
+                "regenerate": True,
+            })
+
+        except Exception as e:
+            logger.error(f"重新生成失败: {e}", exc_info=True)
+            _emit({"type": "error", "message": f"重新生成失败: {str(e)}"})
+        finally:
+            db.close()
+            # 清理 staged 临时目录
+            try:
+                if staged_source_dir and os.path.isdir(staged_source_dir):
+                    shutil.rmtree(staged_source_dir, ignore_errors=True)
+                if staged_expected_path:
+                    _exp_dir = os.path.dirname(staged_expected_path)
+                    if os.path.isdir(_exp_dir):
+                        shutil.rmtree(_exp_dir, ignore_errors=True)
+            except Exception:
+                pass
+            _emit(None)
+
+    if action == "regenerate":
+        loop.run_in_executor(_executor, _run_regenerate)
+    elif action == "generate":
         loop.run_in_executor(_executor, _run_chat_iteration)
     else:
         loop.run_in_executor(_executor, _run_chat_conversation)

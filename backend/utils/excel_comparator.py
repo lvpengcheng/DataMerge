@@ -30,6 +30,20 @@ def normalize_emp_code(emp_code) -> str:
     return code_str
 
 
+def _should_skip_hidden_sheets() -> bool:
+    """读取 .env 中 EXCEL_SKIP_HIDDEN_SHEETS（默认 true=跳过隐藏sheet）"""
+    val = os.getenv("EXCEL_SKIP_HIDDEN_SHEETS", "true").strip().lower()
+    return val not in ("false", "0", "no", "off", "")
+
+
+def _is_visible_sheet(aspose_ws) -> bool:
+    """判断 Aspose Worksheet 是否可见（隐藏/超级隐藏均返回 False）"""
+    try:
+        return bool(aspose_ws.IsVisible)
+    except Exception:
+        return True
+
+
 def calculate_excel_formulas(file_path: str, timeout: int = 120) -> bool:
     """计算Excel文件中的所有公式并保存
 
@@ -522,11 +536,14 @@ def _standardize_key_value(value) -> str:
 
     value_str = str(value).strip()
 
-    # 纯数字字符串中带小数点的（如 "1001.0" → "1001"），且位数不超过15位才做转换
+    # 纯数字字符串（含可选符号、前导零、小数点）→ 归一化为不含前导零的整数串
+    # 覆盖两种常见错配：
+    #   - Excel "数字存为文本"：expected="00012345"  vs  result=12345（int/float）
+    #   - float→string 尾巴：  expected="1001.0"     vs  result="1001"
+    # 限制有效位数 ≤ 15 防止超大数字精度丢失
     try:
-        if '.' in value_str:
-            # 去掉符号和前导零后计算有效位数
-            digits = value_str.replace('.', '').replace('-', '').lstrip('0')
+        if re.fullmatch(r'-?0*\d+(\.\d+)?', value_str):
+            digits = value_str.replace('.', '').replace('-', '').lstrip('0') or '0'
             if len(digits) <= 15:
                 f = float(value_str)
                 if f == int(f):
@@ -781,21 +798,33 @@ def compare_excel_files(
     exp_wb = AsposeWorkbook(str(expected_file))
 
     try:
-        # 过滤掉 Aspose 评估版水印 sheet，取第一个有效 sheet
+        # 过滤掉 Aspose 评估版水印 sheet 和隐藏 sheet（默认跳过隐藏）
+        _skip_hidden = _should_skip_hidden_sheets()
         def _first_real_ws(wb):
+            fallback = None
             for i in range(wb.Worksheets.Count):
                 ws = wb.Worksheets[i]
-                if "Evaluation" not in ws.Name:
-                    return ws
-            return wb.Worksheets[0]
+                if "Evaluation" in ws.Name:
+                    continue
+                if _skip_hidden and not _is_visible_sheet(ws):
+                    if fallback is None:
+                        fallback = ws
+                    continue
+                return ws
+            return fallback if fallback is not None else wb.Worksheets[0]
 
         res_ws = _first_real_ws(res_wb)
         exp_ws = _first_real_ws(exp_wb)
         logger.info(f"对比: expected['{exp_ws.Name}'] vs result['{res_ws.Name}']")
 
+        # 智能识别表头起始行（处理顶部 banner / 数字索引行场景）
+        res_header_row = _detect_header_row(result_file, sheet_name=res_ws.Name)
+        exp_header_row = _detect_header_row(expected_file, sheet_name=exp_ws.Name)
+        logger.info(f"表头行: expected@row{exp_header_row}, result@row{res_header_row}")
+
         # Aspose 一次读取：值 + 公式（result），仅值（expected）
-        result_df, result_formulas = _aspose_read_sheet_df_and_formulas(res_ws)
-        expected_df = _aspose_read_sheet_df(exp_ws)
+        result_df, result_formulas = _aspose_read_sheet_df_and_formulas(res_ws, header_row=res_header_row)
+        expected_df = _aspose_read_sheet_df(exp_ws, header_row=exp_header_row)
     finally:
         del res_wb, exp_wb
 
@@ -846,7 +875,68 @@ def _read_sheet_df_data_only(ws_data) -> pd.DataFrame:
 
 # ==================== Aspose 直读辅助函数 ====================
 
-def _aspose_read_sheet_df(aspose_ws) -> pd.DataFrame:
+def _detect_header_row(file_path: str, sheet_name: Optional[str] = None) -> int:
+    """用 IntelligentExcelParser 智能识别表头所在行（1-indexed）。
+
+    用途：当 Excel 顶部有 banner / 数字索引行时，第 1 行不是真正的表头。
+    返回 1 表示第 1 行就是表头（默认行为）。
+    多行表头时取最后一行（data_row_start - 1）。
+
+    Args:
+        file_path: Excel 文件路径
+        sheet_name: 指定 sheet（可选）。None 时返回第一个 sheet 的表头行
+    Returns:
+        表头行号（1-indexed），找不到时返回 1
+    """
+    try:
+        from excel_parser import IntelligentExcelParser
+        parser = IntelligentExcelParser()
+        parsed = parser.parse_excel_file(
+            file_path,
+            max_data_rows=1,
+            active_sheet_only=False,
+            best_region_only=True,
+        )
+        for sd in parsed:
+            if sheet_name and sd.sheet_name != sheet_name:
+                continue
+            if not sd.regions:
+                continue
+            r = sd.regions[0]
+            # 多行表头时 head_row_end > head_row_start，取 head_row_end 作为最后一行表头
+            row = r.head_row_end if r.head_row_end > 0 else r.head_row_start
+            if row >= 1:
+                return row
+            return 1
+        return 1
+    except Exception as e:
+        logger.warning(f"[表头侦测] 识别 {file_path} 的表头行失败，回退第1行: {e}")
+        return 1
+
+
+def _dedupe_headers(headers: List) -> List[str]:
+    """对列名去重：重复时追加 _2, _3, ... 后缀；None/空值替换为 __unnamed_{idx}。
+
+    用于处理 Excel 多 banner / 多组表头场景下子表头重复（如多个"应发合计"），
+    避免 pandas 用 df['col'] 时返回 DataFrame 触发 "Series is ambiguous" 错误。
+    """
+    result: List[str] = []
+    seen: Dict[str, int] = {}
+    for i, h in enumerate(headers):
+        if h is None or (isinstance(h, str) and h.strip() == ""):
+            base = f"__unnamed_{i+1}"
+        else:
+            base = str(h).strip()
+        if base in seen:
+            seen[base] += 1
+            result.append(f"{base}_{seen[base]}")
+        else:
+            seen[base] = 1
+            result.append(base)
+    return result
+
+
+def _aspose_read_sheet_df(aspose_ws, header_row: int = 1) -> pd.DataFrame:
     """使用 Aspose .NET 直接读取 worksheet 为 DataFrame（仅读值，不读公式）。
 
     通过 Aspose 适配层一次打开即可同时获取计算后的值，
@@ -854,8 +944,9 @@ def _aspose_read_sheet_df(aspose_ws) -> pd.DataFrame:
 
     Args:
         aspose_ws: Aspose.Cells.Worksheet .NET 对象
+        header_row: 表头所在行号（1-indexed），默认1。当 Excel 顶部有 banner / 数字索引行时由调用方指定真实表头行
     Returns:
-        DataFrame，列名取自第一行
+        DataFrame，列名取自 header_row 指定的那一行；重复列名自动加 _2/_3 后缀避免 pandas 歧义错误
     """
     from excel_parser import _AsposeWorksheet
 
@@ -863,37 +954,49 @@ def _aspose_read_sheet_df(aspose_ws) -> pd.DataFrame:
     if ws.max_row < 1 or ws.max_column < 1:
         return pd.DataFrame()
 
-    # 读取表头（第1行，1-indexed）
-    headers = []
+    if header_row < 1:
+        header_row = 1
+
+    # 读取表头
+    raw_headers = []
     for col_idx in range(1, ws.max_column + 1):
-        val = ws.cell(row=1, column=col_idx).value
-        headers.append(val)
+        val = ws.cell(row=header_row, column=col_idx).value
+        raw_headers.append(val)
 
-    valid_headers = [h for h in headers if h is not None]
-    if not valid_headers:
+    # 找到最后一个非空列，截断尾部空列
+    last_valid = -1
+    for i, h in enumerate(raw_headers):
+        if h is not None and (not isinstance(h, str) or h.strip() != ""):
+            last_valid = i
+    if last_valid < 0:
         return pd.DataFrame()
+    raw_headers = raw_headers[: last_valid + 1]
+    max_col = len(raw_headers)
 
-    max_col = len(headers)
+    # 去重列名（处理多 banner 场景下重复子表头）
+    unique_headers = _dedupe_headers(raw_headers)
 
-    # 读取数据行
-    data = []
-    for row_idx in range(2, ws.max_row + 1):
-        row_data = {}
+    # 标记真正参与对比的列（原始 header 非空）
+    keep_mask = [h is not None and (not isinstance(h, str) or h.strip() != "") for h in raw_headers]
+    final_headers = [unique_headers[i] for i in range(max_col) if keep_mask[i]]
+
+    # 按位置读取数据行（不再用 dict 键以避免重复列丢失）
+    rows = []
+    for row_idx in range(header_row + 1, ws.max_row + 1):
+        row_vals = []
         for col_idx in range(1, max_col + 1):
-            h = headers[col_idx - 1]
-            if h is None:
+            if not keep_mask[col_idx - 1]:
                 continue
             val = ws.cell(row=row_idx, column=col_idx).value
-            # 大数字格式化，避免科学计数法
             if isinstance(val, float) and abs(val) >= 1e15 and val == int(val):
                 val = format(val, '.0f')
-            row_data[h] = val
-        data.append(row_data)
+            row_vals.append(val)
+        rows.append(row_vals)
 
-    return pd.DataFrame(data, columns=valid_headers)
+    return pd.DataFrame(rows, columns=final_headers)
 
 
-def _aspose_read_sheet_df_and_formulas(aspose_ws) -> tuple:
+def _aspose_read_sheet_df_and_formulas(aspose_ws, header_row: int = 1) -> tuple:
     """使用 Aspose .NET 同时读取 worksheet 的值和公式。
 
     一次打开文件即可获取：
@@ -902,6 +1005,7 @@ def _aspose_read_sheet_df_and_formulas(aspose_ws) -> tuple:
 
     Args:
         aspose_ws: Aspose.Cells.Worksheet .NET 对象
+        header_row: 表头所在行号（1-indexed），默认1
     Returns:
         (DataFrame, formulas_dict)
         formulas_dict: {列名: 公式文本}，仅包含第一数据行中有公式的列
@@ -912,39 +1016,45 @@ def _aspose_read_sheet_df_and_formulas(aspose_ws) -> tuple:
     if ws.max_row < 1 or ws.max_column < 1:
         return pd.DataFrame(), {}
 
-    # 读取表头（第1行，1-indexed）
-    headers = []
+    if header_row < 1:
+        header_row = 1
+    first_data_row = header_row + 1
+
+    raw_headers = []
     for col_idx in range(1, ws.max_column + 1):
-        val = ws.cell(row=1, column=col_idx).value
-        headers.append(val)
+        val = ws.cell(row=header_row, column=col_idx).value
+        raw_headers.append(val)
 
-    valid_headers = [h for h in headers if h is not None]
-    if not valid_headers:
+    last_valid = -1
+    for i, h in enumerate(raw_headers):
+        if h is not None and (not isinstance(h, str) or h.strip() != ""):
+            last_valid = i
+    if last_valid < 0:
         return pd.DataFrame(), {}
+    raw_headers = raw_headers[: last_valid + 1]
+    max_col = len(raw_headers)
 
-    max_col = len(headers)
+    unique_headers = _dedupe_headers(raw_headers)
+    keep_mask = [h is not None and (not isinstance(h, str) or h.strip() != "") for h in raw_headers]
+    final_headers = [unique_headers[i] for i in range(max_col) if keep_mask[i]]
 
-    # 读取数据行 + 公式
-    data = []
+    rows = []
     formulas = {}
-    for row_idx in range(2, ws.max_row + 1):
-        row_data = {}
+    for row_idx in range(first_data_row, ws.max_row + 1):
+        row_vals = []
         for col_idx in range(1, max_col + 1):
-            h = headers[col_idx - 1]
-            if h is None:
+            if not keep_mask[col_idx - 1]:
                 continue
             cell = ws.cell(row=row_idx, column=col_idx)
             val = cell.value
-            # 大数字格式化，避免科学计数法
             if isinstance(val, float) and abs(val) >= 1e15 and val == int(val):
                 val = format(val, '.0f')
-            row_data[h] = val
-            # 只收集第一数据行的公式（供 AI 修正提示）
-            if row_idx == 2 and cell.formula:
-                formulas[h] = cell.formula
-        data.append(row_data)
+            row_vals.append(val)
+            if row_idx == first_data_row and cell.formula:
+                formulas[unique_headers[col_idx - 1]] = cell.formula
+        rows.append(row_vals)
 
-    return pd.DataFrame(data, columns=valid_headers), formulas
+    return pd.DataFrame(rows, columns=final_headers), formulas
 
 
 def _match_sheet_name(target: str, available: List[str]) -> Optional[str]:
@@ -1040,16 +1150,21 @@ def compare_excel_files_multi_sheet(
     # 【第3次打开 expected】Aspose 直读（仅值）
     exp_wb = AsposeWorkbook(str(expected_file))
 
-    # 构建 sheet 名称列表和索引映射（过滤 Aspose 评估版水印 sheet）
+    # 构建 sheet 名称列表和索引映射（过滤 Aspose 评估版水印 sheet 和隐藏 sheet）
+    _skip_hidden = _should_skip_hidden_sheets()
     def _real_sheet_info(wb):
         """返回 (名称列表, {名称: worksheet对象})"""
         names = []
         ws_map = {}
         for i in range(wb.Worksheets.Count):
             ws = wb.Worksheets[i]
-            if "Evaluation" not in ws.Name:
-                names.append(ws.Name)
-                ws_map[ws.Name] = ws
+            if "Evaluation" in ws.Name:
+                continue
+            if _skip_hidden and not _is_visible_sheet(ws):
+                logger.info(f"[多Sheet对比] 跳过隐藏sheet: '{ws.Name}'")
+                continue
+            names.append(ws.Name)
+            ws_map[ws.Name] = ws
         return names, ws_map
 
     exp_sheets, exp_ws_map = _real_sheet_info(exp_wb)
@@ -1103,7 +1218,8 @@ def compare_excel_files_multi_sheet(
             # 结果中缺失此 sheet
             missing_sheets.append(exp_sheet_name)
             try:
-                exp_df = _aspose_read_sheet_df(exp_ws_map[exp_sheet_name])
+                exp_hdr_row = _detect_header_row(expected_file, sheet_name=exp_sheet_name)
+                exp_df = _aspose_read_sheet_df(exp_ws_map[exp_sheet_name], header_row=exp_hdr_row)
                 miss_cells = len(exp_df) * max(len(exp_df.columns) - 1, 1)
             except Exception:
                 miss_cells = 100
@@ -1125,9 +1241,12 @@ def compare_excel_files_multi_sheet(
         logger.info(f"[多Sheet对比] 按名称匹配对比: '{exp_sheet_name}' ↔ '{res_sheet_name}'")
 
         try:
-            # Aspose 直读：expected 仅值，result 值+公式
-            exp_df = _aspose_read_sheet_df(exp_ws_map[exp_sheet_name])
-            res_df, res_formulas = _aspose_read_sheet_df_and_formulas(res_ws_map[res_sheet_name])
+            # Aspose 直读：expected 仅值，result 值+公式（智能识别表头行）
+            exp_hdr_row = _detect_header_row(expected_file, sheet_name=exp_sheet_name)
+            res_hdr_row = _detect_header_row(result_file, sheet_name=res_sheet_name)
+            logger.info(f"[多Sheet对比] '{exp_sheet_name}' 表头行: expected@row{exp_hdr_row}, result@row{res_hdr_row}")
+            exp_df = _aspose_read_sheet_df(exp_ws_map[exp_sheet_name], header_row=exp_hdr_row)
+            res_df, res_formulas = _aspose_read_sheet_df_and_formulas(res_ws_map[res_sheet_name], header_row=res_hdr_row)
 
             # 标准化列名
             exp_df.columns = [_standardize_column_name(c) for c in exp_df.columns]

@@ -175,6 +175,11 @@ const Tools = {
             } else {
                 this._setSplitStatus('完成，已下载', 'ok');
             }
+
+            _splitFiles.length = 0;
+            const fileInput = document.getElementById('file-input');
+            if (fileInput) fileInput.value = '';
+            this._renderSplitList();
         } catch (e) {
             this._setSplitStatus(`失败: ${e.message}`, 'error');
         } finally {
@@ -522,7 +527,9 @@ const Tools = {
 
     async _fetchAndDownload(url, fileName) {
         try {
-            const resp = await AUTH.authFetch(url);
+            const sep = url.includes('?') ? '&' : '?';
+            const bustedUrl = `${url}${sep}_=${Date.now()}`;
+            const resp = await AUTH.authFetch(bustedUrl, { cache: 'no-store' });
             if (!resp.ok) return alert('下载失败: ' + resp.statusText);
             const blob = await resp.blob();
             const blobUrl = URL.createObjectURL(blob);
