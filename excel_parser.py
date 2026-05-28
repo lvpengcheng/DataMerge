@@ -3017,7 +3017,13 @@ class IntelligentExcelParser:
             if is_merged_banner and non_empty_cells >= 3:
                 return True
             # 1c: 单非空 + 包含日期/月份/期间模式
-            if re.search(r'\d{4}[.\-/年]\d{1,2}|\d{1,2}\.\d{1,2}\s*[-~至]\s*\d{1,2}\.\d{1,2}', first_value_str):
+            # 限定年份 19xx/20xx/21xx + 月份 1-12 + 后面不能再跟 .数字
+            # 避免把会计科目码 "2211.04.01"、"6601.01.01" 等误判为日期 banner
+            if re.search(
+                r'(?<!\d)(?:19|20|21)\d{2}[.\-/年](?:0?[1-9]|1[0-2])(?![.\d])'
+                r'|\d{1,2}\.\d{1,2}\s*[-~至]\s*\d{1,2}\.\d{1,2}',
+                first_value_str
+            ):
                 return True
             # 1d: 单非空 + 文本较长（>=6 字符）且不是 HEADER_KEYWORDS 精确匹配
             if len(first_value_str) >= 6 and first_value_str not in self.HEADER_KEYWORDS:
@@ -3222,7 +3228,13 @@ class IntelligentExcelParser:
         # ['5000-产品-产品市场部','5000-产品-产品市场部'])误判为标题。
         if non_empty_cells <= 2:
             # 1c: 包含日期/月份/期间模式（如 "2026.04月04.01-04.30"、"2026年4月"）
-            if re.search(r'\d{4}[.\-/年]\d{1,2}|\d{1,2}\.\d{1,2}\s*[-~至]\s*\d{1,2}\.\d{1,2}', first_value_str):
+            # 限定年份 19xx/20xx/21xx + 月份 1-12 + 后面不能再跟 .数字
+            # 避免把会计科目码 "2211.04.01"、"6601.01.01" 等误判为日期 banner
+            if re.search(
+                r'(?<!\d)(?:19|20|21)\d{2}[.\-/年](?:0?[1-9]|1[0-2])(?![.\d])'
+                r'|\d{1,2}\.\d{1,2}\s*[-~至]\s*\d{1,2}\.\d{1,2}',
+                first_value_str
+            ):
                 return True
         # 1d: 文本较长（>=6 字符）且不是 HEADER_KEYWORDS 的精确匹配
         # 限制为 (单 cell) 或 (合并展开横幅,要求 distinct=1 且 non_empty>=3),

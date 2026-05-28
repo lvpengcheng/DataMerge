@@ -246,6 +246,12 @@ def _apply_confirmed_mapping(source_dir: str, source_structure: dict, confirmed_
     # 兼容嵌套形式：{"file_mapping": {...}}
     fm = confirmed_mapping.get("file_mapping") if isinstance(confirmed_mapping.get("file_mapping"), dict) else confirmed_mapping
 
+    # 透传 multi_sheet_source 给 rewrite_excel，避免重写时把多Sheet 文件压缩成单Sheet
+    try:
+        multi_sheet_source = FastHeaderMatcher._infer_multi_sheet_source(source_structure or {})
+    except Exception:
+        multi_sheet_source = False
+
     for input_name, info in fm.items():
         if not isinstance(info, dict):
             continue
@@ -253,6 +259,8 @@ def _apply_confirmed_mapping(source_dir: str, source_structure: dict, confirmed_
         info.setdefault("input_file", input_name)
         if not info.get("file_path"):
             info["file_path"] = os.path.join(source_dir, input_name)
+        if multi_sheet_source:
+            info["multi_sheet_source"] = True
         try:
             FastHeaderMatcher.rewrite_excel(info, source_dir)
             expected = info.get("expected_file")

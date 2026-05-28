@@ -38,6 +38,34 @@ class FastHeaderMatcher:
         return True
 
     @staticmethod
+    def _is_data_like_header(name) -> bool:
+        """判断列名是否"看起来像数据值"——纯数字 / 日期等。
+        这类列名通常出自 Aspose 把数据行误读为表头的场景（典型：员工工资单
+        模板里 I 列首行是个人薪资标准数值）。这种列名在每个员工 sheet 都不同，
+        参与表头相似度比对会让结构相同的 sheet 因为一个数据列拉低分数。
+        匹配阶段应将其剔除；脚本通常按列位置访问，不依赖列名字面值。
+        """
+        if name is None:
+            return False
+        s = str(name).strip()
+        if not s:
+            return False
+        # 纯数字（含小数、负号、千分位、科学计数法）
+        try:
+            float(s.replace(',', ''))
+            return True
+        except (ValueError, TypeError):
+            pass
+        # 常见日期格式: 2026-01-15 / 2026/1/15 / 2026.01.15
+        import re as _re
+        if _re.match(r'^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}', s):
+            return True
+        # 时间戳样: 2026-01-15 12:34:56
+        if _re.match(r'^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}[\sT]\d{1,2}:\d{1,2}', s):
+            return True
+        return False
+
+    @staticmethod
     def _infer_multi_sheet_source(source_structure: Dict[str, Any]) -> bool:
         """读取或反推 multi_sheet_source 标记。
 
@@ -236,6 +264,13 @@ class FastHeaderMatcher:
                 file_mapping[f_name]["sheet_mapping"][input_sheet["sheet_name"]] = input_sheet["sheet_name"]
             return {"success": True, "mapping": {"file_mapping": file_mapping}}
 
+        # 多Sheet 模板模式：所有训练 sheet 共享同一稳定列集合（如每个 sheet=一个员工）
+        # 这种模式下，上传 sheet 名是动态实例名（员工名），脚本通常按 sheet title 提取
+        # 实例标识，所以匹配后必须保留 INPUT 原 sheet 名，不能重命名为训练 sheet 名。
+        template_mode = self._is_template_mode(train_sheets)
+        if template_mode:
+            logger.info("[匹配] 检测到多Sheet模板模式（每个 sheet 共享同一稳定列集合）")
+
         for train_idx, train_sheet in enumerate(train_sheets):
             train_file = train_sheet["file_name"]
             train_sheet_name = train_sheet["sheet_name"]
@@ -285,7 +320,8 @@ class FastHeaderMatcher:
 
                 match_results.append({
                     "train_file": train_file,
-                    "train_sheet": train_sheet_name,
+                    # 模板模式下保留 input 原 sheet 名，避免动态实例名（如员工名）被覆盖
+                    "train_sheet": matched_input["sheet_name"] if template_mode else train_sheet_name,
                     "train_headers": train_headers,
                     "input_file": matched_input["file_name"],
                     "input_file_path": matched_input["file_path"],
@@ -304,8 +340,80 @@ class FastHeaderMatcher:
             error_msg = "以下训练时的数据源在上传文件中未找到匹配:\n" + "\n".join(errors)
             return {"success": False, "error": error_msg}
 
+        # 多Sheet 模板兜底：训练时所有 sheet 共享同一稳定列集合（典型场景：每个 sheet
+        # 是一个员工/月份/分公司的同模板表），上传比训练多出来的 sheet 也应纳入计算，
+        # 不要因为"训练只有 N 个 sheet"就丢弃后续的同模板 sheet。
+        if template_mode:
+            template_train = train_sheets[0]
+            # 用所有训练 sheet 的共享稳定列作为"模板必备列"，允许个别训练 sheet
+            # 含有的边缘列（如 Column_J/K 空白占位）不参与兜底门槛判断。
+            template_cols_stable = self._get_template_common_cols(train_sheets)
+            for input_idx, input_sheet in enumerate(input_sheets):
+                if input_idx in used_input_indices:
+                    continue
+                input_cols_stable = frozenset(
+                    h for h in input_sheet["headers"].keys()
+                    if self._is_valid_header(h) and not self._is_data_like_header(h)
+                )
+                # 兜底加入条件：上传 sheet 的稳定列集合包含训练模板的稳定列集合
+                if not template_cols_stable.issubset(input_cols_stable):
+                    continue
+
+                col_mapping, score = self._match_headers(
+                    list(input_sheet["headers"].keys()),
+                    list(template_train["headers"].keys())
+                )
+                used_input_indices.add(input_idx)
+                logger.info(
+                    f"[匹配]   + 模板兜底: {input_sheet['file_name']}/{input_sheet['sheet_name']} "
+                    f"（参考训练 {template_train['sheet_name']}, score={score:.2f}）"
+                )
+                match_results.append({
+                    "train_file": template_train["file_name"],
+                    # 关键：保留 input 原 sheet 名，rewrite 时不重命名
+                    "train_sheet": input_sheet["sheet_name"],
+                    "train_headers": template_train["headers"],
+                    "input_file": input_sheet["file_name"],
+                    "input_file_path": input_sheet["file_path"],
+                    "input_sheet": input_sheet["sheet_name"],
+                    "input_headers": input_sheet["headers"],
+                    "col_mapping": col_mapping,
+                    "score": score,
+                    # 仅当列名映射不全恒等时才需要重写
+                    "needs_rewrite": any(k != v for k, v in col_mapping.items()),
+                })
+
         file_mapping = self._build_file_mapping(match_results)
         return {"success": True, "mapping": {"file_mapping": file_mapping}}
+
+    def _is_template_mode(self, train_sheets: List[Dict[str, Any]]) -> bool:
+        """判定训练是否为"多 Sheet 同模板"模式。
+
+        放宽规则：训练 sheet 之间存在足够大的"稳定列交集"即视为模板，
+        允许个别 sheet 多/少几个边缘列（如 Aspose 给空白列起的 Column_J/K
+        占位、外币栏在部分员工才有等）。
+        """
+        return len(self._get_template_common_cols(train_sheets)) >= 3
+
+    def _get_template_common_cols(self, train_sheets: List[Dict[str, Any]]) -> frozenset:
+        """计算所有训练 sheet 共享的稳定列集合（剔除空头与数据样列名后取交集）。
+
+        返回空集合表示不构成模板（任一 sheet 没有稳定列，或 sheet 之间无任何共享列）。
+        """
+        if not train_sheets or len(train_sheets) < 2:
+            return frozenset()
+        common: Optional[frozenset] = None
+        for ts in train_sheets:
+            cols = frozenset(
+                h for h in ts.get("headers", {}).keys()
+                if self._is_valid_header(h) and not self._is_data_like_header(h)
+            )
+            if not cols:
+                return frozenset()
+            common = cols if common is None else (common & cols)
+            if not common:
+                return frozenset()
+        return common or frozenset()
 
     def _is_fully_identical(
         self, train_sheet: Dict, input_sheet: Dict, col_mapping: Dict[str, str]
@@ -410,19 +518,28 @@ class FastHeaderMatcher:
         if not input_headers or not train_headers:
             return {}, 0.0
 
-        input_set = set(input_headers)
-        train_set = set(train_headers)
+        # 评分时剔除"数据样列名"（纯数字/日期等）。这些列名在每个员工模板里
+        # 都不同（如薪资标准数值），不应作为相似度信号；脚本按列位置访问，
+        # 不依赖这些列名字面映射。
+        input_score = [h for h in input_headers if not self._is_data_like_header(h)]
+        train_score = [h for h in train_headers if not self._is_data_like_header(h)]
+        # 两边都被剔光时退化为旧逻辑，避免空集除零
+        if not input_score or not train_score:
+            input_score, train_score = input_headers, train_headers
+
+        input_set = set(input_score)
+        train_set = set(train_score)
 
         if input_set == train_set:
-            return {h: h for h in input_headers}, 1.0
+            return {h: h for h in input_score}, 1.0
 
         header_mapping = {}
         exact = input_set & train_set
         for h in exact:
             header_mapping[h] = h
 
-        unmatched_input = [h for h in input_headers if h not in exact]
-        unmatched_train = [h for h in train_headers if h not in exact]
+        unmatched_input = [h for h in input_score if h not in exact]
+        unmatched_train = [h for h in train_score if h not in exact]
 
         for inp in unmatched_input:
             best = self._find_similar_header(inp, unmatched_train)
@@ -430,7 +547,10 @@ class FastHeaderMatcher:
                 header_mapping[inp] = best
                 unmatched_train.remove(best)
 
-        total = max(len(input_headers), len(train_headers))
+        # 评分语义："训练需要的列，上传是否都覆盖了"——分母用训练侧列数。
+        # 用 max(input, train) 作分母会让"上传多了无关列"也被扣分，对模板新增
+        # 员工/月份等"列结构相同但行/sheet 数变化"的场景不合理。
+        total = len(train_score)
         score = len(header_mapping) / total if total > 0 else 0.0
         return header_mapping, score
 
@@ -463,11 +583,21 @@ class FastHeaderMatcher:
 
         output_path = os.path.join(output_dir, expected_file)
 
+        # 多Sheet 训练场景：训练侧标记 multi_sheet_source=True，或当前 sheet_mapping
+        # 含 >=2 项，需要全量读所有 sheet 重写。否则 active_sheet_only=True 会只保留
+        # 一个 sheet，导致下游 source_data 缺失。
+        multi_sheet = bool(mapping_info.get("multi_sheet_source")) or len(sheet_mapping) >= 2
+
         # 对需要重写的文件做一次全量解析（带数据）
-        logger.info(f"[匹配] 全量解析文件用于重写: {os.path.basename(file_path)}")
+        logger.info(
+            f"[匹配] 全量解析文件用于重写: {os.path.basename(file_path)} "
+            f"(multi_sheet={multi_sheet}, mapped_sheets={len(sheet_mapping)})"
+        )
         parser = IntelligentExcelParser()
         parsed_data = parser.parse_excel_file(
-            file_path, active_sheet_only=True, best_region_only=True,
+            file_path,
+            active_sheet_only=not multi_sheet,
+            best_region_only=not multi_sheet,
             read_formulas=False
         )
 

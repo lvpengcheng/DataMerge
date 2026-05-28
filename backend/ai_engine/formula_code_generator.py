@@ -1439,7 +1439,19 @@ class FormulaCodeGenerator:
 
             fixed_lines.append(line)
 
-        # 如果有文本常量需要定义，插入到for循环之前
+        # 兜底扫描：AI 可能在某个函数内部直接写了
+        #   TXT_X = excel_text('xxx')
+        # 又在另一个函数的 f-string 里引用 {TXT_X}。这种行没有 f"..."，
+        # 上面的循环根本不会进入处理分支，于是 TXT_X 始终是函数局部变量，
+        # 跨函数调用时报 NameError。这里把所有 `TXT_? = excel_text(...)` 收集起来，
+        # 交给 _inject_text_constants 在模块顶层补一份兜底定义。
+        for raw in fixed_lines:
+            m = re.match(r"\s*(TXT_\w+)\s*=\s*excel_text\(\s*['\"]([^'\"]+)['\"]\s*\)", raw)
+            if m:
+                vn, tv = m.group(1), m.group(2)
+                text_constants.setdefault(vn, tv)
+
+        # 如果有文本常量需要定义，插入到模块顶层
         if text_constants:
             fixed_lines = self._inject_text_constants(fixed_lines, text_constants)
             fix_count += len(text_constants)
@@ -1461,46 +1473,85 @@ class FormulaCodeGenerator:
         return f"TXT_{short_hash}"
 
     def _inject_text_constants(self, lines: list, text_constants: dict) -> list:
-        """将TXT_常量定义插入到for循环之前
+        """将TXT_常量定义插入到模块顶层（imports 之后、第一个 def 之前）。
 
-        查找for循环行，在其前面插入常量定义。
-        如果常量已经存在则跳过。
+        【关键】TXT_常量必须在模块级，而不是某个函数局部，否则跨函数引用会报
+        NameError: name 'TXT_xx' is not defined（典型场景：main() 调用
+        fill_result_sheets()，常量被错误地放进 main() 的 for 循环之前，
+        fill_result_sheets() 看不到）。
+        如果常量已经在【模块顶层】定义（零缩进）则跳过；
+        若 AI 把它定义在了某个函数内部（有缩进），仍然在模块顶层补一份兜底。
         """
-        # 检查哪些常量已经定义了
-        code_text = '\n'.join(lines)
+        # 仅当模块顶层（零缩进）已经定义过该常量时，才视为"已存在"无需注入。
+        # AI 经常把 `TXT_X = excel_text(...)` 放在某个函数内部，导致跨函数引用失败。
+        module_level_defs = set()
+        for line in lines:
+            # 零缩进的赋值：line 与 line.lstrip() 长度相同
+            if line and line == line.lstrip():
+                m = re.match(r'(TXT_\w+)\s*=', line)
+                if m:
+                    module_level_defs.add(m.group(1))
+
         new_constants = {k: v for k, v in text_constants.items()
-                        if f"{k} = " not in code_text and f"{k}=" not in code_text}
+                        if k not in module_level_defs}
 
         if not new_constants:
             return lines
 
-        # 找到for循环的位置
-        insert_pos = None
+        # 定位插入点：imports 之后、第一个 def/class 之前（模块顶层）
+        # 跳过文件起始的 docstring / 注释 / from-import / import / future
+        insert_pos = 0
+        last_import_idx = -1
+        in_docstring = False
+        docstring_quote = None
+
         for i, line in enumerate(lines):
             stripped = line.strip()
-            if re.match(r'for\s+\w+\s+in\s+range', stripped):
+
+            # 处理三引号 docstring（仅在最顶层）
+            if not in_docstring:
+                for q in ('"""', "'''"):
+                    if stripped.startswith(q):
+                        # 同行结束 or 跨行
+                        if stripped.count(q) >= 2 and len(stripped) > 3:
+                            pass  # single-line docstring
+                        else:
+                            in_docstring = True
+                            docstring_quote = q
+                        break
+            else:
+                if docstring_quote and docstring_quote in stripped:
+                    in_docstring = False
+                    docstring_quote = None
+                continue
+
+            # 遇到第一个 def/class，停止
+            if re.match(r'^(def|class|async\s+def)\s+', stripped):
+                break
+
+            # 记录最后一行 import / from import
+            if re.match(r'^(import\s+|from\s+\S+\s+import\s+)', stripped):
+                last_import_idx = i
+
+        if last_import_idx >= 0:
+            insert_pos = last_import_idx + 1
+        else:
+            # 没有 import：找到第一个非空非注释非 docstring 行作为插入点
+            for i, line in enumerate(lines):
+                s = line.strip()
+                if not s or s.startswith('#') or s.startswith('"""') or s.startswith("'''"):
+                    continue
                 insert_pos = i
                 break
 
-        if insert_pos is None:
-            # 找不到for循环，插到函数开头（第一个非空非注释行之后）
-            for i, line in enumerate(lines):
-                if line.strip() and not line.strip().startswith('#') and not line.strip().startswith('def '):
-                    insert_pos = i
-                    break
-
-        if insert_pos is None:
-            return lines
-
-        # 生成常量定义行
-        indent = lines[insert_pos][:len(lines[insert_pos]) - len(lines[insert_pos].lstrip())]
-        const_lines = [f"{indent}# Excel文本常量（避免f-string引号冲突）"]
+        # 模块级常量，零缩进
+        const_lines = ["# Excel文本常量（避免f-string引号冲突，模块级以便跨函数引用）"]
         for var_name, text_value in new_constants.items():
             # 安全检查：TXT常量值不应含单引号、大括号等（属公式片段，非文本常量）
             if "'" in text_value or '{' in text_value or '}' in text_value:
                 logger.warning(f"[TXT常量] 跳过含特殊字符的值: {var_name} = {text_value[:50]}")
                 continue
-            const_lines.append(f"{indent}{var_name} = '\"" + text_value + "\"'")
+            const_lines.append(f"{var_name} = '\"" + text_value + "\"'")
         const_lines.append("")
 
         return lines[:insert_pos] + const_lines + lines[insert_pos:]

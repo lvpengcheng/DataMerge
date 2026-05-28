@@ -1423,23 +1423,18 @@ async def calculate_data(
 
         # 优先从 DB 读取元数据（第一入口：非流式计算）
         try:
-            _db = SessionLocal()
-            try:
-                _db_script = _db.query(db_models.Script).filter(
-                    db_models.Script.tenant_id == tenant_id,
-                    db_models.Script.is_active == True,
-                ).order_by(db_models.Script.created_at.desc()).first()
-                if _db_script:
-                    if _db_script.manual_headers:
-                        _mh = _db_script.manual_headers
-                        manual_headers = json.loads(_mh) if isinstance(_mh, str) else _mh
-                    if _db_script.source_structure:
-                        _ss = _db_script.source_structure
-                        script_info["source_structure"] = json.loads(_ss) if isinstance(_ss, str) else _ss
-            finally:
-                _db.close()
+            # 按当前激活脚本的 script_id 精确加载，避免被同租户下其他脚本污染。
+            _active_sid = active_script.get("script_id") or ""
+            _meta = _load_script_info_for_precheck(tenant_id, _active_sid)
+            if _meta:
+                _mh = _meta.get("manual_headers")
+                if _mh is not None:
+                    manual_headers = _mh
+                _ss = _meta.get("source_structure")
+                if _ss is not None:
+                    script_info["source_structure"] = _ss
         except Exception as _e:
-            logger.warning(f"DB 读取脚本元数据失败: {_e}")
+            logger.warning(f"加载脚本元数据失败: {_e}")
 
         # 获取源文件结构
         source_structure = script_info.get("source_structure", {})
@@ -3663,14 +3658,14 @@ def _load_script_info_for_precheck(tenant_id: str, script_id: str) -> dict:
     db = None
     try:
         db = SessionLocal()
+        row = None
+        # 仅当 script_id 是数字（DB主键）时才查 DB；
+        # 字符串型 script_id（如 "script_xxxx"）走文件系统兜底，避免误取到同租户下的其他脚本。
         try:
             sid = int(script_id)
-            row = db.query(db_models.Script).filter_by(id=sid, is_active=True).first()
+            row = db.query(db_models.Script).filter_by(id=sid, tenant_id=tenant_id).first()
         except (ValueError, TypeError):
-            row = db.query(db_models.Script).filter(
-                db_models.Script.tenant_id == tenant_id,
-                db_models.Script.is_active == True,
-            ).order_by(db_models.Script.created_at.desc()).first()
+            row = None
         if row and (row.manual_headers or row.source_structure):
             info = {
                 "manual_headers": row.manual_headers,
@@ -4017,33 +4012,10 @@ async def run_compute_task(
         # ========== 【关键修复】根据列头映射表名/sheet名/列名 ==========
         pre_loaded_source_data = None
         try:
-            # 优先从 DB scripts 表读取元数据
-            _script_info = None
-            try:
-                if db_session:
-                    _db_script = db_session.query(db_models.Script).filter(
-                        db_models.Script.tenant_id == tenant_id,
-                        db_models.Script.is_active == True,
-                    ).order_by(db_models.Script.created_at.desc()).first()
-                    if _db_script and (_db_script.manual_headers or _db_script.source_structure):
-                        _script_info = {
-                            "manual_headers": _db_script.manual_headers,
-                            "source_structure": _db_script.source_structure,
-                        }
-            except Exception as _e:
-                logger.warning(f"DB 读取 script 元数据失败: {_e}")
-
-            # 回退：从文件系统读取
-            if not _script_info:
-                try:
-                    _info_file = storage_manager.get_tenant_dir(tenant_id) / "scripts" / f"{script_id}_info.json"
-                    if _info_file.exists():
-                        _script_info = json.loads(_info_file.read_text(encoding="utf-8"))
-                except Exception:
-                    pass
-            if not _script_info:
-                _active = storage_manager.get_active_script(tenant_id)
-                _script_info = _active.get("script_info", {}) if _active else {}
+            # 按用户实际选择的 script_id 加载脚本元数据，
+            # 复用统一的事前校验加载逻辑（DB→文件系统→active 兜底），
+            # 避免误取到同租户下其他脚本的 source_structure。
+            _script_info = _load_script_info_for_precheck(tenant_id, script_id)
 
             source_structure = _script_info.get("source_structure")
             manual_headers = _script_info.get("manual_headers")

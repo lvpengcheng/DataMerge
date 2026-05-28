@@ -207,7 +207,15 @@ def main():
             host="0.0.0.0",
             port=8000,
             reload=True,
-            reload_excludes=["*tenants*", "*.xlsx", "*.xls", "*.log"],  # 排除训练产生的文件
+            # 仅监视后端代码目录：避免根目录大文件（excel_parser.py）/ 前端 / 训练产物变化时
+            # 触发热重载，导致正在跑的 SSE 流被切断（前端表现为 "Failed to fetch"）。
+            reload_dirs=["backend"],
+            reload_excludes=[
+                "*tenants*", "*global_assets*", "*examples*",
+                "*.xlsx", "*.xls", "*.xlsm", "*.csv",
+                "*.log", "*.db", "*.sqlite*", "*.json",
+                "*__pycache__*", "*.pyc",
+            ],
             log_level="info",
             log_config=log_config,
             use_colors=True
@@ -233,7 +241,13 @@ def main():
             host="0.0.0.0",
             port=8000,
             reload=True,
-            reload_excludes=["*tenants*", "*.xlsx", "*.xls", "*.log"],  # 排除训练产生的文件
+            reload_dirs=["backend"],
+            reload_excludes=[
+                "*tenants*", "*global_assets*", "*examples*",
+                "*.xlsx", "*.xls", "*.xlsm", "*.csv",
+                "*.log", "*.db", "*.sqlite*", "*.json",
+                "*__pycache__*", "*.pyc",
+            ],
             log_level="info"
         )
 

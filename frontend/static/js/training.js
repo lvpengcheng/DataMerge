@@ -864,6 +864,7 @@ function _sendRegenerateMessage(text) {
 
 // ==================== SSE ====================
 async function _fetchTrainingSSE(url, options) {
+    let _gotAnyEvent = false;
     try {
         // 使用 AUTH.authFetch 保证 token 正确携带 + 401 自动跳转登录
         const response = await AUTH.authFetch(url, options);
@@ -890,6 +891,7 @@ async function _fetchTrainingSSE(url, options) {
                 if (!jsonStr) continue;
                 try {
                     const event = JSON.parse(jsonStr);
+                    _gotAnyEvent = true;
                     _handleSSEEvent(event);
                 } catch (parseErr) {
                     if (parseErr.message && !parseErr.message.includes('JSON')) throw parseErr;
@@ -898,7 +900,18 @@ async function _fetchTrainingSSE(url, options) {
         }
     } catch (e) {
         console.error('SSE error:', e);
-        _addSystemMessage('请求失败: ' + e.message, 'status', { error: true });
+        // 网络中断 / 服务热重载：fetch 抛 TypeError("Failed to fetch")
+        // 给出可操作的提示，而不是裸的 "Failed to fetch"
+        const isNetErr = (e && e.name === 'TypeError') ||
+                         (e && typeof e.message === 'string' && /Failed to fetch|NetworkError|ERR_/i.test(e.message));
+        if (isNetErr) {
+            const hint = _gotAnyEvent
+                ? '与服务器的连接已断开（可能服务正在重启），请稍后重试或刷新页面。'
+                : '无法连接到服务器，请确认服务在线后重试。';
+            _addSystemMessage(hint, 'status', { error: true });
+        } else {
+            _addSystemMessage('请求失败: ' + e.message, 'status', { error: true });
+        }
     } finally {
         _setUIStreaming(false);
     }
