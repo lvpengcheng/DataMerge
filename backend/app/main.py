@@ -4485,68 +4485,18 @@ async def compute_submit(
         source_dir = temp_dir / "source"
         source_dir.mkdir(parents=True, exist_ok=True)
 
+        # 把 UploadFile 的字节预读到内存，避免跨线程访问 SpooledTemporaryFile
+        file_buffers: List[tuple] = []
         for file in source_files:
-            file_path = source_dir / file.filename
-            with open(file_path, 'wb') as f:
-                shutil.copyfileobj(file.file, f)
+            data = await file.read()
+            file_buffers.append((file.filename, data))
 
-        # 3. 同步检测加密文件
         passwords_dict = {}
         if file_passwords:
             try:
                 passwords_dict = json.loads(file_passwords)
             except Exception:
                 pass
-
-        from backend.utils.aspose_helper import is_encrypted as _is_enc, decrypt_excel as _dec_excel
-        encrypted_files = []
-        for file_path in source_dir.iterdir():
-            if file_path.is_file() and file_path.suffix.lower() in ('.xlsx', '.xls', '.xlsm'):
-                if _is_enc(str(file_path.resolve())) and not passwords_dict.get(file_path.name):
-                    encrypted_files.append(file_path.name)
-
-        if encrypted_files:
-            # 清理临时目录
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            from fastapi.responses import JSONResponse
-            return JSONResponse(
-                status_code=422,
-                content={"error_type": "encrypted_files", "encrypted_files": encrypted_files,
-                         "message": f"检测到加密文件: {', '.join(encrypted_files)}"},
-            )
-
-        # 3.5 解密带密码的文件（事前校验需要读取列结构）
-        if passwords_dict:
-            for file_path in source_dir.iterdir():
-                if not file_path.is_file() or file_path.suffix.lower() not in ('.xlsx', '.xls', '.xlsm'):
-                    continue
-                pwd = passwords_dict.get(file_path.name)
-                if pwd:
-                    fp_str = str(file_path.resolve())
-                    if _is_enc(fp_str):
-                        try:
-                            decrypted = _dec_excel(fp_str, password=pwd)
-                            shutil.move(decrypted, fp_str)
-                        except Exception as _de:
-                            logger.warning(f"[compute/submit] 解密 {file_path.name} 失败: {_de}")
-
-        # 3.6 banner-split 多区域预处理
-        try:
-            from backend.utils.banner_splitter import preprocess_uploaded_files
-            preprocess_uploaded_files([
-                str(p.resolve()) for p in source_dir.iterdir()
-                if p.is_file() and p.suffix.lower() in ('.xlsx', '.xlsm')
-            ])
-        except Exception as _bs_err:
-            logger.warning(f"[compute/submit] banner-split 预处理失败（继续）: {_bs_err}")
-
-        # 3.7 事前校验（基础资料兜底 + 表头匹配 + AI 建议 + 历史数据）
-        from backend.utils.compute_precheck import precheck_compute
-        from fastapi.responses import JSONResponse
-
-        _script_info = _load_script_info_for_precheck(tenant_id, script_id)
-        _source_structure = _script_info.get("source_structure")
-        _manual_headers = _script_info.get("manual_headers")
 
         _confirmed = None
         if confirmed_mapping:
@@ -4564,26 +4514,87 @@ async def compute_submit(
             except Exception as _cr:
                 logger.warning(f"[compute/submit] confirmed_renames 解析失败: {_cr}")
 
-        _precheck_db = SessionLocal()
-        try:
-            pc_result = precheck_compute(
-                source_dir=str(source_dir),
-                source_structure=_source_structure,
-                manual_headers=_manual_headers,
-                script_content=script_content,
-                tenant_id=tenant_id,
-                salary_year=salary_year,
-                salary_month=salary_month,
-                db_session=_precheck_db,
-                ai_provider_name=os.environ.get("AI_PROVIDER", "deepseek"),
-                confirmed_mapping=_confirmed,
-                confirmed_renames=_confirmed_renames,
-            )
-        finally:
+        _script_info = _load_script_info_for_precheck(tenant_id, script_id)
+        _source_structure = _script_info.get("source_structure")
+        _manual_headers = _script_info.get("manual_headers")
+
+        from fastapi.responses import JSONResponse
+        from backend.utils.aspose_helper import is_encrypted as _is_enc, decrypt_excel as _dec_excel
+        from backend.utils.compute_precheck import precheck_compute
+
+        # 3. 同步重活全部丢线程池：写盘 + 加密检测 + 解密 + banner-split + precheck
+        # 不能在线程池内 raise HTTPException（依赖请求上下文），用返回值带回信号
+        def _sync_pre_compute():
+            for fname, data in file_buffers:
+                with open(source_dir / fname, 'wb') as f:
+                    f.write(data)
+
+            enc = []
+            for fp in source_dir.iterdir():
+                if fp.is_file() and fp.suffix.lower() in ('.xlsx', '.xls', '.xlsm'):
+                    if _is_enc(str(fp.resolve())) and not passwords_dict.get(fp.name):
+                        enc.append(fp.name)
+            if enc:
+                return {"encrypted_files": enc, "pc_result": None}
+
+            if passwords_dict:
+                for fp in source_dir.iterdir():
+                    if not fp.is_file() or fp.suffix.lower() not in ('.xlsx', '.xls', '.xlsm'):
+                        continue
+                    pwd = passwords_dict.get(fp.name)
+                    if pwd:
+                        fp_str = str(fp.resolve())
+                        if _is_enc(fp_str):
+                            try:
+                                decrypted = _dec_excel(fp_str, password=pwd)
+                                shutil.move(decrypted, fp_str)
+                            except Exception as _de:
+                                logger.warning(f"[compute/submit] 解密 {fp.name} 失败: {_de}")
+
             try:
-                _precheck_db.close()
-            except Exception:
-                pass
+                from backend.utils.banner_splitter import preprocess_uploaded_files
+                preprocess_uploaded_files([
+                    str(p.resolve()) for p in source_dir.iterdir()
+                    if p.is_file() and p.suffix.lower() in ('.xlsx', '.xlsm')
+                ])
+            except Exception as _bs_err:
+                logger.warning(f"[compute/submit] banner-split 预处理失败（继续）: {_bs_err}")
+
+            _db = SessionLocal()
+            try:
+                pc = precheck_compute(
+                    source_dir=str(source_dir),
+                    source_structure=_source_structure,
+                    manual_headers=_manual_headers,
+                    script_content=script_content,
+                    tenant_id=tenant_id,
+                    salary_year=salary_year,
+                    salary_month=salary_month,
+                    db_session=_db,
+                    ai_provider_name=os.environ.get("AI_PROVIDER", "deepseek"),
+                    confirmed_mapping=_confirmed,
+                    confirmed_renames=_confirmed_renames,
+                )
+            finally:
+                try:
+                    _db.close()
+                except Exception:
+                    pass
+            return {"encrypted_files": [], "pc_result": pc}
+
+        loop = asyncio.get_running_loop()
+        _pre = await loop.run_in_executor(None, _sync_pre_compute)
+
+        if _pre["encrypted_files"]:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return JSONResponse(
+                status_code=422,
+                content={"error_type": "encrypted_files",
+                         "encrypted_files": _pre["encrypted_files"],
+                         "message": f"检测到加密文件: {', '.join(_pre['encrypted_files'])}"},
+            )
+
+        pc_result = _pre["pc_result"]
 
         # 历史数据警告：未带 skip_history_check 时也阻断（让用户确认）
         if (not pc_result.ok) or (pc_result.history_warnings and not skip_history_check):
@@ -5409,10 +5420,6 @@ async def compute_with_script(
         temp_dir = Path(tempfile.mkdtemp(prefix="compute_"))
 
         try:
-            # 保存源文件
-            source_dir = temp_dir / "source"
-            source_dir.mkdir(parents=True, exist_ok=True)
-
             # 解析文件密码
             passwords_dict = {}
             if file_passwords:
@@ -5421,199 +5428,196 @@ async def compute_with_script(
                 except Exception:
                     pass
 
+            # 预读 UploadFile 字节，避免跨线程访问 SpooledTemporaryFile
+            file_buffers: List[tuple] = []
             for file in source_files:
-                file_path = source_dir / file.filename
-                with open(file_path, 'wb') as f:
-                    shutil.copyfileobj(file.file, f)
+                data = await file.read()
+                file_buffers.append((file.filename, data))
 
-                # 检测并解密加密文件
+            # 整段同步重活丢线程池：写盘 + 加解密 + 脚本执行 + 行数统计
+            def _sync_run():
+                source_dir = temp_dir / "source"
+                source_dir.mkdir(parents=True, exist_ok=True)
+
+                for fname, data in file_buffers:
+                    with open(source_dir / fname, 'wb') as f:
+                        f.write(data)
+
                 from ..utils.aspose_helper import is_encrypted as _is_enc, decrypt_excel as _dec_excel
 
-            # 检测加密并解密（单次遍历）
-            encrypted_no_pwd = []
-            for file in source_files:
-                file_path = source_dir / file.filename
-                file_path_str = str(file_path.resolve())
-                if not _is_enc(file_path_str):
-                    continue
-                pwd = passwords_dict.get(file.filename)
-                if not pwd:
-                    encrypted_no_pwd.append(file.filename)
-                else:
-                    decrypted = _dec_excel(file_path_str, password=pwd)
-                    shutil.move(decrypted, file_path_str)
+                encrypted_no_pwd = []
+                for fname, _data in file_buffers:
+                    file_path = source_dir / fname
+                    file_path_str = str(file_path.resolve())
+                    if not _is_enc(file_path_str):
+                        continue
+                    pwd = passwords_dict.get(fname)
+                    if not pwd:
+                        encrypted_no_pwd.append(fname)
+                    else:
+                        decrypted = _dec_excel(file_path_str, password=pwd)
+                        shutil.move(decrypted, file_path_str)
 
-            if encrypted_no_pwd:
-                from fastapi.responses import JSONResponse
-                return JSONResponse(
-                    status_code=422,
-                    content={
-                        "error_type": "encrypted_files",
-                        "encrypted_files": encrypted_no_pwd,
-                        "message": f"以下文件有密码保护: {', '.join(encrypted_no_pwd)}",
-                    }
-                )
+                if encrypted_no_pwd:
+                    return {"_kind": "encrypted", "encrypted": encrypted_no_pwd}
 
-            # DB持久化：注册源文件为数据资产
-            if db_session:
-                for src_file in source_dir.iterdir():
-                    if src_file.is_file():
-                        _persist_source_file(
-                            db_session, compute_task_id, tenant_id,
-                            str(src_file), src_file.name, src_file.stat().st_size
-                        )
+                # DB持久化：注册源文件为数据资产
+                if db_session:
+                    for src_file in source_dir.iterdir():
+                        if src_file.is_file():
+                            _persist_source_file(
+                                db_session, compute_task_id, tenant_id,
+                                str(src_file), src_file.name, src_file.stat().st_size
+                            )
 
-            # 保存脚本
-            script_path = temp_dir / f"{script_id}.py"
-            script_path.write_text(script_content, encoding='utf-8')
+                # 保存脚本
+                script_path = temp_dir / f"{script_id}.py"
+                script_path.write_text(script_content, encoding='utf-8')
 
-            # 执行脚本
-            output_dir = temp_dir / "output"
-            output_dir.mkdir(parents=True, exist_ok=True)
+                output_dir = temp_dir / "output"
+                output_dir.mkdir(parents=True, exist_ok=True)
 
-            # 动态导入并执行
-            import sys
-            import importlib.util
+                import sys
+                import importlib.util
 
-            sys.path.insert(0, str(temp_dir))
-            spec = importlib.util.spec_from_file_location("compute_script", script_path)
-            module = importlib.util.module_from_spec(spec)
+                sys.path.insert(0, str(temp_dir))
+                spec = importlib.util.spec_from_file_location("compute_script", script_path)
+                module = importlib.util.module_from_spec(spec)
 
-            # 设置全局变量（供不带参数的main()函数使用）
-            module.input_folder = str(source_dir)
-            module.output_folder = str(output_dir)
-            if salary_year is not None:
-                module.salary_year = salary_year
-            if salary_month is not None:
-                module.salary_month = salary_month
-            if standard_hours is not None:
-                module.monthly_standard_hours = standard_hours
+                module.input_folder = str(source_dir)
+                module.output_folder = str(output_dir)
+                if salary_year is not None:
+                    module.salary_year = salary_year
+                if salary_month is not None:
+                    module.salary_month = salary_month
+                if standard_hours is not None:
+                    module.monthly_standard_hours = standard_hours
 
-            # 注入历史数据提供者
-            try:
-                from backend.utils.historical_data import HistoricalDataProvider
-                module.history_provider = HistoricalDataProvider(tenant_id)
-            except Exception as _hp_err:
-                logger.warning(f"历史数据提供者注入失败: {_hp_err}")
-
-            spec.loader.exec_module(module)
-
-            # 【加密支持】monkey-patch IntelligentExcelParser 自动注入密码
-            # 注意：文件已在上游被 _dec_excel 解密，仅对仍加密的文件注入密码
-            if passwords_dict:
                 try:
-                    from excel_parser import IntelligentExcelParser as _IEP
-                    from backend.utils.aspose_helper import is_encrypted as _chk_enc
-                    _IEP._orig_parse_backup = _IEP.parse_excel_file
-                    _orig_parse = _IEP.parse_excel_file
-                    _fp_map = passwords_dict
+                    from backend.utils.historical_data import HistoricalDataProvider
+                    module.history_provider = HistoricalDataProvider(tenant_id)
+                except Exception as _hp_err:
+                    logger.warning(f"历史数据提供者注入失败: {_hp_err}")
 
-                    def _auto_pwd_parse(self_parser, file_path, *args, **kwargs):
-                        if 'password' not in kwargs or kwargs.get('password') is None:
-                            fname = os.path.basename(str(file_path))
-                            pwd = _fp_map.get(fname)
-                            if pwd:
-                                try:
-                                    still_enc = _chk_enc(str(file_path))
-                                except Exception:
-                                    still_enc = True  # 检测失败时保守注入
-                                if still_enc:
-                                    kwargs['password'] = pwd
-                                else:
-                                    pass  # 文件已解密，跳过密码注入
-                        return _orig_parse(self_parser, file_path, *args, **kwargs)
+                spec.loader.exec_module(module)
 
-                    _IEP.parse_excel_file = _auto_pwd_parse
-                except Exception:
-                    pass
+                if passwords_dict:
+                    try:
+                        from excel_parser import IntelligentExcelParser as _IEP
+                        from backend.utils.aspose_helper import is_encrypted as _chk_enc
+                        _IEP._orig_parse_backup = _IEP.parse_excel_file
+                        _orig_parse = _IEP.parse_excel_file
+                        _fp_map = passwords_dict
 
-            # 调用main函数（智能传递参数）
-            if hasattr(module, 'main'):
-                # 检查main函数的签名，只传递它接受的参数
+                        def _auto_pwd_parse(self_parser, file_path, *args, **kwargs):
+                            if 'password' not in kwargs or kwargs.get('password') is None:
+                                fname = os.path.basename(str(file_path))
+                                pwd = _fp_map.get(fname)
+                                if pwd:
+                                    try:
+                                        still_enc = _chk_enc(str(file_path))
+                                    except Exception:
+                                        still_enc = True
+                                    if still_enc:
+                                        kwargs['password'] = pwd
+                            return _orig_parse(self_parser, file_path, *args, **kwargs)
+
+                        _IEP.parse_excel_file = _auto_pwd_parse
+                    except Exception:
+                        pass
+
+                if not hasattr(module, 'main'):
+                    return {"_kind": "no_main"}
+
                 import inspect
                 sig = inspect.signature(module.main)
                 params = list(sig.parameters.keys())
-
-                # 构建参数字典
                 kwargs = {}
-
-                # 基本参数（位置参数）
                 if len(params) >= 2:
-                    # 如果有至少2个参数，按位置传递 source_dir 和 output_dir
                     args = [str(source_dir), str(output_dir)]
-
-                    # 可选参数（关键字参数）
                     if 'salary_year' in params and salary_year is not None:
                         kwargs['salary_year'] = salary_year
                     if 'salary_month' in params and salary_month is not None:
                         kwargs['salary_month'] = salary_month
                     if 'monthly_standard_hours' in params and standard_hours is not None:
                         kwargs['monthly_standard_hours'] = standard_hours
-
-                    result = module.main(*args, **kwargs)
+                    module.main(*args, **kwargs)
                 elif len(params) == 0:
-                    # main() 不带参数，使用全局变量方式（已在上面设置）
-                    result = module.main()
+                    module.main()
                 else:
-                    # 只有1个参数，尝试传递 source_dir
-                    result = module.main(str(source_dir))
-            else:
-                raise HTTPException(status_code=500, detail="脚本缺少main函数")
+                    module.main(str(source_dir))
 
-            # 恢复 monkey-patch
-            if passwords_dict:
+                if passwords_dict:
+                    try:
+                        from excel_parser import IntelligentExcelParser as _IEP2
+                        if hasattr(_IEP2, '_orig_parse_backup'):
+                            _IEP2.parse_excel_file = _IEP2._orig_parse_backup
+                            del _IEP2._orig_parse_backup
+                    except Exception:
+                        pass
+
+                output_files = list(output_dir.glob("*.xlsx"))
+                if not output_files:
+                    return {"_kind": "no_output"}
+                output_file = output_files[0]
+
+                logger.info(f"[compute] 跳过公式计算（用户打开Excel时自动重算）")
+
+                tenant_dir = storage_manager.get_tenant_dir(tenant_id)
+                compute_dir = tenant_dir / "compute_results"
+                compute_dir.mkdir(parents=True, exist_ok=True)
+
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                saved_file = compute_dir / f"result_{timestamp}_{output_file.name}"
+                shutil.copy(output_file, saved_file)
+
                 try:
-                    from excel_parser import IntelligentExcelParser as _IEP2
-                    if hasattr(_IEP2, '_orig_parse_backup'):
-                        _IEP2.parse_excel_file = _IEP2._orig_parse_backup
-                        del _IEP2._orig_parse_backup
+                    from Aspose.Cells import Workbook as _CountWb
+                    _cwb = _CountWb(str(saved_file))
+                    rows_processed = sum(_cwb.Worksheets[i].Cells.MaxDataRow + 1
+                                         for i in range(_cwb.Worksheets.Count))
                 except Exception:
-                    pass
+                    rows_processed = 0
 
-            # 查找输出文件
-            output_files = list(output_dir.glob("*.xlsx"))
-            if not output_files:
+                if db_session:
+                    _persist_result_file(
+                        db_session, compute_task_id, tenant_id,
+                        saved_file, output_file.name
+                    )
+                    duration = (datetime.now() - compute_start_time).total_seconds()
+                    _persist_compute_complete(
+                        db_session, compute_task_id, duration,
+                        {"output_file": saved_file.name, "rows_processed": rows_processed}
+                    )
+
+                return {
+                    "_kind": "ok",
+                    "output_file": saved_file.name,
+                    "rows_processed": rows_processed,
+                }
+
+            loop = asyncio.get_running_loop()
+            run_result = await loop.run_in_executor(None, _sync_run)
+
+            if run_result["_kind"] == "encrypted":
+                from fastapi.responses import JSONResponse
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "error_type": "encrypted_files",
+                        "encrypted_files": run_result["encrypted"],
+                        "message": f"以下文件有密码保护: {', '.join(run_result['encrypted'])}",
+                    }
+                )
+            if run_result["_kind"] == "no_main":
+                raise HTTPException(status_code=500, detail="脚本缺少main函数")
+            if run_result["_kind"] == "no_output":
                 raise HTTPException(status_code=500, detail="未生成输出文件")
-
-            output_file = output_files[0]
-
-            # 【性能优化】跳过公式计算 — 智算时 Excel 由用户打开，公式会自动重算
-            logger.info(f"[compute] 跳过公式计算（用户打开Excel时自动重算）")
-
-            # 保存到租户目录
-            tenant_dir = storage_manager.get_tenant_dir(tenant_id)
-            compute_dir = tenant_dir / "compute_results"
-            compute_dir.mkdir(parents=True, exist_ok=True)
-
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            saved_file = compute_dir / f"result_{timestamp}_{output_file.name}"
-            shutil.copy(output_file, saved_file)
-
-            # 统计行数（使用 Aspose 轻量读取）
-            try:
-                from Aspose.Cells import Workbook as _CountWb
-                _cwb = _CountWb(str(saved_file))
-                rows_processed = sum(_cwb.Worksheets[i].Cells.MaxDataRow + 1
-                                     for i in range(_cwb.Worksheets.Count))
-            except Exception:
-                rows_processed = 0
-
-            # DB持久化：注册结果文件 + 标记任务完成
-            if db_session:
-                _persist_result_file(
-                    db_session, compute_task_id, tenant_id,
-                    saved_file, output_file.name
-                )
-                duration = (datetime.now() - compute_start_time).total_seconds()
-                _persist_compute_complete(
-                    db_session, compute_task_id, duration,
-                    {"output_file": saved_file.name, "rows_processed": rows_processed}
-                )
 
             return {
                 "success": True,
-                "output_file": saved_file.name,
-                "rows_processed": rows_processed,
+                "output_file": run_result["output_file"],
+                "rows_processed": run_result["rows_processed"],
                 "tenant_id": tenant_id,
                 "script_id": script_id
             }

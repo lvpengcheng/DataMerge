@@ -15,6 +15,21 @@ let _chatStreamEl = null;   // AI 对话流式输出的 DOM 元素
 let _chatStreamBuf = '';    // AI 对话流式输出的文本缓冲
 let _pendingScriptName = null;  // 新建训练时由用户命名的脚本名（仅新建会话首次提交时使用）
 
+// 重置上传相关状态：密码映射、文件 input、文件列表 UI、附件徽标
+// 在切租户/切会话/新建/删除/提交完成等"开始下一轮操作"前调用
+function _resetUploadState() {
+    _filePasswordsMap = {};
+    ['source-files', 'target-file', 'rule-files'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.value = '';
+    });
+    ['source-file-list', 'target-file-list', 'rule-file-list'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.innerHTML = '';
+    });
+    try { _updateAttachBadge(); } catch (e) {}
+}
+
 // ==================== 初始化 ====================
 document.addEventListener('DOMContentLoaded', function () {
     AUTH.requireAuth();
@@ -138,6 +153,7 @@ function _selectTenant(tenantId) {
     _chatMessages = [];
     _currentAccuracy = null;
     _currentCode = null;
+    _resetUploadState();
     _clearChatUI();
     _hideActionButtons();
     _applyTenantPermission();
@@ -258,6 +274,7 @@ function createNewSession() {
         _chatMessages = [];
         _currentAccuracy = null;
         _currentCode = null;
+        _resetUploadState();
         _clearChatUI();
         _hideActionButtons();
         _highlightActiveSession();
@@ -329,6 +346,7 @@ async function _promptScriptName(tenantId) {
 async function selectSession(sessionId) {
     if (_isStreaming) return;
     _pendingScriptName = null;  // 切换到已存在会话，不再需要新建命名
+    _resetUploadState();
     try {
         const resp = await AUTH.authFetch(`/api/training/chat/sessions/${sessionId}/messages`);
         if (!resp.ok) return;
@@ -388,6 +406,7 @@ async function deleteSession(sessionId) {
     if (_currentSessionId === sessionId) {
         _currentSessionId = null;
         _chatMessages = [];
+        _resetUploadState();
         _clearChatUI();
         _hideActionButtons();
         const regenBtn = document.getElementById('regenerate-btn');
@@ -797,6 +816,7 @@ function _startTraining(userText) {
     _setUIStreaming(true);
 
     _fetchTrainingSSE('/api/training/chat/start', { method: 'POST', body: formData });
+    _resetUploadState();
 }
 
 function _sendChatMessage(text, action) {
@@ -860,6 +880,7 @@ function _sendRegenerateMessage(text) {
         method: 'POST',
         body: formData,
     });
+    _resetUploadState();
 }
 
 // ==================== SSE ====================

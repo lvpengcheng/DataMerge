@@ -2024,6 +2024,12 @@ async def send_message(
 
                 config["source_dir"] = str(p_source)
 
+                # 源文件已替换，旧的结构描述/AI 缓存对新结构不再适用，必须清掉
+                # 否则 AI 失败时 (code=None) 这些旧值仍被后续 chat/generate 引用，导致幻觉错位
+                config.pop("source_structure_desc", None)
+                config.pop("latest_detailed_diff", None)
+                session.source_structure = None
+
             # 2) 替换 expected
             if had_new_expected:
                 old_exp = config.get("expected_file") or ""

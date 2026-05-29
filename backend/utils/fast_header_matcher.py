@@ -332,9 +332,17 @@ class FastHeaderMatcher:
                     "needs_rewrite": needs_rewrite
                 })
             else:
-                logger.error(f"[匹配]   ✗ 未找到匹配")
-                missing_info = self._describe_missing(train_sheet, input_sheets, used_input_indices, best_score, best_input_idx)
-                errors.append(missing_info)
+                # 模板模式下，训练侧 sheet 未在上传文件中出现是合理场景
+                # （例：训练 8 员工、本月只来 5 个员工 → 缺席 3 个不算错），仅警告跳过
+                if template_mode:
+                    logger.warning(
+                        f"[匹配]   ○ 训练 sheet '{train_file}/{train_sheet_name}' 在上传文件中无对应 "
+                        f"(模板模式，已忽略，最高分={best_score:.2f})"
+                    )
+                else:
+                    logger.error(f"[匹配]   ✗ 未找到匹配")
+                    missing_info = self._describe_missing(train_sheet, input_sheets, used_input_indices, best_score, best_input_idx)
+                    errors.append(missing_info)
 
         if errors:
             error_msg = "以下训练时的数据源在上传文件中未找到匹配:\n" + "\n".join(errors)
