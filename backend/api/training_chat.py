@@ -315,12 +315,20 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None,
             logger.warning(f"[后台全量加载] 解析 {filename} 失败: {e}")
 
     # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 → 加文件名前缀
-    from backend.utils.data_helpers import assign_sheet_keys
+    from backend.utils.data_helpers import assign_sheet_keys, make_unique_sheet_key
     key_map = assign_sheet_keys((fb, sn) for fb, sn, _, _ in _collected)
+    # 同时建立 {file_base}_{sheet_name} 别名，兼容旧脚本（用文件名前缀做子串匹配）
+    alias_used: set = set(key_map.values())
     for file_base, sheet_name, merged_df, columns in _collected:
         final_key = key_map[(file_base, sheet_name)]
-        source_data[final_key] = {"df": merged_df, "columns": columns}
+        entry = {"df": merged_df, "columns": columns}
+        source_data[final_key] = entry
         logger.info(f"[后台全量加载] {final_key}: {len(merged_df)} 行")
+
+        alias_raw = f"{file_base}_{sheet_name}"
+        if alias_raw != final_key:
+            alias_key = make_unique_sheet_key(alias_raw, alias_used, max_len=31)
+            source_data[alias_key] = entry  # 共享 df，无内存膨胀
 
     return source_data
 

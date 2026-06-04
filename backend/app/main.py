@@ -532,6 +532,22 @@ async def rules_chat_endpoint(
 
 @app.on_event("startup")
 async def startup_event():
+    # Windows IOCP 监听 socket 在客户端 RST 时偶发抛 WinError 64，listener 不会挂掉
+    # 但 asyncio 会把每次失败打成 ERROR 级日志（IIS ARR 反向代理高频探测时会刷屏）
+    # 这里安装 filter 屏蔽这类无害噪音，不影响真正的 socket 故障日志
+    if os.name == "nt":
+        class _WinAcceptNoiseFilter(logging.Filter):
+            def filter(self, record):
+                msg = record.getMessage()
+                if "WinError 64" in msg:
+                    return False
+                if "Accept failed on a socket" in msg:
+                    return False
+                if "accept_coro" in msg and "OSError" in msg:
+                    return False
+                return True
+        logging.getLogger("asyncio").addFilter(_WinAcceptNoiseFilter())
+
     db_models.Base.metadata.create_all(bind=engine)
     # 增量迁移：为已有表添加新列
     from backend.database.init_db import _migrate_add_columns

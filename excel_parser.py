@@ -1485,7 +1485,13 @@ class IntelligentExcelParser:
                self._is_title_row(worksheet, current_row, max_col):
                 current_row += 1
                 continue
-            
+
+            # 跳过悬空汇总噪音行(全数字/错误,无文本标识)
+            if self._is_header_noise_row(worksheet, current_row, max_col):
+                self.logger.info(f"入口跳过噪音行 r{current_row}")
+                current_row += 1
+                continue
+
             header_info = self._analyze_header_range(worksheet, current_row, min(current_row + 20, max_row), max_col)
             
             if header_info:
@@ -1717,7 +1723,12 @@ class IntelligentExcelParser:
             self.logger.debug(f"选择最优方案: {best_candidate.method}, "
                             f"表头:{best_candidate.header_start}-{best_candidate.header_end}, "
                             f"得分:{best_candidate.score:.3f}")
-            return HeaderInfo(start_row=best_candidate.header_start, end_row=best_candidate.header_end)
+            # 【Fix F 后处理】最终方案 header_end 是稀疏分组行 + header_end+1 是密集列名行
+            #   → 把列名行并入表头（覆盖反向/滑动窗口候选选中后未触发 _find_header_end Fix F 的情况）
+            final_end = best_candidate.header_end
+            if self._is_sparse_group_above_dense_fields(worksheet, final_end, max_row, max_col):
+                final_end = final_end + 1
+            return HeaderInfo(start_row=best_candidate.header_start, end_row=final_end)
 
         return None
 
@@ -2032,6 +2043,12 @@ class IntelligentExcelParser:
             if self._is_title_row(worksheet, row, max_col) or self._is_instruction_row(worksheet, row, max_col):
                 break
 
+            # 【Fix H】嵌入式汇总/小计噪音行：跳过但不 break，继续向上扫描真表头
+            #   场景：r6 = '·· 社保缴纳地汇总 ·· 0.0 0.0 0.0 ...'，夹在 r5 一级表头与 r7 二级表头之间
+            if self._is_header_noise_row(worksheet, row, max_col):
+                self.logger.info(f"跳过表头中的汇总噪音行 r{row}")
+                continue
+
             features = self.row_analyzer.analyze_row_features(worksheet, row, max_col)
 
             # 检查相邻行之间的格式突变
@@ -2118,6 +2135,108 @@ class IntelligentExcelParser:
             if v is not None and str(v).strip() != '':
                 cols.add(c)
         return cols
+
+    def _is_sparse_group_above_dense_fields(self, worksheet: Any, header_end_row: int,
+                                            max_row: int, max_col: int) -> bool:
+        """【Fix F helper】判断 header_end_row 是否是"带水平合并的稀疏分组行"，
+        且 header_end_row+1 是密集列名行（应被并入表头）。
+
+        判定（全部满足）：
+        1. header_end_row 有水平合并
+        2. header_end_row+1 不为空、不超出
+        3. 上层非空列 ⊆ 下层非空列
+        4. 下层非空列数 ≥ 2 × 上层
+        5. 下层 text_ratio ≥ 0.7
+        """
+        next_row = header_end_row + 1
+        if next_row > max_row:
+            return False
+        if self._is_empty_row(worksheet, next_row, max_col):
+            return False
+        if not self._has_horizontal_merge(worksheet, header_end_row, max_col):
+            return False
+        upper_cols = self._row_non_empty_cols(worksheet, header_end_row, max_col)
+        lower_cols = self._row_non_empty_cols(worksheet, next_row, max_col)
+        if not upper_cols:
+            return False
+        if len(lower_cols) < 2 * len(upper_cols):
+            return False
+        if not upper_cols.issubset(lower_cols):
+            return False
+        lower_features = self.row_analyzer.analyze_row_features(worksheet, next_row, max_col)
+        if lower_features.text_ratio < 0.7:
+            return False
+        self.logger.info(
+            f"Fix F 命中：r{header_end_row} 稀疏分组+合并，r{next_row} 密集列名 "
+            f"(上 {len(upper_cols)} 列 ⊆ 下 {len(lower_cols)} 列, text_ratio={lower_features.text_ratio:.2f})"
+        )
+        return True
+
+    def _is_header_noise_row(self, worksheet: Any, row: int, max_col: int) -> bool:
+        """【Fix H】检测嵌入在表头中的"汇总/小计/合计"噪音行
+
+        典型场景：
+        (1) 希奥睿 r6: ['', '社保缴纳地 汇总', '', '', '', '', '0.0', '', '0.0', '0.0', ...]
+            — 关键字驱动：含 "汇总" 文本 + 数值占比高
+        (2) 曼胡默尔 工资明细 r1: 142 列只有 col P-T 5 个值 (9482666.6, #N/A, -1188.2, 220863.4, #N/A)
+            — 稀疏散点驱动：极稀疏 + 数字/错误公式占绝对主导，无关键字
+
+        这种行夹在多级表头中间或表头上方，会切断 _find_header_start 向上回溯，
+        导致真正的上层表头被遗漏。
+
+        判定条件（满足任一分支即可）：
+        分支A — 关键字驱动：
+            1. 至少一个 cell 含汇总类关键字（汇总/小计/合计/总计/total/subtotal）
+            2. 非空 cell ≥ 2 个
+            3. 数值/错误公式占非空 cell ≥ 0.5
+        分支B — 稀疏散点驱动：
+            1. 非空 cell 占总列比例 ≤ 0.15（稀疏）
+            2. 非空 cell ≥ 2 个（排除孤格 banner）
+            3. 数值/错误公式占非空 cell ≥ 0.8（数字主导，无文本表头特征）
+        """
+        keywords = ('汇总', '小计', '合计', '总计', 'total', 'subtotal')
+        error_markers = ('#n/a', '#div/0', '#value', '#ref', '#name', '#null', '#num')
+        has_keyword = False
+        non_empty = 0
+        num_or_err_count = 0
+        text_count = 0
+        for c in range(1, max_col + 1):
+            v = worksheet.cell(row, c).value
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s == '':
+                continue
+            non_empty += 1
+            low = s.lower()
+            if any(kw in low for kw in keywords):
+                has_keyword = True
+            is_num_or_err = False
+            try:
+                float(s)
+                is_num_or_err = True
+            except (ValueError, TypeError):
+                if any(em in low for em in error_markers):
+                    is_num_or_err = True
+            if is_num_or_err:
+                num_or_err_count += 1
+            else:
+                text_count += 1
+        if non_empty < 2:
+            return False
+        # 分支A：关键字 + 数字主导
+        if has_keyword and (num_or_err_count / non_empty) >= 0.5:
+            return True
+        # 分支B：极稀疏 + 数字/错误公式绝对主导（典型的孤立汇总公式行）
+        sparsity = non_empty / max(max_col, 1)
+        if sparsity <= 0.15 and (num_or_err_count / non_empty) >= 0.8:
+            return True
+        # 分支C：零文本 + 多个数字/错误公式（密集型悬空汇总行,
+        #   场景:曼胡默尔 工资明细 r1 — col 1-15 全空, col 16-142 全是数字/#N/A,
+        #   零文本特征排除正常数据行,真实数据行至少有姓名/工号等文本标识）
+        if text_count == 0 and num_or_err_count >= 5:
+            return True
+        return False
 
     def _has_format_break(self, worksheet: Any, row1: int, row2: int, max_col: int) -> bool:
         """检测两行之间是否有明显的格式突变
@@ -2335,6 +2454,14 @@ class IntelligentExcelParser:
                     continue
                 break
             return current_header_end  # 直接返回，避免主循环重新评估
+
+        # 【Fix F】稀疏分组行 + 密集字段行：start_row 是带水平合并的稀疏分组，
+        # start_row+1 是密集列名行，且上层非空列 ⊆ 下层非空列。
+        #   场景：菲仕兰服务费 r3=['','','','','','','社会保险类'(G:J 合并),'','','','工资类'(K:U 合并),...]
+        #         r4=['序号','','组织名称','姓名','工号','','公司缴纳金额',...]
+        #   主循环 Strategy 2 看 r5+ 序号 16,17,... 误判 r4 为数据 → 提前返回 r3，遗漏 r4 真表头。
+        if self._is_sparse_group_above_dense_fields(worksheet, start_row, max_row, max_col):
+            return start_row + 1
 
         for row in range(start_row, min(start_row + MAX_HEADER_ROWS + 1, max_row + 1)):
             if self._is_empty_row(worksheet, row, max_col):
@@ -2728,6 +2855,9 @@ class IntelligentExcelParser:
         # 逐行处理表头区域（作为备用）
         for row in range(start_row, end_row + 1):
             if self._is_title_row(worksheet, row, max_col):
+                continue
+            # 【Fix H】跳过嵌入在表头范围内的汇总/小计噪音行，避免污染列名
+            if self._is_header_noise_row(worksheet, row, max_col):
                 continue
 
             row_processed_cols = set()
@@ -3464,6 +3594,9 @@ class IntelligentExcelParser:
         processed_merges = set()
         for row in range(start_row, end_row + 1):
             if self._is_title_row(worksheet, row, max_col):
+                continue
+            # 【Fix H】跳过嵌入在表头范围内的汇总/小计噪音行
+            if self._is_header_noise_row(worksheet, row, max_col):
                 continue
 
             for col in range(1, max_col + 1):

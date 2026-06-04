@@ -857,13 +857,19 @@ class FastHeaderMatcher:
 
         # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 → 加文件名前缀
         key_map = assign_sheet_keys((fb, sn) for fb, sn, _, _ in _collected)
+        # 同时建立 {file_base}_{sheet_name} 别名，兼容旧脚本(load_source_data 用文件名前缀做子串匹配)
+        from backend.utils.data_helpers import make_unique_sheet_key
+        alias_used: set = set(key_map.values())
         for file_base, train_sheet, merged_df, first_columns in _collected:
             key = key_map[(file_base, train_sheet)]
-            source_data[key] = {
-                "df": merged_df,
-                "columns": first_columns
-            }
+            entry = {"df": merged_df, "columns": first_columns}
+            source_data[key] = entry
             logger.info(f"[预加载] {key}: {len(merged_df)}行 × {len(first_columns)}列")
+
+            alias_raw = f"{file_base}_{train_sheet}"
+            if alias_raw != key:
+                alias_key = make_unique_sheet_key(alias_raw, alias_used, max_len=31)
+                source_data[alias_key] = entry  # 共享同一份 df，无内存膨胀
 
         return source_data
 
