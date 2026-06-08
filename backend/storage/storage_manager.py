@@ -511,6 +511,36 @@ class StorageManager:
         with open(active_file, 'w', encoding='utf-8') as f:
             json.dump(active_info, f, ensure_ascii=False, indent=2)
 
+    # ========== 脚本启用/禁用（适用于 FS-only 与 DB 脚本统一过滤） ==========
+    def _disabled_scripts_file(self, tenant_id: str) -> Path:
+        return self.get_tenant_dir(tenant_id) / "disabled_scripts.json"
+
+    def get_disabled_script_ids(self, tenant_id: str) -> set:
+        """读取被禁用的脚本 ID 集合（FS 层面，用于补充 DB.is_active=False）"""
+        f = self._disabled_scripts_file(tenant_id)
+        if not f.exists():
+            return set()
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            return set(data.get("disabled", []))
+        except Exception:
+            return set()
+
+    def set_script_disabled(self, tenant_id: str, script_id: str, disabled: bool) -> set:
+        """禁用/恢复脚本（FS 层面）。返回最新的禁用 ID 集合"""
+        ids = self.get_disabled_script_ids(tenant_id)
+        if disabled:
+            ids.add(script_id)
+        else:
+            ids.discard(script_id)
+        f = self._disabled_scripts_file(tenant_id)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps({"disabled": sorted(ids)}, ensure_ascii=False, indent=2), encoding="utf-8")
+        return ids
+
+    def is_script_disabled(self, tenant_id: str, script_id: str) -> bool:
+        return script_id in self.get_disabled_script_ids(tenant_id)
+
     def _generate_batch_id(self) -> str:
         """生成批次ID"""
         import time

@@ -54,6 +54,7 @@ class UserResponse(BaseModel):
     role_id: Optional[int]
     role_name: Optional[str] = ""
     is_active: bool
+    permissions: Dict[str, Any] = {}
 
     class Config:
         from_attributes = True

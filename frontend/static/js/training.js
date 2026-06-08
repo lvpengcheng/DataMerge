@@ -289,14 +289,17 @@ function createNewSession() {
 
 // 弹出小模态框让用户输入脚本名（也展示当前租户已有名称作为参考/选择）
 async function _promptScriptName(tenantId) {
+    // 哈希 ID 格式: script_ + 12 位 hex(参见 storage_manager.save_script)
+    const _hashIdPattern = /^script_[0-9a-f]{12}$/i;
     let existingNames = [];
     try {
         const resp = await AUTH.authFetch(`/api/tenant-scripts/${encodeURIComponent(tenantId)}`);
         if (resp.ok) {
             const data = await resp.json();
+            // 仅展示有真实 name 的脚本,过滤掉系统生成的哈希 ID
             existingNames = (data.scripts || [])
-                .map(s => s.name || s.script_id)
-                .filter(Boolean)
+                .map(s => (s.name || '').trim())
+                .filter(n => n && !_hashIdPattern.test(n))
                 .filter((v, i, a) => a.indexOf(v) === i);
         }
     } catch (_) {}
@@ -799,6 +802,8 @@ function _startTraining(userText) {
     if (manualHeaders) formData.append('manual_headers', manualHeaders);
     const multiSheetSource = document.getElementById('multi-sheet-source').checked;
     if (multiSheetSource) formData.append('multi_sheet_source', 'true');
+    const _useHistEl = document.getElementById('use-history');
+    formData.append('use_history', (_useHistEl && _useHistEl.checked) ? 'true' : 'false');
     if (_currentSessionId) formData.append('session_id', _currentSessionId);
     if (Object.keys(_filePasswordsMap).length > 0) {
         formData.append('file_passwords', JSON.stringify(_filePasswordsMap));

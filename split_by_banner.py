@@ -92,7 +92,23 @@ def split_one_file(source_path: Path, output_path: Path):
     parser = IntelligentExcelParser()
     results = parser.parse_excel_file(str(source_path), max_data_rows=1, read_formulas=False)
 
-    src_wb = openpyxl.load_workbook(str(source_path), data_only=False)
+    # 拆分前先把所有公式计算并落为字面值，避免跨 sheet 引用断链导致 #REF!
+    import tempfile, os
+    flat_fd, flat_path = tempfile.mkstemp(suffix=Path(source_path).suffix or ".xlsx", prefix="flat_")
+    os.close(flat_fd)
+    try:
+        from backend.utils.aspose_helper import flatten_formulas_to_values
+        flatten_formulas_to_values(str(source_path), flat_path)
+        load_path = flat_path
+    except Exception as e:
+        # 失败则退回原文件，不阻断拆分流程
+        try:
+            os.unlink(flat_path)
+        except Exception:
+            pass
+        load_path = str(source_path)
+
+    src_wb = openpyxl.load_workbook(load_path, data_only=False)
     dst_wb = openpyxl.Workbook()
     dst_wb.remove(dst_wb.active)
     used_names: set = set()
@@ -144,6 +160,14 @@ def split_one_file(source_path: Path, output_path: Path):
         dst_wb.create_sheet("empty")
 
     dst_wb.save(str(output_path))
+
+    # 清理临时 flatten 文件
+    if 'flat_path' in locals() and load_path != str(source_path):
+        try:
+            import os as _os
+            _os.unlink(flat_path)
+        except Exception:
+            pass
 
 
 def main():

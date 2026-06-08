@@ -32,14 +32,20 @@ def replace_source_data_format_in_rules(rules_content: str, new_source_structure
     """替换 rules_content 中的 '## 源数据格式' 段落为当前训练数据的源结构。
 
     检测 '## 源数据格式' 标题，替换到下一个 '## ' 标题（或文档末尾）之间的全部内容。
-    如果 rules_content 不含该段落，原样返回（向后兼容旧规则文件）。
+    如果 rules_content 不含该段落，自动追加（保证后续 prompt 拼接时源数据结构始终存在于 rules 内嵌入版本中，
+    这样 prompt 模板就不需要再单独注入一份重复的 source_structure）。
     """
-    if not rules_content or "## 源数据格式" not in rules_content:
+    if not new_source_structure:
         return rules_content
+    section = f"## 源数据格式\n\n{new_source_structure.strip()}\n"
+    if not rules_content:
+        return section
+    if "## 源数据格式" not in rules_content:
+        sep = "" if rules_content.endswith("\n") else "\n"
+        return f"{rules_content}{sep}\n{section}"
 
     pattern = r'## 源数据格式\s*\n.*?(?=\n## |\Z)'
-    replacement = f"## 源数据格式\n\n{new_source_structure.strip()}\n"
-    return re.sub(pattern, replacement, rules_content, count=1, flags=re.DOTALL)
+    return re.sub(pattern, section, rules_content, count=1, flags=re.DOTALL)
 
 
 class FormulaCodeGenerator:
@@ -79,6 +85,7 @@ class FormulaCodeGenerator:
         multi_sheet_source: bool = False,
         analysis=None,
         skip_load: bool = False,
+        use_history: bool = True,
     ) -> Tuple[str, str]:
         """生成公式模式的Python代码
 
@@ -107,13 +114,17 @@ class FormulaCodeGenerator:
         log("=== 公式模式：开始生成代码 ===")
         self.last_prompt = None  # 记录实际提示词，供调用方获取
         self._multi_sheet_source = multi_sheet_source  # 记录给 _build_complete_code 使用
+        self._use_history = bool(use_history)  # 记录给 _build_complete_code 使用，控制是否创建历史数据 sheet
         self._analysis = analysis  # 保存analysis供 _build_complete_code 使用
+        self._expected_structure = expected_structure  # 供 _build_complete_code 注入 reserved sheet 名
 
         # 1. 加载源数据获取结构信息
         if not skip_load:
             log("步骤1: 分析源数据结构...")
+            _reserved_sheets = set((expected_structure or {}).get("sheets", {}).keys())
             source_info = self.formula_builder.load_source_data(input_folder, manual_headers,
-                                                                 multi_sheet_source=multi_sheet_source)
+                                                                 multi_sheet_source=multi_sheet_source,
+                                                                 reserved_sheet_names=_reserved_sheets)
             log(f"发现 {len(source_info['sheets'])} 个源数据sheet")
         else:
             log("步骤1: 使用预加载的源数据结构")
@@ -137,10 +148,11 @@ class FormulaCodeGenerator:
         )
         log("步骤2: 生成源数据结构描述完成")
 
-        # 2.5 替换规则中的源数据格式为当前训练数据结构
-        if rules_content and "## 源数据格式" in rules_content:
+        # 2.5 把当前训练数据的源数据结构同步到规则文档中（无该段落则追加），
+        # 后续 prompt 模板不再单独注入 source_structure，避免与 rules 内嵌版本重复
+        if rules_content is not None:
             rules_content = replace_source_data_format_in_rules(rules_content, source_structure)
-            log("步骤2.5: 已替换规则中的源数据格式为当前训练数据结构")
+            log("步骤2.5: 已同步规则中的源数据格式为当前训练数据结构")
 
         # 3. 统计预期列数，收集列名
         total_columns = 0
@@ -1688,6 +1700,11 @@ EMPTY = '""'           # Excel空字符串，用法：f"=IFERROR(...,{EMPTY})"
 ZERO = '0'             # 数字0
 
 
+# 训练阶段记录的"结果 sheet 名"集合，供 load_source_data 在源 sheet 与结果 sheet 同名时
+# 自动改写为 "{file_base}_{sheet}" 形式，避免 write_source_sheets / fill_result_sheets 互相覆盖。
+_RESULT_SHEET_NAMES = __RESERVED_SHEETS__
+
+
 def excel_text(text):
     """返回Excel文本值字符串，用于f-string中避免引号冲突
     用法: TXT_XXX = excel_text('全职')  →  TXT_XXX = '"全职"'
@@ -1866,16 +1883,19 @@ def load_source_data(input_folder, manual_headers):
             import traceback
             traceback.print_exc()
 
-    # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 → 加文件名前缀
+    # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 / 撞结果 sheet → 加文件名前缀
     _name_count = {}
     for _fb, _sn, _, _ in _collected:
         _name_count[_sn] = _name_count.get(_sn, 0) + 1
+    _reserved = set(globals().get('_RESULT_SHEET_NAMES', []))
     _used_keys = set()
     for file_base, sheet_name_orig, merged_df, columns in _collected:
-        if _name_count.get(sheet_name_orig, 0) <= 1:
-            _raw_key = sheet_name_orig
-        else:
+        _collide_cross_file = _name_count.get(sheet_name_orig, 0) > 1
+        _collide_reserved = sheet_name_orig in _reserved
+        if _collide_cross_file or _collide_reserved:
             _raw_key = f"{file_base}_{sheet_name_orig}"
+        else:
+            _raw_key = sheet_name_orig
         if len(_raw_key) > 31:
             _raw_key = _raw_key[:31]
         _base = _raw_key
@@ -1970,7 +1990,16 @@ def write_source_sheets(wb, source_data):
     header_fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
     from openpyxl.utils import get_column_letter
 
+    # 别名去重：source_data 可能含别名 key（如 file_base_sheet 与 sheet 共享同一 entry dict）
+    # 这些别名仅供旧脚本通过文件名前缀查找，不应作为独立 sheet 写入 workbook。
+    # 同一 entry dict 通过 id() 识别，先到的 key 胜出（dict 保留插入顺序）。
+    _entry_id_to_primary = {}  # id(entry) -> primary sheet_name
     for sheet_name, data_info in source_data.items():
+        _eid = id(data_info)
+        if _eid in _entry_id_to_primary:
+            print(f"  [跳过别名] {sheet_name} (与 {_entry_id_to_primary[_eid]} 共享数据)")
+            continue
+        _entry_id_to_primary[_eid] = sheet_name
         df = data_info["df"]
 
         # 清理列名：只去除换行符和首尾空格，保留列名内的正常空格
@@ -2064,6 +2093,15 @@ def write_source_sheets(wb, source_data):
                         cell.data_type = 's'
 
         source_sheets[sheet_name] = {"df": df, "ws": ws}
+
+    # 把别名 key 也指向已写入的 ws（旧脚本可能通过别名查 source_sheets）
+    for alias_name, data_info in source_data.items():
+        if alias_name in source_sheets:
+            continue
+        _eid = id(data_info)
+        primary = _entry_id_to_primary.get(_eid)
+        if primary and primary in source_sheets:
+            source_sheets[alias_name] = source_sheets[primary]
 
     return source_sheets
 
@@ -2400,9 +2438,13 @@ def main():
     params_sheet = write_params_sheet(wb, salary_year_val, salary_month_val, monthly_hours_val)
 
     # 步骤2.6: 创建历史数据sheet（供公式引用）
-    print("步骤2.6: 创建历史数据sheet...")
-    history_prov = globals().get('history_provider', None)
-    history_sheet_name = write_history_sheet(wb, history_prov, salary_year_val, salary_month_val)
+    history_sheet_name = None
+    if __USE_HISTORY__:
+        print("步骤2.6: 创建历史数据sheet...")
+        history_prov = globals().get('history_provider', None)
+        history_sheet_name = write_history_sheet(wb, history_prov, salary_year_val, salary_month_val)
+    else:
+        print("步骤2.6: 跳过历史数据sheet（use_history=False）")
 
     # 步骤3: 调用AI生成的函数填充结果sheet（可能有多个）
     print("步骤3: 填充结果sheet...")
@@ -2413,12 +2455,19 @@ def main():
     if default_sheet.title == "Sheet" and default_sheet in wb.worksheets:
         wb.remove(default_sheet)
 
-    # 把所有结果sheet移到最前面，保持它们的相对顺序（与目标文件sheet顺序一致）
+    # 把所有结果sheet移到最前面，并按目标文件sheet顺序排列
     # 排除源数据sheet、"参数"sheet和"历史数据"sheet
     source_sheet_names = set(source_sheets.keys())
     result_sheets = [ws for ws in wb.worksheets
                      if ws.title not in source_sheet_names
                      and ws.title != "参数" and ws.title != "历史数据"]
+    # 优先按 _RESULT_SHEET_NAMES（训练时记录的目标文件sheet顺序）排序；
+    # 不在该列表里的(AI多生成的) sheet 追加到末尾，相对顺序保持不变。
+    _expected_order = list(globals().get('_RESULT_SHEET_NAMES', []) or [])
+    if _expected_order:
+        _order_index = {name: i for i, name in enumerate(_expected_order)}
+        _tail = len(_expected_order)
+        result_sheets.sort(key=lambda ws: _order_index.get(ws.title, _tail))
     for target_pos, ws in enumerate(result_sheets):
         current_pos = wb.worksheets.index(ws)
         if current_pos != target_pos:
@@ -2448,6 +2497,19 @@ def main():
         # 替换模板中的 active_sheet_only 占位符
         _aso_value = "False" if getattr(self, "_multi_sheet_source", False) else "True"
         complete_code = complete_code.replace("__ACTIVE_SHEET_ONLY__", _aso_value)
+
+        # 替换 __RESERVED_SHEETS__ 占位符（结果 sheet 名集合，供脚本判定与源 sheet 同名情形）
+        # 顺序保留 expected_structure 中 sheets 的插入序，运行时按此顺序重排结果 sheet
+        _exp_struct = getattr(self, "_expected_structure", None) or {}
+        _reserved_names = list((_exp_struct.get("sheets", {}) or {}).keys())
+        import json as _json_rs
+        complete_code = complete_code.replace(
+            "__RESERVED_SHEETS__", _json_rs.dumps(_reserved_names, ensure_ascii=False)
+        )
+
+        # 替换 __USE_HISTORY__ 占位符（控制是否在输出 workbook 中创建历史数据 sheet）
+        _uh_value = "True" if getattr(self, "_use_history", False) else "False"
+        complete_code = complete_code.replace("__USE_HISTORY__", _uh_value)
 
         # 替换 __MERGE_CONFIG__ 占位符
         if merge_config:
@@ -2744,9 +2806,11 @@ def main():
 
             # 修复两行代码粘在一起的问题（如 "+ 1EMPTY = ''"）
             # 检测模式：数字后面紧跟大写字母开头的标识符和等号
-            if re.search(r'\d+[A-Z_][A-Z_0-9]*\s*=', line):
+            # ⚠️ 必须用 (?<![a-zA-Z_0-9]) 排除"标识符内部的数字"——
+            # 例如 TXT_13Xin = ... 中 13Xin 是合法标识符的一部分，不应拆分。
+            if re.search(r'(?<![a-zA-Z_0-9])\d+[A-Z_][A-Z_0-9]*\s*=', line):
                 # 在数字和大写字母之间插入换行
-                line = re.sub(r'(\d+)([A-Z_][A-Z_0-9]*\s*=)', r'\1\n\2', line)
+                line = re.sub(r'(?<![a-zA-Z_0-9])(\d+)([A-Z_][A-Z_0-9]*\s*=)', r'\1\n\2', line)
                 # 如果修复后包含换行，需要拆分成多行
                 if '\n' in line:
                     cleaned_lines.extend(line.split('\n'))

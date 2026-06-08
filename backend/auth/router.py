@@ -15,6 +15,9 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
 def _build_user_response(user: User) -> UserResponse:
+    role_perms = {}
+    if user.role and isinstance(user.role.permissions, dict):
+        role_perms = user.role.permissions
     return UserResponse(
         id=user.id,
         username=user.username,
@@ -26,6 +29,7 @@ def _build_user_response(user: User) -> UserResponse:
         role_id=user.role_id,
         role_name=user.role.name if user.role else "",
         is_active=user.is_active,
+        permissions=role_perms,
     )
 
 

@@ -103,11 +103,77 @@ def _copy_cell(src_cell, dst_cell):
         dst_cell.protection = copy(src_cell.protection)
 
 
+def _copy_column_widths(src_ws, dst_ws):
+    """整体复制列宽设置（按列字母索引）"""
+    try:
+        for col_letter, col_dim in src_ws.column_dimensions.items():
+            if col_dim is None:
+                continue
+            dst_dim = dst_ws.column_dimensions[col_letter]
+            if col_dim.width is not None:
+                dst_dim.width = col_dim.width
+            if col_dim.hidden:
+                dst_dim.hidden = col_dim.hidden
+            if col_dim.bestFit:
+                dst_dim.bestFit = col_dim.bestFit
+    except Exception:
+        pass
+
+
+def _copy_row_heights(src_ws, dst_ws, src_rows: list, dst_start_row: int):
+    """按行号映射复制行高"""
+    try:
+        for offset, src_row in enumerate(src_rows):
+            src_dim = src_ws.row_dimensions.get(src_row)
+            if src_dim is None or src_dim.height is None:
+                continue
+            dst_ws.row_dimensions[dst_start_row + offset].height = src_dim.height
+    except Exception:
+        pass
+
+
+def _copy_full_row_heights(src_ws, dst_ws):
+    """整 sheet 复制全部行高"""
+    try:
+        for row_idx, row_dim in src_ws.row_dimensions.items():
+            if row_dim is None or row_dim.height is None:
+                continue
+            dst_ws.row_dimensions[row_idx].height = row_dim.height
+    except Exception:
+        pass
+
+
+def _copy_merged_cells_for_rows(src_ws, dst_ws, src_rows: list, dst_start_row: int):
+    """复制落在 src_rows 范围内的合并单元格区域,按行号映射到目标位置"""
+    try:
+        from openpyxl.utils import get_column_letter
+        row_map = {sr: dst_start_row + i for i, sr in enumerate(src_rows)}
+        for mr in list(src_ws.merged_cells.ranges):
+            if mr.min_row in row_map and mr.max_row in row_map:
+                new_min = row_map[mr.min_row]
+                new_max = row_map[mr.max_row]
+                rng = f"{get_column_letter(mr.min_col)}{new_min}:{get_column_letter(mr.max_col)}{new_max}"
+                dst_ws.merge_cells(rng)
+    except Exception:
+        pass
+
+
+def _copy_full_merged_cells(src_ws, dst_ws):
+    """整 sheet 复制合并单元格"""
+    try:
+        for mr in list(src_ws.merged_cells.ranges):
+            dst_ws.merge_cells(str(mr))
+    except Exception:
+        pass
+
+
 def _copy_rows(src_ws, dst_ws, src_rows: list, dst_start_row: int) -> int:
     max_col = src_ws.max_column
     for offset, src_row in enumerate(src_rows):
         for col in range(1, max_col + 1):
             _copy_cell(src_ws.cell(src_row, col), dst_ws.cell(dst_start_row + offset, col))
+    _copy_row_heights(src_ws, dst_ws, src_rows, dst_start_row)
+    _copy_merged_cells_for_rows(src_ws, dst_ws, src_rows, dst_start_row)
     return len(src_rows)
 
 
@@ -116,6 +182,9 @@ def _copy_full_sheet(src_ws, dst_ws):
     for row in range(1, src_ws.max_row + 1):
         for col in range(1, max_col + 1):
             _copy_cell(src_ws.cell(row, col), dst_ws.cell(row, col))
+    _copy_column_widths(src_ws, dst_ws)
+    _copy_full_row_heights(src_ws, dst_ws)
+    _copy_full_merged_cells(src_ws, dst_ws)
 
 
 def _region_row_indices(region) -> list:
@@ -131,7 +200,24 @@ def _process_workbook(input_path: str, output_path: str):
     results = parser.parse_excel_file(input_path, max_data_rows=1, read_formulas=False)
     parsed_sheets = {sd.sheet_name: sd for sd in results}
 
-    src_wb = openpyxl.load_workbook(input_path, data_only=False)
+    # 拆分前先把所有公式计算并落为字面值，避免跨 sheet 引用断链
+    import tempfile, os
+    flat_fd, flat_path = tempfile.mkstemp(suffix=os.path.splitext(input_path)[1] or ".xlsx", prefix="flat_")
+    os.close(flat_fd)
+    load_path = input_path
+    try:
+        from backend.utils.aspose_helper import flatten_formulas_to_values
+        flatten_formulas_to_values(input_path, flat_path)
+        load_path = flat_path
+    except Exception as e:
+        logger.warning(f"[banner-split] flatten 公式失败,退回原文件: {e}")
+        try:
+            os.unlink(flat_path)
+        except Exception:
+            pass
+        flat_path = None
+
+    src_wb = openpyxl.load_workbook(load_path, data_only=False)
     dst_wb = openpyxl.Workbook()
     dst_wb.remove(dst_wb.active)
     used_names: set = set()
@@ -189,6 +275,7 @@ def _process_workbook(input_path: str, output_path: str):
 
             # 把选中/合并的 region 顺序写入新 sheet（合并时第二个起跳过表头）
             dst_ws = dst_wb.create_sheet(_sanitize_sheet_name(sheet_name, used_names))
+            _copy_column_widths(src_ws, dst_ws)
             cur_row = 1
             for idx, region in enumerate(best_regions):
                 if idx == 0:
@@ -208,6 +295,7 @@ def _process_workbook(input_path: str, output_path: str):
         for banner, region_list in banner_groups.items():
             sub_name = _compose_sub_sheet_name(sheet_name, banner, used_names)
             dst_ws = dst_wb.create_sheet(sub_name)
+            _copy_column_widths(src_ws, dst_ws)
             cur_row = 1
             for region in region_list:
                 written = _copy_rows(src_ws, dst_ws, _region_row_indices(region), cur_row)
@@ -215,6 +303,7 @@ def _process_workbook(input_path: str, output_path: str):
         if no_banner_regions:
             sub_name = _compose_sub_sheet_name(sheet_name, "other", used_names)
             dst_ws = dst_wb.create_sheet(sub_name)
+            _copy_column_widths(src_ws, dst_ws)
             cur_row = 1
             for region in no_banner_regions:
                 written = _copy_rows(src_ws, dst_ws, _region_row_indices(region), cur_row)
@@ -224,6 +313,12 @@ def _process_workbook(input_path: str, output_path: str):
         dst_wb.create_sheet("empty")
 
     dst_wb.save(output_path)
+    # 清理 flatten 临时文件
+    if flat_path:
+        try:
+            os.unlink(flat_path)
+        except Exception:
+            pass
     return output_path
 
 

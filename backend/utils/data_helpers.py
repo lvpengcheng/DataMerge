@@ -167,18 +167,21 @@ def make_unique_sheet_key(name: str, existing_keys: set, max_len: int = 31) -> s
     return name
 
 
-def assign_sheet_keys(file_sheet_pairs, max_len: int = 31):
+def assign_sheet_keys(file_sheet_pairs, max_len: int = 31, reserved_names=None):
     """根据跨文件 sheet 名是否冲突，决定每个 sheet 的最终 key。
 
     规则（用户指定）：
     - 跨文件 sheet 名不重复 → 直接用 sheet_name
     - 有重复（如多个文件都有 "Sheet1"）→ 用 f"{file_base}_{sheet_name}" 加文件名前缀
-    - 最后统一过 make_unique_sheet_key 做 31 字符截断 + 撞名后缀
+    - 若 sheet_name 命中 reserved_names（目标/结果 sheet 名）→ 同样改为 f"{file_base}_{sheet_name}"
+      避免源 sheet 与结果 sheet 同名造成 write_source_sheets 与 fill_result_sheets 互相覆盖。
+    - 最后统一过 make_unique_sheet_key 做截断 + 撞名后缀
 
     Args:
         file_sheet_pairs: 可迭代序列，元素为 (file_base, sheet_name) 二元组。
                          file_base 是文件名去后缀；sheet_name 是 banner-split 后的子 sheet 名。
-        max_len: Excel sheet 名长度上限，默认 31。
+        max_len: sheet key 长度上限，默认 31（Excel 硬限制）。
+        reserved_names: 可选的字符串集合；命中时强制走 file_base_sheet 形式。
 
     Returns:
         dict[(file_base, sheet_name)] -> final_key
@@ -189,12 +192,16 @@ def assign_sheet_keys(file_sheet_pairs, max_len: int = 31):
     for _file_base, sheet_name in pairs:
         name_count[sheet_name] = name_count.get(sheet_name, 0) + 1
 
+    reserved = set(reserved_names) if reserved_names else set()
+
     used: set = set()
     result: dict = {}
     for file_base, sheet_name in pairs:
-        if name_count.get(sheet_name, 0) <= 1:
-            raw_key = sheet_name
-        else:
+        collide_cross_file = name_count.get(sheet_name, 0) > 1
+        collide_reserved = sheet_name in reserved
+        if collide_cross_file or collide_reserved:
             raw_key = f"{file_base}_{sheet_name}"
+        else:
+            raw_key = sheet_name
         result[(file_base, sheet_name)] = make_unique_sheet_key(raw_key, used, max_len=max_len)
     return result

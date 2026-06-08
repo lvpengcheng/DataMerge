@@ -12,12 +12,12 @@
         <header>
             <div class="header-left">
                 <nav class="nav-links">
-                    <a href="/dashboard">首页</a>
-                    <a href="/rules">规则</a>
-                    <a href="/training">智训</a>
-                    <a href="/compute">智算</a>
-                    <a href="/tools" class="active">智能小工具</a>
-                    <a href="/admin" id="nav-admin" style="display:none;">管理</a>
+                    <a href="/dashboard" data-perm="can_view">首页</a>
+                    <a href="/rules" data-perm="menu.rules">规则</a>
+                    <a href="/training" data-perm="can_train">智训</a>
+                    <a href="/compute" data-perm="can_compute">智算</a>
+                    <a href="/tools" class="active" data-perm="menu.tools">智能小工具</a>
+                    <a href="/admin" id="nav-admin" data-perm="can_manage_users" style="display:none;">管理</a>
                 </nav>
             </div>
             <div class="user-info" id="user-info"></div>
@@ -25,11 +25,11 @@
 
         <!-- Tab 导航 -->
         <div class="tab-nav">
-            <button class="tab-btn active" data-tab="split-sheet">Sheet拆分</button>
-            <button class="tab-btn admin-only" data-tab="templates">模版管理</button>
-            <button class="tab-btn" data-tab="training-history">训练历史</button>
-            <button class="tab-btn" data-tab="compute-history">计算历史</button>
-            <button class="tab-btn admin-only" data-tab="data-compare">数据对比</button>
+            <button class="tab-btn active" data-tab="split-sheet" data-perm="tools.split_sheet">Sheet拆分</button>
+            <button class="tab-btn admin-only" data-tab="templates" data-perm="tools.templates">模版管理</button>
+            <button class="tab-btn" data-tab="training-history" data-perm="tools.training_history">训练历史</button>
+            <button class="tab-btn" data-tab="compute-history" data-perm="tools.compute_history">计算历史</button>
+            <button class="tab-btn admin-only" data-tab="data-compare" data-perm="tools.data_compare">数据对比</button>
         </div>
 
         <!-- Sheet 拆分 Tab -->

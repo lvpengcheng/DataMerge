@@ -1326,6 +1326,12 @@ async def disable_script(
     s.is_active = False
     s.updated_at = datetime.utcnow()
     db.commit()
+    # 同步到 FS 层禁用列表，确保 /api/tenant-scripts 也过滤掉
+    try:
+        from ..storage.storage_manager import StorageManager
+        StorageManager().set_script_disabled(s.tenant_id, s.name, True)
+    except Exception:
+        pass
     return {"success": True, "message": f"已停用脚本「{s.name}」(v{s.version})", "script_id": script_id}
 
 
@@ -1356,5 +1362,35 @@ async def enable_script(
     s.is_active = True
     s.updated_at = datetime.utcnow()
     db.commit()
+    # 同步从 FS 禁用列表移除
+    try:
+        from ..storage.storage_manager import StorageManager
+        StorageManager().set_script_disabled(s.tenant_id, s.name, False)
+    except Exception:
+        pass
     return {"success": True, "message": f"已启用脚本「{s.name}」(v{s.version})", "script_id": script_id}
+
+
+@router.post("/tenant-scripts/{tenant_id}/{script_id}/disable")
+async def disable_tenant_script(
+    tenant_id: str,
+    script_id: str,
+    _admin: User = Depends(require_admin),
+):
+    """按租户+脚本ID禁用（覆盖 FS-only 脚本，不依赖 DB 行）"""
+    from ..storage.storage_manager import StorageManager
+    StorageManager().set_script_disabled(tenant_id, script_id, True)
+    return {"success": True, "tenant_id": tenant_id, "script_id": script_id, "disabled": True}
+
+
+@router.post("/tenant-scripts/{tenant_id}/{script_id}/enable")
+async def enable_tenant_script(
+    tenant_id: str,
+    script_id: str,
+    _admin: User = Depends(require_admin),
+):
+    """按租户+脚本ID恢复"""
+    from ..storage.storage_manager import StorageManager
+    StorageManager().set_script_disabled(tenant_id, script_id, False)
+    return {"success": True, "tenant_id": tenant_id, "script_id": script_id, "disabled": False}
 

@@ -186,6 +186,19 @@ for sheet_data in results:
                 "  禁止把步骤N+1写在步骤N的if/else/for块内部"
             ),
         },
+        "param_naming": {
+            "compact": "【规则10】参数/变量命名：禁止包含换行符，禁止以数字开头（必须以字母或下划线开头）",
+            "detailed": (
+                "【规则10】参数/变量命名规范\n"
+                "- ❌ 禁止：命名中包含换行符 \\n、回车 \\r 或制表符 \\t\n"
+                "- ❌ 禁止：以数字开头（如 `2024_data`、`1月工资`）\n"
+                "- ✅ 必须：以字母或下划线开头，后续只能是字母/数字/下划线\n"
+                "- 适用范围：Python 变量名、sheet 名变量（sn_xxx）、列号变量（col_xxx）、参数 sheet 中的命名项、Excel 命名区域\n"
+                "  ❌ 错误：`2月数据 = ...`、`sn_工资\\n表 = '...'`、`col_2024 = 5`\n"
+                "  ✅ 正确：`feb_data = ...`、`sn_工资表 = '...'`、`col_y2024 = 5`\n"
+                "- 中文字符允许出现在变量名中间或末尾，但首字符必须是字母/下划线"
+            ),
+        },
     }
 
     # 修正专用额外规则
@@ -564,36 +577,30 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
         return result
 
     def _build_expected_sheets_info(self, expected_structure: dict, rules_content: str) -> tuple:
-        """构建预期输出Sheet信息和总列数（消除3处重复逻辑）
+        """构建中间计算项段落和总列数（"预期输出Sheet列表"段落已并入 __COMPRESSED_EXPECTED__,此处不再重复输出）
 
         Returns:
-            (expected_sheets_info: str, total_columns: int)
+            (intermediate_section: str, total_columns: int)
         """
         total_columns = 0
-        expected_sheets_info = ""
+        intermediate_section = ""
 
         if isinstance(expected_structure, dict) and "sheets" in expected_structure:
-            sheets = expected_structure.get("sheets", {})
-            if sheets:
-                expected_sheets_info = "\n## 预期输出Sheet列表\n"
-                for sheet_name, sheet_info in sheets.items():
-                    headers = sheet_info.get("headers", {})
-                    col_count = len(headers)
-                    total_columns += col_count
-                    expected_sheets_info += f"- **{sheet_name}** ({col_count}列): {list(headers.keys())}\n"
+            for sheet_info in expected_structure.get("sheets", {}).values():
+                total_columns += len(sheet_info.get("headers", {}))
 
-        # 从规则中提取中间计算项
+        # 从规则中提取中间计算项（这部分内容预期输出结构里没有，必须单独说明）
         intermediate_items = self._extract_intermediate_items_from_rules(rules_content)
         if intermediate_items:
             total_columns += len(intermediate_items)
             intermediate_names = [item.split(':')[1] if ':' in item else item for item in intermediate_items]
-            expected_sheets_info += f"\n## 中间计算项（追加在最后一列之后，淡蓝色背景 #DCE6F1）\n"
-            expected_sheets_info += f"- 共 {len(intermediate_items)} 个中间项: {intermediate_names}\n"
+            intermediate_section = f"\n## 中间计算项（追加在最后一列之后，淡蓝色背景 #DCE6F1）\n"
+            intermediate_section += f"- 共 {len(intermediate_items)} 个中间项: {intermediate_names}\n"
             for item in intermediate_items:
-                expected_sheets_info += f"  - {item}\n"
-            expected_sheets_info += f"\n⚠️ 中间项必须作为新增列追加在结果sheet最后，使用淡蓝色背景(#DCE6F1)标识\n"
+                intermediate_section += f"  - {item}\n"
+            intermediate_section += f"\n⚠️ 中间项必须作为新增列追加在结果sheet最后，使用淡蓝色背景(#DCE6F1)标识\n"
 
-        return expected_sheets_info, total_columns
+        return intermediate_section, total_columns
 
     def _extract_intermediate_items_from_rules(self, rules_content: str) -> List[str]:
         """从规则文本中提取中间计算项的列名
@@ -1693,7 +1700,7 @@ input_folder, output_folder, manual_headers: {manual_headers_json}
 
         # 使用集中式辅助方法提取规则和统计列数
         rules_info = self._extract_cleaning_and_format_rules(rules_content)
-        expected_sheets_info, total_columns = self._build_expected_sheets_info(expected_structure, rules_content)
+        intermediate_section, total_columns = self._build_expected_sheets_info(expected_structure, rules_content)
         golden_and_rules = self._build_golden_and_rules(total_columns)
 
         template = """你是专业Python程序员，擅长人力资源行业的薪资计算、税务处理、考勤管理，同时你也是一个EXCEL公式大师。
@@ -1721,8 +1728,7 @@ input_folder, output_folder, manual_headers: {manual_headers_json}
 - 已定义函数：find_source_sheet(source_sheets, target_columns=[...], sheet_name_hint="...", salary_year=None, salary_month=None) -> key
   匹配优先级：①Sheet名称精确匹配 ②薪资年月匹配YYYYMM格式sheet ③表头列名匹配
 
-__SOURCE_STRUCTURE__
-__EXPECTED_SHEETS_INFO__
+__INTERMEDIATE_SECTION__
 __MULTI_SHEET_SOURCE_GUIDANCE__
 
 ⚠️ 如果规则文档中包含「列处理分层」信息，请严格按照层级处理：L1同源列用main_df.iloc[i].get()直接复制（不查列号），L2跨表列才使用VLOOKUP查找。
@@ -1738,7 +1744,7 @@ __CONDITIONAL_FORMAT_RULES__
 __PRECISION_RULES__
 
 ## 计算规则
-注意：规则中「公式: 无」表示目标文件没有现成公式，你必须根据该列的「规则描述」自行推导出正确的Excel公式（如VLOOKUP、IF、SUM等）。不要因为公式为空就跳过或仅做简单复制。
+注意：规则文档已包含源数据格式与每列计算规则。规则中"公式: 无"表示目标文件没有现成公式，你必须根据该列的"规则描述"自行推导出正确的Excel公式（如VLOOKUP、IF、SUM等）。不要因为公式为空就跳过或仅做简单复制。
 __RULES__
 
 """
@@ -1763,8 +1769,7 @@ __RULES__
 
         return (template
                 .replace('__TOTAL_COLUMNS__', str(total_columns))
-                .replace('__SOURCE_STRUCTURE__', source_structure)
-                .replace('__EXPECTED_SHEETS_INFO__', expected_sheets_info)
+                .replace('__INTERMEDIATE_SECTION__', intermediate_section)
                 .replace('__MULTI_SHEET_SOURCE_GUIDANCE__', multi_sheet_guidance)
                 .replace('__COMPRESSED_EXPECTED__', compressed_expected)
                 .replace('__DATA_CLEANING_RULES__', rules_info["data_cleaning"])
@@ -2029,8 +2034,8 @@ def fill_columns_batch_{batch_index + 1}(ws, r, source_sheets):
         # 统一提取规则
         extracted = self._extract_cleaning_and_format_rules(rules_content)
 
-        # 统一构建预期Sheet信息
-        expected_sheets_info, total_columns = self._build_expected_sheets_info(expected_structure, rules_content)
+        # 统一构建预期Sheet信息（仅含中间计算项，sheets 列表已通过 compressed_expected 提供）
+        intermediate_section, total_columns = self._build_expected_sheets_info(expected_structure, rules_content)
 
         # 黄金样例 + 补充规则 + 函数签名（在f-string中需要转义花括号）
         golden_and_rules = self._build_golden_and_rules(total_columns, escape_braces=True)
@@ -2078,8 +2083,7 @@ def fill_columns_batch_{batch_index + 1}(ws, r, source_sheets):
 - 已定义函数：find_source_sheet(source_sheets, target_columns=[...], sheet_name_hint="...", salary_year=None, salary_month=None) -> key
   匹配优先级：①Sheet名称精确匹配 ②薪资年月匹配YYYYMM格式sheet ③表头列名匹配
 
-{source_structure}
-{expected_sheets_info}
+{intermediate_section}
 {_ms_guidance}
 
 ## 预期输出结构
@@ -2089,7 +2093,7 @@ def fill_columns_batch_{batch_index + 1}(ws, r, source_sheets):
 {extracted['precision']}
 
 ## 计算规则
-注意：规则中「公式: 无」表示目标文件没有现成公式，你必须根据该列的「规则描述」自行推导出正确的Excel公式（如VLOOKUP、IF、SUM等）。不要因为公式为空就跳过或仅做简单复制。
+注意：规则文档已包含源数据格式与每列计算规则。规则中"公式: 无"表示目标文件没有现成公式，你必须根据该列的"规则描述"自行推导出正确的Excel公式（如VLOOKUP、IF、SUM等）。不要因为公式为空就跳过或仅做简单复制。
 {rules}
 
 {golden_and_rules}"""

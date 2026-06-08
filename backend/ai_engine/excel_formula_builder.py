@@ -58,12 +58,15 @@ class ExcelFormulaBuilder:
         self.result_sheet = None
 
     def load_source_data(self, input_folder: str, manual_headers: Dict = None,
-                          multi_sheet_source: bool = False) -> Dict[str, Any]:
+                          multi_sheet_source: bool = False,
+                          reserved_sheet_names=None) -> Dict[str, Any]:
         """加载所有源数据
 
         Args:
             input_folder: 输入文件夹路径
             manual_headers: 手动表头配置
+            multi_sheet_source: 是否启用多 sheet 读取
+            reserved_sheet_names: 目标/结果 sheet 名集合；命中时源 sheet key 改为 file_base_sheet 形式
 
         Returns:
             源数据信息字典
@@ -121,8 +124,11 @@ class ExcelFormulaBuilder:
             except Exception as e:
                 logger.error(f"加载文件失败 {filename}: {e}")
 
-        # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 → 加文件名前缀
-        key_map = assign_sheet_keys((fb, sn) for fb, sn, _, _, _ in _collected)
+        # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 / 撞目标 sheet → 加文件名前缀
+        key_map = assign_sheet_keys(
+            ((fb, sn) for fb, sn, _, _, _ in _collected),
+            reserved_names=reserved_sheet_names,
+        )
         # 已分配的 key 同步给实例集合，便于后续可能的扩展
         self._used_sheet_keys.update(key_map.values())
 

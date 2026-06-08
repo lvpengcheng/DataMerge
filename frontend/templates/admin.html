@@ -11,12 +11,12 @@
         <header>
             <div class="header-left">
                 <nav class="nav-links">
-                    <a href="/dashboard">首页</a>
-                    <a href="/rules">规则</a>
-                    <a href="/training">智训</a>
-                    <a href="/compute">智算</a>
-                    <a href="/tools">智能小工具</a>
-                    <a href="/admin" class="active">管理</a>
+                    <a href="/dashboard" data-perm="can_view">首页</a>
+                    <a href="/rules" data-perm="menu.rules">规则</a>
+                    <a href="/training" data-perm="can_train">智训</a>
+                    <a href="/compute" data-perm="can_compute">智算</a>
+                    <a href="/tools" data-perm="menu.tools">智能小工具</a>
+                    <a href="/admin" class="active" data-perm="can_manage_users">管理</a>
                 </nav>
             </div>
             <div class="user-info" id="user-info"></div>
@@ -24,12 +24,12 @@
 
         <!-- Tab 导航 -->
         <div class="tab-nav">
-            <button class="tab-btn active" data-tab="users">用户管理</button>
-            <button class="tab-btn" data-tab="roles">角色管理</button>
-            <button class="tab-btn" data-tab="orgs">组织管理</button>
-            <button class="tab-btn" data-tab="tenant-auth">租户授权</button>
-            <button class="tab-btn" data-tab="ref-data">基础数据</button>
-            <button class="tab-btn" data-tab="scripts">脚本管理</button>
+            <button class="tab-btn active" data-tab="users" data-perm="admin.users">用户管理</button>
+            <button class="tab-btn" data-tab="roles" data-perm="admin.roles">角色管理</button>
+            <button class="tab-btn" data-tab="orgs" data-perm="admin.orgs">组织管理</button>
+            <button class="tab-btn" data-tab="tenant-auth" data-perm="admin.tenant_auth">租户授权</button>
+            <button class="tab-btn" data-tab="ref-data" data-perm="admin.ref_data">基础数据</button>
+            <button class="tab-btn" data-tab="scripts" data-perm="admin.scripts">脚本管理</button>
         </div>
 
         <!-- 用户管理 Tab -->

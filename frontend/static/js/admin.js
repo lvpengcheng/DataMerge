@@ -21,9 +21,9 @@ const Admin = {
     // ==================== 初始化 ====================
     async init() {
         if (!AUTH.requireAuth()) return;
-        if (!AUTH.isAdmin()) {
-            alert('需要管理员权限');
-            window.location.href = '/training';
+        if (!AUTH.hasPerm('can_manage_users')) {
+            alert('无权访问管理后台');
+            window.location.href = '/dashboard';
             return;
         }
         AUTH.renderUserInfo(document.querySelector('header'));
@@ -193,10 +193,11 @@ const Admin = {
         this.openModal('新建角色', `
             <div class="form-group"><label>角色名</label><input id="m-role-name" required></div>
             <div class="form-group"><label>描述</label><input id="m-role-desc"></div>
-            <div class="form-group"><label>权限（JSON）</label><textarea id="m-role-perms" rows="3">{"can_train": true, "can_compute": true}</textarea></div>
+            <div class="form-group"><label>权限</label>
+                ${this._renderPermissionTree({can_train: true, can_compute: true})}
+            </div>
         `, async () => {
-            let perms = {};
-            try { perms = JSON.parse(document.getElementById('m-role-perms').value); } catch(e) { alert('权限JSON格式错误'); return; }
+            const perms = this._collectPermissions();
             const resp = await AUTH.authFetch('/api/admin/roles', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -209,6 +210,7 @@ const Admin = {
             if (resp.ok) { this.closeModal(); await this.loadRoles(); this.renderRoles(); }
             else { await _alertErr(resp, '创建失败'); }
         });
+        this._bindPermissionTree();
     },
 
     async showEditRole(id) {
@@ -218,10 +220,11 @@ const Admin = {
         this.openModal('编辑角色', `
             <div class="form-group"><label>角色名</label><input id="m-role-name" value="${role.name}" ${role.is_system ? 'disabled' : ''}></div>
             <div class="form-group"><label>描述</label><input id="m-role-desc" value="${role.description || ''}"></div>
-            <div class="form-group"><label>权限（JSON）</label><textarea id="m-role-perms" rows="3">${JSON.stringify(role.permissions || {}, null, 2)}</textarea></div>
+            <div class="form-group"><label>权限</label>
+                ${this._renderPermissionTree(role.permissions || {})}
+            </div>
         `, async () => {
-            let perms = {};
-            try { perms = JSON.parse(document.getElementById('m-role-perms').value); } catch(e) { alert('权限JSON格式错误'); return; }
+            const perms = this._collectPermissions();
             const resp = await AUTH.authFetch(`/api/admin/roles/${id}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
@@ -234,6 +237,204 @@ const Admin = {
             if (resp.ok) { this.closeModal(); await this.loadRoles(); this.renderRoles(); }
             else { await _alertErr(resp, '更新失败'); }
         });
+        this._bindPermissionTree();
+    },
+
+    // ============ 权限树定义与渲染（按真实菜单结构组织） ============
+    _PERMISSION_TREE: [
+        {
+            label: '首页', children: [
+                { key: 'can_view', label: '查看首页（仪表盘）' },
+            ]
+        },
+        {
+            label: '规则', children: [
+                { key: 'menu.rules', label: '查看规则页' },
+            ]
+        },
+        {
+            label: '智训', children: [
+                { key: 'can_train', label: '进入智训页 / 训练脚本' },
+            ]
+        },
+        {
+            label: '智算', children: [
+                { key: 'can_compute', label: '进入智算页 / 执行脚本' },
+            ]
+        },
+        {
+            label: '智能小工具', children: [
+                { key: 'menu.tools', label: '进入智能小工具页' },
+                { key: 'tools.split_sheet', label: '└ Sheet 拆分' },
+                { key: 'tools.templates', label: '└ 模版管理（管理员）' },
+                { key: 'tools.training_history', label: '└ 训练历史' },
+                { key: 'tools.compute_history', label: '└ 计算历史' },
+                { key: 'tools.data_compare', label: '└ 数据对比（管理员）' },
+            ]
+        },
+        {
+            label: '管理后台', children: [
+                { key: 'admin', label: '超级管理员（隐式授予所有权限）' },
+                { key: 'can_manage_users', label: '进入管理后台' },
+                { key: 'admin.users', label: '└ 用户管理' },
+                { key: 'admin.roles', label: '└ 角色管理' },
+                { key: 'admin.orgs', label: '└ 组织管理' },
+                { key: 'admin.tenant_auth', label: '└ 租户授权' },
+                { key: 'admin.ref_data', label: '└ 基础数据' },
+                { key: 'admin.scripts', label: '└ 脚本管理' },
+            ]
+        },
+    ],
+
+    _renderPermissionTree(currentPerms) {
+        const known = new Set();
+        const groups = this._PERMISSION_TREE.map((group, gi) => {
+            const items = group.children.map(item => {
+                known.add(item.key);
+                const checked = currentPerms[item.key] === true ? 'checked' : '';
+                return `
+                    <label class="perm-leaf" title="${item.key}">
+                        <input type="checkbox" class="perm-leaf-cb" data-perm-key="${item.key}" data-group="${gi}" ${checked}>
+                        <span class="perm-leaf-label">${item.label}</span>
+                    </label>`;
+            }).join('');
+            const total = group.children.length;
+            return `
+                <div class="perm-group" data-group="${gi}">
+                    <div class="perm-group-header" data-toggle-group="${gi}">
+                        <span class="perm-group-toggle">▾</span>
+                        <input type="checkbox" class="perm-group-cb" data-group="${gi}" onclick="event.stopPropagation();">
+                        <span class="perm-group-label">${group.label}</span>
+                        <span class="perm-group-count" data-count="${gi}">0 / ${total}</span>
+                    </div>
+                    <div class="perm-group-items">${items}</div>
+                </div>`;
+        }).join('');
+
+        // 兼容已存在但未在树中定义的 key
+        const extras = Object.keys(currentPerms).filter(k => !known.has(k));
+        let extraBlock = '';
+        if (extras.length) {
+            const extraItems = extras.map(k => `
+                <label class="perm-leaf" title="自定义权限">
+                    <input type="checkbox" class="perm-leaf-cb" data-perm-key="${k}" data-group="extra" ${currentPerms[k] ? 'checked' : ''}>
+                    <span class="perm-leaf-label">${k}</span>
+                </label>`).join('');
+            extraBlock = `
+                <div class="perm-group perm-group--extra" data-group="extra">
+                    <div class="perm-group-header">
+                        <span class="perm-group-toggle">▾</span>
+                        <span class="perm-group-label">自定义权限（树外保留）</span>
+                        <span class="perm-group-count" data-count="extra">0 / ${extras.length}</span>
+                    </div>
+                    <div class="perm-group-items">${extraItems}</div>
+                </div>`;
+        }
+
+        return `
+            <div class="perm-tree-toolbar">
+                <button type="button" class="btn-mini" data-perm-action="expand-all">展开全部</button>
+                <button type="button" class="btn-mini" data-perm-action="collapse-all">收起全部</button>
+                <button type="button" class="btn-mini" data-perm-action="check-all">全部勾选</button>
+                <button type="button" class="btn-mini" data-perm-action="uncheck-all">全部清空</button>
+                <span class="perm-tree-summary" id="perm-tree-summary"></span>
+            </div>
+            <div id="perm-tree" class="perm-tree">${groups}${extraBlock}</div>`;
+    },
+
+    _bindPermissionTree() {
+        const tree = document.getElementById('perm-tree');
+        if (!tree) return;
+
+        const updateSummary = () => {
+            const all = tree.querySelectorAll('.perm-leaf-cb');
+            const checked = tree.querySelectorAll('.perm-leaf-cb:checked');
+            const summary = document.getElementById('perm-tree-summary');
+            if (summary) summary.textContent = `已勾选 ${checked.length} / ${all.length}`;
+        };
+
+        const syncGroup = (gi) => {
+            const group = tree.querySelector(`.perm-group[data-group="${gi}"]`);
+            const groupCb = group ? group.querySelector('.perm-group-cb') : null;
+            const leaves = tree.querySelectorAll(`.perm-leaf-cb[data-group="${gi}"]`);
+            const countEl = tree.querySelector(`[data-count="${gi}"]`);
+            if (countEl) {
+                const total = leaves.length;
+                const cnt = Array.from(leaves).filter(cb => cb.checked).length;
+                countEl.textContent = `${cnt} / ${total}`;
+            }
+            if (!groupCb || !leaves.length) return;
+            const all = Array.from(leaves).every(cb => cb.checked);
+            const some = Array.from(leaves).some(cb => cb.checked);
+            groupCb.checked = all;
+            groupCb.indeterminate = !all && some;
+        };
+
+        // 折叠/展开（点 header 区域，但点 checkbox/leaf 不触发）
+        tree.querySelectorAll('.perm-group-header[data-toggle-group]').forEach(h => {
+            h.addEventListener('click', (e) => {
+                if (e.target.closest('.perm-group-cb')) return;
+                const group = h.parentElement;
+                if (group) group.classList.toggle('collapsed');
+            });
+        });
+
+        // group 复选 → 同步所有 leaf
+        tree.querySelectorAll('.perm-group-cb').forEach(gcb => {
+            const gi = gcb.dataset.group;
+            syncGroup(gi);
+            gcb.addEventListener('change', () => {
+                tree.querySelectorAll(`.perm-leaf-cb[data-group="${gi}"]`).forEach(lcb => { lcb.checked = gcb.checked; });
+                gcb.indeterminate = false;
+                syncGroup(gi);
+                updateSummary();
+            });
+        });
+
+        // leaf 改 → 同步所属 group
+        tree.querySelectorAll('.perm-leaf-cb').forEach(lcb => {
+            lcb.addEventListener('change', () => {
+                syncGroup(lcb.dataset.group);
+                updateSummary();
+            });
+        });
+
+        // 工具栏
+        const toolbar = tree.previousElementSibling;
+        if (toolbar) {
+            toolbar.querySelectorAll('[data-perm-action]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const act = btn.dataset.permAction;
+                    if (act === 'expand-all') {
+                        tree.querySelectorAll('.perm-group').forEach(g => g.classList.remove('collapsed'));
+                    } else if (act === 'collapse-all') {
+                        tree.querySelectorAll('.perm-group').forEach(g => g.classList.add('collapsed'));
+                    } else if (act === 'check-all') {
+                        tree.querySelectorAll('.perm-leaf-cb').forEach(cb => { cb.checked = true; });
+                        tree.querySelectorAll('.perm-group-cb').forEach(gcb => { gcb.checked = true; gcb.indeterminate = false; });
+                        tree.querySelectorAll('.perm-group').forEach(g => syncGroup(g.dataset.group));
+                        updateSummary();
+                    } else if (act === 'uncheck-all') {
+                        tree.querySelectorAll('.perm-leaf-cb').forEach(cb => { cb.checked = false; });
+                        tree.querySelectorAll('.perm-group-cb').forEach(gcb => { gcb.checked = false; gcb.indeterminate = false; });
+                        tree.querySelectorAll('.perm-group').forEach(g => syncGroup(g.dataset.group));
+                        updateSummary();
+                    }
+                });
+            });
+        }
+
+        updateSummary();
+    },
+
+    _collectPermissions() {
+        const tree = document.getElementById('perm-tree');
+        if (!tree) return {};
+        const perms = {};
+        tree.querySelectorAll('.perm-leaf-cb').forEach(cb => {
+            if (cb.checked) perms[cb.dataset.permKey] = true;
+        });
+        return perms;
     },
 
     async deleteRole(id, name) {

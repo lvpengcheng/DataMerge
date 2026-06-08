@@ -296,6 +296,65 @@ def dataframe_to_excel(
 # 格式转换
 # ═══════════════════════════════════════════════════════
 
+def flatten_formulas_to_values(src_path: str, dst_path: str = None, password: str = None) -> str:
+    """另存一份"保留全部格式与数据、仅清除关联公式"的 Excel。
+
+    用途：Sheet 拆分前的预处理。原样保留 Aspose 加载到的所有信息（单元格样式、
+    合并、行高/列宽、批注、图表、表格等），仅将公式 cell 替换为计算后的字面值，
+    避免拆分时跨 sheet 引用 / 同 sheet 行号偏移导致 #REF!。
+
+    Args:
+        src_path: 源 Excel 路径
+        dst_path: 目标路径（不传时直接覆盖源文件）
+        password: 打开密码（可选）
+
+    Returns:
+        实际保存的目标路径
+    """
+    if dst_path is None:
+        dst_path = src_path
+
+    if password:
+        opts = LoadOptions()
+        opts.Password = password
+        wb = _licensed_workbook(src_path, opts)
+    else:
+        wb = _licensed_workbook(src_path)
+
+    # 递归求值所有公式（含跨 sheet / 跨工作簿外部引用）
+    wb.CalculateFormula()
+
+    # 遍历每个 sheet 的真实使用范围，把公式 cell 替换为字面值
+    # 保留：cell.Style、行高、列宽、合并、批注、图表等一切非公式属性
+    converted = 0
+    for si in range(wb.Worksheets.Count):
+        ws = wb.Worksheets[si]
+        cells = ws.Cells
+        try:
+            max_row = cells.MaxRow
+            max_col = cells.MaxColumn
+        except Exception:
+            continue
+        if max_row is None or max_row < 0 or max_col is None or max_col < 0:
+            continue
+        for r in range(max_row + 1):
+            for c in range(max_col + 1):
+                cell = cells.GetCell(r, c)
+                if cell is None or not cell.IsFormula:
+                    continue
+                try:
+                    val = cell.Value  # 已计算的字面值
+                except Exception:
+                    val = None
+                # 公式求值失败时（cell.Value 抛错或为 None）写入空串，避免残留破公式
+                cell.PutValue(val if val is not None else "")
+                converted += 1
+
+    fmt = _ext_save_format(dst_path) or SaveFormat.Xlsx
+    wb.Save(dst_path, fmt)
+    return dst_path
+
+
 def save_as(wb_or_path, output_path: str) -> str:
     """
     Workbook（或文件路径）按目标文件扩展名保存。

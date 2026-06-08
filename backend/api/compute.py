@@ -3,6 +3,7 @@
 """
 
 import os
+import re
 import shutil
 import tempfile
 import logging
@@ -314,28 +315,40 @@ async def execute_compute(
 
             # 保存结果到租户目录并注册为 data_asset
             saved_assets = []
-            for output_file in output_files:
+            # 统一文件名: {租户}_{脚本名}_{时间戳}.{ext}
+            def _safe_part(s, fallback):
+                s = (str(s) if s else "").strip() or fallback
+                return re.sub(r'[\\/:*?"<>|]+', '_', s)
+            _safe_tenant = _safe_part(task.tenant_id, "tenant")
+            _safe_script = _safe_part(script.name, f"script_{task.tenant_id}")
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            for idx, output_file in enumerate(output_files):
+                ext = output_file.suffix or ".xlsx"
+                if len(output_files) > 1:
+                    new_filename = f"{_safe_tenant}_{_safe_script}_{ts}_{idx + 1}{ext}"
+                else:
+                    new_filename = f"{_safe_tenant}_{_safe_script}_{ts}{ext}"
+
                 # 保存到租户目录
                 tenant_output_dir = PROJECT_ROOT / "tenants" / task.tenant_id / "assets" / "result"
                 tenant_output_dir.mkdir(parents=True, exist_ok=True)
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                dest_name = f"{timestamp}_{output_file.name}"
-                dest_path = tenant_output_dir / dest_name
+                dest_path = tenant_output_dir / new_filename
                 shutil.copy2(output_file, dest_path)
 
                 # 注册为数据资产
                 result_asset = DataAsset(
                     tenant_id=task.tenant_id,
                     asset_type="result",
-                    name=f"计算结果_{output_file.name}",
+                    name=f"计算结果_{_safe_script}_{ts}",
                     file_path=str(dest_path),
-                    file_name=output_file.name,
+                    file_name=new_filename,
                     file_size=dest_path.stat().st_size,
                     source_task_id=task.id,
                     uploaded_by=current_user.id,
                 )
                 db.add(result_asset)
-                saved_assets.append(dest_name)
+                saved_assets.append(new_filename)
 
             result_summary["saved_assets"] = saved_assets
             task.status = "completed"

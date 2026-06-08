@@ -29,15 +29,7 @@ const Tools = {
     async init() {
         if (!AUTH.requireAuth()) return;
         AUTH.renderUserInfo(document.querySelector('header'));
-
-        const isAdmin = AUTH.isAdmin();
-        if (isAdmin) {
-            const navAdmin = document.getElementById('nav-admin');
-            if (navAdmin) navAdmin.style.display = '';
-        } else {
-            // 隐藏管理员专属 tab
-            document.querySelectorAll('.tab-btn.admin-only').forEach(btn => btn.style.display = 'none');
-        }
+        // nav-admin / tab-btn 的显隐由 data-perm + applyPermFilter 处理(在 renderUserInfo 中触发)
 
         this.initTabs();
         this.initSplitSheet();

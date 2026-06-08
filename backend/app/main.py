@@ -1454,6 +1454,7 @@ async def calculate_data(
 
         # 获取源文件结构
         source_structure = script_info.get("source_structure", {})
+        expected_structure = script_info.get("expected_structure", {})
         match_success = True
         match_error = None
         smart_mapping = None
@@ -1480,6 +1481,7 @@ async def calculate_data(
                                 input_files=current_input_files,
                                 manual_headers=manual_headers,
                                 output_dir=input_dir,
+                                expected_structure=expected_structure,
                             )
                         _single_parse_ok = True
                     except Exception as _sp_err:
@@ -2311,6 +2313,7 @@ async def calculate_data_split(
             )
 
         source_structure = script_info["source_structure"]
+        expected_structure = script_info.get("expected_structure", {})
 
         # 使用DataValidator进行校验和自动映射
         from backend.utils.data_validator import DataValidator, parse_validation_rules_from_content
@@ -2493,6 +2496,7 @@ async def calculate_data_split(
                             input_files=current_input_files,
                             manual_headers=manual_headers,
                             output_dir=input_dir,
+                            expected_structure=expected_structure,
                         )
                     _single_parse_ok = True
                 except Exception as _sp_err:
@@ -3666,27 +3670,43 @@ def _extract_code_from_response(response: str):
 # ==================== 计算任务 DB 持久化辅助函数 ====================
 
 def _load_script_info_for_precheck(tenant_id: str, script_id: str) -> dict:
-    """加载脚本元数据（source_structure / manual_headers），事前校验时使用。
+    """加载脚本元数据（source_structure / manual_headers / use_history），事前校验时使用。
 
     优先级：DB Script 表 → 文件系统 {script_id}_info.json → 当前激活脚本的 script_info
+    use_history: 训练时记录的"使用历史数据"开关；未训练标记则为 None(交由调用方回退关键字扫描)
     """
     info: dict = {}
+    _struct_from_db = False
     db = None
     try:
         db = SessionLocal()
         row = None
-        # 仅当 script_id 是数字（DB主键）时才查 DB；
-        # 字符串型 script_id（如 "script_xxxx"）走文件系统兜底，避免误取到同租户下的其他脚本。
+        # 数字主键直接查 DB
         try:
             sid = int(script_id)
             row = db.query(db_models.Script).filter_by(id=sid, tenant_id=tenant_id).first()
         except (ValueError, TypeError):
             row = None
-        if row and (row.manual_headers or row.source_structure):
-            info = {
-                "manual_headers": row.manual_headers,
-                "source_structure": row.source_structure,
-            }
+        # 字符串型 script_id 也尝试按 name 精确匹配查 DB(主要为读 config.use_history;
+        # is_active=True 保证不会拿到旧版本)
+        if row is None:
+            try:
+                row = (
+                    db.query(db_models.Script)
+                    .filter_by(tenant_id=tenant_id, name=script_id, is_active=True)
+                    .order_by(db_models.Script.version.desc())
+                    .first()
+                )
+            except Exception:
+                row = None
+        if row:
+            if row.manual_headers or row.source_structure:
+                info["manual_headers"] = row.manual_headers
+                info["source_structure"] = row.source_structure
+                _struct_from_db = True
+            cfg = row.config if isinstance(row.config, dict) else {}
+            if "use_history" in cfg:
+                info["use_history"] = bool(cfg.get("use_history"))
     except Exception as e:
         logger.warning(f"[Precheck] DB 读 script 元数据失败: {e}")
     finally:
@@ -3696,20 +3716,26 @@ def _load_script_info_for_precheck(tenant_id: str, script_id: str) -> dict:
             except Exception:
                 pass
 
-    if not info:
+    if not _struct_from_db:
         try:
             info_file = storage_manager.get_tenant_dir(tenant_id) / "scripts" / f"{script_id}_info.json"
             if info_file.exists():
-                info = json.loads(info_file.read_text(encoding="utf-8"))
+                fs_info = json.loads(info_file.read_text(encoding="utf-8"))
+                # FS 只补结构字段,use_history 优先 DB
+                for k, v in fs_info.items():
+                    info.setdefault(k, v)
+                _struct_from_db = bool(info.get("source_structure") or info.get("manual_headers"))
         except Exception:
             pass
 
-    if not info:
+    if not _struct_from_db:
         try:
             active = storage_manager.get_active_script(tenant_id)
-            info = (active or {}).get("script_info", {}) or {}
+            active_info = (active or {}).get("script_info", {}) or {}
+            for k, v in active_info.items():
+                info.setdefault(k, v)
         except Exception:
-            info = {}
+            pass
 
     # SQLite/JSON 列可能是字符串，反序列化（最多 2 层兜底）
     for key in ("source_structure", "manual_headers"):
@@ -4035,6 +4061,12 @@ async def run_compute_task(
 
             source_structure = _script_info.get("source_structure")
             manual_headers = _script_info.get("manual_headers")
+            expected_structure = _script_info.get("expected_structure")
+            if isinstance(expected_structure, str):
+                try:
+                    expected_structure = json.loads(expected_structure)
+                except (json.JSONDecodeError, TypeError):
+                    expected_structure = None
 
             # 确保从DB读出的JSON列是dict（SQLite可能返回字符串，甚至双重编码）
             for _ in range(2):
@@ -4105,6 +4137,7 @@ async def run_compute_task(
                                 input_files=input_files,
                                 manual_headers=manual_headers,
                                 output_dir=str(source_dir),
+                                expected_structure=expected_structure,
                             ))
                         _single_parse_ok = True
                     except Exception as _sp_err:
@@ -4198,7 +4231,8 @@ async def run_compute_task(
                                 file_base = train_file.replace('.xlsx', '').replace('.xls', '')
                                 for sn in file_data.get("sheets", {}).keys():
                                     _ek_pairs.append((file_base, sn))
-                            _ek_map = assign_sheet_keys(_ek_pairs)
+                            _reserved = set((expected_structure or {}).get("sheets", {}).keys()) if expected_structure else set()
+                            _ek_map = assign_sheet_keys(_ek_pairs, reserved_names=_reserved)
                             expected_keys = set(_ek_map.values())
 
                             missing_keys = expected_keys - set(pre_loaded_source_data.keys())
@@ -4491,6 +4525,10 @@ async def compute_submit(
     try:
         logger.info(f"[compute/submit] 租户={tenant_id}, 脚本={script_id}")
 
+        # 0. 拒绝已禁用/删除的脚本
+        if storage_manager.is_script_disabled(tenant_id, script_id):
+            raise HTTPException(status_code=400, detail=f"脚本已被禁用或删除: {script_id}")
+
         # 1. 获取脚本内容
         script_content = storage_manager.get_script_content(tenant_id, script_id)
         if not script_content:
@@ -4533,6 +4571,13 @@ async def compute_submit(
         _script_info = _load_script_info_for_precheck(tenant_id, script_id)
         _source_structure = _script_info.get("source_structure")
         _manual_headers = _script_info.get("manual_headers")
+        _expected_structure = _script_info.get("expected_structure")
+        if isinstance(_expected_structure, str):
+            try:
+                _expected_structure = json.loads(_expected_structure)
+            except (json.JSONDecodeError, TypeError):
+                _expected_structure = None
+        _use_history_flag = _script_info.get("use_history")  # None 表示未训练标记,回退关键字扫描
 
         from fastapi.responses import JSONResponse
         from backend.utils.aspose_helper import is_encrypted as _is_enc, decrypt_excel as _dec_excel
@@ -4590,6 +4635,8 @@ async def compute_submit(
                     ai_provider_name=os.environ.get("AI_PROVIDER", "deepseek"),
                     confirmed_mapping=_confirmed,
                     confirmed_renames=_confirmed_renames,
+                    use_history=_use_history_flag,
+                    expected_structure=_expected_structure,
                 )
             finally:
                 try:
@@ -4914,6 +4961,12 @@ async def compute_with_script_stream(
 
                         source_structure = _script_info.get("source_structure")
                         manual_headers = _script_info.get("manual_headers")
+                        expected_structure = _script_info.get("expected_structure")
+                        if isinstance(expected_structure, str):
+                            try:
+                                expected_structure = json.loads(expected_structure)
+                            except (json.JSONDecodeError, TypeError):
+                                expected_structure = None
 
                         # 确保从DB读出的JSON列是dict（SQLite可能返回字符串，甚至双重编码）
                         for _ in range(2):
@@ -4984,6 +5037,7 @@ async def compute_with_script_stream(
                                             input_files=input_files,
                                             manual_headers=manual_headers,
                                             output_dir=str(source_dir),
+                                            expected_structure=expected_structure,
                                         ))
                                     _single_parse_ok = True
                                 except Exception as _sp_err:
@@ -5077,7 +5131,8 @@ async def compute_with_script_stream(
                                             file_base = train_file.replace('.xlsx', '').replace('.xls', '')
                                             for sn in file_data.get("sheets", {}).keys():
                                                 _ek_pairs2.append((file_base, sn))
-                                        _ek_map2 = assign_sheet_keys(_ek_pairs2)
+                                        _reserved2 = set((expected_structure or {}).get("sheets", {}).keys()) if expected_structure else set()
+                                        _ek_map2 = assign_sheet_keys(_ek_pairs2, reserved_names=_reserved2)
                                         expected_keys = set(_ek_map2.values())
 
                                         missing_keys = expected_keys - set(pre_loaded_source_data.keys())
@@ -5909,22 +5964,80 @@ async def get_training_logs(tenant_id: str, limit: int = 50):
 
 @app.get("/api/tenant-scripts/{tenant_id}")
 async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
-    """获取租户的所有训练脚本列表"""
+    """获取租户的所有训练脚本列表
+
+    显示规则：
+      - FS 目录名固定为 script_<hash12>(磁盘哈希命名)
+      - 通过代码 MD5[:12] 关联 DB Script，若匹配且 DB.name 是友好名(非 hash 形式)则优先显示
+      - 同一份代码(FS + DB 双写)只显示一条，避免重复
+    """
+    import hashlib as _hashlib
+    import re as _re
+
     try:
         tenant_dir = storage_manager.get_tenant_dir(tenant_id)
         training_dir = tenant_dir / "training"
         active_script = storage_manager.get_active_script(tenant_id)
         active_script_id = active_script.get("script_id") if active_script else None
 
+        _hash_id_pattern = _re.compile(r"^script_[0-9a-f]{12}$", _re.I)
+
+        # 收集禁用脚本：FS 层 disabled_scripts.json + DB 中 is_active=False 的脚本名
+        disabled_ids = storage_manager.get_disabled_script_ids(tenant_id)
+        try:
+            db_disabled_names = {
+                s.name for s in db.query(db_models.Script).filter(
+                    db_models.Script.tenant_id == tenant_id,
+                    db_models.Script.is_active == False,
+                ).all()
+            }
+            disabled_ids = disabled_ids | db_disabled_names
+        except Exception:
+            pass
+
+        # 预加载 DB 脚本，按代码哈希索引，便于 FS 条目反查友好名
+        db_scripts = []
+        db_by_code_hash: dict = {}  # hash12 -> Script (取最新)
+        try:
+            db_scripts = db.query(db_models.Script).filter(
+                db_models.Script.tenant_id == tenant_id,
+                db_models.Script.is_active == True,
+            ).order_by(db_models.Script.created_at.desc()).all()
+            for ds in db_scripts:
+                if not ds.code:
+                    continue
+                h = _hashlib.md5(ds.code.encode("utf-8")).hexdigest()[:12]
+                if h not in db_by_code_hash:
+                    db_by_code_hash[h] = ds
+        except Exception as e:
+            logger.warning(f"DB 查询脚本失败: {e}")
+
         scripts = []
         fs_script_ids = set()
+        used_db_ids = set()  # 已被 FS 条目"借用名字"的 DB 行，避免重复显示
 
         if training_dir.exists():
             for script_dir in sorted(training_dir.iterdir(), key=lambda d: d.stat().st_mtime, reverse=True):
                 if not script_dir.is_dir():
                     continue
                 script_id = script_dir.name
+                if script_id in disabled_ids:
+                    continue  # 禁用/删除的脚本不出现在智训/智算选择列表中
                 fs_script_ids.add(script_id)
+
+                # 通过 hash 反查 DB 友好名
+                hash_part = script_id[len("script_"):] if script_id.startswith("script_") else ""
+                matched_db = db_by_code_hash.get(hash_part)
+                friendly_name = None
+                version = None
+                db_id = None
+                if matched_db:
+                    if matched_db.name and not _hash_id_pattern.match(matched_db.name):
+                        friendly_name = matched_db.name
+                    version = matched_db.version
+                    db_id = matched_db.id
+                    used_db_ids.add(matched_db.id)
+
                 result_file = script_dir / "training_result.json"
                 score = None
                 created = None
@@ -5935,32 +6048,40 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
                         created = data.get("saved_time")
                     except Exception:
                         pass
-                scripts.append({
+
+                entry = {
                     "script_id": script_id,
                     "score": score,
                     "is_active": script_id == active_script_id,
-                    "created": created or datetime.fromtimestamp(script_dir.stat().st_mtime).isoformat()
-                })
+                    "created": created or datetime.fromtimestamp(script_dir.stat().st_mtime).isoformat(),
+                }
+                if friendly_name:
+                    entry["name"] = friendly_name
+                if version is not None:
+                    entry["version"] = version
+                if db_id is not None:
+                    entry["db_id"] = db_id
+                scripts.append(entry)
 
-        # 合并 DB 中的脚本（按 name 去重，只取每个 name 的最新有效版本）
-        try:
-            db_scripts = db.query(db_models.Script).filter(
-                db_models.Script.tenant_id == tenant_id,
-                db_models.Script.is_active == True,
-            ).order_by(db_models.Script.created_at.desc()).all()
-            for ds in db_scripts:
-                if ds.name not in fs_script_ids:
-                    scripts.append({
-                        "script_id": ds.name,
-                        "name": ds.name,
-                        "version": ds.version,
-                        "score": ds.accuracy,
-                        "is_active": ds.name == active_script_id,
-                        "created": ds.created_at.isoformat() if ds.created_at else None,
-                        "db_id": ds.id,
-                    })
-        except Exception as e:
-            logger.warning(f"DB 查询脚本失败: {e}")
+        # 合并 DB 中尚未被 FS 关联的脚本
+        for ds in db_scripts:
+            if ds.id in used_db_ids:
+                continue
+            if ds.name in disabled_ids:
+                continue
+            if ds.name in fs_script_ids:
+                continue
+            # 跳过 DB.name 为 hash 形式但磁盘没对应文件夹的孤立项(展示意义不大)
+            display_name = ds.name if not _hash_id_pattern.match(ds.name or "") else None
+            scripts.append({
+                "script_id": ds.name,
+                "name": display_name or ds.name,
+                "version": ds.version,
+                "score": ds.accuracy,
+                "is_active": ds.name == active_script_id,
+                "created": ds.created_at.isoformat() if ds.created_at else None,
+                "db_id": ds.id,
+            })
 
         return {
             "tenant_id": tenant_id,

@@ -6,6 +6,7 @@ import os
 import json
 import asyncio
 import logging
+import re
 import shutil
 import tempfile
 import time
@@ -17,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Form, File, UploadFile, Request
 from fastapi.responses import StreamingResponse
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 from pydantic import BaseModel
@@ -228,12 +230,15 @@ def _analyze_expected_structure(expected_file: str) -> Dict[str, Any]:
 
 def _load_full_source_data(source_dir: str, manual_headers: Dict = None,
                            multi_sheet_source: bool = False,
-                           file_passwords: Dict = None) -> Dict:
+                           file_passwords: Dict = None,
+                           reserved_sheet_names=None) -> Dict:
     """全量加载源文件数据（无 max_data_rows 限制），供脚本执行时使用。
     该函数设计为在后台线程中运行，与 AI 代码生成并行执行。
 
     返回格式与模板代码中 load_source_data() 一致：
     {"文件名_sheet名": {"df": DataFrame, "columns": [列名]}}
+
+    reserved_sheet_names: 结果 sheet 名集合；命中时强制 file_base_sheet 形式。
     """
     import pandas as pd
     from excel_parser import IntelligentExcelParser
@@ -314,21 +319,17 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None,
         except Exception as e:
             logger.warning(f"[后台全量加载] 解析 {filename} 失败: {e}")
 
-    # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 → 加文件名前缀
-    from backend.utils.data_helpers import assign_sheet_keys, make_unique_sheet_key
-    key_map = assign_sheet_keys((fb, sn) for fb, sn, _, _ in _collected)
-    # 同时建立 {file_base}_{sheet_name} 别名，兼容旧脚本（用文件名前缀做子串匹配）
-    alias_used: set = set(key_map.values())
+    # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 / 撞结果 sheet → 加文件名前缀
+    from backend.utils.data_helpers import assign_sheet_keys
+    key_map = assign_sheet_keys(
+        ((fb, sn) for fb, sn, _, _ in _collected),
+        reserved_names=reserved_sheet_names,
+    )
     for file_base, sheet_name, merged_df, columns in _collected:
         final_key = key_map[(file_base, sheet_name)]
         entry = {"df": merged_df, "columns": columns}
         source_data[final_key] = entry
         logger.info(f"[后台全量加载] {final_key}: {len(merged_df)} 行")
-
-        alias_raw = f"{file_base}_{sheet_name}"
-        if alias_raw != final_key:
-            alias_key = make_unique_sheet_key(alias_raw, alias_used, max_len=31)
-            source_data[alias_key] = entry  # 共享 df，无内存膨胀
 
     return source_data
 
@@ -375,13 +376,13 @@ def _get_session_context(db: Session, session_id: int) -> Dict[str, Any]:
         .first()
     )
 
-    # 获取最近 5 条对话消息
+    # 获取最近 20 轮对话消息（user+assistant 合计 40 条）
     recent_messages = (
         db.query(TrainingMessage)
         .filter_by(session_id=session_id)
         .filter(TrainingMessage.role.in_(["user", "assistant"]))
         .order_by(TrainingMessage.created_at.desc())
-        .limit(5)
+        .limit(40)
         .all()
     )
     recent_messages.reverse()  # 时间正序
@@ -850,6 +851,7 @@ async def start_training(
     force_retrain: bool = Form(False),
     session_id: Optional[int] = Form(None),  # 传入已有 session_id 则继续
     multi_sheet_source: Optional[str] = Form(None),  # "true" 启用数据源多Sheet读取
+    use_history: bool = Form(False),  # 启用历史数据(月度累加场景)
     file_passwords: Optional[str] = Form(None),  # JSON: {"文件名": "密码"}
     script_name: Optional[str] = Form(None),  # 用户为本次训练命名的脚本名
     current_user=Depends(get_current_user),
@@ -857,9 +859,7 @@ async def start_training(
 ):
     """开始训练（首轮），返回 SSE 流"""
 
-    # 租户权限 + 唯一性合并校验:
-    # - 租户已有同名 Script: 必须 operable;且非 force_retrain / 非继续 session 时拒绝
-    # - 租户无同名 Script: 任意登录用户均可创建新脚本
+    # 租户权限校验:同名脚本通过版本号自增允许复用（persistence.save_script 自动 +1）
     if not session_id:
         _check_db = SessionLocal()
         try:
@@ -869,14 +869,8 @@ async def start_training(
                 Script.name == _check_name,
                 Script.is_active == True,
             ).first()
-            if _existing:
-                if tenant_id not in accessible_tenants:
-                    raise HTTPException(status_code=403, detail=f"无权访问租户 '{tenant_id}'")
-                if not force_retrain:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"租户 '{tenant_id}' 已存在同名脚本「{_check_name}」（版本 {_existing.version}）。请改用其他脚本名称，或勾选「强制重新训练」覆盖该脚本"
-                    )
+            if _existing and tenant_id not in accessible_tenants:
+                raise HTTPException(status_code=403, detail=f"无权访问租户 '{tenant_id}'")
         finally:
             _check_db.close()
 
@@ -1067,6 +1061,7 @@ async def start_training(
                     "monthly_standard_hours": monthly_standard_hours,
                     "manual_headers": manual_headers_dict,
                     "multi_sheet_source": multi_sheet_source == "true",
+                    "use_history": bool(use_history),
                     "file_passwords": passwords,
                     "script_name": (script_name or "").strip() or f"script_{tenant_id}",
                 }
@@ -1085,6 +1080,32 @@ async def start_training(
                 ts.rules_content = rules_content[:70000] if rules_content else None
                 ts.expected_structure = expected_struct_dict or None
                 db.commit()
+
+                # 自动为创建用户所在 org 授予该租户的 owner 权限（如尚未授权）
+                try:
+                    from ..database.models import TenantAuthorization
+                    if getattr(current_user, "org_id", None):
+                        existing_auth = db.query(TenantAuthorization).filter(
+                            TenantAuthorization.tenant_id == tenant_id,
+                            TenantAuthorization.org_id == current_user.org_id,
+                        ).first()
+                        if existing_auth is None:
+                            db.add(TenantAuthorization(
+                                tenant_id=tenant_id,
+                                org_id=current_user.org_id,
+                                auth_type="owner",
+                                granted_by=current_user.id,
+                            ))
+                            db.commit()
+                            logger.info(f"[自动授权] 用户 {current_user.id} 的 org={current_user.org_id} 获得租户 {tenant_id} 的 owner 权限")
+                        elif existing_auth.revoked_at is not None:
+                            existing_auth.revoked_at = None
+                            existing_auth.granted_by = current_user.id
+                            db.commit()
+                            logger.info(f"[自动授权] 已恢复 org={current_user.org_id} 对租户 {tenant_id} 的授权")
+                except Exception as _auth_e:
+                    logger.warning(f"[自动授权] 失败（不影响训练流程）: {_auth_e}")
+                    db.rollback()
 
             sid = ts.id
 
@@ -1217,6 +1238,7 @@ def main(source_dir, output_dir, **kwargs):
                         source_session_id=sid,
                         accuracy=1.0,
                         created_by=current_user.id if current_user else None,
+                        config={"use_history": bool(config.get("use_history", False))},
                         manual_headers=config.get("manual_headers"),
                         source_structure=ts.source_structure,
                         rules_content=config.get("rules_content", ""),
@@ -1309,6 +1331,7 @@ def main(source_dir, output_dir, **kwargs):
                 _load_full_source_data, src_dir, config.get("manual_headers"),
                 multi_sheet_source=config.get("multi_sheet_source", False),
                 file_passwords=config.get("file_passwords"),
+                reserved_sheet_names=set((config.get("expected_structure") or {}).get("sheets", {}).keys()),
             )
 
             # 使用 FormulaCodeGenerator.generate_code()（与原训练引擎一致）
@@ -1321,6 +1344,7 @@ def main(source_dir, output_dir, **kwargs):
                 manual_headers=config.get("manual_headers"),
                 stream_callback=stream_cb,
                 multi_sheet_source=config.get("multi_sheet_source", False),
+                use_history=config.get("use_history", False),
             )
 
             if not code:
@@ -1436,7 +1460,8 @@ def main(source_dir, output_dir, **kwargs):
                     created_by=current_user.id if current_user else None,
                     config={"manual_headers": config.get("manual_headers"),
                             "source_structure": config.get("source_structure_desc", ""),
-                            "rules_content": config.get("rules_content", "")},
+                            "rules_content": config.get("rules_content", ""),
+                            "use_history": bool(config.get("use_history", False))},
                     manual_headers=config.get("manual_headers"),
                     source_structure=ts.source_structure,
                     rules_content=config.get("rules_content", ""),
@@ -1735,6 +1760,7 @@ async def send_message(
                 _load_full_source_data, src_dir, config.get("manual_headers"),
                 multi_sheet_source=config.get("multi_sheet_source", False),
                 file_passwords=config.get("file_passwords"),
+                reserved_sheet_names=set((config.get("expected_structure") or {}).get("sheets", {}).keys()),
             ) if src_dir and os.path.isdir(src_dir) else None
 
             code = None
@@ -1790,6 +1816,22 @@ async def send_message(
                 _add_message(db, session_id, "assistant", ai_msg, "chat")
                 _emit({"type": "assistant_message", "content": ai_msg})
                 return
+
+            # 调试：把最终要执行的 complete_code 落盘，便于对比"前端流式显示" vs "实际执行"
+            try:
+                _debug_dir = os.path.join("tenants", session.tenant_id, "training_sessions", str(session_id), "debug")
+                os.makedirs(_debug_dir, exist_ok=True)
+                _iter_n = (session.total_iterations or 0) + 1
+                _dump_path = os.path.join(_debug_dir, f"iter_{_iter_n}_executed.py")
+                with open(_dump_path, "w", encoding="utf-8") as _f:
+                    _f.write(f"# session_id={session_id}, iter={_iter_n}, mode={'column-level' if user_mentioned_columns else 'full'}\n")
+                    _f.write(f"# 落盘时间: {datetime.now().isoformat()}\n")
+                    _f.write(f"# 实际传给 sandbox 执行的代码（拼接+修复后），与前端 [CODE] 流式输出可能不一致\n\n")
+                    _f.write(code)
+                logger.info(f"[修正调试] 已落盘最终执行代码: {_dump_path}, 长度={len(code)}")
+                _emit({"type": "log", "message": f"[调试] 实际执行代码已落盘: {_dump_path}"})
+            except Exception as _dump_err:
+                logger.warning(f"[修正调试] 落盘失败: {_dump_err}")
 
             # 保存 AI 回复
             _add_message(db, session_id, "assistant",
@@ -1899,7 +1941,8 @@ async def send_message(
                     created_by=current_user.id if current_user else None,
                     config={"manual_headers": config.get("manual_headers"),
                             "source_structure": config.get("source_structure_desc", ""),
-                            "rules_content": config.get("rules_content", "")},
+                            "rules_content": config.get("rules_content", ""),
+                            "use_history": bool(config.get("use_history", False))},
                     manual_headers=config.get("manual_headers"),
                     source_structure=session.source_structure,
                     rules_content=config.get("rules_content", ""),
@@ -2132,6 +2175,7 @@ async def send_message(
                 _load_full_source_data, src_dir, config.get("manual_headers"),
                 multi_sheet_source=config.get("multi_sheet_source", False),
                 file_passwords=config.get("file_passwords"),
+                reserved_sheet_names=set((config.get("expected_structure") or {}).get("sheets", {}).keys()),
             )
 
             _emit({"type": "status", "message": "AI 正在生成代码（公式模式）..."})
@@ -2143,6 +2187,7 @@ async def send_message(
                 manual_headers=config.get("manual_headers"),
                 stream_callback=stream_cb,
                 multi_sheet_source=config.get("multi_sheet_source", False),
+                use_history=config.get("use_history", False),
             )
 
             if not code:
@@ -2246,7 +2291,8 @@ async def send_message(
                     created_by=current_user.id if current_user else None,
                     config={"manual_headers": config.get("manual_headers"),
                             "source_structure": config.get("source_structure_desc", ""),
-                            "rules_content": config.get("rules_content", "")},
+                            "rules_content": config.get("rules_content", ""),
+                            "use_history": bool(config.get("use_history", False))},
                     manual_headers=config.get("manual_headers"),
                     source_structure=session.source_structure,
                     rules_content=config.get("rules_content", ""),
@@ -2360,12 +2406,21 @@ def set_as_best(
 
     config = session.config or {}
 
+    # 设为最佳 → 强制评分 100%（用户认可即为正确）
+    forced_accuracy = 1.0
+    try:
+        iteration.accuracy = forced_accuracy
+        db.commit()
+    except Exception as _acc_e:
+        logger.warning(f"[set-best] 更新迭代 accuracy 失败: {_acc_e}")
+        db.rollback()
+
     # 先保存到磁盘，获取基于内容哈希的 script_id
     from ..storage.storage_manager import StorageManager
     _sm = StorageManager()
     training_result = {
         "success": True,
-        "best_score": iteration.accuracy or 0,
+        "best_score": forced_accuracy,
         "total_iterations": iteration.iteration_num,
         "best_code": iteration.generated_code,
         "mode": session.mode or "formula",
@@ -2394,8 +2449,9 @@ def set_as_best(
         code=iteration.generated_code,
         mode=session.mode,
         source_session_id=session_id,
-        accuracy=iteration.accuracy,
+        accuracy=forced_accuracy,
         created_by=current_user.id,
+        config={"use_history": bool(config.get("use_history", False))},
         manual_headers=config.get("manual_headers"),
         source_structure=session.source_structure,
         rules_content=config.get("rules_content", ""),
@@ -2409,14 +2465,14 @@ def set_as_best(
     db.commit()
 
     _add_message(db, session_id, "system",
-                 f"已设为最佳脚本 (v{script.version}，准确率 {iteration.accuracy*100:.1f}%)",
+                 f"已设为最佳脚本 (v{script.version}，评分 100%)",
                  "status", {"script_id": script.id, "version": script.version})
 
     return {
         "ok": True,
         "script_id": script.id,
         "version": script.version,
-        "accuracy": iteration.accuracy,
+        "accuracy": forced_accuracy,
     }
 
 
@@ -2443,9 +2499,10 @@ async def upload_code(
 
     config = session.config or {}
 
-    # 执行验证
+    # 执行验证（放入线程池，避免阻塞事件循环导致 Windows 反向代理 502）
     iteration_num = (session.total_iterations or 0) + 1
-    run_result = _run_single_iteration(
+    run_result = await run_in_threadpool(
+        _run_single_iteration,
         session_id, code_content, session.tenant_id,
         config.get("source_dir", ""),
         config.get("expected_file", ""),
@@ -2475,7 +2532,8 @@ async def upload_code(
     persistence.update_session_best(session_id, accuracy, iteration_num)
 
     # 持久化迭代产物（脚本、生成Excel、差异Excel）到磁盘，更新下载路径
-    iter_files = _persist_iteration_files(
+    iter_files = await run_in_threadpool(
+        _persist_iteration_files,
         session.tenant_id, session_id, iteration_num,
         code_content, run_result
     )
@@ -2489,7 +2547,8 @@ async def upload_code(
     try:
         from ..storage.storage_manager import StorageManager
         _sm = StorageManager()
-        _sm.save_script(
+        await run_in_threadpool(
+            _sm.save_script,
             session.tenant_id, code_content,
             {"success": run_result.get("success", False),
              "best_score": accuracy,
@@ -2517,7 +2576,8 @@ async def upload_code(
             created_by=current_user.id,
             config={"manual_headers": config.get("manual_headers"),
                     "source_structure": config.get("source_structure_desc", ""),
-                    "rules_content": config.get("rules_content", "")},
+                    "rules_content": config.get("rules_content", ""),
+                    "use_history": bool(config.get("use_history", False))},
             manual_headers=config.get("manual_headers"),
             source_structure=session.source_structure,
             rules_content=config.get("rules_content", ""),
@@ -2624,18 +2684,29 @@ def download_iteration_file(
     if not files:
         files = config.get("latest_files", {})
 
+    # 统一文件名: {租户}_{脚本名}_{时间戳}.{ext}
+    def _safe_part(s, fallback):
+        s = (str(s) if s else "").strip() or fallback
+        return re.sub(r'[\\/:*?"<>|]+', '_', s)
+
+    _script_name = (config.get("script_name") or "").strip() or f"script_{session.tenant_id}"
+    _safe_tenant = _safe_part(session.tenant_id, "tenant")
+    _safe_script = _safe_part(_script_name, "script")
+    _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    _base = f"{_safe_tenant}_{_safe_script}_{_ts}"
+
     if file_type == "script":
         file_path = files.get("script_file")
         media_type = "text/x-python"
-        filename = f"script_{session.tenant_id}_{session.session_key}.py"
+        filename = f"{_base}.py"
     elif file_type == "output":
         file_path = files.get("output_file")
         media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        filename = f"output_{session.session_key}.xlsx"
+        filename = f"{_base}.xlsx"
     elif file_type == "diff":
         file_path = files.get("diff_file")
         media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        filename = f"diff_{session.session_key}.xlsx"
+        filename = f"{_base}_差异对比.xlsx"
     else:
         raise HTTPException(status_code=400, detail=f"未知文件类型: {file_type}")
 

@@ -378,3 +378,155 @@ header {
     color: #999;
     font-size: 14px;
 }
+
+/* ============ 权限树 ============ */
+.perm-tree {
+    max-height: 360px;
+    overflow-y: auto;
+    border: 1px solid #e3e7ed;
+    border-radius: 8px;
+    background: #fafbfc;
+    padding: 8px;
+}
+.perm-tree::-webkit-scrollbar { width: 8px; }
+.perm-tree::-webkit-scrollbar-thumb {
+    background: #ccd2da;
+    border-radius: 4px;
+}
+.perm-tree::-webkit-scrollbar-thumb:hover { background: #aab2bd; }
+
+.perm-group {
+    background: #fff;
+    border: 1px solid #e3e7ed;
+    border-radius: 6px;
+    margin-bottom: 8px;
+    overflow: hidden;
+    transition: border-color .15s ease, box-shadow .15s ease;
+}
+.perm-group:hover {
+    border-color: #c8d4e3;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, .04);
+}
+.perm-group:last-child { margin-bottom: 0; }
+.perm-group--extra {
+    border-style: dashed;
+    border-color: #d99c66;
+    background: #fffaf3;
+}
+
+.perm-group-header {
+    display: flex;
+    align-items: center;
+    padding: 8px 12px;
+    background: #f4f7fb;
+    border-bottom: 1px solid #e3e7ed;
+    cursor: pointer;
+    user-select: none;
+    font-weight: 600;
+    color: #2c3e50;
+    font-size: 14px;
+    transition: background .15s ease;
+}
+.perm-group-header:hover { background: #eaf0f8; }
+.perm-group--extra .perm-group-header {
+    background: #fdf3e6;
+    color: #b15a1a;
+    cursor: default;
+}
+
+.perm-group-toggle {
+    width: 16px;
+    text-align: center;
+    color: #8b95a3;
+    font-size: 11px;
+    margin-right: 4px;
+    transition: transform .2s ease;
+}
+.perm-group.collapsed .perm-group-toggle { transform: rotate(-90deg); }
+.perm-group.collapsed .perm-group-items { display: none; }
+
+.perm-group-cb {
+    margin-right: 8px;
+    cursor: pointer;
+    width: 16px;
+    height: 16px;
+    accent-color: #1976d2;
+}
+.perm-group-label {
+    flex: 1;
+    font-size: 14px;
+}
+.perm-group-count {
+    font-size: 12px;
+    color: #8b95a3;
+    font-weight: normal;
+    background: #fff;
+    padding: 1px 8px;
+    border-radius: 10px;
+    border: 1px solid #e3e7ed;
+}
+
+.perm-group-items {
+    padding: 4px 0;
+}
+
+.perm-leaf {
+    display: flex;
+    align-items: center;
+    padding: 6px 12px 6px 36px;
+    cursor: pointer;
+    transition: background .12s ease;
+    position: relative;
+    font-size: 13px;
+    color: #4a5568;
+}
+.perm-leaf::before {
+    content: '';
+    position: absolute;
+    left: 22px;
+    top: 50%;
+    width: 8px;
+    height: 1px;
+    background: #d8dee6;
+}
+.perm-leaf:hover { background: #f4f7fb; }
+.perm-leaf input[type="checkbox"] {
+    margin-right: 8px;
+    cursor: pointer;
+    width: 15px;
+    height: 15px;
+    accent-color: #1976d2;
+    flex-shrink: 0;
+}
+.perm-leaf-label { flex: 1; }
+.perm-leaf input[type="checkbox"]:checked + .perm-leaf-label {
+    color: #1976d2;
+    font-weight: 500;
+}
+
+.perm-tree-toolbar {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 8px;
+    align-items: center;
+}
+.perm-tree-toolbar .btn-mini {
+    padding: 4px 10px;
+    font-size: 12px;
+    border: 1px solid #d0d7de;
+    background: #fff;
+    border-radius: 4px;
+    cursor: pointer;
+    color: #4a5568;
+    transition: background .12s ease, border-color .12s ease;
+}
+.perm-tree-toolbar .btn-mini:hover {
+    background: #f4f7fb;
+    border-color: #1976d2;
+    color: #1976d2;
+}
+.perm-tree-toolbar .perm-tree-summary {
+    margin-left: auto;
+    font-size: 12px;
+    color: #8b95a3;
+}

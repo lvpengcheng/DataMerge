@@ -61,8 +61,15 @@ def precheck_compute(
     ai_provider_name: Optional[str] = None,
     confirmed_mapping: Optional[Dict[str, Any]] = None,
     confirmed_renames: Optional[Dict[str, str]] = None,
+    use_history: Optional[bool] = None,
+    expected_structure: Optional[dict] = None,
 ) -> PrecheckResult:
-    """智算事前校验主入口"""
+    """智算事前校验主入口
+
+    use_history: 训练时记录的"使用历史数据"开关
+        - True/False: 显式开关，覆盖关键字检测
+        - None     : 未训练标记(存量脚本)，回退到关键字扫描
+    """
     result = PrecheckResult()
 
     if not source_structure:
@@ -132,7 +139,7 @@ def precheck_compute(
             _apply_confirmed_mapping(source_dir, source_structure, confirmed_mapping)
             result.file_mapping = confirmed_mapping.get("file_mapping") or confirmed_mapping
             # 文件已按用户确认改写，跳过表头匹配/AI 步骤
-            _check_history(script_content, tenant_id, salary_year, salary_month, result)
+            _check_history(script_content, tenant_id, salary_year, salary_month, result, use_history)
             return result
         except Exception as e:
             logger.error(f"[Precheck] 应用 confirmed_mapping 失败: {e}", exc_info=True)
@@ -157,6 +164,7 @@ def precheck_compute(
                     input_files=input_files,
                     manual_headers=manual_headers,
                     output_dir=None,  # 校验阶段不写 fallback
+                    expected_structure=expected_structure,
                 )
                 if ok and file_mapping:
                     result.file_mapping = file_mapping
@@ -177,7 +185,7 @@ def precheck_compute(
             logger.warning(f"[Precheck] 表头匹配异常: {e}", exc_info=True)
 
     # 步骤 5：历史数据
-    _check_history(script_content, tenant_id, salary_year, salary_month, result)
+    _check_history(script_content, tenant_id, salary_year, salary_month, result, use_history)
 
     return result
 
@@ -388,11 +396,25 @@ def _check_history(
     salary_year: Optional[int],
     salary_month: Optional[int],
     result: PrecheckResult,
+    use_history: Optional[bool] = None,
 ) -> None:
-    """脚本含历史数据关键字 + month>1 → 校验前序月份历史数据是否齐全"""
-    if not script_content:
-        return
-    if not any(kw in script_content for kw in _HISTORY_KEYWORDS):
+    """历史数据齐全性校验
+
+    判定是否依赖历史数据：
+      - use_history is True/False  → 直接采用(训练时显式开关)
+      - use_history is None        → 回退到脚本关键字扫描(兼容存量脚本)
+    """
+    # 决定是否依赖历史数据
+    if use_history is True:
+        depends_on_history = True
+    elif use_history is False:
+        depends_on_history = False
+    else:
+        if not script_content:
+            return
+        depends_on_history = any(kw in script_content for kw in _HISTORY_KEYWORDS)
+
+    if not depends_on_history:
         return
     if not salary_year or not salary_month or salary_month <= 1:
         return

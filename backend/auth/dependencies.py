@@ -44,6 +44,38 @@ async def require_admin(current_user: User = Depends(get_current_user)) -> User:
     return current_user
 
 
+def has_permission(user: User, key: str) -> bool:
+    """判断用户是否拥有指定权限键。
+
+    规则:
+    - admin 角色 → 任意权限
+    - role.permissions 中 admin=True → 任意权限
+    - role.permissions[key] === True → 该权限
+    """
+    if not user or not user.role:
+        return False
+    if user.role.name == "admin":
+        return True
+    perms = user.role.permissions or {}
+    if not isinstance(perms, dict):
+        return False
+    if perms.get("admin") is True:
+        return True
+    return perms.get(key) is True
+
+
+def require_permission(*keys: str):
+    """要求至少拥有 keys 中的任一权限。"""
+    async def _dep(current_user: User = Depends(get_current_user)) -> User:
+        if not keys or any(has_permission(current_user, k) for k in keys):
+            return current_user
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"缺少权限: {' / '.join(keys)}",
+        )
+    return _dep
+
+
 def get_accessible_tenants(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),

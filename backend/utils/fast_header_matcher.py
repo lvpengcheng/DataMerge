@@ -348,6 +348,55 @@ class FastHeaderMatcher:
             error_msg = "以下训练时的数据源在上传文件中未找到匹配:\n" + "\n".join(errors)
             return {"success": False, "error": error_msg}
 
+        # 同结构兜底（单 sheet 训练）：训练时只见过 1 个 sheet（source_structure 只记录了 1 个），
+        # 但智算/重训时上传了多个相同结构的 sheet（如多月数据）。此时 _is_template_mode 因
+        # `len(train_sheets) < 2` 返回 False，模板兜底不会触发，多余的 input sheet 会被丢弃。
+        # 这里对每个未匹配的 input sheet，若其稳定列集合 ⊇ 某个已匹配 train sheet 的稳定列集合，
+        # 则视为同模板的额外实例，自映射加入 match_results（保留 input 原 sheet 名）。
+        if not template_mode and match_results:
+            for input_idx, input_sheet in enumerate(input_sheets):
+                if input_idx in used_input_indices:
+                    continue
+                input_cols_stable = frozenset(
+                    h for h in input_sheet["headers"].keys()
+                    if self._is_valid_header(h) and not self._is_data_like_header(h)
+                )
+                if not input_cols_stable:
+                    continue
+                # 找一个已匹配的 train sheet，其稳定列被该 input sheet 覆盖
+                for mr in match_results:
+                    train_cols_stable = frozenset(
+                        h for h in mr.get("train_headers", {}).keys()
+                        if self._is_valid_header(h) and not self._is_data_like_header(h)
+                    )
+                    if len(train_cols_stable) < 3:
+                        continue
+                    if not train_cols_stable.issubset(input_cols_stable):
+                        continue
+                    col_mapping, score = self._match_headers(
+                        list(input_sheet["headers"].keys()),
+                        list(mr["train_headers"].keys())
+                    )
+                    used_input_indices.add(input_idx)
+                    logger.info(
+                        f"[匹配]   + 同结构兜底: {input_sheet['file_name']}/{input_sheet['sheet_name']} "
+                        f"（参考训练 {mr['train_file']}/{mr['train_sheet']}, score={score:.2f}）"
+                    )
+                    match_results.append({
+                        "train_file": mr["train_file"],
+                        # 关键：保留 input 原 sheet 名，避免多个实例被压缩为同名
+                        "train_sheet": input_sheet["sheet_name"],
+                        "train_headers": mr["train_headers"],
+                        "input_file": input_sheet["file_name"],
+                        "input_file_path": input_sheet["file_path"],
+                        "input_sheet": input_sheet["sheet_name"],
+                        "input_headers": input_sheet["headers"],
+                        "col_mapping": col_mapping,
+                        "score": score,
+                        "needs_rewrite": any(k != v for k, v in col_mapping.items()),
+                    })
+                    break  # 一个 input sheet 只匹配一次，避免重复加入
+
         # 多Sheet 模板兜底：训练时所有 sheet 共享同一稳定列集合（典型场景：每个 sheet
         # 是一个员工/月份/分公司的同模板表），上传比训练多出来的 sheet 也应纳入计算，
         # 不要因为"训练只有 N 个 sheet"就丢弃后续的同模板 sheet。
@@ -645,7 +694,8 @@ class FastHeaderMatcher:
         source_structure: Dict[str, Any],
         input_files: List[str],
         manual_headers: Optional[Dict[str, Any]] = None,
-        output_dir: Optional[str] = None
+        output_dir: Optional[str] = None,
+        expected_structure: Optional[Dict[str, Any]] = None
     ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
         """单次解析：全量读取 + 表头匹配 + 构建预加载数据 + 写 fallback 文件
 
@@ -697,7 +747,8 @@ class FastHeaderMatcher:
 
             # 步骤4: 从内存构建预加载数据（纯 Python，region → DataFrame → 列重命名）
             logger.info("[单次解析] ===== 步骤4: 构建预加载数据 =====")
-            pre_loaded_source_data = self._build_pre_loaded_from_memory(file_mapping, parsed_sheets_map)
+            _reserved_names = set((expected_structure or {}).get("sheets", {}).keys()) if expected_structure else set()
+            pre_loaded_source_data = self._build_pre_loaded_from_memory(file_mapping, parsed_sheets_map, reserved_sheet_names=_reserved_names)
 
             # 步骤5: 文件处理
             # 当 pre_loaded_source_data 有效时，脚本从内存加载数据，完全不读磁盘文件
@@ -791,7 +842,8 @@ class FastHeaderMatcher:
     def _build_pre_loaded_from_memory(
         self,
         file_mapping: Dict[str, Any],
-        parsed_sheets_map: Dict[tuple, Any]
+        parsed_sheets_map: Dict[tuple, Any],
+        reserved_sheet_names: Optional[set] = None
     ) -> Dict[str, Any]:
         """从内存中的解析数据构建 pre_loaded_source_data
 
@@ -855,21 +907,16 @@ class FastHeaderMatcher:
 
                 _collected.append((file_base, train_sheet, merged_df, first_columns))
 
-        # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 → 加文件名前缀
-        key_map = assign_sheet_keys((fb, sn) for fb, sn, _, _ in _collected)
-        # 同时建立 {file_base}_{sheet_name} 别名，兼容旧脚本(load_source_data 用文件名前缀做子串匹配)
-        from backend.utils.data_helpers import make_unique_sheet_key
-        alias_used: set = set(key_map.values())
+        # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 / 撞结果 sheet → 加文件名前缀
+        key_map = assign_sheet_keys(
+            ((fb, sn) for fb, sn, _, _ in _collected),
+            reserved_names=reserved_sheet_names,
+        )
         for file_base, train_sheet, merged_df, first_columns in _collected:
             key = key_map[(file_base, train_sheet)]
             entry = {"df": merged_df, "columns": first_columns}
             source_data[key] = entry
             logger.info(f"[预加载] {key}: {len(merged_df)}行 × {len(first_columns)}列")
-
-            alias_raw = f"{file_base}_{train_sheet}"
-            if alias_raw != key:
-                alias_key = make_unique_sheet_key(alias_raw, alias_used, max_len=31)
-                source_data[alias_key] = entry  # 共享同一份 df，无内存膨胀
 
         return source_data
 

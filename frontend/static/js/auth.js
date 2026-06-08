@@ -36,7 +36,46 @@ const AUTH = {
 
     isAdmin() {
         const user = this.getUser();
-        return user && user.role_name === 'admin';
+        if (!user) return false;
+        if (user.role_name === 'admin') return true;
+        const p = user.permissions || {};
+        return p.admin === true;
+    },
+
+    /** 取当前用户的权限字典 */
+    getPermissions() {
+        const user = this.getUser();
+        return (user && user.permissions) || {};
+    },
+
+    /** 是否拥有某个权限键。admin 视为拥有所有权限 */
+    hasPerm(key) {
+        if (!key) return true;
+        if (this.isAdmin()) return true;
+        const p = this.getPermissions();
+        return p && p[key] === true;
+    },
+
+    /**
+     * 按 data-perm 控制元素显隐(支持空格/逗号分隔多 key,任一通过即显示)。
+     * 用法: <a href="..." data-perm="menu.tools">...</a>
+     * 对有权限的元素强制清空 inline display(覆盖模板中的 display:none)。
+     */
+    applyPermFilter(root) {
+        const scope = root || document;
+        scope.querySelectorAll('[data-perm]').forEach(el => {
+            const raw = el.getAttribute('data-perm') || '';
+            const keys = raw.split(/[\s,]+/).filter(Boolean);
+            if (keys.length === 0) return;
+            const ok = keys.some(k => this.hasPerm(k));
+            if (ok) {
+                el.style.display = '';
+                el.removeAttribute('data-perm-hidden');
+            } else {
+                el.style.display = 'none';
+                el.setAttribute('data-perm-hidden', '1');
+            }
+        });
     },
 
     /** 返回 Authorization 头 */
@@ -75,7 +114,11 @@ const AUTH = {
 
         // 优先填充已有的 #user-info 容器
         let userDiv = headerElement.querySelector('#user-info') || headerElement.querySelector('.user-info');
-        if (userDiv && userDiv.children.length > 0) return; // 已渲染过
+        if (userDiv && userDiv.children.length > 0) {
+            // 已渲染过，但仍需确保权限过滤已应用
+            try { this.applyPermFilter(document); } catch (_) {}
+            return;
+        }
 
         if (!userDiv) {
             userDiv = document.createElement('div');
@@ -87,5 +130,8 @@ const AUTH = {
             <span class="user-name">${user.display_name || user.username}</span>
             <button class="btn-logout" onclick="AUTH.logout()">退出</button>
         `;
+
+        // 渲染完成后立即应用权限过滤(导航/Tab 等)
+        try { this.applyPermFilter(document); } catch (_) {}
     }
 };
