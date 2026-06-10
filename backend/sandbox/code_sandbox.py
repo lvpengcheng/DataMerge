@@ -203,7 +203,8 @@ class CodeSandbox:
                         _pre_loaded = exec_globals.get('_pre_loaded_source_data')
                         if _pre_loaded and 'load_source_data' in exec_globals:
                             _original_load = exec_globals['load_source_data']
-                            def _cached_load_source_data(input_folder, manual_headers, _data=_pre_loaded):
+                            # 使用 *args/**kwargs 兼容无参（template/auto 模式）和带参（formula 模式）两种签名
+                            def _cached_load_source_data(*args, _data=_pre_loaded, **kwargs):
                                 output_buffer.write(f"[性能优化] 使用预加载源数据（{len(_data)}个sheet，跳过Excel解析）\n")
                                 return _data
                             exec_globals['load_source_data'] = _cached_load_source_data
@@ -395,11 +396,13 @@ class CodeSandbox:
                 return False
 
         # 2. 检查危险模块导入 - 只检查真正危险的模块
+        # 注意：shutil 整体不列入这里——shutil.rmtree 已在 absolute_dangerous 单独拦截，
+        # 而 shutil.copy/copy2/copyfile/move 是 template 模式复制模板到输出目录的必需操作
         dangerous_modules = {
             'subprocess', 'os.system', 'os.popen', 'os.remove', 'os.unlink', 'os.rmdir',
-            'shutil',  # 包含rmtree等危险操作
             'execfile'  # Python 2的遗留函数
             # 移除 '__import__', 'eval', 'exec', 'compile'，允许使用
+            # 移除 'shutil'，因 template 模式需要 shutil.copy2；rmtree 由 absolute_dangerous 拦截
         }
 
         import_lines = []

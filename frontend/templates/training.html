@@ -91,9 +91,10 @@
                                     <div class="file-list" id="source-file-list"></div>
                                 </div>
                                 <div class="form-group">
-                                    <label>目标文件:</label>
+                                    <label id="target-file-label">目标文件:</label>
                                     <input type="file" id="target-file" accept=".xlsx,.xls">
                                     <div class="file-list" id="target-file-list"></div>
+                                    <small id="target-file-hint" style="display:none;color:#666;font-size:12px;margin-top:4px;"></small>
                                 </div>
                             </div>
                             <div class="form-row">
@@ -118,10 +119,10 @@
                                 </div>
                                 <div class="form-group">
                                     <label>生成模式:</label>
-                                    <select id="mode">
+                                    <select id="mode" onchange="onModeChange()">
                                         <option value="formula">公式模式</option>
-                                        <option value="auto">自动选择</option>
-                                        <option value="modular">模块化模式</option>
+                                        <option value="auto">自动模式</option>
+                                        <option value="template">模板填充模式</option>
                                         <option value="direct">直接导入</option>
                                     </select>
                                 </div>
@@ -154,7 +155,31 @@
     <!-- 隐藏的上传代码 input -->
     <input type="file" id="upload-code-input" accept=".py" style="display:none;" onchange="handleUploadCode(event)">
 
+    <!-- 目标 Sheet 选择弹窗（模板/自动模式：智训按钮触发分析后弹出） -->
+    <div class="modal-overlay" id="sheet-picker-modal" style="display:none;">
+        <div class="modal-dialog" style="max-width:560px;">
+            <div class="modal-header">
+                <span id="sheet-picker-title">选择需要处理的 Sheet</span>
+                <button class="modal-close" onclick="closeSheetPicker(true)">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div style="margin-bottom:8px;color:#666;font-size:13px;" id="sheet-picker-hint">
+                    勾选目标文件中需要处理的 Sheet。仅勾选的 Sheet 会被发给 AI 用于代码生成，避免无关 Sheet 干扰。
+                </div>
+                <div style="margin-bottom:8px;display:flex;gap:8px;">
+                    <button type="button" onclick="sheetPickerToggleAll(true)" style="font-size:12px;">全选</button>
+                    <button type="button" onclick="sheetPickerToggleAll(false)" style="font-size:12px;">全不选</button>
+                </div>
+                <div id="sheet-picker-list" style="max-height:340px;overflow:auto;border:1px solid #e3e3e3;padding:8px;border-radius:4px;"></div>
+                <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px;">
+                    <button type="button" onclick="closeSheetPicker(true)">取消</button>
+                    <button type="button" onclick="closeSheetPicker(false)" id="sheet-picker-confirm" style="background:#1677ff;color:#fff;">确定，开始训练</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script src="/static/js/auth.js"></script>
-    <script src="/static/js/training.js?v=20260608b"></script>
+    <script src="/static/js/training.js?v=20260609f"></script>
 </body>
 </html>

@@ -71,9 +71,38 @@ document.addEventListener('DOMContentLoaded', function () {
         _updateAttachBadge();
     });
 
+    // 初次加载根据当前 mode 同步 label
+    if (typeof onModeChange === 'function') {
+        try { onModeChange(); } catch (e) { /* 忽略：某些会话路径 mode 控件不存在 */ }
+    }
+
     // 加载租户列表
     _loadTenants();
 });
+
+// ==================== 生成模式切换 ====================
+function onModeChange() {
+    const mode = (document.getElementById('mode') || {}).value || 'formula';
+    const labelEl = document.getElementById('target-file-label');
+    const hintEl = document.getElementById('target-file-hint');
+    if (!labelEl) return;
+    if (mode === 'template') {
+        labelEl.textContent = '模板文件:';
+        if (hintEl) {
+            hintEl.style.display = 'block';
+            hintEl.textContent = '模板模式：保留此文件的公式与格式，仅按规则填入指定列（智算时自动复用此模板，无需重传）';
+        }
+    } else if (mode === 'auto') {
+        labelEl.textContent = '目标文件 (可选):';
+        if (hintEl) {
+            hintEl.style.display = 'block';
+            hintEl.textContent = '自动模式：目标文件可选；提供则作为列结构软参考，AI 仍按规则自由设计输出';
+        }
+    } else {
+        labelEl.textContent = '目标文件:';
+        if (hintEl) { hintEl.style.display = 'none'; hintEl.textContent = ''; }
+    }
+}
 
 // ==================== 租户列表 ====================
 let _tenantList = [];
@@ -791,6 +820,34 @@ function _startTraining(userText) {
     const salaryMonth = document.getElementById('salary-month').value.trim();
     const standardHours = document.getElementById('standard-hours').value.trim();
 
+    // 模板/自动模式：先轻量解析目标文件，弹出 sheet 多选框，让用户勾选目标 sheet
+    const _needsPicker = (mode === 'template' || mode === 'auto') && targetFile;
+    const _go = (selectedSheets) => {
+        _submitStartTraining(userText, sourceFiles, targetFile, ruleFiles,
+                             aiProvider, mode, salaryMonth, standardHours,
+                             selectedSheets || []);
+    };
+    if (_needsPicker) {
+        console.log('[训练] 模板/自动模式 → 调用 peek-template-sheets');
+        _pickTargetSheets(targetFile).then(selectedSheets => {
+            if (selectedSheets === null) {
+                console.log('[训练] 用户取消 sheet 选择，跳过本次训练');
+                return;  // 取消才中止
+            }
+            _go(selectedSheets);
+        }).catch(err => {
+            console.warn('[sheet 选择] 解析失败，fallback 走全量 sheet:', err);
+            try { _addMessage('system', '目标文件 sheet 解析失败：' + (err && err.message ? err.message : err) + '；将默认使用全部 sheet 进入训练'); } catch (e) {}
+            _go([]);  // 软失败：仍进入训练，由后端按全量 sheet 处理
+        });
+    } else {
+        _go([]);  // 公式模式/直接导入：不需选择
+    }
+}
+
+function _submitStartTraining(userText, sourceFiles, targetFile, ruleFiles,
+                              aiProvider, mode, salaryMonth, standardHours,
+                              selectedSheets) {
     const formData = new FormData();
     formData.append('tenant_id', _currentTenantId);
     if (_pendingScriptName) formData.append('script_name', _pendingScriptName);
@@ -809,6 +866,10 @@ function _startTraining(userText) {
         formData.append('file_passwords', JSON.stringify(_filePasswordsMap));
         console.log('[训练] file_passwords:', JSON.stringify(_filePasswordsMap));
     }
+    if (selectedSheets && selectedSheets.length > 0) {
+        formData.append('target_sheets', JSON.stringify(selectedSheets));
+        console.log('[训练] target_sheets:', selectedSheets);
+    }
     // 文件字段放在所有文本字段之后，避免 python-multipart 旧版本解析丢失后续字段
     Array.from(sourceFiles).forEach(f => formData.append('source_files', f));
     if (targetFile) formData.append('target_file', targetFile);
@@ -822,6 +883,113 @@ function _startTraining(userText) {
 
     _fetchTrainingSSE('/api/training/chat/start', { method: 'POST', body: formData });
     _resetUploadState();
+}
+
+// ==================== 目标 Sheet 选择弹窗 ====================
+
+let _sheetPickerResolver = null;  // Promise resolve 函数
+
+function _pickTargetSheets(targetFile) {
+    return new Promise((resolve, reject) => {
+        // 先检查 modal DOM 是否存在（应对浏览器缓存了旧版 training.html 的情况）
+        const modal = document.getElementById('sheet-picker-modal');
+        const list = document.getElementById('sheet-picker-list');
+        const title = document.getElementById('sheet-picker-title');
+        if (!modal || !list || !title) {
+            return reject(new Error('sheet 选择弹窗 DOM 不存在；请按 Ctrl+F5 强制刷新页面再试'));
+        }
+
+        const fd = new FormData();
+        fd.append('target_file', targetFile);
+        const _pwd = _filePasswordsMap[targetFile.name];
+        if (_pwd) fd.append('file_password', _pwd);
+
+        // 强制 inline 样式，避免 CSS 缓存（.modal-overlay 类样式没刷新到时）导致弹窗肉眼看不见
+        Object.assign(modal.style, {
+            display: 'flex',
+            position: 'fixed', top: '0', left: '0', right: '0', bottom: '0',
+            background: 'rgba(0,0,0,0.45)', zIndex: '9999',
+            justifyContent: 'center', alignItems: 'flex-start',
+            paddingTop: '8vh', overflowY: 'auto',
+        });
+        // 内层 dialog 也强制
+        const dialog = modal.querySelector('.modal-dialog');
+        if (dialog) {
+            Object.assign(dialog.style, {
+                background: '#fff', borderRadius: '12px',
+                boxShadow: '0 8px 32px rgba(0,0,0,0.18)',
+                maxWidth: '560px', width: '90vw', padding: '0',
+            });
+        }
+        // header 加点 padding
+        const header = modal.querySelector('.modal-header');
+        if (header) {
+            Object.assign(header.style, {
+                padding: '14px 18px', borderBottom: '1px solid #eee',
+                fontWeight: '600', display: 'flex',
+                justifyContent: 'space-between', alignItems: 'center',
+            });
+        }
+        const body = modal.querySelector('.modal-body');
+        if (body) Object.assign(body.style, { padding: '14px 18px' });
+
+        title.textContent = '正在分析目标文件...';
+        list.innerHTML = '<div style="padding:16px;text-align:center;color:#888;">解析中，请稍候...</div>';
+        console.log('[sheet picker] modal 已显示，开始 peek',
+                    'computed:', getComputedStyle(modal).display, getComputedStyle(modal).position);
+
+        // 用 AUTH.authFetch 携带登录 token
+        AUTH.authFetch('/api/training/chat/peek-template-sheets', {
+            method: 'POST', body: fd,
+        })
+        .then(r => r.ok ? r.json() : r.json().then(j => Promise.reject(new Error(j.detail || ('HTTP ' + r.status)))))
+        .then(data => {
+            const sheets = (data && data.sheets) || [];
+            if (sheets.length === 0) {
+                modal.style.display = 'none';
+                return reject(new Error('目标文件没有可用 sheet'));
+            }
+            title.textContent = `选择需要处理的 Sheet（共 ${sheets.length} 个）`;
+            list.innerHTML = sheets.map((s, i) => {
+                const previewStr = (s.preview || []).slice(0, 2).map(row => row.filter(x => x).slice(0, 6).join(' | ')).join(' / ') || '(空)';
+                const safeName = String(s.name).replace(/"/g, '&quot;');
+                return `
+                <label style="display:block;padding:6px 4px;border-bottom:1px solid #f0f0f0;cursor:pointer;">
+                    <input type="checkbox" class="sheet-picker-chk" data-name="${safeName}" checked style="width:auto;margin-right:8px;">
+                    <span style="font-weight:500;">${safeName}</span>
+                    <div style="margin-left:24px;font-size:12px;color:#888;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${previewStr}</div>
+                </label>`;
+            }).join('');
+            _sheetPickerResolver = resolve;
+        })
+        .catch(err => {
+            modal.style.display = 'none';
+            reject(err);
+        });
+    });
+}
+
+function sheetPickerToggleAll(checked) {
+    document.querySelectorAll('#sheet-picker-list .sheet-picker-chk').forEach(c => { c.checked = !!checked; });
+}
+
+function closeSheetPicker(cancelled) {
+    const modal = document.getElementById('sheet-picker-modal');
+    let result = null;
+    if (!cancelled) {
+        const checked = document.querySelectorAll('#sheet-picker-list .sheet-picker-chk:checked');
+        result = Array.from(checked).map(c => c.getAttribute('data-name'));
+        if (result.length === 0) {
+            alert('请至少勾选一个 Sheet');
+            return;
+        }
+    }
+    modal.style.display = 'none';
+    if (typeof _sheetPickerResolver === 'function') {
+        const r = _sheetPickerResolver;
+        _sheetPickerResolver = null;
+        r(result);
+    }
 }
 
 function _sendChatMessage(text, action) {

@@ -5996,8 +5996,10 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
             pass
 
         # 预加载 DB 脚本，按代码哈希索引，便于 FS 条目反查友好名
+        # 同一 hash 可能对应多条 DB 记录（旧 hash 名 + 后续友好名）；
+        # 选择规则：**优先保留有友好名的**，没有友好名时再退回到最新一条
         db_scripts = []
-        db_by_code_hash: dict = {}  # hash12 -> Script (取最新)
+        db_by_code_hash: dict = {}  # hash12 -> Script
         try:
             db_scripts = db.query(db_models.Script).filter(
                 db_models.Script.tenant_id == tenant_id,
@@ -6007,8 +6009,15 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
                 if not ds.code:
                     continue
                 h = _hashlib.md5(ds.code.encode("utf-8")).hexdigest()[:12]
-                if h not in db_by_code_hash:
+                cur = db_by_code_hash.get(h)
+                _is_friendly = bool(ds.name) and not _hash_id_pattern.match(ds.name)
+                if cur is None:
                     db_by_code_hash[h] = ds
+                else:
+                    cur_friendly = bool(cur.name) and not _hash_id_pattern.match(cur.name)
+                    # 已存在的是 hash 名、当前是友好名 → 替换
+                    if (not cur_friendly) and _is_friendly:
+                        db_by_code_hash[h] = ds
         except Exception as e:
             logger.warning(f"DB 查询脚本失败: {e}")
 
@@ -6057,6 +6066,14 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
                 }
                 if friendly_name:
                     entry["name"] = friendly_name
+                else:
+                    # DB 无友好名时，用保存时间生成可读名，避免前端只能显示 hash id
+                    try:
+                        ts_raw = str(entry["created"]).split('.')[0]
+                        dt_obj = datetime.fromisoformat(ts_raw)
+                        entry["name"] = f"训练 {dt_obj.strftime('%Y-%m-%d %H:%M')}"
+                    except Exception:
+                        entry["name"] = script_id
                 if version is not None:
                     entry["version"] = version
                 if db_id is not None:
@@ -6064,6 +6081,14 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
                 scripts.append(entry)
 
         # 合并 DB 中尚未被 FS 关联的脚本
+        # 用代码 hash 去重：同一份代码不论 DB 里有几条 Script（旧 hash 名 + 新友好名）
+        # 一旦其 hash 已被 FS 条目表示，整条 DB 记录都不再单独列出
+        seen_hashes = set()
+        # FS 已展示过的 hash（FS 目录名形如 script_<hash12>）
+        for sid in fs_script_ids:
+            if sid.startswith("script_"):
+                seen_hashes.add(sid[len("script_"):])
+
         for ds in db_scripts:
             if ds.id in used_db_ids:
                 continue
@@ -6071,8 +6096,23 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
                 continue
             if ds.name in fs_script_ids:
                 continue
+            # 代码 hash 去重
+            ds_hash = None
+            if ds.code:
+                ds_hash = _hashlib.md5(ds.code.encode("utf-8")).hexdigest()[:12]
+                if ds_hash in seen_hashes:
+                    continue
             # 跳过 DB.name 为 hash 形式但磁盘没对应文件夹的孤立项(展示意义不大)
             display_name = ds.name if not _hash_id_pattern.match(ds.name or "") else None
+            if not display_name:
+                try:
+                    if ds.created_at:
+                        display_name = f"训练 {ds.created_at.strftime('%Y-%m-%d %H:%M')}"
+                except Exception:
+                    pass
+            # 最终兜底：仍无可读名 → 用 db 主键编号，避免前端显示空白或 hash
+            if not display_name:
+                display_name = f"未命名脚本 #{ds.id}"
             scripts.append({
                 "script_id": ds.name,
                 "name": display_name or ds.name,
@@ -6082,6 +6122,8 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
                 "created": ds.created_at.isoformat() if ds.created_at else None,
                 "db_id": ds.id,
             })
+            if ds_hash:
+                seen_hashes.add(ds_hash)
 
         return {
             "tenant_id": tenant_id,

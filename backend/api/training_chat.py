@@ -832,6 +832,72 @@ def get_session_messages(
     }
 
 
+# ==================== 模板 sheet 预览（智训前弹出选择） ====================
+
+
+@router.post("/peek-template-sheets")
+async def peek_template_sheets(
+    target_file: UploadFile = File(...),
+    file_password: Optional[str] = Form(None),
+    current_user=Depends(get_current_user),
+):
+    """智训前轻量解析目标/模板文件，仅返回 sheet 列表 + 简短表头预览。
+
+    用于：模板/自动模式点击智训后弹出 sheet 多选框；用户勾选后再调 /start。
+    避免在 /start 阶段把所有 sheet 都喂给 AI。
+    """
+    work_dir = tempfile.mkdtemp(prefix=f"peek_{current_user.id}_")
+    fp_path = os.path.join(work_dir, target_file.filename)
+    try:
+        content = await target_file.read()
+        with open(fp_path, "wb") as fp:
+            fp.write(content)
+
+        # 加密兜底解密
+        if file_password:
+            try:
+                from ..utils.aspose_helper import is_encrypted, decrypt_excel
+                if is_encrypted(fp_path):
+                    _dec = decrypt_excel(fp_path, password=file_password)
+                    shutil.move(_dec, fp_path)
+            except Exception as _e:
+                logger.warning(f"[peek] 解密失败: {_e}")
+
+        # 用 openpyxl read_only 快速取 sheet 名 + 首行表头预览
+        sheets_info = []
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(fp_path, read_only=True, data_only=True)
+            for sn in wb.sheetnames:
+                ws = wb[sn]
+                # 取前 2 行做表头预览（保留原值）
+                preview_rows = []
+                for i, row in enumerate(ws.iter_rows(values_only=True, max_row=3)):
+                    cells = [(str(v).strip() if v is not None else "") for v in row[:30]]
+                    preview_rows.append(cells)
+                    if i >= 2:
+                        break
+                # 估算列数 / 数据行数（read_only 无 max_row 准确值，给提示即可）
+                sheets_info.append({
+                    "name": sn,
+                    "preview": preview_rows,
+                })
+            wb.close()
+        except Exception as e:
+            logger.error(f"[peek] 解析失败: {e}", exc_info=True)
+            raise HTTPException(status_code=400, detail=f"目标文件解析失败: {e}")
+
+        return {
+            "file_name": target_file.filename,
+            "sheets": sheets_info,
+        }
+    finally:
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 # ==================== 开始训练 (首轮) ====================
 
 
@@ -854,6 +920,7 @@ async def start_training(
     use_history: bool = Form(False),  # 启用历史数据(月度累加场景)
     file_passwords: Optional[str] = Form(None),  # JSON: {"文件名": "密码"}
     script_name: Optional[str] = Form(None),  # 用户为本次训练命名的脚本名
+    target_sheets: Optional[str] = Form(None),  # JSON 数组：模板/自动模式下用户勾选的目标 sheet 名
     current_user=Depends(get_current_user),
     accessible_tenants: list = Depends(get_operable_tenants),
 ):
@@ -913,6 +980,17 @@ async def start_training(
         except Exception:
             logger.warning(f"file_passwords JSON 解析失败: {_fp_raw}")
 
+    # 解析 target_sheets（模板/自动模式：用户勾选的目标 sheet 列表）
+    _parsed_target_sheets: Optional[List[str]] = None
+    if target_sheets:
+        try:
+            _ts = json.loads(target_sheets)
+            if isinstance(_ts, list):
+                _parsed_target_sheets = [str(x).strip() for x in _ts if str(x).strip()]
+                logger.info(f"[chat训练] 用户勾选 target_sheets: {_parsed_target_sheets}")
+        except Exception:
+            logger.warning(f"target_sheets JSON 解析失败: {target_sheets}")
+
     from ..utils.aspose_helper import is_encrypted, decrypt_excel
     import shutil as _shutil
 
@@ -956,9 +1034,14 @@ async def start_training(
         )
 
     # 第三步：多区域 sheet 预处理（banner 拆分 / 头一致合并 / 头不一致 best-region）
+    # 模板模式下：expected_file 是用户精心设计的模板（含公式/格式/合并），必须保留原状，不做任何拆分
+    _files_for_preprocess = [fp for fp, _ in all_excel_files]
+    if mode == "template" and expected_file and expected_file in _files_for_preprocess:
+        _files_for_preprocess.remove(expected_file)
+        logger.info(f"[chat训练] template 模式：跳过目标模板的 banner 预处理（保留原模板结构、公式、合并单元格）")
     try:
         from ..utils.banner_splitter import preprocess_uploaded_files
-        preprocess_uploaded_files([fp for fp, _ in all_excel_files])
+        preprocess_uploaded_files(_files_for_preprocess)
     except Exception as e:
         logger.warning(f"[chat训练] banner-split 预处理整体失败（继续）: {e}")
 
@@ -1062,8 +1145,10 @@ async def start_training(
                     "manual_headers": manual_headers_dict,
                     "multi_sheet_source": multi_sheet_source == "true",
                     "use_history": bool(use_history),
+                    "mode": mode,
                     "file_passwords": passwords,
                     "script_name": (script_name or "").strip() or f"script_{tenant_id}",
+                    "target_sheets": _parsed_target_sheets,
                 }
                 ts = persistence.create_session(
                     tenant_id=tenant_id,
@@ -1134,6 +1219,20 @@ async def start_training(
                 else:
                     p_expected = expected_file
 
+                # template 模式：把目标文件作为模板持久化到租户级目录(脚本会引用此路径，智算时复用)
+                p_template = None
+                if mode == "template" and expected_file and os.path.exists(expected_file):
+                    try:
+                        templates_dir = Path(_sm.get_tenant_dir(tenant_id)) / "templates"
+                        templates_dir.mkdir(parents=True, exist_ok=True)
+                        # 文件名: {session_id}_<原始文件名>，避免不同会话覆盖
+                        p_template = str(templates_dir / f"{sid}_{Path(expected_file).name}")
+                        shutil.copy2(expected_file, p_template)
+                        logger.info(f"[模板持久化] {expected_file} -> {p_template}")
+                    except Exception as _tpl_e:
+                        logger.warning(f"[模板持久化] 失败（不阻断训练）: {_tpl_e}", exc_info=True)
+                        p_template = None
+
                 # 保存规则文本
                 if rules_content:
                     (session_persist_dir / "rules.txt").write_text(rules_content, encoding="utf-8")
@@ -1144,6 +1243,9 @@ async def start_training(
                 _cfg["source_dir"] = str(p_source)
                 if p_expected:
                     _cfg["expected_file"] = p_expected
+                if p_template:
+                    _cfg["template_path"] = p_template
+                    _cfg["mode"] = "template"
                 ts.config = _cfg
                 from sqlalchemy.orm.attributes import flag_modified
                 flag_modified(ts, "config")
@@ -1286,13 +1388,33 @@ def main(source_dir, output_dir, **kwargs):
                 return
             # ========== 结束直接导入模式 ==========
 
-            # 创建 FormulaCodeGenerator（复用原有训练管线）
+            # 创建代码生成器：根据 mode 分叉
+            #   - template → TemplateCodeGenerator (模板填充)
+            #   - 其他 → FormulaCodeGenerator (公式模式)
             def stream_cb(msg):
                 _emit({"type": "log", "message": msg})
 
             _emit({"type": "status", "message": "正在调用 AI 生成代码..."})
 
-            generator, provider = _create_formula_generator(ai_provider, stream_callback=stream_cb)
+            _mode = (config.get("mode") or "formula").lower()
+            _is_template_mode = (_mode == "template")
+            _is_auto_mode = (_mode == "auto")
+            if _is_template_mode:
+                # 模板模式：用 TemplateCodeGenerator
+                from ..ai_engine.template_code_generator import TemplateCodeGenerator
+                from ..ai_engine.ai_provider import AIProviderFactory as _AIPF
+                _tpl_provider = _AIPF.create_provider(ai_provider) if ai_provider else _AIPF.create_with_fallback()
+                generator = TemplateCodeGenerator(ai_provider=_tpl_provider)
+                provider = _tpl_provider
+            elif _is_auto_mode:
+                # 自动模式：用 AutoCodeGenerator（AI 自由设计 + 纯计算）
+                from ..ai_engine.auto_code_generator import AutoCodeGenerator
+                from ..ai_engine.ai_provider import AIProviderFactory as _AIPF
+                _auto_provider = _AIPF.create_provider(ai_provider) if ai_provider else _AIPF.create_with_fallback()
+                generator = AutoCodeGenerator(ai_provider=_auto_provider)
+                provider = _auto_provider
+            else:
+                generator, provider = _create_formula_generator(ai_provider, stream_callback=stream_cb)
 
             # 获取 expected_structure
             expected_struct = config.get("expected_structure", {})
@@ -1334,18 +1456,47 @@ def main(source_dir, output_dir, **kwargs):
                 reserved_sheet_names=set((config.get("expected_structure") or {}).get("sheets", {}).keys()),
             )
 
-            # 使用 FormulaCodeGenerator.generate_code()（与原训练引擎一致）
-            _emit({"type": "status", "message": "AI 正在生成代码（使用公式模式）..."})
-
-            code, ai_response = generator.generate_code(
-                input_folder=src_dir,
-                rules_content=rules,
-                expected_structure=expected_struct,
-                manual_headers=config.get("manual_headers"),
-                stream_callback=stream_cb,
-                multi_sheet_source=config.get("multi_sheet_source", False),
-                use_history=config.get("use_history", False),
-            )
+            # 调用代码生成器（按 mode 分叉签名）
+            _cfg_target_sheets = config.get("target_sheets") or None
+            if _is_template_mode:
+                _emit({"type": "status", "message": "AI 正在生成代码（使用模板填充模式）..."})
+                _tpl_path = config.get("template_path") or expected_file
+                if not _tpl_path or not os.path.exists(_tpl_path):
+                    _emit({"type": "error", "message": "模板文件丢失，无法进入模板模式（请确认目标/模板文件已上传）"})
+                    return
+                code, ai_response = generator.generate_code(
+                    input_folder=src_dir,
+                    rules_content=rules,
+                    template_path=_tpl_path,
+                    manual_headers=config.get("manual_headers"),
+                    stream_callback=stream_cb,
+                    multi_sheet_source=config.get("multi_sheet_source", False),
+                    use_history=config.get("use_history", False),
+                    target_sheets=_cfg_target_sheets,
+                )
+            elif _is_auto_mode:
+                _emit({"type": "status", "message": "AI 正在生成代码（自动模式 — 自由设计）..."})
+                code, ai_response = generator.generate_code(
+                    input_folder=src_dir,
+                    rules_content=rules,
+                    expected_structure=expected_struct,  # 软参考，AutoCodeGenerator 不强制对齐
+                    manual_headers=config.get("manual_headers"),
+                    stream_callback=stream_cb,
+                    multi_sheet_source=config.get("multi_sheet_source", False),
+                    use_history=config.get("use_history", False),
+                    target_sheets=_cfg_target_sheets,
+                )
+            else:
+                _emit({"type": "status", "message": "AI 正在生成代码（使用公式模式）..."})
+                code, ai_response = generator.generate_code(
+                    input_folder=src_dir,
+                    rules_content=rules,
+                    expected_structure=expected_struct,
+                    manual_headers=config.get("manual_headers"),
+                    stream_callback=stream_cb,
+                    multi_sheet_source=config.get("multi_sheet_source", False),
+                    use_history=config.get("use_history", False),
+                )
 
             if not code:
                 _add_message(db, sid, "system", "AI 未能生成有效代码", "status",
@@ -1746,13 +1897,32 @@ async def send_message(
             # 获取源数据结构描述
             source_structure_desc = config.get("source_structure_desc", "")
 
-            # 创建 FormulaCodeGenerator 并修正代码
+            # 自动模式暂不支持差异修正（AutoCodeGenerator.generate_correction_code 尚未实现）
+            # 模板模式支持：走 TemplateCodeGenerator.generate_correction_code，仅改写 fill_template
+            _cur_mode = (config.get("mode") or session.mode or "").lower()
+            if _cur_mode == "auto":
+                _add_message(
+                    db, session_id, "system",
+                    "自动模式不支持差异修正，请改用「重新生成」并调整规则文档；或在新会话中训练。",
+                    "status", {"mode": _cur_mode, "blocked_action": "generate"},
+                )
+                _emit({"type": "error", "message": "自动模式不支持差异修正，请使用『重新生成』"})
+                return
+
+            # 创建代码生成器（按 mode 分叉）
             ai_provider_name = config.get("ai_provider", "deepseek")
 
             def stream_cb(msg):
                 _emit({"type": "log", "message": msg})
 
-            generator, provider = _create_formula_generator(ai_provider_name, stream_callback=stream_cb)
+            if _cur_mode == "template":
+                from ..ai_engine.template_code_generator import TemplateCodeGenerator
+                from ..ai_engine.ai_provider import AIProviderFactory as _AIPF
+                _tpl_provider = _AIPF.create_provider(ai_provider_name) if ai_provider_name else _AIPF.create_with_fallback()
+                generator = TemplateCodeGenerator(ai_provider=_tpl_provider)
+                provider = _tpl_provider
+            else:
+                generator, provider = _create_formula_generator(ai_provider_name, stream_callback=stream_cb)
 
             # 【后台全量加载】修正轮次也需要全量数据
             src_dir = config.get("source_dir", "")
@@ -1766,7 +1936,8 @@ async def send_message(
             code = None
 
             # 策略：用户提到具体列名时，使用列级精准修正；否则全量修正
-            if user_mentioned_columns:
+            # 模板模式没有列级修正方法，直接走全量
+            if user_mentioned_columns and _cur_mode != "template":
                 _emit({"type": "status",
                        "message": f"AI 正在精准修正 {len(user_mentioned_columns)} 列: {', '.join(user_mentioned_columns.keys())}..."})
                 logger.info(f"[chat修正] 用户指定列级修正: {list(user_mentioned_columns.keys())}")
@@ -2157,7 +2328,22 @@ async def send_message(
 
             _emit({"type": "status", "message": "正在调用 AI 重新生成代码..."})
 
-            generator, _provider = _create_formula_generator(ai_provider, stream_callback=stream_cb)
+            _is_template_mode = (mode or "").lower() == "template"
+            _is_auto_mode = (mode or "").lower() == "auto"
+            if _is_template_mode:
+                from ..ai_engine.template_code_generator import TemplateCodeGenerator
+                from ..ai_engine.ai_provider import AIProviderFactory as _AIPF
+                _tpl_provider = _AIPF.create_provider(ai_provider) if ai_provider else _AIPF.create_with_fallback()
+                generator = TemplateCodeGenerator(ai_provider=_tpl_provider)
+                _provider = _tpl_provider
+            elif _is_auto_mode:
+                from ..ai_engine.auto_code_generator import AutoCodeGenerator
+                from ..ai_engine.ai_provider import AIProviderFactory as _AIPF
+                _auto_provider = _AIPF.create_provider(ai_provider) if ai_provider else _AIPF.create_with_fallback()
+                generator = AutoCodeGenerator(ai_provider=_auto_provider)
+                _provider = _auto_provider
+            else:
+                generator, _provider = _create_formula_generator(ai_provider, stream_callback=stream_cb)
 
             src_dir = config.get("source_dir", "")
             expected_struct = config.get("expected_structure", {})
@@ -2178,17 +2364,43 @@ async def send_message(
                 reserved_sheet_names=set((config.get("expected_structure") or {}).get("sheets", {}).keys()),
             )
 
-            _emit({"type": "status", "message": "AI 正在生成代码（公式模式）..."})
-
-            code, ai_response = generator.generate_code(
-                input_folder=src_dir,
-                rules_content=rules,
-                expected_structure=expected_struct,
-                manual_headers=config.get("manual_headers"),
-                stream_callback=stream_cb,
-                multi_sheet_source=config.get("multi_sheet_source", False),
-                use_history=config.get("use_history", False),
-            )
+            if _is_template_mode:
+                _emit({"type": "status", "message": "AI 正在生成代码（模板填充模式）..."})
+                _tpl_path = config.get("template_path") or config.get("expected_file")
+                if not _tpl_path or not os.path.exists(_tpl_path):
+                    _emit({"type": "error", "message": "模板文件丢失"})
+                    return
+                code, ai_response = generator.generate_code(
+                    input_folder=src_dir,
+                    rules_content=rules,
+                    template_path=_tpl_path,
+                    manual_headers=config.get("manual_headers"),
+                    stream_callback=stream_cb,
+                    multi_sheet_source=config.get("multi_sheet_source", False),
+                    use_history=config.get("use_history", False),
+                )
+            elif _is_auto_mode:
+                _emit({"type": "status", "message": "AI 正在生成代码（自动模式 — 自由设计）..."})
+                code, ai_response = generator.generate_code(
+                    input_folder=src_dir,
+                    rules_content=rules,
+                    expected_structure=expected_struct,
+                    manual_headers=config.get("manual_headers"),
+                    stream_callback=stream_cb,
+                    multi_sheet_source=config.get("multi_sheet_source", False),
+                    use_history=config.get("use_history", False),
+                )
+            else:
+                _emit({"type": "status", "message": "AI 正在生成代码（公式模式）..."})
+                code, ai_response = generator.generate_code(
+                    input_folder=src_dir,
+                    rules_content=rules,
+                    expected_structure=expected_struct,
+                    manual_headers=config.get("manual_headers"),
+                    stream_callback=stream_cb,
+                    multi_sheet_source=config.get("multi_sheet_source", False),
+                    use_history=config.get("use_history", False),
+                )
 
             if not code:
                 _add_message(db, session_id, "system", "AI 未能生成有效代码", "status",
@@ -2439,13 +2651,16 @@ def set_as_best(
         logger.warning(f"[set-best] 保存脚本到磁盘失败: {e}")
         disk_script_id = f"script_{session.tenant_id}"
 
-    # DB 存储使用与磁盘一致的 script_id 作为 name，避免智算查找不到
+    # DB 存储优先使用用户给本次训练命名的脚本名（friendly name）；只有完全没命名时才退回 disk_script_id
     from ..api.training_persistence import TrainingPersistence
     persistence = TrainingPersistence(db)
 
+    _friendly_name = (config.get("script_name") or "").strip()
+    _db_script_name = _friendly_name or disk_script_id
+
     script = persistence.save_script(
         tenant_id=session.tenant_id,
-        name=disk_script_id,
+        name=_db_script_name,
         code=iteration.generated_code,
         mode=session.mode,
         source_session_id=session_id,

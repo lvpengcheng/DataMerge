@@ -1523,17 +1523,32 @@ class IntelligentExcelParser:
 
     @staticmethod
     def _is_fake_merged_header(head_data: Dict[str, str]) -> bool:
-        """识别"伪表头"区域：列被合并展开成同一名+列字母后缀，或大量 Column_* 占位"""
+        """识别"伪表头"区域：列被合并展开成同一名+列字母后缀，或大量 Column_* 占位
+
+        关键是区分两种"列稀疏"场景：
+        - 合并展开的伪头：real_names 同根重复（"工资_A","工资_B"）或全 Column_* 占位
+        - 真实小表被 padding：sheet 整体宽度大于此区域真实宽度，多余列由 Column_* 填充，
+          但 real_names 是彼此独立的有意义列名（如 "姓名","驾驶津贴"）。这种**不是**伪头。
+        """
         if not head_data or len(head_data) < 3:
             return False
         real_names = [k for k in head_data.keys() if not k.startswith('Column_')]
         if not real_names:
             return True  # 全部是 Column_* 占位 → 退化表头
-        column_x_ratio = (len(head_data) - len(real_names)) / len(head_data)
-        if column_x_ratio >= 0.6 and len(real_names) <= 2:
-            return True
+
         suffix_re = re.compile(r'_([A-Z]+|\d+)$')
         roots = {suffix_re.sub('', k) for k in real_names}
+
+        column_x_ratio = (len(head_data) - len(real_names)) / len(head_data)
+        if column_x_ratio >= 0.6 and len(real_names) <= 2:
+            # 大量 Column_* 占位时，仅当 real_names 同根重复（合并展开），或仅 1 个真实名时才视为伪头；
+            # 多个独立列名 = 真实窄表被 padding，保留
+            if len(real_names) == 1:
+                return True
+            if len(real_names) >= 2 and len(roots) == 1:
+                return True
+            return False
+
         if len(roots) > 1:
             return False
         same_root_ratio = len(real_names) / len(head_data)

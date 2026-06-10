@@ -88,6 +88,64 @@ def _region_row_indices(region) -> list:
     return rows
 
 
+def _is_row_all_empty(ws, r: int, max_col: int) -> bool:
+    for c in range(1, max_col + 1):
+        v = ws.cell(r, c).value
+        if v is not None and str(v).strip():
+            return False
+    return True
+
+
+def _scan_banner_rows(ws) -> list:
+    """扫描 sheet 找出所有"banner 标题行"，返回 [(row_idx, banner_text), ...]
+
+    banner 行特征：
+      - 该行只有 1 个非空 cell（典型的独立标题）
+      - 上一行是空行（或本行就是 row 1）
+      - 下一行（或下下行）至少 2 列非空（候选表头）
+
+    比 parser 的 region 边界更可靠：
+      - parser 会把"姓名/金额"等同表头的相邻区域合并为 1 个 region（漏 banner）
+      - parser 的 _find_data_end_row 在长描述行上提前截断（漏数据）
+      - 改用 banner 行直切，规避以上两类截断
+    """
+    max_row = ws.max_row or 0
+    max_col = ws.max_column or 0
+    if max_row <= 0 or max_col <= 0:
+        return []
+
+    banners = []
+    for r in range(1, max_row + 1):
+        non_empty_cols = []
+        for c in range(1, max_col + 1):
+            v = ws.cell(r, c).value
+            if v is not None and str(v).strip():
+                non_empty_cols.append(c)
+        if len(non_empty_cols) != 1:
+            continue
+        if r > 1 and not _is_row_all_empty(ws, r - 1, max_col):
+            continue
+        has_header_below = False
+        for nr in (r + 1, r + 2):
+            if nr > max_row:
+                break
+            count = 0
+            for c in range(1, max_col + 1):
+                v = ws.cell(nr, c).value
+                if v is not None and str(v).strip():
+                    count += 1
+                    if count >= 2:
+                        break
+            if count >= 2:
+                has_header_below = True
+                break
+        if not has_header_below:
+            continue
+        banner_text = str(ws.cell(r, non_empty_cols[0]).value).strip()
+        banners.append((r, banner_text))
+    return banners
+
+
 def split_one_file(source_path: Path, output_path: Path):
     parser = IntelligentExcelParser()
     results = parser.parse_excel_file(str(source_path), max_data_rows=1, read_formulas=False)
@@ -114,9 +172,29 @@ def split_one_file(source_path: Path, output_path: Path):
     used_names: set = set()
 
     parsed_sheets = {sd.sheet_name: sd for sd in results}
+    # 单 sheet 源文件：banner 名直接当子 sheet 名，不加 "{源sheet}-" 前缀
+    single_source_sheet = len(src_wb.sheetnames) == 1
 
     for sheet_name in src_wb.sheetnames:
         src_ws = src_wb[sheet_name]
+
+        # 优先：banner-line 扫描（不依赖 parser 精度）
+        # 当扫到 ≥2 个 banner 行，直接按 banner 行做切片，避免 parser 合并/截断 bug
+        scanned_banners = _scan_banner_rows(src_ws)
+        if len(scanned_banners) >= 2:
+            sheet_max_col = src_ws.max_column or 0
+            for i, (br, btext) in enumerate(scanned_banners):
+                next_br = scanned_banners[i + 1][0] if i + 1 < len(scanned_banners) else (src_ws.max_row + 1)
+                # 块范围 = banner 后一行 .. 下一个 banner 前一行；去掉空行
+                block_rows = [r for r in range(br + 1, next_br) if not _is_row_all_empty(src_ws, r, sheet_max_col)]
+                if not block_rows:
+                    continue
+                composed = btext if single_source_sheet else f"{sheet_name}-{btext}"
+                sub_name = _sanitize_sheet_name(composed, used_names)
+                dst_ws = dst_wb.create_sheet(sub_name)
+                _copy_region_rows(src_ws, dst_ws, block_rows, 1)
+            continue
+
         sheet_data = parsed_sheets.get(sheet_name)
         regions = sheet_data.regions if sheet_data else []
 
@@ -139,7 +217,8 @@ def split_one_file(source_path: Path, output_path: Path):
             continue
 
         for banner, region_list in banner_groups.items():
-            sub_name = _sanitize_sheet_name(f"{sheet_name}-{banner}", used_names)
+            composed = banner if single_source_sheet else f"{sheet_name}-{banner}"
+            sub_name = _sanitize_sheet_name(composed, used_names)
             dst_ws = dst_wb.create_sheet(sub_name)
             cur_row = 1
             for region in region_list:
@@ -148,7 +227,8 @@ def split_one_file(source_path: Path, output_path: Path):
                 cur_row += written + 1  # 不同 region 之间空一行分隔
 
         if no_banner_regions:
-            sub_name = _sanitize_sheet_name(f"{sheet_name}-other", used_names)
+            composed = "other" if single_source_sheet else f"{sheet_name}-other"
+            sub_name = _sanitize_sheet_name(composed, used_names)
             dst_ws = dst_wb.create_sheet(sub_name)
             cur_row = 1
             for region in no_banner_regions:
