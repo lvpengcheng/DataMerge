@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # ========== Stage 1: 从微软官方镜像获取 .NET 9 运行时 ==========
 FROM mcr.microsoft.com/dotnet/runtime:9.0 AS dotnet-runtime
 
@@ -38,8 +39,14 @@ COPY ./fonts /usr/share/fonts/win-fonts
 RUN fc-cache -fv
 
 # ========== 4. Python 依赖 ==========
+# 用 BuildKit 缓存挂载持久化 pip 下载缓存：跨构建复用已下载的 wheel，
+# requirements 有改动时只下增量；缓存挂载不写进镜像层，镜像体积与 --no-cache-dir 时一致。
+# 可选：构建时传国内镜像源加速下载（清华源示例）：
+#   DOCKER_BUILDKIT=1 docker build --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple .
+ARG PIP_INDEX_URL=""
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install ${PIP_INDEX_URL:+-i $PIP_INDEX_URL} -r requirements.txt
 
 # ========== 5. 复制应用代码 ==========
 COPY libs/ ./libs/

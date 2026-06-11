@@ -2,6 +2,7 @@
 let tenantListData = [];
 let currentTenantId = '';
 let currentScriptId = '';
+let scriptsCache = [];          // 当前租户脚本列表（含 mode，供模板入口判断）
 let _filePasswordsMap = null;  // 文件名→密码映射
 let _encryptionCheckInProgress = false;  // 加密检测进行中
 let _currentEventSource = null;  // 当前 EventSource 连接
@@ -442,6 +443,17 @@ document.addEventListener('DOMContentLoaded', function() {
     // 脚本选择器
     document.getElementById('script-selector').addEventListener('change', onScriptSelected);
 
+    // 模板文件（可选）：显示已选文件名
+    const _tplInput = document.getElementById('template-file');
+    if (_tplInput) {
+        _tplInput.addEventListener('change', function () {
+            const list = document.getElementById('template-file-list');
+            if (!list) return;
+            list.innerHTML = (this.files && this.files.length > 0)
+                ? `<div>${this.files[0].name}</div>` : '';
+        });
+    }
+
     // 恢复进行中的计算任务
     _tryResumeActiveTask();
 });
@@ -567,6 +579,7 @@ async function loadTenantScripts(tenantId) {
 
         // 按分数排序，最高分在前
         const scripts = data.scripts.sort((a, b) => (b.score || 0) - (a.score || 0));
+        scriptsCache = scripts;
 
         selector.innerHTML = scripts.map(s => {
             const label = s.name || s.script_id;
@@ -584,6 +597,7 @@ async function loadTenantScripts(tenantId) {
         // 同步 select 元素的选中状态
         selector.value = currentScriptId;
         updateScriptInfo(activeScript || scripts[0]);
+        toggleTemplateInput(activeScript || scripts[0]);
 
     } catch (e) {
         console.error('加载脚本列表失败:', e);
@@ -595,6 +609,14 @@ function onScriptSelected() {
     const selector = document.getElementById('script-selector');
     currentScriptId = selector.value;
 
+    // 优先用缓存里的完整脚本对象（含 mode）；缺失时退回从 option 文本解析分数
+    const cached = scriptsCache.find(s => s.script_id === currentScriptId);
+    if (cached) {
+        updateScriptInfo(cached);
+        toggleTemplateInput(cached);
+        return;
+    }
+
     // 更新脚本信息显示
     const option = selector.options[selector.selectedIndex];
     const text = option.textContent;
@@ -604,6 +626,21 @@ function onScriptSelected() {
             script_id: currentScriptId,
             score: parseFloat(scoreMatch[1]) / 100
         });
+    }
+    toggleTemplateInput(null);
+}
+
+// 仅模板模式脚本显示「模板文件（可选）」入口
+function toggleTemplateInput(script) {
+    const group = document.getElementById('template-file-group');
+    if (!group) return;
+    const isTemplate = !!(script && script.mode === 'template');
+    group.style.display = isTemplate ? 'block' : 'none';
+    if (!isTemplate) {
+        const input = document.getElementById('template-file');
+        const list = document.getElementById('template-file-list');
+        if (input) input.value = '';
+        if (list) list.innerHTML = '';
     }
 }
 
@@ -680,6 +717,12 @@ async function startCompute() {
     Array.from(files).forEach(file => {
         formData.append('source_files', file);
     });
+
+    // 模板模式可选新模板：上传则覆盖训练时模板
+    const templateInput = document.getElementById('template-file');
+    if (templateInput && templateInput.files && templateInput.files.length > 0) {
+        formData.append('template_file', templateInput.files[0]);
+    }
 
     // 添加可选参数
     const salaryMonth = document.getElementById('salary-month').value.trim();

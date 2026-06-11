@@ -201,10 +201,13 @@ class TemplateCodeGenerator:
                         "column_letter": self._guess_column_letter(region, col_name),
                         "has_formula_in_data": has_formula,
                     })
+                # ⚠️ ExcelRegion 的真实字段名是 head_row_start/head_row_end/data_row_start/data_row_end
+                #    （不是 header_rows/data_start_row），早期误用 getattr 取到 None → 退化成硬编码 2 → 写穿表头
                 sheet_info["regions"].append({
-                    "header_rows": getattr(region, "header_rows", None),
-                    "data_start_row": getattr(region, "data_start_row", None),
-                    "data_end_row": getattr(region, "data_end_row", None),
+                    "header_row": getattr(region, "head_row_start", None),
+                    "header_row_end": getattr(region, "head_row_end", None),
+                    "data_start_row": getattr(region, "data_row_start", None),
+                    "data_end_row": getattr(region, "data_row_end", None),
                     "columns": cols,
                 })
             out["sheets"][sd.sheet_name] = sheet_info
@@ -263,34 +266,16 @@ class TemplateCodeGenerator:
                 )
                 fdesc = {}
                 for sd in sheets_data:
-                    # 仅取首个 region（与 _build_col_map 一致；源数据 banner 通常已被预处理拆开）
+                    # 仅取首个 region 的列名（源数据 banner 通常已被预处理拆开）
+                    # ⚠️ 不取 region 的 data_start_row：骨架 _append_source_sheets 会把 DataFrame
+                    #    重写为「row1=表头, row2+=数据」的干净 sheet，所以追加后源 sheet 的数据
+                    #    恒从第 2 行开始，与原文件结构无关。data_start_row 固定为 2。
                     regions = sd.regions or []
                     cols: List[str] = []
-                    header_row = 1
-                    data_start_row = 2
                     if regions:
-                        r0 = regions[0]
-                        head = r0.head_data or {}
+                        head = (regions[0].head_data or {})
                         cols.extend(list(head.keys()))
-                        hr = getattr(r0, "header_rows", None)
-                        if isinstance(hr, list) and hr:
-                            hr = hr[0]
-                        ds = getattr(r0, "data_start_row", None)
-                        if hr is not None:
-                            try:
-                                header_row = int(hr)
-                            except Exception:
-                                pass
-                        if ds is not None:
-                            try:
-                                data_start_row = int(ds)
-                            except Exception:
-                                pass
-                    fdesc[sd.sheet_name] = {
-                        "columns": cols,
-                        "header_row": header_row,
-                        "data_start_row": data_start_row,
-                    }
+                    fdesc[sd.sheet_name] = {"columns": cols}
                 out["files"][fname] = fdesc
             except Exception as e:
                 logger.warning(f"源文件 {fname} 解析失败: {e}")
@@ -317,20 +302,36 @@ class TemplateCodeGenerator:
 ## 工作流（骨架已为你完成的部分）
 1. 模板已经被加载为 openpyxl Workbook（保留全部公式/格式/合并单元格）
 2. **源数据已被骨架追加为 wb 的新 sheet**，统一加 `源_` 前缀（如 `源_考勤明细`、`源_津贴`），与模板 sheet 区分
-3. 你的工作：**只在规则文档要求的列**上写入公式；其他列绝不触碰
+3. 公式可用的**两类查找数据源**：
+   - (a) 骨架追加的源文件 sheet（`_SOURCE_MAP`，带 `源_` 前缀）
+   - (b) 模板自带的 sheet（`_COL_MAP` 里的 sheet 本身也可当查找表/数据源，用真实 sheet 名引用）
+4. 你的工作：**只在规则文档要求的列**上写入公式；其他列（含纯数据源 sheet）绝不触碰
 
 ## 严格约束（违反必败）
 1. **只写规则要求的列**：规则没提到的列、模板里 `has_formula=true` 的列**一律跳过**
-2. **【起始行强约束】写入的第一行必须是 `_COL_MAP[sheet]["data_start_row"]`，绝不能从 1 / 2 / 3 等硬编码起步**
-   - 模板可能有多行表头/标题（`data_start_row` 可能 = 4、5、甚至更大），由 excel_parser 已识别并固化在 _COL_MAP 中
-   - 写法范本：`data_start = _COL_MAP[sheet_name]["data_start_row"]; for r in range(data_start, data_start + row_count): ...`
-   - **错误**：`for r in range(2, n+2): ...`（硬编码起始 2）
-   - 同理读源 sheet 时也要用 `_SOURCE_MAP[源_xxx]["data_start_row"]`，不能假设源 sheet 都从第 2 行开始
-3. **优先写公式**：用 `cell.value = "=VLOOKUP(...)"` 等跨 sheet 公式引用 `源_xxx`，让 Excel 重算
+2. **【起始行强约束 + 多区域必读】每个 sheet 的可写区域来自 `_COL_MAP[sheet]["regions"]`（列表，可能不止一个）：**
+   - 每个 region 各有自己的 `data_start_row`，必须**逐区域**从各自的 `data_start_row` 写起
+   - **绝不**用第一个区域的行号套到全表，**绝不**硬编码 1 / 2 / 3
+   - 模板常有多行表头/标题，`data_start_row` 可能 = 4、5、甚至更大，已由 excel_parser 识别并固化在 _COL_MAP
+   - 写法范本：
+     ```python
+     for region in _COL_MAP[sheet_name]["regions"]:
+         data_start = region["data_start_row"]      # ← 必须从这取
+         data_end = region.get("data_end_row")      # 可能为 None
+         for i in range(row_count):
+             r = data_start + i                      # ← data_start 起步
+             ...
+     ```
+   - **错误**：`for r in range(2, n+2): ...`（硬编码起始 2，会写穿表头）
+   - 读源 sheet 时用 `_SOURCE_MAP[源_xxx]["data_start_row"]`（恒为 2，骨架已把源表头重写到第 1 行）
+3. **优先写公式**：用 `cell.value = "=VLOOKUP(...)"` 等跨 sheet 公式让 Excel 重算
    - 写值也行（`cell.value = 100`），但能写公式就别写值
-4. **公式必须引用 `源_xxx` sheet**（骨架追加的源数据 sheet）：
-   - 例如 `=VLOOKUP(B5,'源_考勤明细'!A:Z,3,FALSE)`
-   - sheet 名用 `'` 单引号包裹（Excel 规范）
+4. **公式的查找数据源分两类，必须按类型用对 sheet 名**：
+   - **(a) 骨架追加的源文件** → 用 `_SOURCE_MAP` 里**带 `源_` 前缀**的 key（如 `'源_考勤明细'`）。例：`=VLOOKUP(B5,'源_考勤明细'!A:Z,3,FALSE)`
+   - **(b) 模板自带的 sheet**（已在 `_COL_MAP` 里、规则要求当数据源/查找表用）→ 用它的**真实 sheet 名，不加 `源_` 前缀**（如 `'员工基础表'`）。它本来就在 wb 里，可直接被其他 sheet 的公式引用。例：`=VLOOKUP(B5,'员工基础表'!A:Z,4,FALSE)`
+   - 判断依据：sheet 名出现在 `_SOURCE_MAP` → 用 (a)；出现在 `_COL_MAP` → 用 (b) 真实名
+   - 两类的 sheet 名都用 `'` 单引号包裹（Excel 规范）
+   - 引用模板自带 sheet 做查找时用整列范围（`A:Z`），不受其表头行数影响
 5. **绝不**修改 cell.style/fill/font/border/number_format/alignment
 6. **绝不**调 Workbook() 创建新 wb；**绝不** wb.save（外层会调）
 7. **绝不**硬编码 sheet 名/列字母字面量；用 `_COL_MAP` / `_SOURCE_MAP` 取
@@ -349,35 +350,39 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
     source_data: dict[sheet_key -> {{'df': DataFrame, 'columns': [...]}}]，原始 DataFrame（如果你要 Python 直接计算）
     salary_year/salary_month/monthly_hours: 上下文参数
 
-    标准套路（必须严格按这个写起始行）：
+    标准套路（必须严格按这个写起始行 + 逐区域）：
         from openpyxl.utils import column_index_from_string
         for sheet_name, sinfo in _COL_MAP.items():
             if sheet_name not in wb.sheetnames: continue
             ws = wb[sheet_name]
-            data_start = sinfo["data_start_row"]   # ← 必须从这取，不要硬编码！
 
-            # 取源 sheet 的真实 sheet 名 + 数据起始行
+            # 取源 sheet 的真实 sheet 名 + 数据起始行（恒为 2）
             src_key = "源_考勤明细"   # 来自 _SOURCE_MAP 的 key
             if src_key not in wb.sheetnames: continue
-            src_data_start = _SOURCE_MAP[src_key]["data_start_row"]
+            src_data_start = _SOURCE_MAP[src_key]["data_start_row"]   # = 2
             src_ws = wb[src_key]
-            row_count = src_ws.max_row - src_data_start + 1   # 源数据行数
 
-            for i in range(row_count):
-                r = data_start + i              # ← 目标行：data_start 起步
-                src_r = src_data_start + i      # ← 源行：源的 data_start 起步
-                ws.cell(row=r, column=column_index_from_string("D")).value = (
-                    f"=VLOOKUP(B{{r}},'{{src_key}}'!A:Z,5,FALSE)"
-                )
+            # 逐区域写：每个区域用自己的 data_start_row，绝不套用第一个区域
+            for region in sinfo["regions"]:
+                data_start = region["data_start_row"]   # ← 必须从这取，不要硬编码！
+                row_count = src_ws.max_row - src_data_start + 1   # 源数据行数
+                for i in range(row_count):
+                    r = data_start + i              # ← 目标行：本区域 data_start 起步
+                    src_r = src_data_start + i      # ← 源行：源 data_start(=2) 起步
+                    ws.cell(row=r, column=column_index_from_string("D")).value = (
+                        f"=VLOOKUP(B{{r}},'{{src_key}}'!A:Z,5,FALSE)"
+                    )
     \"\"\"
     from openpyxl.utils import column_index_from_string
     ...
 ```
 
-## _COL_MAP（运行时已注入；目标模板的列结构）
-**结构**：`{{ sheet_name: {{ "header_row": int, "data_start_row": int, "columns": [ {{ "letter": "A", "name": "列名", "has_formula": bool }}, ... ] }} }}`
+## _COL_MAP（运行时已注入；目标模板的列结构，**按区域分组**）
+**结构**：`{{ sheet_name: {{ "regions": [ {{ "header_row": int, "data_start_row": int, "data_end_row": int|None, "columns": [ {{ "letter": "A", "name": "列名", "has_formula": bool }}, ... ] }}, ... ] }} }}`
+- 一个 sheet 的 `regions` 可能有多个（上下堆叠的多张子表），**每个区域各自从它的 `data_start_row` 写起**
 - `letter` 是目标列字母（写公式时用 `column_index_from_string(letter)` 转列号）
 - `has_formula=true` 的列**一律跳过**（保留模板原公式）
+- **这些 sheet 本身也可当查找数据源**：若规则要求从某模板 sheet 里查数据，直接用它的真实 sheet 名引用（如 `'员工基础表'!A:Z`），**不加 `源_` 前缀**
 
 ```json
 {json.dumps(col_map_for_prompt, ensure_ascii=False, indent=2)[:8000]}
@@ -458,48 +463,43 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
     # ==================== 列映射构建（注入生成代码作为常量） ====================
 
     def _build_col_map(self, template_struct: Dict[str, Any]) -> Dict[str, Any]:
-        """把模板结构精简为 {sheet_name: {header_row, data_start_row, columns: [{letter, name, has_formula}]}}
+        """把模板结构精简为 {sheet_name: {"regions": [{header_row, data_start_row, data_end_row, columns:[{letter,name,has_formula}]}, ...]}}
 
-        兜底策略：
-        - header_row / data_start_row 解析失败为 None 时 → 默认 1 / 2，并打印 warning
-        - 没有 columns 的 sheet 仍保留（让 fill_template 能感知到这个 sheet 存在）
+        多区域支持：一个 sheet 内若有多个数据区域（如上下堆叠的两张表），每个区域都带自己的
+        data_start_row，AI 须分别从各区域的数据起始行写公式，绝不能用第一个区域的行号套到全表。
+
+        过滤策略：
+        - data_start_row 无效（None / <=0，即只有表头没有数据的标题区域）的 region 直接丢弃
+        - 一个 region 都没有的 sheet 仍保留空 regions（让 fill_template 感知 sheet 存在）
         """
         out: Dict[str, Any] = {}
         sheets = template_struct.get("sheets", {}) or {}
         for sn, sinfo in sheets.items():
             regions = sinfo.get("regions", []) or []
-            if not regions:
-                logger.warning(f"[_build_col_map] sheet '{sn}' 无 region，使用兜底 header_row=1/data_start_row=2，且 columns 为空")
-                out[sn] = {"header_row": 1, "data_start_row": 2, "columns": []}
-                continue
-            # 取第一个 region（绝大多数模板单 region；多 region 场景未来可扩展）
-            r0 = regions[0]
-            cols_brief = []
-            for c in r0.get("columns", []) or []:
-                cols_brief.append({
-                    "letter": c.get("column_letter"),
-                    "name": c.get("name"),
-                    "has_formula": bool(c.get("has_formula_in_data", False)),
+            region_list = []
+            for r in regions:
+                ds = r.get("data_start_row")
+                # 只有表头没有数据的区域：data_row_start 为 0/None，跳过
+                if ds is None or (isinstance(ds, int) and ds <= 0):
+                    continue
+                hr = r.get("header_row")
+                de = r.get("data_end_row")
+                cols_brief = []
+                for c in r.get("columns", []) or []:
+                    cols_brief.append({
+                        "letter": c.get("column_letter"),
+                        "name": c.get("name"),
+                        "has_formula": bool(c.get("has_formula_in_data", False)),
+                    })
+                region_list.append({
+                    "header_row": int(hr) if isinstance(hr, int) and hr > 0 else None,
+                    "data_start_row": int(ds),
+                    "data_end_row": int(de) if isinstance(de, int) and de > 0 else None,
+                    "columns": cols_brief,
                 })
-            # header_rows 可能是 list/int；统一取首个数值
-            hr = r0.get("header_rows")
-            if isinstance(hr, list) and hr:
-                hr = hr[0]
-            ds = r0.get("data_start_row")
-            if hr is None or ds is None:
-                logger.warning(
-                    f"[_build_col_map] sheet '{sn}' 表头/数据起始行解析失败 "
-                    f"(header_rows={r0.get('header_rows')}, data_start_row={ds})，使用兜底 1/2"
-                )
-                if hr is None:
-                    hr = 1
-                if ds is None:
-                    ds = 2
-            out[sn] = {
-                "header_row": int(hr),
-                "data_start_row": int(ds),
-                "columns": cols_brief,
-            }
+            if not region_list:
+                logger.warning(f"[_build_col_map] sheet '{sn}' 无有效数据区域（可能全为标题/表头），regions=[]")
+            out[sn] = {"regions": region_list}
         return out
 
     def _build_source_map(self, source_struct: Dict[str, Any]) -> Dict[str, Any]:
@@ -525,15 +525,16 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
         """把 source_struct 转为骨架追加 sheet 后的实际结构：
         {
           "源_<原sheet名>": {
-            "header_row": int,
-            "data_start_row": int,        # ← 真实起始行（从 excel_parser 的 region 里取）
+            "header_row": 1,
+            "data_start_row": 2,          # ← 恒为 2（见下方说明）
             "columns": [ {"letter": "A", "name": "工号"}, ... ]
           }
         }
 
         - key 已加 `源_` 前缀（与骨架 _append_source_sheets 一致），AI 可直接用作公式中的 sheet 名
         - 若多文件 sheet 同名则自动加 `_<文件 stem>` 后缀避免冲突
-        - data_start_row 从 _parse_source 解析出的真实值带过来；解析失败兜底 2
+        - ⚠️ data_start_row 恒为 2：骨架把源 DataFrame 重写为 row1=表头/row2+=数据 的干净 sheet，
+          追加后的源 sheet 与原文件的多行表头/标题行无关，数据必从第 2 行起。
         """
         from openpyxl.utils import get_column_letter
         out: Dict[str, Any] = {}
@@ -546,12 +547,8 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
                 # 兼容新结构（dict）和旧结构（list）
                 if isinstance(sinfo, dict):
                     cols = list(sinfo.get("columns") or [])
-                    header_row = int(sinfo.get("header_row") or 1)
-                    data_start_row = int(sinfo.get("data_start_row") or 2)
                 else:
                     cols = list(sinfo or [])
-                    header_row = 1
-                    data_start_row = 2
 
                 base_key = f"{self.SOURCE_PREFIX}{sn}"
                 final_key = base_key
@@ -561,8 +558,8 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
                 final_key = final_key[:31]  # Excel sheet 名上限
                 used_names.add(final_key)
                 out[final_key] = {
-                    "header_row": header_row,
-                    "data_start_row": data_start_row,
+                    "header_row": 1,
+                    "data_start_row": 2,
                     "columns": [
                         {"letter": get_column_letter(i + 1), "name": c}
                         for i, c in enumerate(cols)
@@ -612,12 +609,14 @@ SOURCE_PREFIX = "源_"
 # ==================================================================================
 
 # ==================== 列定位字典（训练时由 excel_parser 解析模板/源数据后固化） ====================
-# 目标模板结构：
-#   _COL_MAP[sheet_name] = {{"header_row": int, "data_start_row": int,
-#                             "columns": [{{"letter": "A", "name": "工号", "has_formula": False}}, ...]}}
+# 目标模板结构（按区域分组，多区域时每个 region 各有自己的 data_start_row）：
+#   _COL_MAP[sheet_name] = {{"regions": [
+#       {{"header_row": int, "data_start_row": int, "data_end_row": int|None,
+#         "columns": [{{"letter": "A", "name": "工号", "has_formula": False}}, ...]}}, ...]}}
 _COL_MAP = {col_map_literal}
 
 # 源 sheet 结构（key 已带 "源_" 前缀，与骨架 _append_source_sheets 追加后的实际 sheet 名一致）：
+#   骨架把源 DataFrame 重写为 row1=表头/row2+=数据，故 data_start_row 恒为 2。
 #   _SOURCE_MAP["源_考勤明细"] = {{"header_row": 1, "data_start_row": 2,
 #                                  "columns": [{{"letter": "A", "name": "工号"}}, ...]}}
 _SOURCE_MAP = {source_map_literal}
@@ -774,14 +773,29 @@ def main():
     if not os.path.exists(TEMPLATE_PATH):
         raise FileNotFoundError(f"模板文件丢失：{{TEMPLATE_PATH}}")
 
-    out_path = os.path.join(output_folder, Path(TEMPLATE_PATH).name)
-    shutil.copy2(TEMPLATE_PATH, out_path)
+    # 有效模板：智算时若注入了 _template_override_path（用户上传的新模板）则优先用它；否则沿用训练时模板
+    _override = globals().get("_template_override_path")
+    _eff_template = _override if (_override and os.path.exists(_override)) else TEMPLATE_PATH
+    if not os.path.exists(_eff_template):
+        raise FileNotFoundError(f"模板文件丢失：{{_eff_template}}")
+    if _override and _eff_template == _override:
+        print(f"使用上传的新模板：{{_override}}")
+    else:
+        print(f"使用训练时模板：{{TEMPLATE_PATH}}")
+
+    out_path = os.path.join(output_folder, Path(_eff_template).name)
+    shutil.copy2(_eff_template, out_path)
     print(f"模板已复制至：{{out_path}}")
 
     source_data = load_source_data()
 
     import openpyxl
     wb = openpyxl.load_workbook(out_path, keep_vba=True, data_only=False)
+
+    # 结构提示（不拦截）：新模板缺少训练时的目标 sheet 时，相关公式会落空
+    _missing = [sn for sn in _COL_MAP.keys() if sn not in wb.sheetnames]
+    if _missing:
+        print(f"[模板结构警告] 当前模板缺少训练时的目标 sheet: {{_missing}}，相关公式可能落空")
 
     print("步骤：追加源数据 sheet（前缀 `源_`，供 AI 公式引用）...")
     try:
@@ -976,7 +990,7 @@ if __name__ == "__main__":
 3. **完整输出 fill_template 函数**（包括所有列的处理，未改动的列也要 1:1 保留原代码）
 4. **【起始行强约束】数据写入起始行必须用 `_COL_MAP[sheet]["data_start_row"]`，绝不硬编码 1/2/3**
    - 同样：读源 sheet 必须用 `_SOURCE_MAP[源_xxx]["data_start_row"]`
-5. **公式必须引用 `源_xxx` sheet**（骨架已追加），sheet 名外用 `'` 单引号
+5. **公式查找数据源分两类**：骨架追加的源文件用 `_SOURCE_MAP` 的 `源_xxx` key；模板自带 sheet（在 `_COL_MAP` 里）用其**真实 sheet 名、不加 `源_` 前缀**。sheet 名外用 `'` 单引号
 6. **跳过模板里 `has_formula=True` 的列**（保留原公式）
 7. **【f-string 引号强约束】**：外层 f-string 用 **双引号** `f"..."`，公式中 sheet 名用 `'` 单引号；空字符串拼接 `EMPTY` 常量（=`'""'`），写法：`f"=IFERROR(VLOOKUP(B{{r}},'源_考勤'!A:Z,3,FALSE),{{EMPTY}})"`
    - **错误**：`f'=IFERROR(VLOOKUP(...,'源_考勤'!A:Z,...),"")'`  ← 单引号嵌套立即 SyntaxError

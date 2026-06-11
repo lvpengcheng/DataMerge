@@ -4,9 +4,20 @@
 # ==========================================
 set -e
 
+# 启用 BuildKit：Dockerfile 用了 pip 缓存挂载（RUN --mount=type=cache），
+# 需 BuildKit 才生效；旧版构建器会忽略甚至报错。
+export DOCKER_BUILDKIT=1
+export COMPOSE_DOCKER_CLI_BUILD=1
+
 VERSION="1.0.0"
 IMAGE_NAME="datamerge"
 IMAGE_TAG="${IMAGE_NAME}:${VERSION}"
+
+# 可选：设置国内 pip 镜像加速（如 export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple）
+PIP_BUILD_ARG=""
+if [ -n "${PIP_INDEX_URL}" ]; then
+    PIP_BUILD_ARG="--build-arg PIP_INDEX_URL=${PIP_INDEX_URL}"
+fi
 
 echo "=========================================="
 echo "  DataMerge Docker 部署"
@@ -50,8 +61,8 @@ if [ ! -f .env ]; then
 fi
 
 echo ""
-echo "[1/3] 构建 Docker 镜像（首次约 5-10 分钟）..."
-docker build -t ${IMAGE_TAG} -t ${IMAGE_NAME}:latest .
+echo "[1/3] 构建 Docker 镜像（首次约 5-10 分钟，之后命中缓存会快很多）..."
+docker build ${PIP_BUILD_ARG} -t ${IMAGE_TAG} -t ${IMAGE_NAME}:latest .
 
 echo ""
 echo "[2/3] 创建数据目录..."

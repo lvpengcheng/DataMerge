@@ -3943,6 +3943,7 @@ async def run_compute_task(
     file_passwords=None,
     pre_validated_mapping=None,
     precheck_auto_filled=None,
+    template_override_path: Optional[str] = None,
 ):
     """独立的计算任务函数，由 submit 端点触发后台运行。
 
@@ -4312,6 +4313,10 @@ async def run_compute_task(
                 if pre_loaded_source_data:
                     module._pre_loaded_source_data = pre_loaded_source_data
 
+                # 模板模式：注入用户上传的新模板路径，骨架 main() 会优先用它覆盖训练模板
+                if template_override_path:
+                    module._template_override_path = template_override_path
+
                 spec.loader.exec_module(module)
 
                 # 【加密支持】monkey-patch IntelligentExcelParser 自动注入密码
@@ -4513,6 +4518,7 @@ async def compute_submit(
     tenant_id: str = Form(...),
     script_id: str = Form(...),
     source_files: List[UploadFile] = File(...),
+    template_file: Optional[UploadFile] = File(None),
     salary_year: Optional[int] = Form(None),
     salary_month: Optional[int] = Form(None),
     standard_hours: Optional[float] = Form(None),
@@ -4521,7 +4527,10 @@ async def compute_submit(
     confirmed_renames: Optional[str] = Form(None),
     skip_history_check: Optional[bool] = Form(False),
 ):
-    """提交计算任务，立即返回 task_id，计算在后台运行。"""
+    """提交计算任务，立即返回 task_id，计算在后台运行。
+
+    template_file: 模板模式可选上传新模板覆盖训练时模板；不传则用训练时模板。
+    """
     try:
         logger.info(f"[compute/submit] 租户={tenant_id}, 脚本={script_id}")
 
@@ -4544,6 +4553,18 @@ async def compute_submit(
         for file in source_files:
             data = await file.read()
             file_buffers.append((file.filename, data))
+
+        # 模板模式可选新模板：单独存到 temp_dir/template（不放进 source_dir，避免被当成源数据 sheet 追加）
+        template_override_path = None
+        if template_file is not None and template_file.filename:
+            _tpl_bytes = await template_file.read()
+            template_dir = temp_dir / "template"
+            template_dir.mkdir(parents=True, exist_ok=True)
+            _tpl_path = template_dir / template_file.filename
+            with open(_tpl_path, 'wb') as f:
+                f.write(_tpl_bytes)
+            template_override_path = str(_tpl_path.resolve())
+            logger.info(f"[compute/submit] 收到上传模板，将覆盖训练模板: {template_file.filename}")
 
         passwords_dict = {}
         if file_passwords:
@@ -4702,6 +4723,7 @@ async def compute_submit(
             file_passwords=file_passwords,
             pre_validated_mapping=pc_result.file_mapping,
             precheck_auto_filled=pc_result.auto_filled,
+            template_override_path=template_override_path,
         ))
 
         logger.info(f"[compute/submit] 任务已提交: task_id={task_id_str}")
@@ -6050,19 +6072,24 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
                 result_file = script_dir / "training_result.json"
                 score = None
                 created = None
+                _mode = None
                 if result_file.exists():
                     try:
                         data = json.loads(result_file.read_text(encoding="utf-8"))
                         score = data.get("best_score")
                         created = data.get("saved_time")
+                        _mode = data.get("mode")
                     except Exception:
                         pass
+                if _mode is None and matched_db is not None:
+                    _mode = getattr(matched_db, "mode", None)
 
                 entry = {
                     "script_id": script_id,
                     "score": score,
                     "is_active": script_id == active_script_id,
                     "created": created or datetime.fromtimestamp(script_dir.stat().st_mtime).isoformat(),
+                    "mode": _mode,
                 }
                 if friendly_name:
                     entry["name"] = friendly_name
@@ -6121,6 +6148,7 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
                 "is_active": ds.name == active_script_id,
                 "created": ds.created_at.isoformat() if ds.created_at else None,
                 "db_id": ds.id,
+                "mode": getattr(ds, "mode", None),
             })
             if ds_hash:
                 seen_hashes.add(ds_hash)
