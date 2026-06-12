@@ -65,11 +65,9 @@ RUN cp /app/libs/libSkiaSharp.so /usr/lib/libSkiaSharp.so \
 RUN printf '{\n  "runtimeOptions": {\n    "tfm": "net9.0",\n    "framework": {\n      "name": "Microsoft.NETCore.App",\n      "version": "9.0.11"\n    },\n    "additionalProbingPaths": ["/app/libs"]\n  }\n}\n' > /app/libs/runtimeconfig.json
 
 COPY excel_parser.py aspose_init.py run.py split_by_banner.py ./
-COPY backend/ ./backend/
-COPY frontend/ ./frontend/
-COPY global_assets/ ./global_assets/
 
-# ========== 7. 验证 ==========
+# ========== 7. 验证（放在 COPY backend/frontend 之前：只依赖 libs + aspose_init，
+#            这样改业务代码时该层仍命中缓存，不再每次重跑 .NET/Aspose 初始化测试） ==========
 # 文件检查 + ldd（仅显示信息）
 RUN echo "=== File check ===" \
     && test -f /app/libs/SkiaSharp.dll && echo "OK: SkiaSharp.dll" \
@@ -95,6 +93,12 @@ wb = Workbook(); \
 wb.Worksheets[0].Cells[0,0].PutValue('Docker build test'); \
 print('>>> SUCCESS: Aspose.Cells + Workbook OK on Linux'); \
 "
+
+# ========== 业务代码（放在最后：改代码只重跑这几步轻量 COPY，
+#            前面的 apt/dotnet/字体/pip/libs/Aspose 验证全部命中缓存） ==========
+COPY backend/ ./backend/
+COPY frontend/ ./frontend/
+COPY global_assets/ ./global_assets/
 
 # ========== 8. 运行时目录 ==========
 RUN mkdir -p tenants data logs output compare_results temp

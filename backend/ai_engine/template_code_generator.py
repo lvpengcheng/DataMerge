@@ -598,6 +598,11 @@ import shutil
 import sys
 import pandas as pd
 from pathlib import Path
+# 顶层导入 openpyxl：智算走 importlib 执行（非沙箱），不会注入全局 openpyxl，
+# AI 生成的 fill_template 直接引用 openpyxl/列字母工具时需要它在模块级可用，
+# 否则会报 name 'openpyxl' is not defined（智训沙箱有注入故不报）。
+import openpyxl
+from openpyxl.utils import column_index_from_string, get_column_letter
 
 # 模板持久化路径（训练时确定，智算复用）
 TEMPLATE_PATH = {tpl_repr}
@@ -790,7 +795,10 @@ def main():
     source_data = load_source_data()
 
     import openpyxl
-    wb = openpyxl.load_workbook(out_path, keep_vba=True, data_only=False)
+    # keep_vba 只对 .xlsm 启用：对普通 .xlsx 启用会让 openpyxl 把内容类型写成
+    # macroEnabled(xlsm)，但扩展名仍是 .xlsx → Excel 报"文件损坏或扩展名无效"。
+    _keep_vba = out_path.lower().endswith(".xlsm")
+    wb = openpyxl.load_workbook(out_path, keep_vba=_keep_vba, data_only=False)
 
     # 结构提示（不拦截）：新模板缺少训练时的目标 sheet 时，相关公式会落空
     _missing = [sn for sn in _COL_MAP.keys() if sn not in wb.sheetnames]

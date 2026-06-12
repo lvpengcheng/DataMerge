@@ -3930,6 +3930,42 @@ def _persist_compute_failed(db, task_id, error_message):
             pass
 
 
+def _normalize_xlsx_content_type(xlsx_path) -> bool:
+    """修复 openpyxl keep_vba=True 在普通 .xlsx 上保存留下的"宏"痕迹。
+
+    早期模板模式脚本用 load_workbook(keep_vba=True) 加载普通 .xlsx，保存时 openpyxl 会留下两处
+    与宏相关的残留，但包里其实没有 vbaProject.bin：
+      ① [Content_Types].xml 把 workbook 标成 macroEnabled(xlsm)；
+      ② xl/_rels/workbook.xml.rels 里有一条悬空的 vbaProject 关系（指向不存在的 vbaProject.bin）。
+    扩展名仍是 .xlsx → Excel 报"文件损坏/扩展名无效"或"未启用宏但包含启用宏的内容"。
+
+    修复方式：用 openpyxl keep_vba=False 重新加载并另存，openpyxl 会干净地重建 [Content_Types].xml
+    与 workbook.xml.rels，两处残留同时清除（公式/格式/数据完整保留）。仅当检测到上述残留时才动手。
+    """
+    import zipfile
+    try:
+        if not str(xlsx_path).lower().endswith(".xlsx"):
+            return False
+        with zipfile.ZipFile(xlsx_path) as z:
+            names = z.namelist()
+            ct = z.read("[Content_Types].xml").decode("utf-8", "ignore") if "[Content_Types].xml" in names else ""
+            rels = z.read("xl/_rels/workbook.xml.rels").decode("utf-8", "ignore") if "xl/_rels/workbook.xml.rels" in names else ""
+            has_vba_bin = any("vbaProject" in n.lower() for n in names)
+        # 真有 vbaProject.bin 的（真正的 xlsm 误存成 xlsx）不在此处理，避免误删宏
+        if has_vba_bin:
+            return False
+        if ("macroEnabled" not in ct) and ("vbaProject" not in rels):
+            return False
+        import openpyxl as _opx
+        _wb = _opx.load_workbook(str(xlsx_path), keep_vba=False, data_only=False)
+        _wb.save(str(xlsx_path))
+        logger.info(f"[内容类型修复] 已清除 macroEnabled/悬空 vbaProject 残留: {os.path.basename(str(xlsx_path))}")
+        return True
+    except Exception as e:
+        logger.warning(f"[内容类型修复] 跳过 {xlsx_path}: {e}")
+        return False
+
+
 async def run_compute_task(
     task_id: str,
     buffer,
@@ -4302,6 +4338,18 @@ async def run_compute_task(
                 if standard_hours is not None:
                     module.monthly_standard_hours = standard_hours
 
+                # 兜底注入 openpyxl 全局：智算走 importlib 执行（非沙箱），早期模板脚本
+                # 顶层未 import openpyxl，AI 生成代码直接引用会报 name 'openpyxl' is not defined。
+                # 与训练沙箱保持一致地把 openpyxl 及常用列字母工具注入模块，救活旧脚本。
+                try:
+                    import openpyxl as _openpyxl
+                    from openpyxl.utils import column_index_from_string as _cifs, get_column_letter as _gcl
+                    module.openpyxl = _openpyxl
+                    module.column_index_from_string = _cifs
+                    module.get_column_letter = _gcl
+                except Exception as _opx_err:
+                    logger.warning(f"openpyxl 全局注入失败: {_opx_err}")
+
                 # 注入历史数据提供者（供公式代码模板的 write_history_sheet 使用）
                 try:
                     from backend.utils.historical_data import HistoricalDataProvider
@@ -4413,6 +4461,11 @@ async def run_compute_task(
         output_files = list(output_dir.glob("*.xlsx"))
         if not output_files:
             raise Exception("未生成输出文件")
+
+        # 兜底修复：早期模板脚本 keep_vba=True 保存出的 .xlsx 内容类型被错标为 macroEnabled，
+        # Excel 会报"文件损坏或扩展名无效"。此处统一改回普通 xlsx 类型，救活旧脚本产物。
+        for _of in output_files:
+            _normalize_xlsx_content_type(_of)
 
         output_file = output_files[0]
 
@@ -5223,7 +5276,15 @@ async def compute_with_script_stream(
                             if standard_hours is not None:
                                 module.monthly_standard_hours = standard_hours
 
-                            # 注入历史数据提供者（供公式代码模板的 write_history_sheet 使用）
+                            # 兜底注入 openpyxl 全局（importlib 执行非沙箱，旧模板脚本顶层未 import）
+                            try:
+                                import openpyxl as _openpyxl
+                                from openpyxl.utils import column_index_from_string as _cifs, get_column_letter as _gcl
+                                module.openpyxl = _openpyxl
+                                module.column_index_from_string = _cifs
+                                module.get_column_letter = _gcl
+                            except Exception as _opx_err:
+                                logger.warning(f"openpyxl 全局注入失败: {_opx_err}")
                             try:
                                 from backend.utils.historical_data import HistoricalDataProvider
                                 module.history_provider = HistoricalDataProvider(tenant_id)
@@ -5330,6 +5391,10 @@ async def compute_with_script_stream(
                     output_files = list(output_dir.glob("*.xlsx"))
                     if not output_files:
                         raise Exception("未生成输出文件")
+
+                    # 兜底修复 macroEnabled 内容类型（早期模板脚本 keep_vba=True 产物）
+                    for _of in output_files:
+                        _normalize_xlsx_content_type(_of)
 
                     output_file = output_files[0]
 
