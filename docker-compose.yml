@@ -26,6 +26,12 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
+    # 资源上限：把失控计算（如卡死的 CalculateFormula、超大文件）的爆炸半径锁在容器内，
+    # OOM 时被杀的是容器而不是宿主机 VM，避免拖垮整机/无法重启。可在 .env 调整：
+    #   APP_MEM_LIMIT=4g   APP_MEM_RESERVATION=1g   APP_CPUS=2
+    mem_limit: ${APP_MEM_LIMIT:-4g}
+    mem_reservation: ${APP_MEM_RESERVATION:-1g}
+    cpus: ${APP_CPUS:-2}
 
   redis:
     image: redis:7-alpine

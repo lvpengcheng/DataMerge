@@ -1323,7 +1323,8 @@ class IntelligentExcelParser:
                         best_region_only: bool = False,
                         password: str = None,
                         read_formulas: bool = True,
-                        skip_hidden_sheets: bool = None) -> List[SheetData]:
+                        skip_hidden_sheets: bool = None,
+                        calculate_formulas: bool = False) -> List[SheetData]:
         """读取并解析Excel文件
 
         Args:
@@ -1340,6 +1341,9 @@ class IntelligentExcelParser:
             password: 文件打开密码（加密文件需要）
             read_formulas: 是否读取公式，False时使用ExportArray批量读取大幅提升性能
             skip_hidden_sheets: 是否跳过隐藏sheet。None=读取 .env 的 EXCEL_SKIP_HIDDEN_SHEETS（默认true）
+            calculate_formulas: 读取前是否先 CalculateFormula() 强制计算公式。
+                          含公式但无缓存值的文件（如 openpyxl/模板模式产出的公式文件）必须开启，
+                          否则 .Value 读到空。默认 False（普通文件已带缓存值，省去计算开销）。
 
         Returns:
             解析后的Sheet数据列表
@@ -1367,6 +1371,14 @@ class IntelligentExcelParser:
                         raise
             else:
                 aspose_wb = _licensed_workbook(str(file_path), load_opts)
+
+            # 含公式但无缓存值的文件（openpyxl/模板模式产出）必须先计算，否则 .Value 读到空。
+            # 包 try：个别坏公式/外链不应阻断整体解析，失败则退回缓存值。
+            if calculate_formulas:
+                try:
+                    aspose_wb.CalculateFormula()
+                except Exception as _calc_err:
+                    logger.warning(f"CalculateFormula 失败（退回缓存值）[{file_path}]: {_calc_err}")
 
             # 提取当前文件的 manual_headers 配置
             file_manual_headers = self._extract_file_manual_headers(file_path, manual_headers)

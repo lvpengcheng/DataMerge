@@ -798,7 +798,8 @@ class FastHeaderMatcher:
                 file_path, manual_headers=file_manual_headers,
                 active_sheet_only=not multi_sheet_source,
                 best_region_only=not multi_sheet_source,
-                read_formulas=False
+                read_formulas=False,
+                calculate_formulas=True,  # 含公式无缓存值的源（如模板产出）先算再读，避免读到空
             )
             return file_path, file_name, sheet_list
 

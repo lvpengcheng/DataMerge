@@ -272,7 +272,8 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None,
                 manual_headers=manual_headers,
                 active_sheet_only=not multi_sheet_source,
                 best_region_only=True,
-                read_formulas=False,  # 脚本执行阶段不需要公式，使用批量读取提升性能
+                read_formulas=False,  # 脚本执行阶段不需要公式文本，使用批量读取提升性能
+                calculate_formulas=True,  # 但要先算公式：含公式无缓存值的源（如模板产出）否则读到空
                 # 不传 max_data_rows → 加载全量数据
             )
             if not results:

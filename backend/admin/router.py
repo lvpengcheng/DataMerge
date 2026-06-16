@@ -703,7 +703,10 @@ def _read_sheets_with_letter_columns(file_path: str):
     from excel_parser import IntelligentExcelParser
 
     parser = IntelligentExcelParser()
-    sheet_data_list = parser.parse_excel_file(file_path, read_formulas=False)
+    # calculate_formulas=True：报表数据源常是"计算结果文件"，含公式列但无缓存值
+    # （openpyxl/模板模式产出的公式不会自动算）。不先算的话 .Value 读到空，
+    # SmartMarker &=DT.[列] 就填成空白。先 CalculateFormula 再取值。
+    sheet_data_list = parser.parse_excel_file(file_path, read_formulas=False, calculate_formulas=True)
 
     sheets: dict = {}
     header_map: dict = {}
