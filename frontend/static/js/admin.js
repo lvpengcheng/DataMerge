@@ -266,6 +266,7 @@ const Admin = {
             label: '智能小工具', children: [
                 { key: 'menu.tools', label: '进入智能小工具页' },
                 { key: 'tools.split_sheet', label: '└ Sheet 拆分' },
+                { key: 'tools.data_merge', label: '└ 多表数据合并' },
                 { key: 'tools.templates', label: '└ 模版管理（管理员）' },
                 { key: 'tools.training_history', label: '└ 训练历史' },
                 { key: 'tools.compute_history', label: '└ 计算历史' },

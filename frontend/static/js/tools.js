@@ -5,6 +5,9 @@
 
 let _modalCallback = null;
 let _splitFiles = [];
+let _mergeFiles = [];
+let _mergeAnalysis = null;   // analyze 返回的结果
+let _mergeGroups = [];       // 当前结果列（直连 or AI 合并后）
 const _ALLOWED_EXT = new Set(['xlsx', 'xls', 'xlsm']);
 
 async function _alertErr(resp, fallback) {
@@ -33,6 +36,7 @@ const Tools = {
 
         this.initTabs();
         this.initSplitSheet();
+        this.initDataMerge();
     },
 
     initTabs() {
@@ -44,8 +48,7 @@ const Tools = {
                 const tab = btn.dataset.tab;
                 document.getElementById('tab-' + tab).classList.add('active');
                 if (tab === 'templates') this.loadTemplateTenants().then(() => this.loadTemplates());
-                else if (tab === 'training-history') this.loadTrainingHistory();
-                else if (tab === 'compute-history') this.loadComputeHistory();
+                else if (tab === 'training-history') this.loadTrainingHistory();                else if (tab === 'compute-history') this.loadComputeHistory();
                 else if (tab === 'data-compare') this.loadCompareHistory();
             });
         });
@@ -177,6 +180,244 @@ const Tools = {
         } finally {
             btn.disabled = (_splitFiles.length === 0);
         }
+    },
+
+    // ==================== 多表数据合并 ====================
+    initDataMerge() {
+        const zone = document.getElementById('merge-upload-zone');
+        const input = document.getElementById('merge-file-input');
+        if (!zone || !input) return;
+        zone.addEventListener('click', () => input.click());
+        zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('dragover'); });
+        zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+        zone.addEventListener('drop', (e) => {
+            e.preventDefault(); zone.classList.remove('dragover');
+            this._addMergeFiles(e.dataTransfer.files);
+        });
+        input.addEventListener('change', () => this._addMergeFiles(input.files));
+        document.getElementById('btn-merge-analyze').addEventListener('click', () => this._analyzeMerge());
+        document.getElementById('btn-merge-execute').addEventListener('click', () => this._doMerge());
+        document.getElementById('btn-merge-match').addEventListener('click', () => this._matchMerge());
+        document.getElementById('merge-select-all').addEventListener('click', () => this._mergeToggleAll(true));
+        document.getElementById('merge-select-none').addEventListener('click', () => this._mergeToggleAll(false));
+    },
+
+    _addMergeFiles(fileList) {
+        for (const f of Array.from(fileList || [])) {
+            const ext = (f.name.split('.').pop() || '').toLowerCase();
+            if (!_ALLOWED_EXT.has(ext)) continue;
+            if (_mergeFiles.some(x => x.name === f.name && x.size === f.size)) continue;
+            _mergeFiles.push(f);
+        }
+        this._renderMergeList();
+    },
+
+    _renderMergeList() {
+        const box = document.getElementById('merge-file-list');
+        if (_mergeFiles.length === 0) {
+            box.innerHTML = '';
+            document.getElementById('btn-merge-analyze').disabled = true;
+            return;
+        }
+        box.innerHTML = _mergeFiles.map((f, i) => `
+            <div class="file-row">
+                <span>📄 ${_escape(f.name)} <span style="color:#999;">(${(f.size / 1024).toFixed(1)} KB)</span></span>
+                <span class="rm" data-i="${i}">×</span>
+            </div>`).join('');
+        box.querySelectorAll('.rm').forEach(el => el.addEventListener('click', (e) => {
+            _mergeFiles.splice(parseInt(e.target.dataset.i, 10), 1);
+            this._renderMergeList();
+        }));
+        document.getElementById('btn-merge-analyze').disabled = (_mergeFiles.length < 2);
+    },
+
+    _setMergeStatus(text, kind) {
+        const el = document.getElementById('merge-status');
+        el.textContent = text || '';
+        el.className = 'status' + (kind ? ' ' + kind : '');
+    },
+
+    async _analyzeMerge() {
+        if (_mergeFiles.length < 2) { this._setMergeStatus('请至少上传 2 个文件', 'error'); return; }
+        const btn = document.getElementById('btn-merge-analyze');
+        btn.disabled = true;
+        this._setMergeStatus('解析中...');
+        try {
+            const fd = new FormData();
+            _mergeFiles.forEach(f => fd.append('files', f));
+            fd.append('tenant_id', '__tools_merge__');
+            const resp = await AUTH.authFetch('/api/tools/merge/analyze', { method: 'POST', body: fd });
+            if (!resp.ok) { await _alertErr(resp, '解析失败'); this._setMergeStatus('解析失败', 'error'); return; }
+            _mergeAnalysis = await resp.json();
+            this._renderMergeConfig(_mergeAnalysis);
+            const hit = (_mergeAnalysis.cache_hit_files || []).length;
+            this._setMergeStatus(`解析完成${hit ? `（${hit} 个文件有历史匹配缓存）` : ''}`, 'ok');
+        } catch (e) {
+            this._setMergeStatus(`失败: ${e.message}`, 'error');
+        } finally {
+            btn.disabled = false;
+        }
+    },
+
+    _renderMergeConfig(data) {
+        const files = data.files || [];
+
+        // 主键下拉（每文件）
+        document.getElementById('merge-key-map').innerHTML = files.map(f => `
+            <div style="margin:4px 0;">
+                <span style="display:inline-block;min-width:160px;">${_escape(f.name)}：</span>
+                <select class="mg-key" data-file="${_escape(f.name)}">
+                    ${(f.columns || []).map(c => `<option value="${_escape(c)}">${_escape(c)}</option>`).join('')}
+                </select>
+            </div>`).join('');
+
+        // 基准文件
+        document.getElementById('merge-base-file').innerHTML =
+            files.map(f => `<option value="${_escape(f.name)}">${_escape(f.name)}</option>`).join('');
+
+        // 字段选择（按文件分块，标注来源）
+        document.getElementById('merge-field-select').innerHTML = files.map(f => `
+            <div style="margin-bottom:10px;">
+                <div style="font-weight:600;color:#2c3e50;margin-bottom:4px;">📄 ${_escape(f.name)}</div>
+                <div style="display:flex;flex-wrap:wrap;gap:4px 16px;">
+                    ${(f.columns || []).map(c => `
+                        <label style="display:inline-flex;align-items:center;gap:4px;font-size:13px;">
+                            <input type="checkbox" class="mg-field" data-file="${_escape(f.name)}" data-col="${_escape(c)}" checked>
+                            ${_escape(c)}
+                        </label>`).join('')}
+                </div>
+            </div>`).join('');
+
+        // 默认结果列 = 每个勾选字段直连一列；字段勾选变化 → 重置为直连
+        document.getElementById('merge-field-select').addEventListener('change', () => this._rebuildDirectGroups());
+        this._rebuildDirectGroups();
+        document.getElementById('merge-config').style.display = 'block';
+    },
+
+    _mergeToggleAll(checked) {
+        document.querySelectorAll('#merge-field-select .mg-field').forEach(cb => { cb.checked = checked; });
+        this._rebuildDirectGroups();
+    },
+
+    _selectedFields() {
+        return Array.from(document.querySelectorAll('#merge-field-select .mg-field:checked'))
+            .map(cb => ({ file: cb.dataset.file, col: cb.dataset.col }));
+    },
+
+    _rebuildDirectGroups() {
+        // 直连：每个勾选字段各成一列；同名列加来源后缀区分
+        const sel = this._selectedFields();
+        const nameCount = {};
+        sel.forEach(s => { nameCount[s.col] = (nameCount[s.col] || 0) + 1; });
+        _mergeGroups = sel.map(s => ({
+            name: nameCount[s.col] > 1 ? `${s.col}（${s.file}）` : s.col,
+            sources: [{ file: s.file, col: s.col }],
+        }));
+        this._renderGroupsPreview();
+        this._setMergeMatchStatus('');
+    },
+
+    _renderGroupsPreview() {
+        const tbody = document.querySelector('#merge-groups-table tbody');
+        tbody.innerHTML = (_mergeGroups || []).map((g, gi) => {
+            const multi = g.sources.length > 1;
+            const srcText = g.sources.map(s => `${_escape(s.file)} · ${_escape(s.col)}`).join('<br>');
+            return `<tr>
+                <td><input class="mg-name" data-gi="${gi}" value="${_escape(g.name)}" style="width:180px;"></td>
+                <td>${srcText}${multi ? ' <span style="color:#c0392b;font-size:12px;">[多源·值不一致将标红]</span>' : ''}</td>
+            </tr>`;
+        }).join('');
+    },
+
+    async _matchMerge() {
+        const sel = this._selectedFields();
+        if (!sel.length) { this._setMergeMatchStatus('请先勾选字段', 'error'); return; }
+        const useAi = document.getElementById('merge-use-ai').checked;
+        const btn = document.getElementById('btn-merge-match');
+        btn.disabled = true;
+        this._setMergeMatchStatus(useAi ? 'AI 匹配中...' : '合并同名列中...');
+        try {
+            const resp = await AUTH.authFetch('/api/tools/merge/match', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    session_id: _mergeAnalysis.session_id,
+                    tenant_id: '__tools_merge__',
+                    selected: sel,
+                    use_ai: useAi,
+                    ai_provider: 'deepseek',
+                }),
+            });
+            if (!resp.ok) { await _alertErr(resp, '匹配失败'); this._setMergeMatchStatus('匹配失败', 'error'); return; }
+            const data = await resp.json();
+            _mergeGroups = (data.groups || []).map(g => ({ name: g.name, sources: g.sources }));
+            this._renderGroupsPreview();
+            const merged = _mergeGroups.filter(g => g.sources.length > 1).length;
+            this._setMergeMatchStatus(`完成：合并出 ${merged} 个多源列${useAi ? '（含 AI）' : '（仅同名）'}，可在下方改名`, 'ok');
+        } catch (e) {
+            this._setMergeMatchStatus(`失败: ${e.message}`, 'error');
+        } finally {
+            btn.disabled = false;
+        }
+    },
+
+    _setMergeMatchStatus(text, kind) {
+        const el = document.getElementById('merge-match-status');
+        if (!el) return;
+        el.textContent = text || '';
+        el.className = 'status' + (kind ? ' ' + kind : '');
+    },
+
+    async _doMerge() {
+        if (!_mergeAnalysis) return;
+        // 用预览表里的（可能改过名的）结果列
+        const groups = (_mergeGroups || []).map((g, gi) => {
+            const inp = document.querySelector(`.mg-name[data-gi="${gi}"]`);
+            return { name: (inp && inp.value.trim()) || g.name, sources: g.sources };
+        });
+        if (!groups.length) { this._setMergeExecStatus('请至少勾选一个字段', 'error'); return; }
+        const key_map = {};
+        document.querySelectorAll('.mg-key').forEach(sel => { key_map[sel.dataset.file] = sel.value; });
+
+        const btn = document.getElementById('btn-merge-execute');
+        btn.disabled = true;
+        this._setMergeExecStatus('生成中...');
+        try {
+            const body = {
+                session_id: _mergeAnalysis.session_id,
+                tenant_id: '__tools_merge__',
+                key_map,
+                result_columns: groups,
+                merge_mode: document.getElementById('merge-mode').value,
+                base_file: document.getElementById('merge-base-file').value,
+                normalize_keys: document.getElementById('merge-normalize-keys').checked,
+            };
+            const resp = await AUTH.authFetch('/api/tools/merge/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            if (!resp.ok) { await _alertErr(resp, '合并失败'); this._setMergeExecStatus('合并失败', 'error'); return; }
+            const conflicts = resp.headers.get('X-Merge-Conflicts') || '0';
+            const rows = resp.headers.get('X-Merge-Rows') || '0';
+            const blob = await resp.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = 'merged_result.xlsx';
+            document.body.appendChild(a); a.click(); document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            this._setMergeExecStatus(`完成：${rows} 行，${conflicts} 个冲突主键已标红，已下载`, 'ok');
+        } catch (e) {
+            this._setMergeExecStatus(`失败: ${e.message}`, 'error');
+        } finally {
+            btn.disabled = false;
+        }
+    },
+
+    _setMergeExecStatus(text, kind) {
+        const el = document.getElementById('merge-exec-status');
+        el.textContent = text || '';
+        el.className = 'status' + (kind ? ' ' + kind : '');
     },
 
     // ==================== 训练历史 ====================

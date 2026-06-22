@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>智能小工具 - 数据整合平台</title>
     <link rel="stylesheet" href="/static/css/admin.css?v=20260414t">
-    <link rel="stylesheet" href="/static/css/tools.css?v=20260521c">
+    <link rel="stylesheet" href="/static/css/tools.css?v=20260616a">
 </head>
 <body>
     <div class="container">
@@ -26,6 +26,7 @@
         <!-- Tab 导航 -->
         <div class="tab-nav">
             <button class="tab-btn active" data-tab="split-sheet" data-perm="tools.split_sheet">Sheet拆分</button>
+            <button class="tab-btn" data-tab="data-merge" data-perm="tools.data_merge">多表合并</button>
             <button class="tab-btn admin-only" data-tab="templates" data-perm="tools.templates">模版管理</button>
             <button class="tab-btn" data-tab="training-history" data-perm="tools.training_history">训练历史</button>
             <button class="tab-btn" data-tab="compute-history" data-perm="tools.compute_history">计算历史</button>
@@ -50,6 +51,86 @@
                 <div class="actions">
                     <button class="btn btn-primary" id="btn-split" disabled>开始拆分并下载</button>
                     <span class="status" id="split-status"></span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 多表合并 Tab -->
+        <div class="tab-content" id="tab-data-merge">
+            <div class="tool-page">
+                <h2>多表数据合并</h2>
+                <div class="desc">
+                    一次上传多个 Excel，按主键把各表挑出的字段归并成一张表。先按列名精确匹配 + 历史缓存，
+                    差异列名用 AI 辅助匹配（可人工修正）。同一主键在不同表对应同一结果列却值不一致时，
+                    该主键复制成多行并整组标红。
+                </div>
+                <div class="upload-zone" id="merge-upload-zone">
+                    <div>点击或拖拽 Excel 文件到此处（至少 2 个）</div>
+                    <div style="font-size:12px;margin-top:6px;">支持 .xlsx / .xls / .xlsm，可多选</div>
+                    <input id="merge-file-input" type="file" accept=".xlsx,.xls,.xlsm" multiple style="display:none;">
+                </div>
+                <div class="split-file-list" id="merge-file-list"></div>
+                <div class="actions">
+                    <button class="btn btn-primary" id="btn-merge-analyze" disabled>解析字段</button>
+                    <span class="status" id="merge-status"></span>
+                </div>
+
+                <div id="merge-config" style="display:none;margin-top:20px;">
+                    <h3>① 合并设置</h3>
+                    <div style="display:flex;gap:24px;flex-wrap:wrap;">
+                        <div class="form-group">
+                            <label>合并模式：</label>
+                            <select id="merge-mode">
+                                <option value="union">全量并集（所有主键）</option>
+                                <option value="base">以基准文件为准（仅基准文件的主键）</option>
+                                <option value="conflict_only">仅输出有冲突的主键</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>基准文件：</label>
+                            <select id="merge-base-file"></select>
+                        </div>
+                        <div class="form-group" style="display:flex;align-items:center;gap:6px;">
+                            <input type="checkbox" id="merge-normalize-keys" checked style="width:auto;">
+                            <label for="merge-normalize-keys" style="margin:0;cursor:pointer;">主键归一化（1.0=1）</label>
+                        </div>
+                    </div>
+                    <div class="form-group" style="margin-top:8px;">
+                        <label>主键列（每个文件）：</label>
+                        <div id="merge-key-map"></div>
+                    </div>
+
+                    <h3 style="margin-top:18px;">② 选择需要展示的字段</h3>
+                    <div style="margin-bottom:6px;">
+                        <button type="button" class="btn btn-sm" id="merge-select-all">全选</button>
+                        <button type="button" class="btn btn-sm" id="merge-select-none">全不选</button>
+                        <span style="color:#888;font-size:12px;margin-left:8px;">每个字段标注了来源文件；直连单源字段直接拼接、不标红。</span>
+                    </div>
+                    <div id="merge-field-select" style="border:1px solid #e3e7ed;border-radius:6px;padding:10px;max-height:300px;overflow:auto;"></div>
+
+                    <h3 style="margin-top:18px;">③ 同义列匹配（可选）</h3>
+                    <div style="margin-bottom:6px;">
+                        <button type="button" class="btn" id="btn-merge-match">匹配同义列</button>
+                        <label style="display:inline-flex;align-items:center;gap:4px;margin-left:8px;">
+                            <input type="checkbox" id="merge-use-ai" style="width:auto;"> 使用 AI（匹配差异命名的列）
+                        </label>
+                        <span class="status" id="merge-match-status" style="margin-left:8px;"></span>
+                    </div>
+                    <div style="color:#888;font-size:12px;margin-bottom:6px;">
+                        不勾 AI：只把各表中<strong>同名列</strong>合并成一个结果列（免 AI）。勾 AI：再把命名不同但同义的列也合并。
+                        合并后的多源列，若同一主键值不一致则标红。不点此按钮则各字段直连输出、不标红。
+                    </div>
+                    <table class="data-table" id="merge-groups-table">
+                        <thead>
+                            <tr><th>输出列名</th><th>来源列（文件 · 列）</th></tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+
+                    <div class="actions" style="margin-top:12px;">
+                        <button class="btn btn-primary" id="btn-merge-execute">生成合并文件并下载</button>
+                        <span class="status" id="merge-exec-status"></span>
+                    </div>
                 </div>
             </div>
         </div>
@@ -201,6 +282,6 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260414t3"></script>
-    <script src="/static/js/tools.js?v=20260521c"></script>
+    <script src="/static/js/tools.js?v=20260616c"></script>
 </body>
 </html>

@@ -324,3 +324,24 @@ class RuleSession(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     user = relationship("User", foreign_keys=[user_id])
+
+
+class MergeFieldMapping(Base):
+    """多表合并：字段匹配结果缓存。
+
+    按"列头指纹"缓存某文件各源列到规范字段名的匹配结果，下次同结构文件
+    （即使改名/换数据）指纹一致即可命中，跳过 AI 重新匹配。列头变→指纹变→自动失效。
+    """
+    __tablename__ = "merge_field_mappings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    header_fingerprint = Column(String(64), nullable=False, index=True)   # SHA256(排序列头)
+    mapping = Column(JSON, nullable=False)                                # {源列名: 规范字段名}
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "header_fingerprint", name="uq_merge_fp"),
+    )
+

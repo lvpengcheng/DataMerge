@@ -91,6 +91,7 @@ from backend.database.models import (
     ReferenceCategory, DataAsset,
     TrainingSession, TrainingIteration, TrainingMessage, Script,
     ComputeTask, ComputeTaskInput, RuleSession,
+    MergeFieldMapping,
 )
 from passlib.context import CryptContext
 
