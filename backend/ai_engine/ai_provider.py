@@ -14,6 +14,25 @@ from backend.utils.indentation_fixer import IndentationFixer
 logger = logging.getLogger(__name__)
 
 
+def _model_omits_temperature(model_name: str) -> bool:
+    """判断该模型是否**不接受** temperature 参数（传了会被 Anthropic/Bedrock 以
+    ValidationException: temperature is deprecated 拒绝）。
+
+    覆盖：Claude 4.x 全系（claude-*-4-6 / -4-7 / -4-8 …）、Fable 系列。
+    兜底：设环境变量 AI_DISABLE_TEMPERATURE=true 可对**任意模型**强制不传 temperature，
+         部署遇到新模型报"temperature deprecated"时无需改代码，先置此开关即可。
+    """
+    if os.getenv("AI_DISABLE_TEMPERATURE", "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    m = (model_name or "").lower()
+    if "fable" in m:
+        return True
+    # 匹配 claude-opus-4-8 / claude-sonnet-4-6 / claude-4-7 等「-4-<数字>」新模型
+    if re.search(r"-4-\d", m):
+        return True
+    return False
+
+
 class BaseAIProvider(ABC):
     """AI提供者基类"""
 
@@ -961,7 +980,7 @@ class OpenAIProvider(BaseAIProvider):
             response = self._client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                temperature=temperature,
+                **({} if _model_omits_temperature(self.model) else {"temperature": temperature}),
                 max_tokens=max_tokens or self.max_tokens,
                 **filtered_kwargs,
             )
@@ -984,7 +1003,7 @@ class OpenAIProvider(BaseAIProvider):
         stream = self._client.chat.completions.create(
             model=self.model,
             messages=messages,
-            temperature=temperature,
+            **({} if _model_omits_temperature(self.model) else {"temperature": temperature}),
             max_tokens=max_tokens or self.max_tokens,
             stream=True,
             **filtered_kwargs,
@@ -1338,7 +1357,7 @@ class ClaudeProvider(BaseAIProvider):
         response = self._client.messages.create(
             model=self.model,
             max_tokens=max_tokens or max(self.max_tokens, 64000),
-            **({} if "-4-7" in self.model else {"temperature": temperature}),
+            **({} if _model_omits_temperature(self.model) else {"temperature": temperature}),
             system=system_prompt,
             messages=messages,
             **filtered_kwargs,
@@ -1385,7 +1404,7 @@ class ClaudeProvider(BaseAIProvider):
         with self._client.messages.stream(
             model=self.model,
             max_tokens=max_tokens or max(self.max_tokens, 64000),
-            **({} if "-4-7" in self.model else {"temperature": temperature}),
+            **({} if _model_omits_temperature(self.model) else {"temperature": temperature}),
             system=system_prompt,
             messages=messages,
             **filtered_kwargs,
@@ -1921,8 +1940,8 @@ class AIProviderFactory:
                 "model": model_name,
                 "max_tokens": int(os.getenv("ANTHROPIC_MAX_TOKENS", "8000")),
             }
-            # Claude 4.7 模型不应设置 temperature；其他模型若 .env 配置了则读取
-            if "-4-7" not in model_name and os.getenv("ANTHROPIC_TEMPERATURE"):
+            # 新模型（Claude 4.x / Fable）不接受 temperature；其他模型若 .env 配置了则读取
+            if not _model_omits_temperature(model_name) and os.getenv("ANTHROPIC_TEMPERATURE"):
                 claude_cfg["temperature"] = float(os.getenv("ANTHROPIC_TEMPERATURE"))
             config.update(claude_cfg)
         elif provider_type == "deepseek":

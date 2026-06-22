@@ -279,6 +279,12 @@ header {
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
 }
 
+/* 角色/权限弹窗加宽（admin.js openModal 传 {wide:true} 时挂 modal--wide）。
+   仅改宽度，不动权限树内部布局。 */
+.modal.modal--wide {
+    width: 720px;
+}
+
 .modal-header {
     display: flex;
     justify-content: space-between;
@@ -416,7 +422,10 @@ header {
 
 .perm-group-header {
     display: flex;
+    flex-wrap: nowrap;
+    justify-content: flex-start;
     align-items: center;
+    gap: 6px;
     padding: 8px 12px;
     background: #f4f7fb;
     border-bottom: 1px solid #e3e7ed;
@@ -435,28 +444,32 @@ header {
 }
 
 .perm-group-toggle {
+    flex: 0 0 16px;
     width: 16px;
     text-align: center;
     color: #8b95a3;
     font-size: 11px;
-    margin-right: 4px;
     transition: transform .2s ease;
 }
 .perm-group.collapsed .perm-group-toggle { transform: rotate(-90deg); }
 .perm-group.collapsed .perm-group-items { display: none; }
 
 .perm-group-cb {
-    margin-right: 8px;
+    flex: 0 0 16px;
     cursor: pointer;
     width: 16px;
     height: 16px;
     accent-color: #1976d2;
 }
 .perm-group-label {
-    flex: 1;
+    flex: 1 1 auto;
     font-size: 14px;
+    text-align: left;
+    white-space: nowrap;
 }
 .perm-group-count {
+    flex: 0 0 auto;
+    white-space: nowrap;
     font-size: 12px;
     color: #8b95a3;
     font-weight: normal;

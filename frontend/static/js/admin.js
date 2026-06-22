@@ -209,7 +209,7 @@ const Admin = {
             });
             if (resp.ok) { this.closeModal(); await this.loadRoles(); this.renderRoles(); }
             else { await _alertErr(resp, '创建失败'); }
-        });
+        }, { wide: true });
         this._bindPermissionTree();
     },
 
@@ -236,7 +236,7 @@ const Admin = {
             });
             if (resp.ok) { this.closeModal(); await this.loadRoles(); this.renderRoles(); }
             else { await _alertErr(resp, '更新失败'); }
-        });
+        }, { wide: true });
         this._bindPermissionTree();
     },
 
@@ -597,10 +597,13 @@ const Admin = {
     },
 
     // ==================== 弹窗工具 ====================
-    openModal(title, bodyHtml, onConfirm) {
+    openModal(title, bodyHtml, onConfirm, opts) {
         document.getElementById('modal-title').textContent = title;
         document.getElementById('modal-body').innerHTML = bodyHtml;
         document.getElementById('modal-overlay').style.display = 'flex';
+        // 角色/权限等内容较宽的弹窗用 modal--wide 加宽，避免权限树被挤在 480px 里
+        const modalEl = document.getElementById('modal');
+        if (modalEl) modalEl.classList.toggle('modal--wide', !!(opts && opts.wide));
         _modalCallback = onConfirm;
     },
 

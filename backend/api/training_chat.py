@@ -96,6 +96,35 @@ def _create_formula_generator(ai_provider_name: str, stream_callback=None):
     return generator, provider
 
 
+def _persist_source_structure_for_mode(generator, mode, src_dir, config):
+    """按模式构建 source_structure 并返回 (structure, source_structure_desc)。
+
+    - 公式模式：用 generator.formula_builder（含表头字母映射，最准）。
+    - 模板/自动模式：generator 没有 formula_builder，改从源目录直接解析构建。
+      这一步必须做，否则 ts.source_structure 为空，智算时 auto_fill_missing_sources /
+      FastHeaderMatcher 都被 `if source_structure` 跳过 → 训练时有、计算时缺的文件
+      不会从基础数据补全（基础文件形同虚设）。
+    """
+    _mode = (mode or "").lower()
+    desc = ""
+    fb = getattr(generator, "formula_builder", None)
+    if _mode in ("template", "auto") or fb is None:
+        structure = _build_source_structure_from_dir(
+            src_dir,
+            manual_headers=config.get("manual_headers"),
+            multi_sheet_source=config.get("multi_sheet_source", False),
+        )
+    else:
+        try:
+            desc = fb.get_source_structure_for_prompt() or ""
+        except Exception:
+            desc = ""
+        structure = _build_source_structure_from_generator(
+            generator, multi_sheet_source=config.get("multi_sheet_source", False)
+        )
+    return structure, desc
+
+
 def _build_source_structure_from_generator(generator, multi_sheet_source: bool = False) -> Dict[str, Any]:
     """从 FormulaCodeGenerator 的已加载数据构建 source_structure。
 
@@ -1514,14 +1543,12 @@ def main(source_dir, output_dir, **kwargs):
             # 保存 source_structure_desc 供后续修正使用
             source_structure_desc = ""
             try:
-                source_structure_desc = generator.formula_builder.get_source_structure_for_prompt()
-                config["source_structure_desc"] = source_structure_desc[:70000]
-                ts.config = config
-
-                # 构建真正的 source_structure（供计算时 FastHeaderMatcher 使用）
-                real_source_structure = _build_source_structure_from_generator(
-                    generator, multi_sheet_source=config.get("multi_sheet_source", False)
+                real_source_structure, source_structure_desc = _persist_source_structure_for_mode(
+                    generator, config.get("mode"), src_dir, config
                 )
+                if source_structure_desc:
+                    config["source_structure_desc"] = source_structure_desc[:70000]
+                    ts.config = config
                 ts.source_structure = real_source_structure
                 db.commit()
             except Exception as e:
@@ -2416,11 +2443,11 @@ async def send_message(
 
             # 保存 source_structure_desc
             try:
-                source_structure_desc = generator.formula_builder.get_source_structure_for_prompt()
-                config["source_structure_desc"] = source_structure_desc[:70000]
-                real_source_structure = _build_source_structure_from_generator(
-                    generator, multi_sheet_source=config.get("multi_sheet_source", False)
+                real_source_structure, source_structure_desc = _persist_source_structure_for_mode(
+                    generator, mode, src_dir, config
                 )
+                if source_structure_desc:
+                    config["source_structure_desc"] = source_structure_desc[:70000]
                 session.source_structure = real_source_structure
                 session.config = config
                 flag_modified(session, "config")
