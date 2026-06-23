@@ -1,0 +1,8 @@
+{
+  "host": "你的服务器IP或域名",
+  "port": 22,
+  "user": "root",
+  "password": "在此填密码（或留空运行时输入 / 用环境变量 DEPLOY_PASSWORD）",
+  "remote_path": "/opt/datamerge",
+  "health_url": "https://excel.onboarding.cn/api/health"
+}
