@@ -3966,6 +3966,60 @@ def _normalize_xlsx_content_type(xlsx_path) -> bool:
         return False
 
 
+def _inject_sandbox_helpers(module):
+    """把训练沙箱注入的 data_helpers / 公式辅助函数，同样注入到智算(importlib)执行的 module。
+
+    目的：智训走 code_sandbox（这些是注入的全局），智算走 importlib（默认没有），
+    AI 生成代码若裸用 find_column/safe_get_column/normalize_emp_code/EMPTY/write_cell 等
+    会在智算报 name X is not defined。此处在 exec_module 之前注入，脚本若自定义同名会自然覆盖。
+    """
+    # data_helpers 函数（兼容两种导入路径）
+    try:
+        try:
+            from backend.utils.data_helpers import (
+                SYNONYM_GROUPS, find_column, safe_get_column,
+                convert_region_to_dataframe, normalize_emp_code,
+                print_available_columns, load_files_to_dataframes,
+            )
+        except ImportError:
+            from utils.data_helpers import (  # type: ignore
+                SYNONYM_GROUPS, find_column, safe_get_column,
+                convert_region_to_dataframe, normalize_emp_code,
+                print_available_columns, load_files_to_dataframes,
+            )
+        for _k, _v in dict(
+            SYNONYM_GROUPS=SYNONYM_GROUPS, find_column=find_column, safe_get_column=safe_get_column,
+            convert_region_to_dataframe=convert_region_to_dataframe, normalize_emp_code=normalize_emp_code,
+            print_available_columns=print_available_columns, load_files_to_dataframes=load_files_to_dataframes,
+        ).items():
+            setattr(module, _k, _v)
+    except Exception as _e:
+        logger.warning(f"data_helpers 注入失败（不阻断）: {_e}")
+
+    # 公式辅助常量/函数（与沙箱一致；脚本若自带定义会覆盖）
+    module.EMPTY = '""'
+    module.ZERO = '0'
+    module.excel_text = lambda text: f'"{text}"'
+
+    def _write_cell(ws, row, column, value, number_format=None):
+        import datetime as _dt
+        import pandas as _pd
+        if (_pd.isna(value) if not isinstance(value, str) else (value == '')):
+            cell = ws.cell(row=row, column=column, value=None)
+        else:
+            if hasattr(value, 'to_pydatetime'):
+                try:
+                    value = value.to_pydatetime()
+                except Exception:
+                    pass
+            cell = ws.cell(row=row, column=column, value=value)
+        if isinstance(value, (_dt.datetime, _dt.date)):
+            cell.number_format = number_format or 'yyyy/mm/dd'
+        elif number_format:
+            cell.number_format = number_format
+    module.write_cell = _write_cell
+
+
 async def run_compute_task(
     task_id: str,
     buffer,
@@ -4350,6 +4404,18 @@ async def run_compute_task(
                 except Exception as _opx_err:
                     logger.warning(f"openpyxl 全局注入失败: {_opx_err}")
 
+                # 兜底注入常用标准库为模块全局：沙箱训练时这些是注入的全局，AI 生成代码
+                # 常直接引用（math/re/datetime/... ）而未 import；importlib 执行非沙箱需补齐，
+                # 否则报 name 'math' is not defined 之类。不覆盖脚本自身后续 import。
+                import importlib as _il
+                for _m in ("math", "re", "json", "datetime", "collections", "itertools",
+                           "functools", "decimal", "statistics", "random", "string", "hashlib", "pandas"):
+                    try:
+                        setattr(module, _m, _il.import_module(_m))
+                    except Exception:
+                        pass
+                _inject_sandbox_helpers(module)
+
                 # 注入历史数据提供者（供公式代码模板的 write_history_sheet 使用）
                 try:
                     from backend.utils.historical_data import HistoricalDataProvider
@@ -4401,7 +4467,10 @@ async def run_compute_task(
                 # 【关键】替换 load_source_data，使用预加载数据
                 if pre_loaded_source_data and hasattr(module, 'load_source_data'):
                     _original_load = module.load_source_data
-                    def _cached_load(input_folder, manual_headers, _data=pre_loaded_source_data):
+                    # *args/**kwargs 兼容两种签名：公式模式 load_source_data(input_folder, manual_headers)
+                    # 与 模板/自动模式 load_source_data()（无参）。否则模板脚本会报
+                    # "missing 2 required positional arguments: input_folder and manual_headers"。
+                    def _cached_load(*args, _data=pre_loaded_source_data, **kwargs):
                         print(f"[性能优化] 使用预加载源数据（{len(_data)}个sheet，跳过Excel解析）")
                         return _data
                     module.load_source_data = _cached_load
@@ -5285,6 +5354,15 @@ async def compute_with_script_stream(
                                 module.get_column_letter = _gcl
                             except Exception as _opx_err:
                                 logger.warning(f"openpyxl 全局注入失败: {_opx_err}")
+                            # 兜底注入常用标准库（math/re/datetime/...），同沙箱，避免 name X is not defined
+                            import importlib as _il
+                            for _m in ("math", "re", "json", "datetime", "collections", "itertools",
+                                       "functools", "decimal", "statistics", "random", "string", "hashlib", "pandas"):
+                                try:
+                                    setattr(module, _m, _il.import_module(_m))
+                                except Exception:
+                                    pass
+                            _inject_sandbox_helpers(module)
                             try:
                                 from backend.utils.historical_data import HistoricalDataProvider
                                 module.history_provider = HistoricalDataProvider(tenant_id)
@@ -5331,7 +5409,8 @@ async def compute_with_script_stream(
                             # 【关键】替换 load_source_data，使用预加载数据
                             if pre_loaded_source_data and hasattr(module, 'load_source_data'):
                                 _original_load = module.load_source_data
-                                def _cached_load(input_folder, manual_headers, _data=pre_loaded_source_data):
+                                # *args/**kwargs 兼容公式模式(input_folder, manual_headers)与模板/自动模式(无参)
+                                def _cached_load(*args, _data=pre_loaded_source_data, **kwargs):
                                     print(f"[性能优化] 使用预加载源数据（{len(_data)}个sheet，跳过Excel解析）")
                                     return _data
                                 module.load_source_data = _cached_load
