@@ -4020,6 +4020,92 @@ def _inject_sandbox_helpers(module):
     module.write_cell = _write_cell
 
 
+def _xlsx_sheet_headers(path: str) -> dict:
+    """读 xlsx 每个 sheet 的"表头签名"：前 6 行的非空字符串单元格值集合。用于 sheet 相似度匹配。"""
+    import openpyxl as _opx
+    out = {}
+    try:
+        wb = _opx.load_workbook(path, read_only=True, data_only=True)
+        for ws in wb.worksheets:
+            sig = set()
+            for r in ws.iter_rows(min_row=1, max_row=6, values_only=True):
+                for v in r:
+                    if isinstance(v, str) and v.strip():
+                        sig.add(v.strip())
+            out[ws.title] = sig
+        wb.close()
+    except Exception as e:
+        logger.warning(f"[sheet重映射] 读表头失败 {path}: {e}")
+    return out
+
+
+def _build_sheet_remap(train_path: str, upload_path: str) -> dict:
+    """训练模板 vs 上传模板，按表头相似度给"上传 sheet 名 → 训练 sheet 名"的映射。
+
+    - 上传里已与训练同名的 sheet 不动。
+    - 训练里缺失的 sheet 名，到上传里"未被占用且表头 Jaccard 最高(>=0.5)"的 sheet 配对。
+    返回 {上传sheet名: 训练sheet名}，仅含需要改名的。
+    """
+    train = _xlsx_sheet_headers(train_path)
+    up = _xlsx_sheet_headers(upload_path)
+    if not train or not up:
+        return {}
+    train_names = set(train.keys())
+    up_names = set(up.keys())
+    remap = {}
+    used_up = set(n for n in up_names if n in train_names)  # 已同名的占用
+    for tname in train_names:
+        if tname in up_names:
+            continue  # 训练这张在上传里同名存在，无需改
+        best, best_score = None, 0.0
+        tset = train[tname]
+        for uname in up_names:
+            if uname in used_up:
+                continue
+            uset = up[uname]
+            if not tset and not uset:
+                score = 1.0
+            elif not tset or not uset:
+                score = 0.0
+            else:
+                inter = len(tset & uset); union = len(tset | uset)
+                score = inter / union if union else 0.0
+            if score > best_score:
+                best, best_score = uname, score
+        if best and best_score >= 0.5:
+            remap[best] = tname
+            used_up.add(best)
+    return remap
+
+
+def _rename_xlsx_sheets(path: str, name_map: dict) -> bool:
+    """把 path 里的 sheet 按 name_map={旧名:新名} 改名并保存。返回是否有改动。"""
+    if not name_map:
+        return False
+    import openpyxl as _opx
+    try:
+        keep_vba = str(path).lower().endswith(".xlsm")
+        wb = _opx.load_workbook(path, keep_vba=keep_vba)
+        changed = False
+        for old, new in name_map.items():
+            if old in wb.sheetnames and new not in wb.sheetnames:
+                wb[old].title = new
+                changed = True
+        if changed:
+            wb.save(path)
+        return changed
+    except Exception as e:
+        logger.warning(f"[sheet重映射] 改名失败 {path}: {e}")
+        return False
+
+
+def _extract_template_path(script_content: str):
+    """从脚本里提取 TEMPLATE_PATH 常量值（训练模板的绝对路径）。"""
+    import re as _re
+    m = _re.search(r"TEMPLATE_PATH\s*=\s*(['\"])(.+?)\1", script_content)
+    return m.group(2) if m else None
+
+
 async def run_compute_task(
     task_id: str,
     buffer,
@@ -4433,6 +4519,13 @@ async def run_compute_task(
 
                 spec.loader.exec_module(module)
 
+                # 兼容旧模板脚本：旧脚本 main() 直接用写死的 TEMPLATE_PATH 常量、不读 _template_override_path。
+                # exec 后（脚本已把 TEMPLATE_PATH 赋成训练值）再覆盖模块级 TEMPLATE_PATH，
+                # 使"智算时上传的新模板"对旧脚本也生效，无需重新训练/重新生成。
+                if template_override_path and hasattr(module, 'TEMPLATE_PATH'):
+                    module.TEMPLATE_PATH = template_override_path
+                    logger.info(f"[模板覆盖] 已将脚本 TEMPLATE_PATH 指向上传的新模板: {template_override_path}")
+
                 # 【加密支持】monkey-patch IntelligentExcelParser 自动注入密码
                 # 注意：文件已在上游被 _dec_excel 解密，仅对仍加密的文件注入密码
                 if passwords_dict:
@@ -4511,6 +4604,25 @@ async def run_compute_task(
                     except Exception:
                         pass
 
+        # 【模板 sheet 重映射 · 改名进】上传了新模板且其 sheet 名与训练模板不同时，
+        # 按表头相似度把上传模板的 sheet 改成训练时的名字，让 fill_template 能按训练名找到并填充；
+        # 记录反向映射，算完后再把结果文件的 sheet 名改回上传时的名字。多 sheet 用 Jaccard 匹配避免配错。
+        _sheet_reverse_map = {}
+        if template_override_path:
+            try:
+                _train_tpl = _extract_template_path(script_content)
+                if _train_tpl and os.path.exists(_train_tpl):
+                    _remap = _build_sheet_remap(_train_tpl, template_override_path)  # {上传名:训练名}
+                    if _remap and _rename_xlsx_sheets(template_override_path, _remap):
+                        _sheet_reverse_map = {v: k for k, v in _remap.items()}  # {训练名:上传名}
+                        logger.info(f"[sheet重映射] 改名进：{_remap}")
+                        buffer.push(task_id, json.dumps({
+                            "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                            "level": "info", "message": f"模板 sheet 已临时对齐训练名以便填充：{_remap}"
+                        }, ensure_ascii=False))
+            except Exception as _rm_e:
+                logger.warning(f"[sheet重映射] 改名进失败（按原名继续）：{_rm_e}")
+
         with concurrent.futures.ThreadPoolExecutor() as executor:
             exec_result = await loop.run_in_executor(executor, execute_script)
 
@@ -4535,6 +4647,15 @@ async def run_compute_task(
         # Excel 会报"文件损坏或扩展名无效"。此处统一改回普通 xlsx 类型，救活旧脚本产物。
         for _of in output_files:
             _normalize_xlsx_content_type(_of)
+
+        # 【模板 sheet 重映射 · 改名出】把结果文件里临时对齐的训练 sheet 名改回上传模板的原名
+        if _sheet_reverse_map:
+            for _of in output_files:
+                try:
+                    if _rename_xlsx_sheets(str(_of), _sheet_reverse_map):
+                        logger.info(f"[sheet重映射] 改名出：{_sheet_reverse_map} @ {_of.name}")
+                except Exception as _ro_e:
+                    logger.warning(f"[sheet重映射] 改名出失败 {_of}: {_ro_e}")
 
         output_file = output_files[0]
 
