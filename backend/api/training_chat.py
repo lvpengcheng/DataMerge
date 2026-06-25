@@ -350,7 +350,10 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None,
             logger.warning(f"[后台全量加载] 解析 {filename} 失败: {e}")
 
     # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 / 撞结果 sheet → 加文件名前缀
+    # 按 (file_base, sheet) 排序，使字典顺序确定，并与智算侧 _build_pre_loaded_from_memory 完全一致
+    # （脚本 find_source_sheet 按首个匹配返回，依赖字典顺序，必须两边一致）。
     from backend.utils.data_helpers import assign_sheet_keys
+    _collected.sort(key=lambda x: (str(x[0]), str(x[1])))
     key_map = assign_sheet_keys(
         ((fb, sn) for fb, sn, _, _ in _collected),
         reserved_names=reserved_sheet_names,

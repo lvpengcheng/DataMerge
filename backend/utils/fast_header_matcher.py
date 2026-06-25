@@ -655,7 +655,8 @@ class FastHeaderMatcher:
             file_path,
             active_sheet_only=not multi_sheet,
             best_region_only=not multi_sheet,
-            read_formulas=False
+            read_formulas=False,
+            calculate_formulas=True,  # 含公式的源先算再写，重写后的文件存的是计算值，与训练侧一致
         )
 
         if not parsed_data:
@@ -748,7 +749,19 @@ class FastHeaderMatcher:
             # 步骤4: 从内存构建预加载数据（纯 Python，region → DataFrame → 列重命名）
             logger.info("[单次解析] ===== 步骤4: 构建预加载数据 =====")
             _reserved_names = set((expected_structure or {}).get("sheets", {}).keys()) if expected_structure else set()
-            pre_loaded_source_data = self._build_pre_loaded_from_memory(file_mapping, parsed_sheets_map, reserved_sheet_names=_reserved_names)
+            # 训练期望的 (file_base, sheet) 全集，用于冲突计数，保证 key 前缀与训练完全一致
+            _expected_pairs = []
+            for _tf, _fd in (source_structure.get("files") or {}).items():
+                if isinstance(_fd, dict) and "error" in _fd:
+                    continue
+                _fb = _tf.replace('.xlsx', '').replace('.xls', '')
+                for _sn in ((_fd.get("sheets") if isinstance(_fd, dict) else None) or {}).keys():
+                    _expected_pairs.append((_fb, _sn))
+            pre_loaded_source_data = self._build_pre_loaded_from_memory(
+                file_mapping, parsed_sheets_map,
+                reserved_sheet_names=_reserved_names,
+                expected_pairs=_expected_pairs,
+            )
 
             # 步骤5: 文件处理
             # 当 pre_loaded_source_data 有效时，脚本从内存加载数据，完全不读磁盘文件
@@ -797,7 +810,8 @@ class FastHeaderMatcher:
             sheet_list = parser.parse_excel_file(
                 file_path, manual_headers=file_manual_headers,
                 active_sheet_only=not multi_sheet_source,
-                best_region_only=not multi_sheet_source,
+                best_region_only=True,   # 与训练侧 _load_full_source_data 一致（每 sheet 取最优区域），
+                                         # 否则多 sheet 时智算会拼接多区域 → 行数比智训多 → 结果不一致
                 read_formulas=False,
                 calculate_formulas=True,  # 含公式无缓存值的源（如模板产出）先算再读，避免读到空
             )
@@ -844,7 +858,8 @@ class FastHeaderMatcher:
         self,
         file_mapping: Dict[str, Any],
         parsed_sheets_map: Dict[tuple, Any],
-        reserved_sheet_names: Optional[set] = None
+        reserved_sheet_names: Optional[set] = None,
+        expected_pairs: Optional[list] = None,
     ) -> Dict[str, Any]:
         """从内存中的解析数据构建 pre_loaded_source_data
 
@@ -906,11 +921,27 @@ class FastHeaderMatcher:
                 else:
                     merged_df = pd.concat(dfs, ignore_index=True)
 
+                # 与训练侧 _load_full_source_data 对齐：空的"序号/S/N"列自动补 1..N。
+                # 否则脚本里"按序号非空过滤行"在智算时会把全部行滤掉，导致结果与智训不一致。
+                try:
+                    _sn_cands = [c for c in merged_df.columns
+                                 if '序号' in str(c) or 'S/N' in str(c).upper()]
+                    for _sn in _sn_cands:
+                        if len(merged_df) > 0 and merged_df[_sn].isna().all():
+                            merged_df[_sn] = range(1, len(merged_df) + 1)
+                except Exception:
+                    pass
+
                 _collected.append((file_base, train_sheet, merged_df, first_columns))
 
         # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 / 撞结果 sheet → 加文件名前缀
+        # 关键①：按 (file_base, sheet) 排序后再建字典，顺序确定且与训练侧一致（find_source_sheet 按首个匹配）。
+        # 关键②：冲突计数用"训练期望全集"(expected_pairs)，而非仅本次匹配到的文件 —— 否则当本次只匹配到
+        #         重复 sheet 的其中一个文件时会漏判冲突 → key 不加前缀(数据)，而训练是(3月_数据)，脚本就找不到源。
+        _collected.sort(key=lambda x: (str(x[0]), str(x[1])))
+        _pairs_for_keys = sorted({(fb, sn) for fb, sn, _, _ in _collected} | set(expected_pairs or []))
         key_map = assign_sheet_keys(
-            ((fb, sn) for fb, sn, _, _ in _collected),
+            _pairs_for_keys,
             reserved_names=reserved_sheet_names,
         )
         for file_base, train_sheet, merged_df, first_columns in _collected:

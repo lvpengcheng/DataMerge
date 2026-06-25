@@ -76,6 +76,13 @@
                 </div>
 
                 <div id="merge-config" style="display:none;margin-top:20px;">
+                    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px;padding:8px;background:#f4f7fb;border-radius:6px;">
+                        <span style="font-weight:600;">套用模版：</span>
+                        <select id="merge-template-select" style="min-width:200px;"><option value="">（选择已保存的模版）</option></select>
+                        <button type="button" class="btn btn-sm" id="btn-apply-template">套用</button>
+                        <button type="button" class="btn btn-sm" id="btn-delete-template">删除</button>
+                        <span class="status" id="merge-template-status" style="margin-left:8px;"></span>
+                    </div>
                     <h3>① 合并设置</h3>
                     <div style="display:flex;gap:24px;flex-wrap:wrap;">
                         <div class="form-group">
@@ -96,7 +103,7 @@
                         </div>
                     </div>
                     <div class="form-group" style="margin-top:8px;">
-                        <label>主键列（每个文件）：</label>
+                        <label>匹配项（每个文件）：</label>
                         <div id="merge-key-map"></div>
                     </div>
 
@@ -119,16 +126,21 @@
                     <div style="color:#888;font-size:12px;margin-bottom:6px;">
                         不勾 AI：只把各表中<strong>同名列</strong>合并成一个结果列（免 AI）。勾 AI：再把命名不同但同义的列也合并。
                         合并后的多源列，若同一主键值不一致则标红。不点此按钮则各字段直连输出、不标红。
+                        <br><span style="color:#1565c0;">提示：下表可拖动 ⋮⋮ 调整列顺序，即最终结果文件的列顺序。</span>
                     </div>
                     <table class="data-table" id="merge-groups-table">
                         <thead>
-                            <tr><th>输出列名</th><th>来源列（文件 · 列）</th></tr>
+                            <tr><th style="width:28px;"></th><th>输出列名</th><th>来源列（文件 · 列）</th></tr>
                         </thead>
                         <tbody></tbody>
                     </table>
 
-                    <div class="actions" style="margin-top:12px;">
+                    <div class="actions" style="margin-top:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
                         <button class="btn btn-primary" id="btn-merge-execute">生成合并文件并下载</button>
+                        <span style="margin-left:16px;">保存为模版：</span>
+                        <input type="text" id="merge-template-name" placeholder="模版名称（如 月度工资合并）" style="min-width:180px;">
+                        <button type="button" class="btn" id="btn-save-template">保存为模版</button>
+                        <span class="status" id="merge-save-status"></span>
                         <span class="status" id="merge-exec-status"></span>
                     </div>
                 </div>
@@ -282,6 +294,6 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260414t3"></script>
-    <script src="/static/js/tools.js?v=20260616c"></script>
+    <script src="/static/js/tools.js?v=20260625d"></script>
 </body>
 </html>

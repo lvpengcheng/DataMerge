@@ -316,6 +316,24 @@ def auto_rename_uploaded_by_combined_score(
 
     logger.info(f"[Rename] 上传未命名匹配: {[f.name for f in extras]}, 缺失期望: {missing}")
 
+    # 1:1 无歧义直通：只缺 1 个期望文件、且只多出 1 个上传文件 → 直接映射，忽略文件名差异。
+    # 场景：训练时模板/源叫 aa.xlsx，计算时改名成 bb.xlsx —— 只有一个候选，没有歧义，
+    # 不应因文件名不同而拒绝计算（列头是否相似无关紧要，用户显然就是拿它替换）。
+    if len(extras) == 1 and len(missing) == 1:
+        u_name = extras[0].name
+        e_name = next(iter(missing))
+        try:
+            old = src_path / u_name
+            new = src_path / e_name
+            if new.exists():
+                new.unlink()
+            old.rename(new)
+            logger.info(f"[Rename] 1:1 唯一匹配，忽略文件名差异自动映射: {u_name} → {e_name}")
+            return ([{"from": u_name, "to": e_name, "score": 1.0,
+                      "jaccard": None, "name_sim": None, "reason": "1:1 唯一匹配"}], [], {})
+        except Exception as _ex:
+            logger.warning(f"[Rename] 1:1 自动映射失败，回退打分匹配: {_ex}")
+
     # 解析每个上传文件的列头
     uploaded_headers = {f.name: _read_uploaded_headers(str(f)) for f in extras}
 

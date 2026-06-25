@@ -290,6 +290,15 @@ async def upload_asset(
         import logging as _logging
         _logging.getLogger(__name__).warning(f"banner-split 预处理失败（继续）: {_e}")
 
+    # 上传规范化：把"被误设成日期格式的数字单元格"格式重置为常规，避免后续解析
+    # 把它当日期读取（撞 Excel 1900 闰年 bug，如 60.74 被读成 59.74）
+    try:
+        from ..utils.source_normalizer import normalize_misformatted_dates
+        normalize_misformatted_dates(str(file_path))
+    except Exception as _e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(f"日期格式规范化失败（继续）: {_e}")
+
     # 解析 sheet 结构
     sheet_summary = _parse_sheet_summary(str(file_path))
 
@@ -535,6 +544,14 @@ async def upload_new_version(
     except Exception as _e:
         import logging as _logging
         _logging.getLogger(__name__).warning(f"banner-split 预处理失败（继续）: {_e}")
+
+    # 上传规范化：误设日期格式的数字单元格重置为常规
+    try:
+        from ..utils.source_normalizer import normalize_misformatted_dates
+        normalize_misformatted_dates(str(file_path))
+    except Exception as _e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(f"日期格式规范化失败（继续）: {_e}")
 
     # 创建新版本记录
     new_parsed_data = _parse_full_data(str(file_path)) if asset.asset_type == "reference" else None

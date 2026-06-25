@@ -1098,6 +1098,13 @@ function showResult(data) {
     const resultCard = document.getElementById('result-card');
     const resultDownloads = document.getElementById('result-downloads');
 
+    // 结果文件：优先用 output_files（原版 + 纯值版），兼容只返回 output_file 的旧消息
+    const files = (data.output_files && data.output_files.length)
+        ? data.output_files
+        : (data.output_file ? [data.output_file] : []);
+
+    const _label = (fn) => fn && fn.includes('_纯值') ? '纯值版' : '原版';
+
     resultCard.className = 'result-card result-success';
     resultCard.innerHTML = `
         <div class="result-row">
@@ -1107,7 +1114,7 @@ function showResult(data) {
             </div>
             <div class="result-item">
                 <div class="label">输出文件</div>
-                <div class="value">${data.output_file || 'N/A'}</div>
+                <div class="value">${files.length ? files.map(f => `${_label(f)}：${f}`).join('<br>') : 'N/A'}</div>
             </div>
             <div class="result-item">
                 <div class="label">处理行数</div>
@@ -1116,9 +1123,16 @@ function showResult(data) {
         </div>
     `;
 
+    const dlBtns = files.length
+        ? files.map(f => `<button class="btn btn-download" onclick="downloadResult('${f}')">下载${_label(f)}</button>`).join('')
+        : '';
+    const dlAll = files.length > 1
+        ? `<button class="btn btn-download" onclick="downloadAllResults(${JSON.stringify(files).replace(/"/g, '&quot;')})">下载全部</button>`
+        : '';
     resultDownloads.innerHTML = `
         <div class="download-row">
-            <button class="btn btn-download" onclick="downloadResult('${data.output_file}')">下载计算结果</button>
+            ${dlAll}
+            ${dlBtns}
             <button class="btn btn-primary" onclick="resetCompute(); startCompute();">重新计算</button>
             <button class="btn btn-secondary" onclick="fullReset()">更换文件</button>
         </div>
@@ -1188,6 +1202,21 @@ async function downloadResult(filename) {
     } catch (e) {
         alert('下载失败: ' + e.message);
     }
+}
+
+function downloadAllResults(files) {
+    if (!files || !files.length) { alert('没有可下载的文件'); return; }
+    // 逐个用隐藏 <a> 触发下载，错开时间避免浏览器拦截多文件下载
+    files.forEach((fn, i) => {
+        setTimeout(() => {
+            const a = document.createElement('a');
+            a.href = `/api/download-compute-result/${encodeURIComponent(currentTenantId)}/${encodeURIComponent(fn)}`;
+            a.download = fn;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }, i * 600);
+    });
 }
 
 // ==================== UI更新 ====================

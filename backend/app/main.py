@@ -2026,6 +2026,15 @@ async def _save_uploaded_files(
         except Exception as _e:
             logger.warning(f"banner-split 预处理失败（继续）: {_e}")
 
+        # 上传规范化：源文件与预期结果中"被误设成日期格式的数字单元格"重置为常规，
+        # 保证训练与计算读到一致的正确数值（避免被当日期读错，如 60.74→59.74）
+        try:
+            from ..utils.source_normalizer import normalize_misformatted_dates
+            for fp, _ in all_files:
+                normalize_misformatted_dates(fp)
+        except Exception as _e:
+            logger.warning(f"日期格式规范化失败（继续）: {_e}")
+
         # 保存到存储管理器
         saved_files = storage_manager.save_training_files(
             tenant_id, rule_paths, source_paths, expected_path
@@ -4106,6 +4115,62 @@ def _extract_template_path(script_content: str):
     return m.group(2) if m else None
 
 
+def _resolve_script_display_name(tenant_id: str, script_id: str, script_content: str = None):
+    """解析脚本的"友好显示名"，用于固化结果文件名。
+
+    script_id 可能是：数字主键 / 脚本名 / 文件型 ``script_<hash12>``（基于代码 MD5）。
+    优先级：数字主键 → 代码哈希反查 DB 友好名（与 /api/tenant-scripts 一致）→ 按名查 →
+    兜底用 script_id 本身（去掉重复的 script_ 前缀）。
+    """
+    import hashlib as _hl
+    import re as _re2
+    _hash_pat = _re2.compile(r"^script_[0-9a-f]{12}$", _re2.I)
+
+    def _friendly(nm):
+        return bool(nm) and not _hash_pat.match(nm)
+
+    name = None
+    try:
+        from backend.database.connection import SessionLocal as _SL
+        from backend.database.models import Script as _ScriptModel
+        _ndb = _SL()
+        try:
+            sc = None
+            # a) 数字主键
+            try:
+                sc = _ndb.query(_ScriptModel).filter_by(id=int(script_id)).first()
+            except (ValueError, TypeError):
+                sc = None
+            # b) 文件型 script_<hash12>：按代码 MD5 反查 DB 友好名
+            if (sc is None or not _friendly(getattr(sc, "name", None))) and script_content:
+                _h = _hl.md5(script_content.encode("utf-8")).hexdigest()[:12]
+                for c in (_ndb.query(_ScriptModel)
+                          .filter_by(tenant_id=tenant_id, is_active=True).all()):
+                    if c.code and _hl.md5(c.code.encode("utf-8")).hexdigest()[:12] == _h:
+                        if _friendly(c.name):
+                            sc = c
+                            break
+                        if sc is None:
+                            sc = c
+            # c) 按名字精确匹配
+            if sc is None:
+                sc = (_ndb.query(_ScriptModel)
+                      .filter_by(tenant_id=tenant_id, name=str(script_id), is_active=True)
+                      .order_by(_ScriptModel.version.desc()).first())
+            if sc and _friendly(sc.name):
+                name = sc.name
+        finally:
+            _ndb.close()
+    except Exception as e:
+        logger.warning(f"[文件名] 解析脚本名失败: {e}")
+
+    if name:
+        return name
+    # 兜底：用 script_id 本身（已是 script_xxx 时不再加前缀）
+    sid = str(script_id or "script")
+    return sid if sid.startswith("script_") else f"script_{sid}"
+
+
 async def run_compute_task(
     task_id: str,
     buffer,
@@ -4355,6 +4420,47 @@ async def run_compute_task(
 
                     # ===== 处理匹配结果 =====
                     if match_success and file_mapping:
+                        # 【根治：智算复用训练的同一套加载逻辑】
+                        # 把上传文件按映射重写到 mapped_source（重命名为训练文件名 + 列名映射 + 计算公式），
+                        # 再调用与训练完全相同的 _load_full_source_data 构建 source_data。
+                        # 这样 key 规则、sheet 集合、去重逻辑与训练"同一份代码"产出 → 天然一致，
+                        # 不再出现"训练能跑、智算丢 sheet / 找不到源 / key 对不上"。失败则回退内存预加载。
+                        try:
+                            from backend.api.training_chat import _load_full_source_data as _load_full_train
+                            _mapped_dir = temp_dir / "mapped_source"
+                            if _mapped_dir.exists():
+                                shutil.rmtree(_mapped_dir, ignore_errors=True)
+                            _mapped_dir.mkdir(parents=True, exist_ok=True)
+                            _rw_ok = 0
+                            for _inp, _info in file_mapping.items():
+                                try:
+                                    FastHeaderMatcher.rewrite_excel(_info, str(_mapped_dir))
+                                    _rw_ok += 1
+                                except Exception as _rw_e:
+                                    logger.warning(f"[compute/task] 重写映射文件失败 {_inp}: {_rw_e}")
+                            _ms = bool(source_structure.get("multi_sheet_source")) if isinstance(source_structure, dict) else False
+                            _rsv = set((expected_structure or {}).get("sheets", {}).keys()) if expected_structure else set()
+                            if _rw_ok:
+                                _rebuilt = _load_full_train(
+                                    str(_mapped_dir),
+                                    manual_headers=manual_headers,
+                                    multi_sheet_source=_ms,
+                                    file_passwords=None,   # mapped 文件已是明文+计算值
+                                    reserved_sheet_names=_rsv,
+                                )
+                                if _rebuilt:
+                                    pre_loaded_source_data = _rebuilt
+                                    logger.info(f"[compute/task] 训练同款加载器重建 source_data: {list(_rebuilt.keys())}")
+                                    buffer.push(task_id, json.dumps({
+                                        "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                        "level": "info",
+                                        "message": f"已用训练同款加载器统一构建源数据（{len(_rebuilt)}个sheet，key 与训练一致）"
+                                    }, ensure_ascii=False))
+                                else:
+                                    logger.warning("[compute/task] 训练同款加载器重建为空，回退内存预加载")
+                        except Exception as _root_e:
+                            logger.warning(f"[compute/task] 根治加载失败，回退内存预加载: {_root_e}", exc_info=True)
+
                         # 输出映射日志
                         for input_file_name, mapping_info in file_mapping.items():
                             expected_file = mapping_info.get("expected_file")
@@ -4648,6 +4754,21 @@ async def run_compute_task(
         for _of in output_files:
             _normalize_xlsx_content_type(_of)
 
+        # 模板格式兜底：把输出单元格格式刷回模板原格式（修复旧脚本里 openpyxl 写 datetime
+        # 自动把常规列改成日期格式的问题）。仅模板模式（能从脚本提取 TEMPLATE_PATH）才执行，
+        # 在反向 sheet 重映射前做——此时输出 sheet 名与有效模板一致。新脚本格式已对 → 幂等。
+        try:
+            _tpl_for_fmt = _extract_template_path(script_content)
+            _eff_tpl_fmt = (template_override_path
+                            if (template_override_path and os.path.exists(template_override_path))
+                            else _tpl_for_fmt)
+            if _eff_tpl_fmt and os.path.exists(_eff_tpl_fmt):
+                from backend.utils.output_postprocess import restore_formats_from_template
+                for _of in output_files:
+                    restore_formats_from_template(str(_of), _eff_tpl_fmt)
+        except Exception as _fmt_e:
+            logger.warning(f"[fmt兜底] 跳过: {_fmt_e}")
+
         # 【模板 sheet 重映射 · 改名出】把结果文件里临时对齐的训练 sheet 名改回上传模板的原名
         if _sheet_reverse_map:
             for _of in output_files:
@@ -4682,9 +4803,32 @@ async def run_compute_task(
         compute_dir = tenant_dir / "compute_results"
         compute_dir.mkdir(parents=True, exist_ok=True)
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        saved_file = compute_dir / f"result_{timestamp}_{output_file.name}"
+        # 固化结果文件名：脚本名_薪资年月_时间戳（填了年月）/ 脚本名_时间戳（没填）
+        from backend.utils.output_postprocess import (
+            build_result_filename, values_only_name, dual_output_enabled, make_values_only_copy,
+        )
+        _ext = output_file.suffix or ".xlsx"
+        _result_name = build_result_filename(
+            _resolve_script_display_name(tenant_id, script_id, script_content),
+            salary_year, salary_month, _ext)
+        saved_file = compute_dir / _result_name
         shutil.copy(output_file, saved_file)
+
+        # 双结果（.env COMPUTE_OUTPUT_VALUES_COPY=true）：再出一个纯值版（公式→值，仅目标 sheet）
+        _values_saved = None
+        try:
+            if dual_output_enabled():
+                _vp = compute_dir / values_only_name(_result_name)
+                if make_values_only_copy(saved_file, _vp):
+                    _values_saved = _vp
+                    buffer.push(task_id, json.dumps({
+                        "type": "log",
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "level": "success",
+                        "message": f"已生成纯值版（仅目标sheet）: {_vp.name}"
+                    }, ensure_ascii=False))
+        except Exception as _ve:
+            logger.warning(f"[纯值版] 生成失败（不阻断）: {_ve}")
 
         # 统计行数（使用 Aspose 轻量读取，避免额外引入 openpyxl）
         try:
@@ -4707,20 +4851,33 @@ async def run_compute_task(
         if db_session:
             _persist_result_file(
                 db_session, compute_task_id, tenant_id,
-                saved_file, output_file.name
+                saved_file, _result_name
             )
+            # 纯值版也注册为结果文件
+            if _values_saved:
+                try:
+                    _persist_result_file(
+                        db_session, compute_task_id, tenant_id,
+                        _values_saved, _values_saved.name
+                    )
+                except Exception as _pe:
+                    logger.warning(f"[纯值版] 注册结果文件失败（不阻断）: {_pe}")
             duration = (datetime.now() - compute_start_time).total_seconds() if compute_start_time else 0
             _persist_compute_complete(
                 db_session, compute_task_id, duration,
                 {"output_file": saved_file.name, "rows_processed": rows_processed}
             )
 
-        # 发送完成消息
+        # 发送完成消息（output_files 列出全部结果文件：原版 + 纯值版）
+        _all_output_files = [saved_file.name]
+        if _values_saved:
+            _all_output_files.append(_values_saved.name)
         final_result = {
             "type": "complete",
             "success": True,
             "data": {
                 "output_file": saved_file.name,
+                "output_files": _all_output_files,
                 "rows_processed": rows_processed,
                 "tenant_id": tenant_id,
                 "script_id": script_id
@@ -4884,6 +5041,16 @@ async def compute_submit(
                 ])
             except Exception as _bs_err:
                 logger.warning(f"[compute/submit] banner-split 预处理失败（继续）: {_bs_err}")
+
+            # 上传规范化：把"被误设成日期格式的数字单元格"重置为常规，避免后续解析按日期读错
+            # （智算直传的源文件不走数据资产上传，故需在此单独规范化）
+            try:
+                from backend.utils.source_normalizer import normalize_misformatted_dates
+                for p in source_dir.iterdir():
+                    if p.is_file() and p.suffix.lower() in ('.xlsx', '.xls', '.xlsm'):
+                        normalize_misformatted_dates(str(p.resolve()))
+            except Exception as _nz_err:
+                logger.warning(f"[compute/submit] 日期格式规范化失败（继续）: {_nz_err}")
 
             _db = SessionLocal()
             try:

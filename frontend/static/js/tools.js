@@ -8,6 +8,7 @@ let _splitFiles = [];
 let _mergeFiles = [];
 let _mergeAnalysis = null;   // analyze 返回的结果
 let _mergeGroups = [];       // 当前结果列（直连 or AI 合并后）
+let _mergeTemplates = [];     // 已保存的命名模版（含 config）
 const _ALLOWED_EXT = new Set(['xlsx', 'xls', 'xlsm']);
 
 async function _alertErr(resp, fallback) {
@@ -200,6 +201,9 @@ const Tools = {
         document.getElementById('btn-merge-match').addEventListener('click', () => this._matchMerge());
         document.getElementById('merge-select-all').addEventListener('click', () => this._mergeToggleAll(true));
         document.getElementById('merge-select-none').addEventListener('click', () => this._mergeToggleAll(false));
+        document.getElementById('btn-save-template').addEventListener('click', () => this._saveMergeTemplate());
+        document.getElementById('btn-apply-template').addEventListener('click', () => this._applyMergeTemplate());
+        document.getElementById('btn-delete-template').addEventListener('click', () => this._deleteMergeTemplate());
     },
 
     _addMergeFiles(fileList) {
@@ -262,40 +266,177 @@ const Tools = {
     _renderMergeConfig(data) {
         const files = data.files || [];
 
-        // 主键下拉（每文件）
-        document.getElementById('merge-key-map').innerHTML = files.map(f => `
+        // 主键下拉（每文件）——默认选中 suggested_key（身份证/工号等唯一标识列）
+        document.getElementById('merge-key-map').innerHTML = files.map(f => {
+            const sk = f.suggested_key || (f.columns || [])[0] || '';
+            return `
             <div style="margin:4px 0;">
                 <span style="display:inline-block;min-width:160px;">${_escape(f.name)}：</span>
                 <select class="mg-key" data-file="${_escape(f.name)}">
-                    ${(f.columns || []).map(c => `<option value="${_escape(c)}">${_escape(c)}</option>`).join('')}
+                    ${(f.columns || []).map(c => `<option value="${_escape(c)}" ${c === sk ? 'selected' : ''}>${_escape(c)}</option>`).join('')}
                 </select>
-            </div>`).join('');
+            </div>`;
+        }).join('');
 
         // 基准文件
         document.getElementById('merge-base-file').innerHTML =
             files.map(f => `<option value="${_escape(f.name)}">${_escape(f.name)}</option>`).join('');
 
-        // 字段选择（按文件分块，标注来源）
-        document.getElementById('merge-field-select').innerHTML = files.map(f => `
+        // 字段选择（按文件分块，标注来源 + 每文件独立全选/全不选）
+        document.getElementById('merge-field-select').innerHTML = files.map((f, fi) => `
             <div style="margin-bottom:10px;">
-                <div style="font-weight:600;color:#2c3e50;margin-bottom:4px;">📄 ${_escape(f.name)}</div>
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+                    <span style="font-weight:600;color:#2c3e50;">📄 ${_escape(f.name)}</span>
+                    <button type="button" class="btn btn-sm mg-file-all" data-fi="${fi}">全选</button>
+                    <button type="button" class="btn btn-sm mg-file-none" data-fi="${fi}">全不选</button>
+                </div>
                 <div style="display:flex;flex-wrap:wrap;gap:4px 16px;">
                     ${(f.columns || []).map(c => `
                         <label style="display:inline-flex;align-items:center;gap:4px;font-size:13px;">
-                            <input type="checkbox" class="mg-field" data-file="${_escape(f.name)}" data-col="${_escape(c)}" checked>
+                            <input type="checkbox" class="mg-field" data-file="${_escape(f.name)}" data-col="${_escape(c)}">
                             ${_escape(c)}
                         </label>`).join('')}
                 </div>
             </div>`).join('');
 
-        // 默认结果列 = 每个勾选字段直连一列；字段勾选变化 → 重置为直连
-        document.getElementById('merge-field-select').addEventListener('change', () => this._rebuildDirectGroups());
+        // 每文件全选/全不选（用 data-fi 索引定位该文件名，避免文件名含特殊字符）
+        document.querySelectorAll('#merge-field-select .mg-file-all').forEach(btn =>
+            btn.addEventListener('click', () => this._mergeToggleFile(files[parseInt(btn.dataset.fi, 10)].name, true)));
+        document.querySelectorAll('#merge-field-select .mg-file-none').forEach(btn =>
+            btn.addEventListener('click', () => this._mergeToggleFile(files[parseInt(btn.dataset.fi, 10)].name, false)));
+
+        // 默认结果列 = 每个勾选字段直连一列；字段勾选变化 → 增量同步（保留已有顺序）
+        document.getElementById('merge-field-select').addEventListener('change', () => this._syncFieldsToGroups());
         this._rebuildDirectGroups();
         document.getElementById('merge-config').style.display = 'block';
+        this._loadMergeTemplates();
+    },
+
+    async _loadMergeTemplates() {
+        try {
+            const resp = await AUTH.authFetch('/api/tools/merge/templates');
+            if (!resp.ok) return;
+            _mergeTemplates = await resp.json();
+            const sel = document.getElementById('merge-template-select');
+            sel.innerHTML = '<option value="">（选择已保存的模版）</option>' +
+                _mergeTemplates.map((t, i) => `<option value="${i}">${_escape(t.name)}</option>`).join('');
+        } catch (_) {}
+    },
+
+    _setTplStatus(text, kind) {
+        const el = document.getElementById('merge-template-status');
+        if (el) { el.textContent = text || ''; el.className = 'status' + (kind ? ' ' + kind : ''); }
+    },
+
+    async _saveMergeTemplate() {
+        const name = (document.getElementById('merge-template-name').value || '').trim();
+        if (!name) { this._setSaveStatus('请输入模版名称', 'error'); return; }
+        // 收集当前配置：主键列名（取首个文件的主键下拉值）、结果列(按列名)、模式
+        const keyEls = document.querySelectorAll('.mg-key');
+        const key_field = keyEls.length ? keyEls[0].value : '';
+        const groups = (_mergeGroups || []).map((g, gi) => {
+            const inp = document.querySelector(`.mg-name[data-gi="${gi}"]`);
+            const nm = (inp && inp.value.trim()) || g.name;
+            const source_cols = [...new Set(g.sources.map(s => s.col))];
+            return { name: nm, source_cols };
+        });
+        const config = {
+            key_field,
+            merge_mode: document.getElementById('merge-mode').value,
+            normalize_keys: document.getElementById('merge-normalize-keys').checked,
+            result_columns: groups,
+        };
+        const btn = document.getElementById('btn-save-template');
+        const oldText = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = '保存中...';
+        this._setSaveStatus('保存中...');
+        try {
+            const resp = await AUTH.authFetch('/api/tools/merge/template/save', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, config }),
+            });
+            if (!resp.ok) { await _alertErr(resp, '保存失败'); this._setSaveStatus('保存失败', 'error'); return; }
+            this._setSaveStatus(`✓ 已保存模版「${name}」`, 'ok');
+            this._loadMergeTemplates();
+        } catch (e) { this._setSaveStatus('保存失败: ' + e.message, 'error'); }
+        finally { btn.disabled = false; btn.textContent = oldText; }
+    },
+
+    _setSaveStatus(text, kind) {
+        const el = document.getElementById('merge-save-status');
+        if (el) { el.textContent = text || ''; el.className = 'status' + (kind ? ' ' + kind : ''); }
+    },
+
+    _applyMergeTemplate() {
+        const idx = document.getElementById('merge-template-select').value;
+        if (idx === '') { this._setTplStatus('请先选择模版', 'error'); return; }
+        const tpl = (_mergeTemplates || [])[parseInt(idx, 10)];
+        if (!tpl || !tpl.config) return;
+        const cfg = tpl.config;
+        const files = (_mergeAnalysis && _mergeAnalysis.files) || [];
+
+        // 1) 主键：各文件里选中与 key_field 同名的列
+        if (cfg.key_field) {
+            document.querySelectorAll('.mg-key').forEach(sel => {
+                const opt = Array.from(sel.options).find(o => o.value === cfg.key_field);
+                if (opt) sel.value = cfg.key_field;
+            });
+        }
+        // 2) 模式 / 归一化
+        if (cfg.merge_mode) document.getElementById('merge-mode').value = cfg.merge_mode;
+        if (typeof cfg.normalize_keys === 'boolean') document.getElementById('merge-normalize-keys').checked = cfg.normalize_keys;
+
+        // 3) 结果列：按 source_cols 列名在已上传文件里匹配，重建 _mergeGroups
+        const missing = [];
+        const groups = [];
+        (cfg.result_columns || []).forEach(rc => {
+            const sources = [];
+            (rc.source_cols || []).forEach(colName => {
+                files.forEach(f => {
+                    if ((f.columns || []).includes(colName)) sources.push({ file: f.name, col: colName });
+                });
+            });
+            if (sources.length) groups.push({ name: rc.name, sources });
+            else missing.push(rc.name);
+        });
+        if (groups.length) {
+            _mergeGroups = groups;
+            this._renderGroupsPreview();
+            // 同步字段勾选：只勾选被结果列用到的列
+            const used = new Set(groups.flatMap(g => g.sources.map(s => s.file + '|||' + s.col)));
+            document.querySelectorAll('#merge-field-select .mg-field').forEach(cb => {
+                cb.checked = used.has(cb.dataset.file + '|||' + cb.dataset.col);
+            });
+        }
+        this._setTplStatus(
+            `已套用「${tpl.name}」` + (missing.length ? `（这些列在当前文件中没找到，已跳过：${missing.join('、')}）` : ''),
+            missing.length ? 'error' : 'ok');
+    },
+
+    async _deleteMergeTemplate() {
+        const idx = document.getElementById('merge-template-select').value;
+        if (idx === '') { this._setTplStatus('请先选择要删除的模版', 'error'); return; }
+        const tpl = (_mergeTemplates || [])[parseInt(idx, 10)];
+        if (!tpl) return;
+        if (!confirm(`确认删除模版「${tpl.name}」？`)) return;
+        try {
+            const resp = await AUTH.authFetch(`/api/tools/merge/template/${tpl.id}`, { method: 'DELETE' });
+            if (!resp.ok) { this._setTplStatus('删除失败', 'error'); return; }
+            this._setTplStatus(`已删除「${tpl.name}」`, 'ok');
+            this._loadMergeTemplates();
+        } catch (e) { this._setTplStatus('删除失败: ' + e.message, 'error'); }
     },
 
     _mergeToggleAll(checked) {
         document.querySelectorAll('#merge-field-select .mg-field').forEach(cb => { cb.checked = checked; });
+        this._rebuildDirectGroups();
+    },
+
+    _mergeToggleFile(fileName, checked) {
+        document.querySelectorAll('#merge-field-select .mg-field').forEach(cb => {
+            if (cb.dataset.file === fileName) cb.checked = checked;
+        });
         this._rebuildDirectGroups();
     },
 
@@ -317,16 +458,87 @@ const Tools = {
         this._setMergeMatchStatus('');
     },
 
+    // 增量同步：勾选变化时保留已有结果列顺序（含拖动顺序、AI 多源组），新勾选追加到末尾，取消的移除
+    _syncFieldsToGroups() {
+        this._syncGroupNames();   // 先保住已改过的列名
+        const selSet = new Set(this._selectedFields().map(s => s.file + '|||' + s.col));
+        // 1) 现有结果列：剔除已取消勾选的来源；来源全没了的组删除
+        let groups = (_mergeGroups || []).map(g => ({
+            name: g.name,
+            sources: (g.sources || []).filter(s => selSet.has(s.file + '|||' + s.col)),
+        })).filter(g => g.sources.length > 0);
+        // 2) 已被现有结果列覆盖的字段
+        const covered = new Set(groups.flatMap(g => g.sources.map(s => s.file + '|||' + s.col)));
+        const usedNames = new Set(groups.map(g => g.name));
+        // 3) 新勾选但未覆盖的字段 → 按 DOM 顺序追加到末尾
+        this._selectedFields().forEach(s => {
+            const key = s.file + '|||' + s.col;
+            if (covered.has(key)) return;
+            covered.add(key);
+            let nm = s.col;
+            if (usedNames.has(nm)) nm = `${s.col}（${s.file}）`;
+            usedNames.add(nm);
+            groups.push({ name: nm, sources: [{ file: s.file, col: s.col }] });
+        });
+        _mergeGroups = groups;
+        this._renderGroupsPreview();
+    },
+
     _renderGroupsPreview() {
         const tbody = document.querySelector('#merge-groups-table tbody');
         tbody.innerHTML = (_mergeGroups || []).map((g, gi) => {
             const multi = g.sources.length > 1;
             const srcText = g.sources.map(s => `${_escape(s.file)} · ${_escape(s.col)}`).join('<br>');
-            return `<tr>
+            return `<tr class="mg-row" draggable="true" data-gi="${gi}">
+                <td class="mg-drag" style="cursor:grab;text-align:center;color:#bbb;user-select:none;font-weight:bold;" title="拖动调整列顺序">⋮⋮</td>
                 <td><input class="mg-name" data-gi="${gi}" value="${_escape(g.name)}" style="width:180px;"></td>
                 <td>${srcText}${multi ? ' <span style="color:#c0392b;font-size:12px;">[多源·值不一致将标红]</span>' : ''}</td>
             </tr>`;
         }).join('');
+        this._bindGroupDrag();
+    },
+
+    // 把当前预览表里（可能改过的）列名回写到 _mergeGroups，避免重渲染丢失
+    _syncGroupNames() {
+        document.querySelectorAll('#merge-groups-table .mg-name').forEach(inp => {
+            const gi = parseInt(inp.dataset.gi, 10);
+            if (_mergeGroups[gi]) _mergeGroups[gi].name = (inp.value.trim() || _mergeGroups[gi].name);
+        });
+    },
+
+    // 结果列拖动排序：拖动顺序即最终输出列顺序
+    _bindGroupDrag() {
+        const tbody = document.querySelector('#merge-groups-table tbody');
+        if (!tbody) return;
+        let dragGi = null;
+        tbody.querySelectorAll('tr.mg-row').forEach(tr => {
+            tr.addEventListener('dragstart', (e) => {
+                dragGi = parseInt(tr.dataset.gi, 10);
+                tr.style.opacity = '0.4';
+                e.dataTransfer.effectAllowed = 'move';
+            });
+            tr.addEventListener('dragend', () => { tr.style.opacity = ''; });
+            tr.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'move';
+                tr.style.borderTop = '2px solid #2c7be5';
+            });
+            tr.addEventListener('dragleave', () => { tr.style.borderTop = ''; });
+            tr.addEventListener('drop', (e) => {
+                e.preventDefault();
+                tr.style.borderTop = '';
+                const targetGi = parseInt(tr.dataset.gi, 10);
+                if (dragGi === null || isNaN(targetGi) || dragGi === targetGi) { dragGi = null; return; }
+                this._syncGroupNames();
+                const arr = _mergeGroups.slice();
+                const [moved] = arr.splice(dragGi, 1);
+                const insertAt = dragGi < targetGi ? targetGi - 1 : targetGi;
+                arr.splice(insertAt, 0, moved);
+                _mergeGroups = arr;
+                dragGi = null;
+                this._renderGroupsPreview();
+            });
+        });
     },
 
     async _matchMerge() {

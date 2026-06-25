@@ -262,11 +262,12 @@ class TemplateCodeGenerator:
                 sheets_data = parser.parse_excel_file(
                     fp, max_data_rows=2, read_formulas=False,
                     active_sheet_only=not multi_sheet_source,
+                    best_region_only=True,   # 取每 sheet 的最优(主数据)区域，与执行时 _load_full_source_data 一致
                     manual_headers=manual_headers,
                 )
                 fdesc = {}
                 for sd in sheets_data:
-                    # 仅取首个 region 的列名（源数据 banner 通常已被预处理拆开）
+                    # best_region_only=True 时每 sheet 只剩最优区域，regions[0] 即主数据区的列。
                     # ⚠️ 不取 region 的 data_start_row：骨架 _append_source_sheets 会把 DataFrame
                     #    重写为「row1=表头, row2+=数据」的干净 sheet，所以追加后源 sheet 的数据
                     #    恒从第 2 行开始，与原文件结构无关。data_start_row 固定为 2。
@@ -726,6 +727,49 @@ def _snapshot_workbook(wb):
     return snap
 
 
+def _snapshot_number_formats(wb):
+    \"\"\"快照所有单元格的 number_format（含空单元格），用于 fill 后恢复模板原有格式。\"\"\"
+    snap = {{}}
+    for ws in wb.worksheets:
+        try:
+            max_row = ws.max_row or 0
+            max_col = ws.max_column or 0
+        except Exception:
+            max_row, max_col = 0, 0
+        if max_row <= 0 or max_col <= 0:
+            continue
+        sheet_snap = {{}}
+        for row in ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col):
+            for cell in row:
+                sheet_snap[(cell.row, cell.column)] = cell.number_format
+        snap[ws.title] = sheet_snap
+    return snap
+
+
+def _restore_number_formats(wb, fmt_snapshot):
+    \"\"\"模板填充模式：严格遵循模板原有单元格格式。
+
+    openpyxl 给 General 单元格写入 datetime 值时会自动把格式改成日期格式，
+    导致模板原本的常规/数值列在输出里变成日期格式。这里按快照把被改动的格式
+    恢复为模板原格式（模板原本是日期列则保持日期，是常规则保持常规）。\"\"\"
+    restored = 0
+    for ws in wb.worksheets:
+        before = fmt_snapshot.get(ws.title)
+        if not before:
+            continue
+        for (r, c), fmt in before.items():
+            try:
+                cell = ws.cell(row=r, column=c)
+                if cell.number_format != fmt:
+                    cell.number_format = fmt
+                    restored += 1
+            except Exception:
+                continue
+    if restored:
+        print(f"  [格式保护] 已恢复 {{restored}} 个被改动的单元格格式为模板原格式")
+    return restored
+
+
 def _safe_repr(v):
     if v is None:
         return None
@@ -812,9 +856,16 @@ def main():
         print(f"[append_source_sheets] 异常（不阻断）：{{_ap_e}}")
 
     snapshot_before = _snapshot_workbook(wb)
+    _fmt_snapshot = _snapshot_number_formats(wb)
 
     print("步骤：调用 AI 生成的 fill_template 写入规则要求的列...")
     fill_template(wb, source_data, salary_year, salary_month, monthly_standard_hours)
+
+    # 模板填充模式：恢复模板原有单元格格式（防止写入 datetime 等被 openpyxl 自动改成日期格式）
+    try:
+        _restore_number_formats(wb, _fmt_snapshot)
+    except Exception as _fe:
+        print(f"[格式保护] 恢复格式异常（不阻断）：{{_fe}}")
 
     try:
         import json as _json

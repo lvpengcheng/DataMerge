@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     default-libmysqlclient-dev \
     pkg-config \
     curl \
+    tzdata \
     libicu-dev \
     libssl-dev \
     libfontconfig1 \
@@ -24,6 +25,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgdiplus \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# ========== 时区：上海（Asia/Shanghai） ==========
+# 让容器内 datetime.now()/日志时间戳/报表生成时间均为北京时间
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+    && echo $TZ > /etc/timezone
 
 # ========== 2. 从 Stage 1 复制 .NET 9 运行时（免去手动安装） ==========
 COPY --from=dotnet-runtime /usr/share/dotnet /usr/share/dotnet

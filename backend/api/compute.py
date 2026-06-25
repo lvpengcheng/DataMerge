@@ -314,41 +314,48 @@ async def execute_compute(
             }
 
             # 保存结果到租户目录并注册为 data_asset
+            from ..utils.output_postprocess import (
+                build_result_filename, values_only_name, dual_output_enabled, make_values_only_copy,
+            )
             saved_assets = []
-            # 统一文件名: {租户}_{脚本名}_{时间戳}.{ext}
-            def _safe_part(s, fallback):
-                s = (str(s) if s else "").strip() or fallback
-                return re.sub(r'[\\/:*?"<>|]+', '_', s)
-            _safe_tenant = _safe_part(task.tenant_id, "tenant")
-            _safe_script = _safe_part(script.name, f"script_{task.tenant_id}")
+            tenant_output_dir = PROJECT_ROOT / "tenants" / task.tenant_id / "assets" / "result"
+            tenant_output_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-            for idx, output_file in enumerate(output_files):
-                ext = output_file.suffix or ".xlsx"
-                if len(output_files) > 1:
-                    new_filename = f"{_safe_tenant}_{_safe_script}_{ts}_{idx + 1}{ext}"
-                else:
-                    new_filename = f"{_safe_tenant}_{_safe_script}_{ts}{ext}"
-
-                # 保存到租户目录
-                tenant_output_dir = PROJECT_ROOT / "tenants" / task.tenant_id / "assets" / "result"
-                tenant_output_dir.mkdir(parents=True, exist_ok=True)
-                dest_path = tenant_output_dir / new_filename
-                shutil.copy2(output_file, dest_path)
-
-                # 注册为数据资产
+            def _register_result(path, fname):
                 result_asset = DataAsset(
                     tenant_id=task.tenant_id,
                     asset_type="result",
-                    name=f"计算结果_{_safe_script}_{ts}",
-                    file_path=str(dest_path),
-                    file_name=new_filename,
-                    file_size=dest_path.stat().st_size,
+                    name=f"计算结果_{fname}",
+                    file_path=str(path),
+                    file_name=fname,
+                    file_size=path.stat().st_size,
                     source_task_id=task.id,
                     uploaded_by=current_user.id,
                 )
                 db.add(result_asset)
-                saved_assets.append(new_filename)
+                saved_assets.append(fname)
+
+            _dual = dual_output_enabled()
+            for idx, output_file in enumerate(output_files):
+                ext = output_file.suffix or ".xlsx"
+                # 文件名固化：脚本名_薪资年月_时间戳 / 脚本名_时间戳（多文件加 _序号）
+                base = build_result_filename(script.name, task.salary_year, task.salary_month, ext)
+                if len(output_files) > 1:
+                    _root, _e = os.path.splitext(base)
+                    new_filename = f"{_root}_{idx + 1}{_e}"
+                else:
+                    new_filename = base
+
+                dest_path = tenant_output_dir / new_filename
+                shutil.copy2(output_file, dest_path)
+                _register_result(dest_path, new_filename)
+
+                # 双结果：再出纯值版（公式→值，仅目标 sheet）
+                if _dual:
+                    _vp = tenant_output_dir / values_only_name(new_filename)
+                    if make_values_only_copy(dest_path, _vp):
+                        _register_result(_vp, _vp.name)
 
             result_summary["saved_assets"] = saved_assets
             task.status = "completed"

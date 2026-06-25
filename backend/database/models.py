@@ -345,3 +345,19 @@ class MergeFieldMapping(Base):
         UniqueConstraint("tenant_id", "header_fingerprint", name="uq_merge_fp"),
     )
 
+
+class MergeTemplate(Base):
+    """多表合并：命名模版。按列名保存合并配置，下月换文件名/数据、列结构一致即可复用。"""
+    __tablename__ = "merge_templates"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(100), nullable=False, index=True, default="__tools_merge__")
+    name = Column(String(200), nullable=False)
+    config = Column(JSON, nullable=False)   # {key_field, merge_mode, normalize_keys, result_columns:[{name, source_cols:[...]}]}
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "name", name="uq_merge_tpl_name"),
+    )
+

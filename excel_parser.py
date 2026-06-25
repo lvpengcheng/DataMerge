@@ -1372,13 +1372,16 @@ class IntelligentExcelParser:
             else:
                 aspose_wb = _licensed_workbook(str(file_path), load_opts)
 
-            # 含公式但无缓存值的文件（openpyxl/模板模式产出）必须先计算，否则 .Value 读到空。
-            # 包 try：个别坏公式/外链不应阻断整体解析，失败则退回缓存值。
+            # 含公式的文件：仅当公式"基本没有缓存值"（openpyxl/模板模式产出、读出来是空）才重算。
+            # 重算公式：得到与 Excel 打开时一致的"显示值"。
+            # 源文件里可能存有脏缓存值（某些工具写入的错误缓存，如 =ROUND(H47*0.5%,2)
+            # 缓存成 59.74，而 Excel 重算后是 60.74），必须重算才能取到正确值。
             if calculate_formulas:
                 try:
                     aspose_wb.CalculateFormula()
+                    logger.info(f"[calc] 已重算公式取显示值: {os.path.basename(str(file_path))}")
                 except Exception as _calc_err:
-                    logger.warning(f"CalculateFormula 失败（退回缓存值）[{file_path}]: {_calc_err}")
+                    logger.warning(f"CalculateFormula 处理失败（退回缓存值）[{file_path}]: {_calc_err}")
 
             # 提取当前文件的 manual_headers 配置
             file_manual_headers = self._extract_file_manual_headers(file_path, manual_headers)

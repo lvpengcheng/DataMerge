@@ -171,7 +171,7 @@ async def merge_analyze(
     if not files or len(files) < 2:
         raise HTTPException(status_code=400, detail="请至少上传 2 个文件")
 
-    from ..utils.merge_engine import compute_header_fingerprint
+    from ..utils.merge_engine import compute_header_fingerprint, guess_key_column
     from ..database.connection import SessionLocal
     from ..database.models import MergeFieldMapping
 
@@ -191,10 +191,18 @@ async def merge_analyze(
                     raise HTTPException(status_code=400, detail=f"{name}: 不支持的扩展名")
                 dest = sdir / name
                 dest.write_bytes(await uf.read())
+                # 上传规范化：误设日期格式的数字单元格重置为常规（避免被当日期读错）
+                try:
+                    from ..utils.source_normalizer import normalize_misformatted_dates
+                    normalize_misformatted_dates(str(dest))
+                except Exception as _ne:
+                    logger.warning(f"[merge] 日期格式规范化失败（继续）: {_ne}")
                 info = _parse_file_to_df(str(dest))
                 cols = info["columns"]
                 fp = compute_header_fingerprint(cols)
-                files_meta.append({"name": name, "sheet": info["sheet"], "columns": cols, "fingerprint": fp})
+                _sk = guess_key_column(cols, info.get("df")) or (cols[0] if cols else "")
+                files_meta.append({"name": name, "sheet": info["sheet"], "columns": cols,
+                                   "fingerprint": fp, "suggested_key": _sk})
                 if tenant_id:
                     row = (db.query(MergeFieldMapping)
                              .filter_by(tenant_id=tenant_id, header_fingerprint=fp).first())
@@ -353,3 +361,77 @@ async def merge_execute(req: MergeExecuteRequest, current_user=Depends(get_curre
     except Exception as e:
         logger.exception("merge/execute 异常")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 多表合并：命名模版（保存/复用，按用户私有） ====================
+
+def _tpl_owner(current_user) -> str:
+    """模版归属：当前登录用户。每个用户只看/管自己创建的模版。"""
+    uid = getattr(current_user, "id", None)
+    return f"user:{uid}" if uid is not None else "user:anon"
+
+
+class MergeTemplateSaveRequest(BaseModel):
+    name: str
+    config: dict          # {key_field, merge_mode, normalize_keys, result_columns:[{name, source_cols:[...]}]}
+
+
+@router.post("/merge/template/save")
+async def merge_template_save(req: MergeTemplateSaveRequest, current_user=Depends(get_current_user)):
+    """保存/覆盖当前用户的一个命名合并模版（同名 upsert）。config 按列名存，便于下月复用。"""
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="模版名称不能为空")
+    from ..database.connection import SessionLocal
+    from ..database.models import MergeTemplate
+    owner = _tpl_owner(current_user)
+    db = SessionLocal()
+    try:
+        row = db.query(MergeTemplate).filter_by(tenant_id=owner, name=name).first()
+        if row:
+            row.config = req.config
+        else:
+            db.add(MergeTemplate(tenant_id=owner, name=name, config=req.config))
+        db.commit()
+        return {"ok": True, "name": name}
+    except Exception as e:
+        db.rollback()
+        logger.exception("merge/template/save 异常")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@router.get("/merge/templates")
+async def merge_templates_list(current_user=Depends(get_current_user)):
+    """列出当前用户自己的命名合并模版（含 config 供前端套用）。"""
+    from ..database.connection import SessionLocal
+    from ..database.models import MergeTemplate
+    owner = _tpl_owner(current_user)
+    db = SessionLocal()
+    try:
+        rows = (db.query(MergeTemplate)
+                  .filter_by(tenant_id=owner)
+                  .order_by(MergeTemplate.updated_at.desc()).all())
+        return [{"id": r.id, "name": r.name, "config": r.config,
+                 "updated_at": r.updated_at.isoformat() if r.updated_at else None} for r in rows]
+    finally:
+        db.close()
+
+
+@router.delete("/merge/template/{tpl_id}")
+async def merge_template_delete(tpl_id: int, current_user=Depends(get_current_user)):
+    """删除当前用户自己的模版（只能删自己的）。"""
+    from ..database.connection import SessionLocal
+    from ..database.models import MergeTemplate
+    owner = _tpl_owner(current_user)
+    db = SessionLocal()
+    try:
+        row = db.query(MergeTemplate).filter_by(id=tpl_id, tenant_id=owner).first()
+        if row:
+            db.delete(row)
+            db.commit()
+            return {"ok": True}
+        raise HTTPException(status_code=404, detail="模版不存在或无权删除")
+    finally:
+        db.close()

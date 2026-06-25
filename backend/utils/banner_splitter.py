@@ -366,8 +366,24 @@ def preprocess_excel_inplace(file_path: str) -> bool:
         return False
 
 
+def _banner_split_enabled() -> bool:
+    """读取 .env 的 ENABLE_BANNER_SPLIT 开关（默认 false=不自动拆分）。
+
+    控制"智训/智算上传文件时的自动 banner 拆分预处理"是否执行。
+    注意：不影响智能小工具里用户手动触发的"Sheet 拆分"（那条走 split_one_file，与此无关）。
+    """
+    val = os.getenv("ENABLE_BANNER_SPLIT", "false").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
 def preprocess_uploaded_files(file_paths: List[str]) -> None:
-    """批量预处理：失败的文件不抛出，记录日志后继续。"""
+    """批量预处理：失败的文件不抛出，记录日志后继续。
+
+    受 .env 的 ENABLE_BANNER_SPLIT 控制（默认关闭）。关闭时整体跳过，源文件保持原样。
+    """
+    if not _banner_split_enabled():
+        logger.info("[banner-split] ENABLE_BANNER_SPLIT 关闭，跳过自动 banner 拆分预处理")
+        return
     for p in file_paths:
         if not p:
             continue

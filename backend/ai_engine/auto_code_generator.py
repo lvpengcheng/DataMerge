@@ -148,6 +148,7 @@ class AutoCodeGenerator:
                 sheets_data = parser.parse_excel_file(
                     fp, max_data_rows=2, read_formulas=False,
                     active_sheet_only=not multi_sheet_source,
+                    best_region_only=True,   # 取每 sheet 最优(主数据)区域，避免 banner 关闭后多区域列名混在一起
                     manual_headers=manual_headers,
                 )
                 fdesc = {}

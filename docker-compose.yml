@@ -10,6 +10,7 @@ services:
     env_file:
       - .env
     environment:
+      - TZ=Asia/Shanghai
       - REDIS_URL=redis://redis:6379/0
       # DATABASE_URL 从 .env 读取（PostgreSQL），不在此处硬编码
       - LD_LIBRARY_PATH=/app/libs:/usr/lib
@@ -36,6 +37,8 @@ services:
   redis:
     image: redis:7-alpine
     container_name: datamerge-redis
+    environment:
+      - TZ=Asia/Shanghai
     ports:
       - "6379:6379"
     volumes:

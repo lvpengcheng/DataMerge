@@ -2133,22 +2133,39 @@ def find_source_sheet(source_sheets, target_columns=None, sheet_name_hint=None,
     if len(source_sheets) == 1:
         return list(source_sheets.keys())[0]
 
-    # 策略2: 根据sheet名称提示匹配（最高优先级 — 与智训一致的sheet名）
+    # 所有候选 key 一律按排序遍历，保证"首个匹配"在智训/智算两侧确定一致
+    # （否则同名 sheet 跨文件时，依赖字典顺序会取到不同的源 → 结果不一致）
+    keys_sorted = sorted(source_sheets.keys())
+
+    # 策略2: 根据 sheet 名称提示匹配（最高优先级 — 与智训一致的 sheet 名），由精确到模糊
     if sheet_name_hint:
-        hint_lower = sheet_name_hint.strip().lower()
-        # 2a: 精确包含匹配
-        for sheet_key in source_sheets.keys():
-            if sheet_name_hint in sheet_key:
-                return sheet_key
-        # 2b: 忽略大小写包含匹配
-        for sheet_key in source_sheets.keys():
-            if hint_lower in sheet_key.lower():
-                return sheet_key
-        # 2c: 去掉文件名前缀后匹配（如 hint="社保明细"，key="人员信息_社保明细"）
-        for sheet_key in source_sheets.keys():
-            parts = sheet_key.split('_', 1)
-            if len(parts) > 1 and hint_lower in parts[1].lower():
-                return sheet_key
+        hint = str(sheet_name_hint).strip()
+        hint_lower = hint.lower()
+
+        def _sheet_part(k):
+            # key 形如 "文件名_sheet名" → 取 sheet 部分；无下划线则整体
+            return (k.split('_', 1)[1] if '_' in k else k).strip()
+
+        # 2a: key 完全等于 hint
+        for k in keys_sorted:
+            if k == hint:
+                return k
+        # 2b: 去文件名前缀后的 sheet 部分完全等于 hint（最精确的语义匹配）
+        m = [k for k in keys_sorted if _sheet_part(k).lower() == hint_lower]
+        if m:
+            return m[0]
+        # 2c: 区分大小写的包含匹配
+        m = [k for k in keys_sorted if hint in k]
+        if m:
+            return m[0]
+        # 2d: 忽略大小写的包含匹配
+        m = [k for k in keys_sorted if hint_lower in k.lower()]
+        if m:
+            return m[0]
+        # 2e: 去文件名前缀后包含匹配（如 hint="社保明细", key="人员信息_社保明细"）
+        m = [k for k in keys_sorted if hint_lower in _sheet_part(k).lower()]
+        if m:
+            return m[0]
 
     # 策略3: 薪资年月匹配（适用于 202501、2025-01、2025年1月 等格式的 sheet 名）
     if salary_year and salary_month:
@@ -2159,9 +2176,9 @@ def find_source_sheet(source_sheets, target_columns=None, sheet_name_hint=None,
             f"{int(salary_month)}月",                       # 1月
         ]
         # 如果有 sheet_name_hint，优先在包含 hint 的 sheet 中匹配年月
-        candidates = list(source_sheets.keys())
+        candidates = list(keys_sorted)
         if sheet_name_hint:
-            hint_candidates = [k for k in candidates if sheet_name_hint.lower() in k.lower()]
+            hint_candidates = [k for k in candidates if str(sheet_name_hint).lower() in k.lower()]
             if hint_candidates:
                 candidates = hint_candidates
 
@@ -2170,23 +2187,22 @@ def find_source_sheet(source_sheets, target_columns=None, sheet_name_hint=None,
                 if pattern in sheet_key:
                     return sheet_key
 
-    # 策略4: 根据列名匹配（如果提供了target_columns）
+    # 策略4: 根据列名匹配（如果提供了target_columns）——按排序遍历，平分时取确定的首个
     if target_columns:
         best_match = None
         best_score = 0
-        for sheet_key, sheet_data in source_sheets.items():
-            sheet_columns = set(sheet_data["df"].columns)
-            target_set = set(target_columns)
-            match_count = len(sheet_columns & target_set)
+        for sheet_key in keys_sorted:
+            sheet_columns = set(source_sheets[sheet_key]["df"].columns)
+            match_count = len(sheet_columns & set(target_columns))
             if match_count > best_score:
                 best_score = match_count
                 best_match = sheet_key
         if best_match and best_score > 0:
             return best_match
 
-    # 策略5: 返回第一个sheet
-    if source_sheets:
-        return list(source_sheets.keys())[0]
+    # 策略5: 返回排序后的第一个sheet（确定性）
+    if keys_sorted:
+        return keys_sorted[0]
 
     # 无可用sheet → 抛出明确异常
     hint_info = f", sheet_name_hint='{sheet_name_hint}'" if sheet_name_hint else ""

@@ -47,6 +47,46 @@ def _norm_header(h) -> str:
     return str(h).strip().replace("　", "").lower()
 
 
+# 唯一标识列优先级（归一化后子串匹配）：身份证 > 证件号 > 工号/员工编号 > 电脑号/卡号 > id
+_KEY_HINT_PATTERNS = [
+    "身份证号码", "身份证号", "身份证", "证件号码", "证件号",
+    "工号", "员工编号", "员工号", "人员编号", "电脑号", "卡号", "编号", "id",
+]
+
+
+def guess_key_column(columns, df=None):
+    """从列名里挑"唯一标识列"作为默认主键：优先身份证/证件号/工号/电脑号等。
+
+    - 按 _KEY_HINT_PATTERNS 优先级找命中的列；同一优先级有多个命中时，
+      若给了 df，则选取值唯一度(nunique/非空行数)最高的那列（满足"唯一匹配的值"）。
+    - 全不命中 → 返回 None（由调用方兜底为首列）。
+    """
+    cols = list(columns or [])
+    if not cols:
+        return None
+    norm = {c: _norm_header(c) for c in cols}
+
+    def _uniqueness(c):
+        if df is None or c not in getattr(df, "columns", []):
+            return 0.0
+        try:
+            s = df[c]
+            n = s.notna().sum()
+            return (s.nunique(dropna=True) / n) if n else 0.0
+        except Exception:
+            return 0.0
+
+    for pat in _KEY_HINT_PATTERNS:
+        hits = [c for c in cols if pat in norm[c]]
+        if not hits:
+            continue
+        if len(hits) == 1 or df is None:
+            return hits[0]
+        # 多个命中 → 取唯一度最高（并列时取首个，确定性）
+        return max(hits, key=lambda c: (_uniqueness(c), -cols.index(c)))
+    return None
+
+
 # ==================== 主键归一化 ====================
 
 def normalize_key(val, enabled: bool = True) -> str:
