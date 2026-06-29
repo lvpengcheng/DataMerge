@@ -2019,6 +2019,17 @@ async def _save_uploaded_files(
                     else:
                         logger.info(f"已解密文件: {filename}")
 
+        # 老版 .xls 自动转 .xlsx（下游用 openpyxl，仅支持 xlsx/xlsm）。解密后、预处理前；
+        # 训练侧也转，保证训练存的文件名与智算时一致（都为 .xlsx）
+        try:
+            from ..utils.source_normalizer import convert_xls_to_xlsx
+            source_paths = [convert_xls_to_xlsx(p) for p in source_paths]
+            expected_path = convert_xls_to_xlsx(expected_path)
+            all_files = ([(p, os.path.basename(p)) for p in source_paths]
+                         + [(expected_path, os.path.basename(expected_path))])
+        except Exception as _xls_e:
+            logger.warning(f"xls 转换失败（继续）: {_xls_e}")
+
         # 多区域 sheet 预处理（banner 拆分 / 头一致合并 / 头不一致 best-region）
         try:
             from ..utils.banner_splitter import preprocess_uploaded_files
@@ -4222,6 +4233,20 @@ async def run_compute_task(
         compute_task_id = int(task_id)
         compute_start_time = datetime.now()
 
+        # 旧脚本里 baked 的训练模板可能是 .xls（模板模式骨架用 openpyxl 加载，不支持 .xls）。
+        # 若未上传新模板且训练模板是 .xls，则转成 .xlsx 并作为 override 注入，救活旧脚本。
+        if not template_override_path:
+            try:
+                _tpl_in_script = _extract_template_path(script_content)
+                if _tpl_in_script and os.path.exists(_tpl_in_script) and _tpl_in_script.lower().endswith(".xls"):
+                    from backend.utils.source_normalizer import convert_xls_to_xlsx
+                    _conv = convert_xls_to_xlsx(_tpl_in_script, keep_original=True)
+                    if _conv != _tpl_in_script and os.path.exists(_conv):
+                        template_override_path = _conv
+                        logger.info(f"[compute/task] 旧 .xls 训练模板已转 .xlsx 并注入: {_conv}")
+            except Exception as _xt:
+                logger.warning(f"[compute/task] 训练模板 xls 转换失败（继续）: {_xt}")
+
         start_msg = {
             "type": "status",
             "message": "计算开始",
@@ -4964,6 +4989,15 @@ async def compute_submit(
             with open(_tpl_path, 'wb') as f:
                 f.write(_tpl_bytes)
             template_override_path = str(_tpl_path.resolve())
+            # 老版 .xls 模板转 .xlsx（模板模式骨架用 openpyxl 加载模板，不支持 .xls）
+            try:
+                from backend.utils.source_normalizer import convert_xls_to_xlsx
+                _conv_tpl = convert_xls_to_xlsx(template_override_path)
+                if _conv_tpl != template_override_path:
+                    template_override_path = _conv_tpl
+                    logger.info(f"[compute/submit] 上传模板 .xls 已转 .xlsx: {_conv_tpl}")
+            except Exception as _xt:
+                logger.warning(f"[compute/submit] 模板 xls 转换失败（继续）: {_xt}")
             logger.info(f"[compute/submit] 收到上传模板，将覆盖训练模板: {template_file.filename}")
 
         passwords_dict = {}
@@ -5032,6 +5066,15 @@ async def compute_submit(
                                 shutil.move(decrypted, fp_str)
                             except Exception as _de:
                                 logger.warning(f"[compute/submit] 解密 {fp.name} 失败: {_de}")
+
+            # 老版 .xls 自动转 .xlsx（下游用 openpyxl，仅支持 xlsx/xlsm）。须在 banner 预处理之前
+            try:
+                from backend.utils.source_normalizer import convert_xls_to_xlsx
+                for p in list(source_dir.iterdir()):
+                    if p.is_file() and p.suffix.lower() == '.xls':
+                        convert_xls_to_xlsx(str(p.resolve()))
+            except Exception as _xls_err:
+                logger.warning(f"[compute/submit] xls 转换失败（继续）: {_xls_err}")
 
             try:
                 from backend.utils.banner_splitter import preprocess_uploaded_files

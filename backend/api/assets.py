@@ -282,6 +282,19 @@ async def upload_asset(
     with open(file_path, "wb") as f:
         f.write(content)
 
+    # 老版 .xls 自动转 .xlsx（下游用 openpyxl，仅支持 xlsx/xlsm）
+    display_filename = file.filename
+    try:
+        from ..utils.source_normalizer import convert_xls_to_xlsx
+        _converted = convert_xls_to_xlsx(str(file_path))
+        if _converted != str(file_path):
+            file_path = Path(_converted)
+            if display_filename and display_filename.lower().endswith(".xls"):
+                display_filename = display_filename[:-4] + ".xlsx"
+    except Exception as _e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(f"xls转换失败（继续用原文件）: {_e}")
+
     # 多区域 sheet 预处理（banner 拆分 / 头一致合并 / 头不一致 best-region）
     try:
         from ..utils.banner_splitter import preprocess_excel_inplace
@@ -325,11 +338,11 @@ async def upload_asset(
         tenant_id=tenant_id,
         asset_type=asset_type,
         category_id=category_id,
-        name=name or file.filename,
+        name=name or display_filename,
         description=description,
         file_path=str(file_path),
-        file_name=file.filename,
-        file_size=len(content),
+        file_name=display_filename,
+        file_size=file_path.stat().st_size,
         sheet_summary=sheet_summary,
         parsed_data=parsed_data,
         effective_from=eff_from,
@@ -537,6 +550,19 @@ async def upload_new_version(
     with open(file_path, "wb") as f:
         f.write(content)
 
+    # 老版 .xls 自动转 .xlsx
+    display_filename = file.filename
+    try:
+        from ..utils.source_normalizer import convert_xls_to_xlsx
+        _converted = convert_xls_to_xlsx(str(file_path))
+        if _converted != str(file_path):
+            file_path = Path(_converted)
+            if display_filename and display_filename.lower().endswith(".xls"):
+                display_filename = display_filename[:-4] + ".xlsx"
+    except Exception as _e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(f"xls转换失败（继续用原文件）: {_e}")
+
     # 多区域 sheet 预处理
     try:
         from ..utils.banner_splitter import preprocess_excel_inplace
@@ -562,8 +588,8 @@ async def upload_new_version(
         name=asset.name,
         description=asset.description,
         file_path=str(file_path),
-        file_name=file.filename,
-        file_size=len(content),
+        file_name=display_filename,
+        file_size=file_path.stat().st_size,
         sheet_summary=_parse_sheet_summary(str(file_path)),
         parsed_data=new_parsed_data,
         version=asset.version + 1,

@@ -9,9 +9,56 @@
 即 Excel 序列号 >= 18262）保持不变。不改动解析器读值逻辑。
 """
 
+import os
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def convert_xls_to_xlsx(file_path: str, keep_original: bool = False) -> str:
+    """把老版 .xls 转成 .xlsx（同目录），返回新路径。
+
+    项目大量使用 openpyxl（只支持 .xlsx/.xlsm），故在上传入口统一把 .xls 转成 .xlsx，
+    下游逻辑无需改动。非 .xls（已是 .xlsx/.xlsm 或其他）原样返回。
+
+    keep_original=False（默认）：转换后删除原 .xls，避免目录里 glob 到两份；
+    keep_original=True：保留原 .xls（如训练模板这类被其它常量引用、不能删的源文件）。
+    """
+    if not file_path or not os.path.exists(file_path):
+        return file_path
+    if not str(file_path).lower().endswith(".xls"):
+        return file_path
+    try:
+        from Aspose.Cells import Workbook
+        import aspose_init
+        aspose_init.ensure_license()
+    except Exception as e:
+        logger.warning(f"[xls转换] Aspose 不可用，跳过: {e}")
+        return file_path
+
+    new_path = file_path[:-4] + ".xlsx"   # ".xls"(4) → ".xlsx"
+    try:
+        wb = Workbook(file_path)
+        try:
+            wb.Save(new_path)             # 按扩展名自动存为 xlsx
+        finally:
+            try:
+                wb.Dispose()
+            except Exception:
+                pass
+        # 删除原 .xls，避免目录里 glob 到两份（keep_original 时保留）
+        if not keep_original:
+            try:
+                if os.path.exists(new_path) and os.path.abspath(new_path) != os.path.abspath(file_path):
+                    os.remove(file_path)
+            except Exception:
+                pass
+        logger.info(f"[xls转换] {os.path.basename(file_path)} → {os.path.basename(new_path)}")
+        return new_path
+    except Exception as e:
+        logger.warning(f"[xls转换] 转换失败，保留原文件: {file_path} - {e}")
+        return file_path
+
 
 # Excel 序列号 18262 = 1950-01-01。小于此值的"日期"几乎不可能是真实业务日期，
 # 基本是被误设成日期格式的数字（社保费、比例等）。

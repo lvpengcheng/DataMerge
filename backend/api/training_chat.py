@@ -896,6 +896,15 @@ async def peek_template_sheets(
             except Exception as _e:
                 logger.warning(f"[peek] 解密失败: {_e}")
 
+        # 老版 .xls 转 .xlsx（下面用 openpyxl 读取，不支持 .xls）
+        try:
+            from ..utils.source_normalizer import convert_xls_to_xlsx
+            _conv = convert_xls_to_xlsx(fp_path)
+            if _conv != fp_path:
+                fp_path = _conv
+        except Exception as _xe:
+            logger.warning(f"[peek] xls 转换失败: {_xe}")
+
         # 用 openpyxl read_only 快速取 sheet 名 + 首行表头预览
         sheets_info = []
         try:
@@ -1067,6 +1076,22 @@ async def start_training(
         )
 
     # 第三步：多区域 sheet 预处理（banner 拆分 / 头一致合并 / 头不一致 best-region）
+    # 老版 .xls 自动转 .xlsx（解密后、预处理前）。模板(expected)也转，否则 openpyxl 加载会失败
+    try:
+        from ..utils.source_normalizer import convert_xls_to_xlsx
+        for fn in list(os.listdir(source_dir)):
+            if fn.lower().endswith(".xls"):
+                convert_xls_to_xlsx(os.path.join(source_dir, fn))
+        if expected_file and expected_file.lower().endswith(".xls"):
+            expected_file = convert_xls_to_xlsx(expected_file)
+        # 路径已变，重建 Excel 文件清单
+        all_excel_files = [(os.path.join(source_dir, fn), fn) for fn in os.listdir(source_dir)
+                           if fn.endswith((".xlsx", ".xlsm")) and not fn.startswith("~")]
+        if expected_file:
+            all_excel_files.append((expected_file, os.path.basename(expected_file)))
+    except Exception as _xls_e:
+        logger.warning(f"[chat训练] xls 转换失败（继续）: {_xls_e}")
+
     # 模板模式下：expected_file 是用户精心设计的模板（含公式/格式/合并），必须保留原状，不做任何拆分
     _files_for_preprocess = [fp for fp, _ in all_excel_files]
     if mode == "template" and expected_file and expected_file in _files_for_preprocess:
