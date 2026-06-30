@@ -1328,6 +1328,14 @@ function _showDownloadBar(sessionId, files) {
         contentDiv.appendChild(rulesBtn);
     }
 
+    // 最终规则（AI 整理：原始规则 + 多轮对话 + 当前最佳代码）
+    const finalBtn1 = document.createElement('button');
+    finalBtn1.className = 'download-btn';
+    finalBtn1.textContent = '📋 最终规则';
+    finalBtn1.title = '根据原始规则+多轮对话+当前最佳代码，整理出可直接用于下次训练的最终规则';
+    finalBtn1.onclick = () => _downloadFinalRules(sessionId, finalBtn1);
+    contentDiv.appendChild(finalBtn1);
+
     if (contentDiv.children.length === 0) return;  // 没有可下载的文件
 
     bar.appendChild(label);
@@ -1589,6 +1597,14 @@ function _showHistoryDownloadBar(sessionId, latestFiles, hasRules) {
         contentDiv.appendChild(rulesBtn);
     }
 
+    // 最终规则（AI 整理：原始规则 + 多轮对话 + 当前最佳代码）
+    const finalBtn2 = document.createElement('button');
+    finalBtn2.className = 'download-btn';
+    finalBtn2.textContent = '📋 最终规则';
+    finalBtn2.title = '根据原始规则+多轮对话+当前最佳代码，整理出可直接用于下次训练的最终规则';
+    finalBtn2.onclick = () => _downloadFinalRules(sessionId, finalBtn2);
+    contentDiv.appendChild(finalBtn2);
+
     if (contentDiv.children.length === 0) return;
 
     bar.appendChild(label);
@@ -1622,6 +1638,36 @@ async function _downloadOriginalFile(sessionId, category, filename) {
         URL.revokeObjectURL(objUrl);
     } catch (e) {
         alert('下载失败: ' + e.message);
+    }
+}
+
+// 下载"最终规则"：调用 AI 根据 原始规则+多轮对话+最佳代码 整理后下载为 .md
+async function _downloadFinalRules(sessionId, btn) {
+    const oldText = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ 整理中...'; }
+    try {
+        const resp = await AUTH.authFetch(`/api/training/chat/sessions/${sessionId}/final-rules`);
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            alert('生成最终规则失败: ' + (err.detail || `HTTP ${resp.status}`));
+            return;
+        }
+        const data = await resp.json();
+        const rules = data.rules || '';
+        if (!rules.trim()) { alert('未生成有效规则内容'); return; }
+        const blob = new Blob([rules], { type: 'text/markdown;charset=utf-8' });
+        const objUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = objUrl;
+        a.download = data.filename || `最终规则_${sessionId}.md`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(objUrl);
+    } catch (e) {
+        alert('生成最终规则失败: ' + e.message);
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = oldText || '📋 最终规则'; }
     }
 }
 

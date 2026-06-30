@@ -3130,6 +3130,149 @@ def download_original_file(
         raise HTTPException(status_code=400, detail=f"未知文件类别: {file_category}")
 
 
+@router.get("/sessions/{session_id}/final-rules")
+def generate_final_rules(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """根据【原始规则 + 多轮对话 + 当前最佳代码】，用 AI 整理出一份"最终规则"。
+
+    目的：训练经过多轮对话才逼近最优，用户想改逻辑时不必从最原始规则重来——
+    用这份整理好的最终规则作为下次训练的初始规则，可一步到位接近当前轮次的效果。
+    返回 {rules, filename}，前端据此下载 .md。
+    """
+    session = db.query(TrainingSession).filter_by(id=session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    config = session.config or {}
+
+    # 1) 原始规则：优先持久化 rules.txt，回退 config / session 字段
+    original_rules = ""
+    try:
+        from ..storage.storage_manager import StorageManager
+        sm = StorageManager()
+        rules_file = sm.get_tenant_dir(session.tenant_id) / "training_chat" / str(session_id) / "rules.txt"
+        if rules_file.exists():
+            original_rules = rules_file.read_text(encoding="utf-8")
+    except Exception:
+        pass
+    if not original_rules:
+        original_rules = config.get("rules_content", "") or (session.rules_content or "")
+
+    # 2) 当前最佳代码（按准确率最高、轮次最新）
+    best_iteration = (
+        db.query(TrainingIteration)
+        .filter_by(session_id=session_id)
+        .filter(TrainingIteration.accuracy.isnot(None))
+        .order_by(TrainingIteration.accuracy.desc(), TrainingIteration.iteration_num.desc())
+        .first()
+    )
+    best_code = best_iteration.generated_code if best_iteration else ""
+    best_accuracy = best_iteration.accuracy if best_iteration else None
+
+    # 3) 全量对话（user + assistant），按时间正序
+    msgs = (
+        db.query(TrainingMessage)
+        .filter_by(session_id=session_id)
+        .filter(TrainingMessage.role.in_(["user", "assistant"]))
+        .order_by(TrainingMessage.created_at.asc())
+        .all()
+    )
+    if not (original_rules or msgs or best_code):
+        raise HTTPException(status_code=400, detail="该会话暂无可整理的规则/对话/代码")
+
+    # 控制长度，避免超出上下文窗口（对话取每条前 1500 字，代码取前 12000 字）
+    convo_lines = []
+    for m in msgs:
+        role_cn = "用户" if m.role == "user" else "AI"
+        content = (m.content or "").strip()
+        if len(content) > 1500:
+            content = content[:1500] + " …(截断)"
+        if content:
+            convo_lines.append(f"【{role_cn}】{content}")
+    conversation = "\n".join(convo_lines) if convo_lines else "（无对话记录）"
+    code_for_prompt = (best_code or "")[:80000]
+
+    # 输出/源结构（帮助 AI 理解目标列与取数口径）
+    import json as _json
+    exp_struct = config.get("expected_structure") or {}
+    src_struct_desc = config.get("source_structure_desc") or ""
+    try:
+        exp_struct_txt = _json.dumps(exp_struct, ensure_ascii=False, indent=2)[:4000] if exp_struct else "（无）"
+    except Exception:
+        exp_struct_txt = "（无）"
+
+    try:
+        from ..ai_engine.ai_provider import AIProviderFactory
+        ai_provider_name = config.get("ai_provider") or os.environ.get("AI_PROVIDER", "deepseek")
+        provider = AIProviderFactory.create_provider(ai_provider_name)
+
+        # ===== 阶段 A：从最终代码逆向出"系统当前真实逻辑"（权威依据）=====
+        stage_a_system = (
+            "你是资深数据/薪酬计算逻辑逆向分析专家。下面是一段经过多轮调试、已达到最佳准确率的"
+            "生产脚本。请你逐字段/逐输出列地**逆向还原它实际执行的业务逻辑**（这是系统当前真实"
+            "行为的唯一权威依据）。\n"
+            "对每个输出列/字段，尽量给出：①取数来源（哪个源表/源列）②计算公式或取值规则"
+            "（含系数、四舍五入位数、单位换算）③触发条件/分支（如某类人群不同算法）④过滤、"
+            "去重、汇总、补零、类型转换等清洗动作 ⑤特殊情况/边界处理。\n"
+            "只陈述代码**确实做了什么**，不要臆测；代码没体现的不要编。用中文，可用列表/表格，"
+            "尽量精确，不要贴大段代码。"
+        )
+        stage_a_user = (
+            f"# 输出文件结构（目标列参考）\n{exp_struct_txt}\n\n"
+            f"# 源数据结构\n{src_struct_desc or '（无）'}\n\n"
+            f"# 最终脚本\n```python\n{code_for_prompt}\n```\n\n"
+            "请输出【代码真实逻辑】的逐字段分析。"
+        )
+        code_logic = (provider.chat([
+            {"role": "system", "content": stage_a_system},
+            {"role": "user", "content": stage_a_user},
+        ]) or "").strip()
+
+        # ===== 阶段 B：交叉校正——以代码逻辑为准，融合原始规则与对话意图，输出最终规则 =====
+        stage_b_system = (
+            "你是数据整合规则的总编。现在要产出一份**最终规则**，作为下次训练的初始规则，目标是"
+            "让下次几乎一步到位复现当前最佳结果。你手里有三份材料，权威级别不同：\n"
+            "1）【代码真实逻辑】= 系统当前实际行为，**最高权威**，凡冲突以它为准；\n"
+            "2）【多轮对话】= 需求演进与修正，用于理解*为什么*这么算、术语口径、易错点；"
+            "其中被后续推翻的说法要丢弃，只取最终生效的意图；\n"
+            "3）【初始规则】= 最初意图，可能已过时，仅作背景与术语补充。\n\n"
+            "请做**深度整合与修正**，而不是拼接：\n"
+            "- 以代码逻辑为骨架，逐输出列写明：取数来源、精确计算公式（系数/小数位/单位）、"
+            "适用条件与分支、清洗/汇总/补位规则、特殊情况处理；\n"
+            "- 用对话与初始规则补全业务含义、命名口径、边界约定，并**显式纠正**初始规则中与代码"
+            "不一致的地方（不必保留错误旧规则，但可在结尾用一小节『与初始规则的差异』点出关键修正）；\n"
+            "- 消除矛盾、补齐缺口，使整份规则自洽、可执行、无歧义；\n"
+            "- 中文 Markdown，业务语言描述（不要贴代码），结构清晰；只输出规则正文，不要寒暄/过程描述。"
+        )
+        stage_b_user = (
+            f"# 代码真实逻辑（最高权威）\n{code_logic or '（无）'}\n\n"
+            f"# 多轮对话（按时间正序，理解意图与修正）\n{conversation}\n\n"
+            f"# 初始规则（可能过时，仅作背景）\n{original_rules or '（无）'}\n\n"
+            "请输出深度整合与修正后的【最终规则】Markdown 正文。"
+        )
+        final_rules = provider.chat([
+            {"role": "system", "content": stage_b_system},
+            {"role": "user", "content": stage_b_user},
+        ])
+    except Exception as e:
+        logger.exception("生成最终规则失败")
+        raise HTTPException(status_code=500, detail=f"生成最终规则失败: {e}")
+
+    final_rules = (final_rules or "").strip()
+    if not final_rules:
+        raise HTTPException(status_code=500, detail="AI 未返回有效规则内容")
+
+    safe_key = str(getattr(session, "session_key", None) or session_id)
+    return {
+        "rules": final_rules,
+        "filename": f"最终规则_{safe_key}.md",
+        "best_accuracy": best_accuracy,
+        "based_on_iterations": session.total_iterations or 0,
+    }
+
+
 # ==================== 辅助函数 ====================
 
 

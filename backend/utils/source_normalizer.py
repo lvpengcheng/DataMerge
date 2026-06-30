@@ -15,11 +15,136 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _text_quality(texts) -> float:
+    """文本可读性评分(0~1)：CJK/ASCII/全角标点算"好"，替换符(�)与 Latin-1 扩展段算"坏"。
+    .xls codepage 标错时，中文常被误读成 Latin-1 扩展字符（如 ã€å¤©），据此判乱码。"""
+    joined = "".join(t for t in texts if t)
+    if not joined:
+        return 1.0  # 无文本，不判乱码
+    good = 0.0
+    bad = 0.0
+    for ch in joined:
+        o = ord(ch)
+        if ch in "\t\n\r ":
+            continue
+        if o == 0xFFFD:                      # 替换符
+            bad += 2
+        elif 0x4E00 <= o <= 0x9FFF:          # CJK 汉字
+            good += 1
+        elif 0x20 <= o <= 0x7E:              # ASCII 可见
+            good += 1
+        elif 0x3000 <= o <= 0x303F or 0xFF00 <= o <= 0xFFEF:  # CJK标点/全角
+            good += 1
+        elif 0x80 <= o <= 0x24F:             # Latin-1 补充/扩展A → GBK 误读特征
+            bad += 1
+        else:
+            bad += 0.3                        # 其它生僻字符，轻微扣分
+    total = good + bad
+    return (good / total) if total else 1.0
+
+
+def _looks_garbled(texts) -> bool:
+    return _text_quality(texts) < 0.7
+
+
+def _sample_xlsx_text(path, max_n: int = 400) -> list:
+    """用 openpyxl 只读模式快速取若干文本单元格，用于乱码检测。"""
+    out = []
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            for ws in wb.worksheets[:3]:
+                for i, row in enumerate(ws.iter_rows(values_only=True, max_row=30)):
+                    for v in row[:40]:
+                        if isinstance(v, str) and v.strip():
+                            out.append(v)
+                    if len(out) >= max_n:
+                        break
+                if len(out) >= max_n:
+                    break
+        finally:
+            wb.close()
+    except Exception:
+        pass
+    return out
+
+
+def _xls_to_xlsx_via_xlrd(xls_path: str, xlsx_path: str) -> bool:
+    """用 xlrd 读取 .xls 并自动选择最佳编码(encoding_override)，重写为 .xlsx。
+
+    适用于 Aspose 因 .xls codepage 标错而乱码的情况。仅取值（丢格式/公式），
+    对源数据足够；返回是否成功。"""
+    try:
+        import xlrd
+        from openpyxl import Workbook as _OWb
+    except Exception as e:
+        logger.warning(f"[xls转换] xlrd/openpyxl 不可用: {e}")
+        return False
+
+    candidates = ["gbk", "gb18030", "utf-8", "big5", "cp936", "cp1252"]
+
+    def _quality_for(enc):
+        try:
+            bk = xlrd.open_workbook(xls_path, encoding_override=enc, on_demand=True)
+        except Exception:
+            return -1, None
+        samples = []
+        try:
+            for si in range(min(bk.nsheets, 3)):
+                sh = bk.sheet_by_index(si)
+                for r in range(min(sh.nrows, 30)):
+                    for c in range(min(sh.ncols, 40)):
+                        v = sh.cell_value(r, c)
+                        if isinstance(v, str) and v.strip():
+                            samples.append(v)
+                try:
+                    bk.unload_sheet(si)
+                except Exception:
+                    pass
+        finally:
+            try:
+                bk.release_resources()
+            except Exception:
+                pass
+        return _text_quality(samples), enc
+
+    best_enc, best_q = None, -1.0
+    for enc in candidates:
+        q, _ = _quality_for(enc)
+        if q > best_q:
+            best_q, best_enc = q, enc
+    if best_enc is None:
+        return False
+
+    try:
+        bk = xlrd.open_workbook(xls_path, encoding_override=best_enc)
+        owb = _OWb(write_only=True)
+        for si in range(bk.nsheets):
+            sh = bk.sheet_by_index(si)
+            title = (sh.name or f"Sheet{si + 1}")[:31]
+            ws = owb.create_sheet(title=title)
+            for r in range(sh.nrows):
+                ws.append([
+                    (v if (v is not None and v != "") else None)
+                    for v in sh.row_values(r)
+                ])
+        owb.save(xlsx_path)
+        logger.info(f"[xls转换] xlrd 重转完成(编码={best_enc}, 质量={best_q:.2f}): {os.path.basename(xlsx_path)}")
+        return True
+    except Exception as e:
+        logger.warning(f"[xls转换] xlrd 重转失败: {e}")
+        return False
+
+
 def convert_xls_to_xlsx(file_path: str, keep_original: bool = False) -> str:
     """把老版 .xls 转成 .xlsx（同目录），返回新路径。
 
     项目大量使用 openpyxl（只支持 .xlsx/.xlsm），故在上传入口统一把 .xls 转成 .xlsx，
     下游逻辑无需改动。非 .xls（已是 .xlsx/.xlsm 或其他）原样返回。
+
+    转换后会检测是否乱码（.xls codepage 标错时 Aspose 会读出乱码导致表头匹配失败、
+    算不出结果）；若乱码则用 xlrd 自动择优编码重转。
 
     keep_original=False（默认）：转换后删除原 .xls，避免目录里 glob 到两份；
     keep_original=True：保留原 .xls（如训练模板这类被其它常量引用、不能删的源文件）。
@@ -46,6 +171,25 @@ def convert_xls_to_xlsx(file_path: str, keep_original: bool = False) -> str:
                 wb.Dispose()
             except Exception:
                 pass
+
+        # 乱码检测与修复：Aspose 结果疑似乱码 → 用 xlrd 自动编码重转（择优者替换）
+        try:
+            asp_samples = _sample_xlsx_text(new_path)
+            if _looks_garbled(asp_samples):
+                logger.warning(f"[xls转换] Aspose 结果疑似乱码，尝试 xlrd 自动编码重转: {os.path.basename(file_path)}")
+                tmp_path = new_path + ".xlrd.xlsx"
+                if _xls_to_xlsx_via_xlrd(file_path, tmp_path):
+                    if _text_quality(_sample_xlsx_text(tmp_path)) > _text_quality(asp_samples):
+                        os.replace(tmp_path, new_path)
+                        logger.info(f"[xls转换] 已用 xlrd 编码修复乱码: {os.path.basename(new_path)}")
+                    else:
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+        except Exception as _enc_e:
+            logger.warning(f"[xls转换] 乱码检测/修复跳过: {_enc_e}")
+
         # 删除原 .xls，避免目录里 glob 到两份（keep_original 时保留）
         if not keep_original:
             try:

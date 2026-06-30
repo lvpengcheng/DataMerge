@@ -17,9 +17,15 @@ logger = logging.getLogger(__name__)
 _ILLEGAL = re.compile(r'[\\/:*?"<>|]+')
 
 
-def _safe_name(s, fallback="result"):
+def _safe_name(s, fallback="result", max_bytes=120):
     s = (str(s) if s else "").strip() or fallback
-    return _ILLEGAL.sub("_", s)
+    s = _ILLEGAL.sub("_", s)
+    # 按 UTF-8 字节截断脚本名部分：防止文件名过长触发文件系统(单段≤255字节)/路径长度上限，
+    # 否则原版能存、更长的"_纯值"版存不出来 → 纯值版按钮缺失。中文按 3 字节计。
+    b = s.encode("utf-8")
+    if len(b) > max_bytes:
+        s = b[:max_bytes].decode("utf-8", "ignore").rstrip("_ ") or fallback
+    return s
 
 
 def build_result_filename(script_name, salary_year=None, salary_month=None, ext=".xlsx") -> str:
@@ -143,31 +149,46 @@ def make_values_only_copy(src_xlsx, dst_xlsx, source_sheet_prefix="源_"):
 
         # 1) 公式格转纯值
         for i in range(wb.Worksheets.Count):
-            ws = wb.Worksheets[i]
-            cells = ws.Cells
-            it = cells.GetEnumerator()
-            while it.MoveNext():
-                cell = it.Current
-                try:
-                    if cell.IsFormula:
-                        cell.PutValue(cell.Value)
-                except Exception:
-                    continue
+            try:
+                ws = wb.Worksheets[i]
+                cells = ws.Cells
+                it = cells.GetEnumerator()
+                while it.MoveNext():
+                    cell = it.Current
+                    try:
+                        if cell.IsFormula:
+                            cell.PutValue(cell.Value)
+                    except Exception:
+                        continue
+            except Exception as _we:
+                logger.warning(f"[纯值版] sheet 转值跳过(忽略): idx={i} - {_we}")
+                continue
 
         # 2) 删除 源_ 前缀的源数据 sheet（倒序删，避免索引错位）
-        for i in range(wb.Worksheets.Count - 1, -1, -1):
-            try:
-                name = wb.Worksheets[i].Name
-                if source_sheet_prefix and str(name).startswith(source_sheet_prefix):
-                    wb.Worksheets.RemoveAt(i)
-            except Exception:
-                continue
+        #    保护：至少保留一个 sheet —— 若删完会为空（极端：全是 源_ sheet），则不删，
+        #    避免 Aspose Save 因"工作簿无 sheet"报错导致整个纯值版生成失败。
+        try:
+            names = [str(wb.Worksheets[i].Name) for i in range(wb.Worksheets.Count)]
+            src_idx = [i for i, n in enumerate(names)
+                       if source_sheet_prefix and n.startswith(source_sheet_prefix)]
+            non_src_count = wb.Worksheets.Count - len(src_idx)
+            if non_src_count >= 1:
+                # 有目标 sheet：安全删除全部 源_ sheet（倒序）
+                for i in sorted(src_idx, reverse=True):
+                    try:
+                        wb.Worksheets.RemoveAt(i)
+                    except Exception as _re:
+                        logger.warning(f"[纯值版] 删除源sheet失败(忽略): idx={i} - {_re}")
+            elif src_idx:
+                logger.warning(f"[纯值版] 全部为源数据sheet，保留以避免空工作簿: {names}")
+        except Exception as _se:
+            logger.warning(f"[纯值版] 处理源sheet时异常(忽略，继续保存): {_se}")
 
         wb.Save(str(dst_xlsx))
         logger.info(f"[纯值版] 已生成: {dst_xlsx}")
         return str(dst_xlsx)
     except Exception as e:
-        logger.warning(f"[纯值版] 处理异常，跳过: {src_xlsx} - {e}")
+        logger.exception(f"[纯值版] 生成失败（返回 None）: {src_xlsx} -> {dst_xlsx}: {e}")
         return None
     finally:
         try:

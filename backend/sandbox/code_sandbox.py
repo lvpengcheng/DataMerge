@@ -633,6 +633,12 @@ class CodeSandbox:
             if not is_allowed:
                 raise PermissionError(f"不允许访问文件: {filepath}")
 
+            # 治本：文本模式统一 encoding="utf-8"，避免在非 UTF-8 默认编码的系统（Windows GBK、
+            # 部分服务器 locale）上脚本读写中文 CSV/文本时乱码。二进制模式或已显式指定编码则不动。
+            # open(file, mode, buffering, encoding, ...) —— encoding 为第 4 个位置参数(args[1])
+            if 'b' not in mode and 'encoding' not in kwargs and len(args) < 2:
+                kwargs['encoding'] = 'utf-8'
+
             return open(filepath, mode, *args, **kwargs)
 
         safe_env['open'] = safe_open

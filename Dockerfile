@@ -113,6 +113,11 @@ RUN mkdir -p tenants data logs output compare_results temp
 # ========== 9. 环境变量 ==========
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
+# 进程级强制 UTF-8：让所有 open() 文本读写默认 utf-8（不随系统 locale），
+# 避免读脚本/CSV/文本时中文乱码。覆盖沙箱与 importlib 两条执行路径。
+ENV PYTHONUTF8=1
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
 ENV DATABASE_URL=sqlite:///./data/data.db
 ENV LD_LIBRARY_PATH=/app/libs:/usr/lib:${LD_LIBRARY_PATH}
 ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false

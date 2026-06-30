@@ -728,7 +728,7 @@ def _snapshot_workbook(wb):
 
 
 def _snapshot_number_formats(wb):
-    \"\"\"快照所有单元格的 number_format（含空单元格），用于 fill 后恢复模板原有格式。\"\"\"
+    \"\"\"Snapshot every cell number_format (including empty cells), used to restore template formats after fill.\"\"\"
     snap = {{}}
     for ws in wb.worksheets:
         try:
@@ -747,11 +747,12 @@ def _snapshot_number_formats(wb):
 
 
 def _restore_number_formats(wb, fmt_snapshot):
-    \"\"\"模板填充模式：严格遵循模板原有单元格格式。
+    \"\"\"Template-fill mode: strictly keep the template original cell formats.
 
-    openpyxl 给 General 单元格写入 datetime 值时会自动把格式改成日期格式，
-    导致模板原本的常规/数值列在输出里变成日期格式。这里按快照把被改动的格式
-    恢复为模板原格式（模板原本是日期列则保持日期，是常规则保持常规）。\"\"\"
+    openpyxl auto-changes a General cell to a date format when a datetime value is
+    written, turning the template's plain/numeric columns into date columns in the
+    output. Restore each cell's number_format from the snapshot (date stays date,
+    general stays general).\"\"\"
     restored = 0
     for ws in wb.worksheets:
         before = fmt_snapshot.get(ws.title)
@@ -766,7 +767,7 @@ def _restore_number_formats(wb, fmt_snapshot):
             except Exception:
                 continue
     if restored:
-        print(f"  [格式保护] 已恢复 {{restored}} 个被改动的单元格格式为模板原格式")
+        print(f"  [fmt-guard] restored {{restored}} cells to template format")
     return restored
 
 
@@ -861,11 +862,12 @@ def main():
     print("步骤：调用 AI 生成的 fill_template 写入规则要求的列...")
     fill_template(wb, source_data, salary_year, salary_month, monthly_standard_hours)
 
-    # 模板填充模式：恢复模板原有单元格格式（防止写入 datetime 等被 openpyxl 自动改成日期格式）
+    # Template-fill mode: restore template original cell formats
+    # (prevent openpyxl auto-changing General to date format when datetime is written)
     try:
         _restore_number_formats(wb, _fmt_snapshot)
     except Exception as _fe:
-        print(f"[格式保护] 恢复格式异常（不阻断）：{{_fe}}")
+        print(f"[fmt-guard] restore format error (ignored): {{_fe}}")
 
     try:
         import json as _json
