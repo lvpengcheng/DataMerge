@@ -728,14 +728,54 @@ def list_chat_sessions(
         .all()
     )
 
+    # 收集停用脚本标识：DB is_active=False 的名称/代码哈希 + FS 禁用表（与 /api/tenant-scripts 口径一致）
+    _disabled_names = set()
+    _disabled_hashes = set()
+    try:
+        import hashlib as _hl
+        for ds in db.query(Script).filter(Script.tenant_id == tenant_id, Script.is_active == False).all():
+            if ds.name:
+                _disabled_names.add(ds.name)
+            if ds.code:
+                _disabled_hashes.add(_hl.md5(ds.code.encode("utf-8")).hexdigest()[:12])
+        from ..storage.storage_manager import StorageManager
+        _disabled_names |= set(StorageManager().get_disabled_script_ids(tenant_id) or [])
+    except Exception:
+        pass
+
+    def _script_disabled(scr):
+        if scr is None:
+            return False
+        if not scr.is_active:
+            return True
+        if scr.name and scr.name in _disabled_names:
+            return True
+        if scr.code:
+            import hashlib as _hl2
+            _h = _hl2.md5(scr.code.encode("utf-8")).hexdigest()[:12]
+            if _h in _disabled_hashes or ("script_" + _h) in _disabled_names:
+                return True
+        return False
+
     result = []
     for s in sessions:
+        cfg = s.config or {}
+
         # 获取最新脚本信息
         script = None
         if s.final_script_id:
             script = db.query(Script).filter_by(id=s.final_script_id).first()
+            if script is None:
+                continue  # 关联脚本已被删除 → 会话不再显示
+            if _script_disabled(script):
+                continue  # 关联脚本已停用 → 会话不再显示
 
-        cfg = s.config or {}
+        # 兜底：多数会话 final_script_id 为空，脚本关联在 cfg.script_name 上
+        #       → 按会话记录的脚本名判断是否已停用（停用按名生效）
+        _sname = (cfg.get("script_name") or "").strip()
+        if _sname and _sname in _disabled_names:
+            continue
+
         latest_files = cfg.get("latest_files", {})
         result.append({
             "id": s.id,
@@ -2896,12 +2936,12 @@ def get_current_code(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """获取会话当前最佳代码"""
+    """获取会话最新代码（最近一次迭代/上传的代码，而非历史最高分）"""
     best = (
         db.query(TrainingIteration)
         .filter_by(session_id=session_id)
-        .filter(TrainingIteration.accuracy.isnot(None))
-        .order_by(TrainingIteration.accuracy.desc(), TrainingIteration.iteration_num.desc())
+        .filter(TrainingIteration.generated_code.isnot(None))
+        .order_by(TrainingIteration.iteration_num.desc())
         .first()
     )
     if not best:

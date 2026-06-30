@@ -16,7 +16,10 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
 from ..database.connection import get_db
-from ..database.models import User, Role, Organization, TenantAuthorization, Template, ComputeTask, DataAsset, Script
+from ..database.models import (
+    User, Role, Organization, TenantAuthorization, Template, ComputeTask, DataAsset, Script,
+    TrainingSession, TrainingMessage, TrainingIteration, ScriptMigration,
+)
 from ..auth.dependencies import require_admin, get_current_user
 from ..auth.schemas import (
     UserCreate, UserUpdate, UserResponse,
@@ -1396,4 +1399,251 @@ async def enable_tenant_script(
     from ..storage.storage_manager import StorageManager
     StorageManager().set_script_disabled(tenant_id, script_id, False)
     return {"success": True, "tenant_id": tenant_id, "script_id": script_id, "disabled": False}
+
+
+# ========================= 测试环境脚本迁移 =========================
+
+import hashlib as _hashlib
+import json as _json
+from pydantic import BaseModel as _BaseModel
+
+
+def _code_hash(code: str) -> str:
+    """跨环境稳定标识：script_<md5(code)[:12]>，与文件型 script_id 一致。"""
+    return "script_" + _hashlib.md5((code or "").encode("utf-8")).hexdigest()[:12]
+
+
+def _test_env_conf():
+    base = (os.getenv("TEST_ENV_BASE_URL") or "").strip().rstrip("/")
+    user = (os.getenv("TEST_ENV_USERNAME") or "").strip()
+    pwd = os.getenv("TEST_ENV_PASSWORD") or ""
+    return base, user, pwd
+
+
+def _remote_login(base, user, pwd):
+    import requests
+    resp = requests.post(f"{base}/api/auth/login",
+                         json={"username": user, "password": pwd}, timeout=30)
+    resp.raise_for_status()
+    return resp.json()["access_token"]
+
+
+def _remote_get(base, token, path):
+    import requests
+    resp = requests.get(f"{base}{path}",
+                        headers={"Authorization": f"Bearer {token}"}, timeout=180)
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ---- 导出端（双环境同代码都有，被对方远程拉取）----
+
+@router.get("/migration/export-list")
+async def migration_export_list(db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    """列出本环境可迁移的已训练脚本（供其它环境拉取）。"""
+    scripts = (db.query(Script).filter(Script.is_active == True)
+               .order_by(Script.tenant_id, Script.name).all())
+    items = []
+    for s in scripts:
+        if not s.code:
+            continue
+        items.append({
+            "db_id": s.id, "hash": _code_hash(s.code), "name": s.name,
+            "tenant_id": s.tenant_id, "mode": s.mode, "accuracy": s.accuracy,
+            "version": s.version, "source_session_id": s.source_session_id,
+            "has_session": s.source_session_id is not None,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+        })
+    return {"total": len(items), "items": items}
+
+
+@router.get("/migration/export/{db_id}")
+async def migration_export(db_id: int, db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    """导出单脚本完整包：Script + 训练会话 + 对话 + 迭代。"""
+    s = db.query(Script).filter(Script.id == db_id).first()
+    if not s:
+        raise HTTPException(status_code=404, detail="脚本不存在")
+    _sc_cols = ("name", "description", "code", "mode", "config", "manual_headers",
+                "source_structure", "rules_content", "expected_structure", "accuracy", "version", "tenant_id")
+    script = {c: getattr(s, c) for c in _sc_cols}
+    session, messages, iterations = None, [], []
+    if s.source_session_id:
+        ts = db.query(TrainingSession).filter(TrainingSession.id == s.source_session_id).first()
+        if ts:
+            _ss_cols = ("session_key", "mode", "status", "config", "ai_provider", "salary_year",
+                        "salary_month", "manual_headers", "rules_content", "source_structure",
+                        "expected_structure", "total_iterations", "best_accuracy")
+            session = {c: getattr(ts, c) for c in _ss_cols}
+            for m in (db.query(TrainingMessage).filter_by(session_id=ts.id)
+                      .order_by(TrainingMessage.created_at.asc()).all()):
+                messages.append({"role": m.role, "content": m.content, "msg_type": m.msg_type,
+                                 "metadata": m.metadata_,
+                                 "created_at": m.created_at.isoformat() if m.created_at else None})
+            for it in (db.query(TrainingIteration).filter_by(session_id=ts.id)
+                       .order_by(TrainingIteration.iteration_num.asc()).all()):
+                iterations.append({c: getattr(it, c) for c in (
+                    "iteration_num", "status", "prompt_text", "ai_response", "generated_code",
+                    "execution_result", "accuracy", "error_details", "duration_seconds")})
+    return {"hash": _code_hash(s.code), "source_db_id": s.id, "script": script,
+            "session": session, "messages": messages, "iterations": iterations}
+
+
+# ---- 导入端（当前环境，UI 调用）----
+
+class _MigrateItem(_BaseModel):
+    db_id: int
+    hash: str
+    name: Optional[str] = ""
+
+
+class _MigrateReq(_BaseModel):
+    target_tenant_id: str
+    items: List[_MigrateItem]
+    overwrite: bool = False
+
+
+@router.get("/migration/remote-scripts")
+async def migration_remote_scripts(
+    target_tenant: str = Query(..., description="迁入的目标租户"),
+    db: Session = Depends(get_db), _admin: User = Depends(require_admin),
+):
+    """登录测试环境→拉取其已训练脚本列表→标注已迁移/已存在。"""
+    base, user, pwd = _test_env_conf()
+    if not (base and user and pwd):
+        raise HTTPException(status_code=400, detail="未配置测试环境（TEST_ENV_BASE_URL/USERNAME/PASSWORD）")
+    try:
+        token = _remote_login(base, user, pwd)
+        data = _remote_get(base, token, "/api/admin/migration/export-list")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"连接测试环境失败: {e}")
+    items = data.get("items", [])
+    migrated = {r.source_script_hash for r in
+                db.query(ScriptMigration).filter_by(target_tenant_id=target_tenant).all()}
+    local_hashes = {_code_hash(s.code) for s in
+                    db.query(Script).filter_by(tenant_id=target_tenant, is_active=True).all() if s.code}
+    for it in items:
+        h = it.get("hash")
+        it["already_migrated"] = h in migrated
+        it["exists_by_hash"] = h in local_hashes
+    return {"total": len(items), "items": items, "source_url": base}
+
+
+@router.post("/migration/import")
+async def migration_import(req: _MigrateReq, db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    """把选中的测试环境脚本+训练记录迁入当前环境的目标租户。"""
+    base, user, pwd = _test_env_conf()
+    if not (base and user and pwd):
+        raise HTTPException(status_code=400, detail="未配置测试环境")
+    try:
+        token = _remote_login(base, user, pwd)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"测试环境登录失败: {e}")
+
+    tenant = req.target_tenant_id
+    local_map = {}
+    for s in db.query(Script).filter_by(tenant_id=tenant, is_active=True).all():
+        if s.code:
+            local_map.setdefault(_code_hash(s.code), s)
+
+    from ..storage.storage_manager import StorageManager
+    sm = StorageManager()
+    imported, conflicts, skipped = [], [], []
+
+    for item in req.items:
+        existing = local_map.get(item.hash)
+        if existing and not req.overwrite:
+            conflicts.append({"db_id": item.db_id, "hash": item.hash, "name": item.name})
+            continue
+        try:
+            bundle = _remote_get(base, token, f"/api/admin/migration/export/{item.db_id}")
+        except Exception as e:
+            skipped.append({"name": item.name, "reason": f"拉取失败: {e}"})
+            continue
+        sc = bundle.get("script") or {}
+        code = sc.get("code") or ""
+        if not code:
+            skipped.append({"name": item.name, "reason": "无代码"})
+            continue
+
+        # 1) 训练会话 + 对话 + 迭代
+        new_session_id = None
+        sess = bundle.get("session")
+        if sess:
+            skey = sess.get("session_key") or f"mig_{item.hash}"
+            if db.query(TrainingSession).filter_by(session_key=skey).first():
+                skey = f"{skey}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            ts = TrainingSession(
+                tenant_id=tenant, session_key=skey,
+                mode=sess.get("mode") or sc.get("mode") or "formula",
+                status=sess.get("status") or "completed", config=sess.get("config"),
+                ai_provider=sess.get("ai_provider"), salary_year=sess.get("salary_year"),
+                salary_month=sess.get("salary_month"), manual_headers=sess.get("manual_headers"),
+                rules_content=sess.get("rules_content"), source_structure=sess.get("source_structure"),
+                expected_structure=sess.get("expected_structure"),
+                total_iterations=sess.get("total_iterations") or 0, best_accuracy=sess.get("best_accuracy"),
+            )
+            db.add(ts)
+            db.flush()
+            new_session_id = ts.id
+            for m in bundle.get("messages", []):
+                db.add(TrainingMessage(
+                    session_id=ts.id, role=m.get("role") or "user", content=m.get("content") or "",
+                    msg_type=m.get("msg_type") or "chat", metadata_=m.get("metadata")))
+            for itr in bundle.get("iterations", []):
+                db.add(TrainingIteration(
+                    session_id=ts.id, iteration_num=itr.get("iteration_num") or 0,
+                    status=itr.get("status") or "completed", prompt_text=itr.get("prompt_text"),
+                    ai_response=itr.get("ai_response"), generated_code=itr.get("generated_code"),
+                    execution_result=itr.get("execution_result"), accuracy=itr.get("accuracy"),
+                    error_details=itr.get("error_details"), duration_seconds=itr.get("duration_seconds")))
+
+        # 2) Script（覆盖或新建）
+        if existing:
+            tgt = existing
+            tgt.code = code
+            tgt.name = sc.get("name") or existing.name
+            tgt.description = sc.get("description") or ""
+            tgt.mode = sc.get("mode") or "formula"
+            tgt.config = sc.get("config")
+            tgt.manual_headers = sc.get("manual_headers")
+            tgt.source_structure = sc.get("source_structure")
+            tgt.rules_content = sc.get("rules_content")
+            tgt.expected_structure = sc.get("expected_structure")
+            tgt.accuracy = sc.get("accuracy")
+            tgt.source_session_id = new_session_id
+            tgt.is_active = True
+            tgt.updated_at = datetime.utcnow()
+        else:
+            tgt = Script(
+                tenant_id=tenant, name=sc.get("name") or item.hash, description=sc.get("description") or "",
+                code=code, mode=sc.get("mode") or "formula", config=sc.get("config"),
+                manual_headers=sc.get("manual_headers"), source_structure=sc.get("source_structure"),
+                rules_content=sc.get("rules_content"), expected_structure=sc.get("expected_structure"),
+                accuracy=sc.get("accuracy"), source_session_id=new_session_id, version=1, is_active=True)
+            db.add(tgt)
+        db.flush()
+        if new_session_id:
+            ts2 = db.query(TrainingSession).filter_by(id=new_session_id).first()
+            if ts2:
+                ts2.final_script_id = tgt.id
+
+        # 3) 落盘 scripts/script_<hash>.py + _info.json（智算 get_script_content 据此读取）
+        try:
+            scripts_dir = sm.get_tenant_dir(tenant) / "scripts"
+            scripts_dir.mkdir(parents=True, exist_ok=True)
+            (scripts_dir / f"{item.hash}.py").write_text(code, encoding="utf-8")
+            info = {"script_id": item.hash, "tenant_id": tenant, "name": tgt.name,
+                    "score": sc.get("accuracy"), "migrated_from": base}
+            (scripts_dir / f"{item.hash}_info.json").write_text(
+                _json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as fe:
+            logging.getLogger(__name__).warning(f"[迁移] 落盘失败: {fe}")
+
+        # 4) 迁移记录
+        db.add(ScriptMigration(source_url=base, source_script_hash=item.hash, source_db_id=item.db_id,
+                               target_tenant_id=tenant, target_script_id=tgt.id, name=tgt.name))
+        imported.append({"name": tgt.name, "hash": item.hash, "overwritten": bool(existing)})
+
+    db.commit()
+    return {"imported": imported, "conflicts": conflicts, "skipped": skipped}
 

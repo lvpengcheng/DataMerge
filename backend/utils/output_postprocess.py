@@ -124,8 +124,15 @@ def restore_formats_from_template(output_path, template_path) -> int:
     return restored
 
 
-def make_values_only_copy(src_xlsx, dst_xlsx, source_sheet_prefix="源_"):
-    """生成纯值副本：公式→值，并删除 源_ 前缀的源数据 sheet（只保留目标 sheet）。
+def make_values_only_copy(src_xlsx, dst_xlsx, source_sheet_prefix="源_", keep_sheets=None):
+    """生成纯值副本：公式→值，并只保留目标 sheet。
+
+    sheet 取舍优先级：
+      1) keep_sheets（目标 sheet 白名单）给定且命中时：只保留名字在白名单内的 sheet
+         （按去空格归一比较），其余（含无 源_ 前缀的源 sheet）全部删除。
+         安全阀：若白名单一个都没命中（结果 sheet 名与目标文件对不上），则不按白名单删，
+         回退到仅删 源_ 前缀，避免产出空/错文件。
+      2) 否则：删除 源_ 前缀的源数据 sheet。
 
     返回 dst_xlsx（成功）或 None（失败/被跳过）。
     """
@@ -164,25 +171,48 @@ def make_values_only_copy(src_xlsx, dst_xlsx, source_sheet_prefix="源_"):
                 logger.warning(f"[纯值版] sheet 转值跳过(忽略): idx={i} - {_we}")
                 continue
 
-        # 2) 删除 源_ 前缀的源数据 sheet（倒序删，避免索引错位）
-        #    保护：至少保留一个 sheet —— 若删完会为空（极端：全是 源_ sheet），则不删，
-        #    避免 Aspose Save 因"工作簿无 sheet"报错导致整个纯值版生成失败。
+        # 2) 取舍 sheet：优先按目标 sheet 白名单，否则删 源_ 前缀
         try:
             names = [str(wb.Worksheets[i].Name) for i in range(wb.Worksheets.Count)]
-            src_idx = [i for i, n in enumerate(names)
-                       if source_sheet_prefix and n.startswith(source_sheet_prefix)]
-            non_src_count = wb.Worksheets.Count - len(src_idx)
-            if non_src_count >= 1:
-                # 有目标 sheet：安全删除全部 源_ sheet（倒序）
-                for i in sorted(src_idx, reverse=True):
-                    try:
-                        wb.Worksheets.RemoveAt(i)
-                    except Exception as _re:
-                        logger.warning(f"[纯值版] 删除源sheet失败(忽略): idx={i} - {_re}")
-            elif src_idx:
-                logger.warning(f"[纯值版] 全部为源数据sheet，保留以避免空工作簿: {names}")
+
+            keep_norm = None
+            if keep_sheets:
+                keep_norm = {str(s).strip() for s in keep_sheets if str(s).strip()}
+
+            applied_whitelist = False
+            if keep_norm:
+                survive_idx = [i for i, n in enumerate(names) if n.strip() in keep_norm]
+                if survive_idx:
+                    # 白名单命中：删除所有不在白名单内的 sheet（含无前缀的源 sheet）
+                    survive_set = set(survive_idx)
+                    for i in sorted((i for i in range(len(names)) if i not in survive_set), reverse=True):
+                        try:
+                            wb.Worksheets.RemoveAt(i)
+                        except Exception as _re:
+                            logger.warning(f"[纯值版] 删除非目标sheet失败(忽略): idx={i} - {_re}")
+                    applied_whitelist = True
+                    logger.info(f"[纯值版] 按目标sheet白名单保留: {[names[i] for i in survive_idx]}（原有 {names}）")
+                else:
+                    # 安全阀：白名单未命中任何输出 sheet → 回退仅删 源_ 前缀
+                    logger.warning(f"[纯值版] 目标sheet白名单 {sorted(keep_norm)} 未命中输出 {names}，回退仅删源_前缀")
+
+            if not applied_whitelist:
+                # 删除 源_ 前缀的源数据 sheet（倒序删，避免索引错位）
+                # 保护：至少保留一个 sheet —— 若删完会为空（极端：全是 源_ sheet），则不删，
+                # 避免 Aspose Save 因"工作簿无 sheet"报错导致整个纯值版生成失败。
+                src_idx = [i for i, n in enumerate(names)
+                           if source_sheet_prefix and n.startswith(source_sheet_prefix)]
+                non_src_count = wb.Worksheets.Count - len(src_idx)
+                if non_src_count >= 1:
+                    for i in sorted(src_idx, reverse=True):
+                        try:
+                            wb.Worksheets.RemoveAt(i)
+                        except Exception as _re:
+                            logger.warning(f"[纯值版] 删除源sheet失败(忽略): idx={i} - {_re}")
+                elif src_idx:
+                    logger.warning(f"[纯值版] 全部为源数据sheet，保留以避免空工作簿: {names}")
         except Exception as _se:
-            logger.warning(f"[纯值版] 处理源sheet时异常(忽略，继续保存): {_se}")
+            logger.warning(f"[纯值版] 处理sheet时异常(忽略，继续保存): {_se}")
 
         wb.Save(str(dst_xlsx))
         logger.info(f"[纯值版] 已生成: {dst_xlsx}")

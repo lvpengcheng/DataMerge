@@ -30,6 +30,7 @@
             <button class="tab-btn" data-tab="tenant-auth" data-perm="admin.tenant_auth">租户授权</button>
             <button class="tab-btn" data-tab="ref-data" data-perm="admin.ref_data">基础数据</button>
             <button class="tab-btn" data-tab="scripts" data-perm="admin.scripts">脚本管理</button>
+            <button class="tab-btn" data-tab="test-migration" data-perm="admin.test_migration">测试迁移</button>
         </div>
 
         <!-- 用户管理 Tab -->
@@ -171,6 +172,37 @@
                 <tbody></tbody>
             </table>
         </div>
+
+        <!-- 测试迁移 Tab -->
+        <div class="tab-content" id="tab-test-migration">
+            <div class="toolbar" style="flex-wrap:wrap; gap:10px; align-items:center;">
+                <label style="display:inline-flex; align-items:center; gap:4px;">迁入目标租户：
+                    <select id="mig-target-tenant" style="padding:6px 10px; min-width:180px;"></select>
+                </label>
+                <button class="btn btn-primary" onclick="Admin.loadMigrationScripts()">拉取测试环境脚本</button>
+                <span id="mig-status" style="color:#888;"></span>
+            </div>
+            <div class="toolbar" style="gap:10px;">
+                <label style="display:inline-flex; align-items:center; gap:4px;">
+                    <input type="checkbox" id="mig-select-all" onchange="Admin.migToggleAll(this.checked)"> 全选
+                </label>
+                <button class="btn btn-primary" onclick="Admin.doMigrate()">确认迁移所选</button>
+            </div>
+            <table class="data-table" id="migration-table">
+                <thead>
+                    <tr>
+                        <th style="width:36px;"></th>
+                        <th>脚本名称</th>
+                        <th>脚本ID(代码哈希)</th>
+                        <th>来源租户</th>
+                        <th>模式</th>
+                        <th>准确率</th>
+                        <th>状态</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
     </div>
 
     <!-- 全局加载遮罩 -->
@@ -195,6 +227,6 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260414t3"></script>
-    <script src="/static/js/admin.js?v=20260616f"></script>
+    <script src="/static/js/admin.js?v=20260630a"></script>
 </body>
 </html>

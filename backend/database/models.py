@@ -361,3 +361,18 @@ class MergeTemplate(Base):
         UniqueConstraint("tenant_id", "name", name="uq_merge_tpl_name"),
     )
 
+
+class ScriptMigration(Base):
+    """测试环境脚本迁移记录：标识某个测试环境脚本（按代码哈希）是否已迁移到本环境某租户。"""
+    __tablename__ = "script_migrations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    source_url = Column(String(300), nullable=True)              # 测试环境地址
+    source_script_hash = Column(String(64), nullable=False, index=True)  # script_<md5(code)[:12]>
+    source_db_id = Column(Integer, nullable=True)                # 测试环境 Script.id
+    target_tenant_id = Column(String(100), nullable=False, index=True)   # 迁入的目标租户
+    target_script_id = Column(Integer, nullable=True)            # 本环境新建 Script.id
+    name = Column(String(200), default="")
+    migrated_at = Column(DateTime, default=datetime.utcnow)
+
+

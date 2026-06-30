@@ -7,6 +7,7 @@ let _roles = [];
 let _orgs = [];
 let _orgsFlatMap = {};  // id -> org
 let _modalCallback = null;
+let _migItems = [];     // 测试迁移：拉取到的脚本列表
 
 /** 安全解析错误响应，防止非 JSON 响应（如 nginx 502/504 纯文本）导致二次报错 */
 async function _alertErr(resp, fallback) {
@@ -50,6 +51,7 @@ const Admin = {
                 else if (tab === 'tenant-auth') this.loadTenantAuth();
                 else if (tab === 'ref-data') this.loadRefCategories().then(() => this.loadRefData());
                 else if (tab === 'scripts') this.loadScripts();
+                else if (tab === 'test-migration') this.initMigration();
             });
         });
     },
@@ -844,6 +846,121 @@ const Admin = {
         }
         alert(data.message || '已恢复');
         this.loadScripts();
+    },
+
+    // ==================== 测试迁移 ====================
+    async initMigration() {
+        // 载入目标租户下拉
+        const sel = document.getElementById('mig-target-tenant');
+        if (sel && !sel.dataset.loaded) {
+            try {
+                const resp = await AUTH.authFetch('/api/admin/tenant-auth/tenants');
+                if (resp.ok) {
+                    const tenants = await resp.json();
+                    sel.innerHTML = (tenants || []).map(t => `<option value="${t}">${t}</option>`).join('');
+                    sel.dataset.loaded = '1';
+                }
+            } catch (_) {}
+        }
+    },
+
+    _setMigStatus(text) {
+        const el = document.getElementById('mig-status');
+        if (el) el.textContent = text || '';
+    },
+
+    async loadMigrationScripts() {
+        const tenant = (document.getElementById('mig-target-tenant')?.value || '').trim();
+        if (!tenant) { alert('请先选择迁入目标租户'); return; }
+        this._setMigStatus('正在连接测试环境并拉取...');
+        try {
+            const resp = await AUTH.authFetch(`/api/admin/migration/remote-scripts?target_tenant=${encodeURIComponent(tenant)}`);
+            if (!resp.ok) { await _alertErr(resp, '拉取失败'); this._setMigStatus('拉取失败'); return; }
+            const data = await resp.json();
+            _migItems = data.items || [];
+            this.renderMigrationList();
+            this._setMigStatus(`来源：${data.source_url || ''}，共 ${_migItems.length} 个脚本`);
+        } catch (e) {
+            this._setMigStatus('拉取失败: ' + e.message);
+        }
+    },
+
+    renderMigrationList() {
+        const tbody = document.querySelector('#migration-table tbody');
+        const _esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+        if (!_migItems.length) {
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#999;">无数据，请先拉取</td></tr>';
+            document.getElementById('mig-select-all').checked = false;
+            return;
+        }
+        tbody.innerHTML = _migItems.map((it, i) => {
+            const acc = (it.accuracy != null) ? (it.accuracy * 100).toFixed(1) + '%' : '-';
+            let stat = '';
+            if (it.already_migrated) stat = '<span style="color:#2e7d32;">已迁移</span>';
+            else if (it.exists_by_hash) stat = '<span style="color:#e65100;">已存在(将覆盖)</span>';
+            else stat = '<span style="color:#888;">未迁移</span>';
+            return `<tr>
+                <td><input type="checkbox" class="mig-cb" data-i="${i}"></td>
+                <td>${_esc(it.name)}</td>
+                <td><code style="font-size:12px;">${_esc(it.hash)}</code></td>
+                <td>${_esc(it.tenant_id)}</td>
+                <td>${_esc(it.mode)}</td>
+                <td>${acc}</td>
+                <td>${stat}</td>
+            </tr>`;
+        }).join('');
+    },
+
+    migToggleAll(checked) {
+        document.querySelectorAll('#migration-table .mig-cb').forEach(cb => { cb.checked = checked; });
+    },
+
+    _selectedMigItems() {
+        return Array.from(document.querySelectorAll('#migration-table .mig-cb:checked'))
+            .map(cb => _migItems[parseInt(cb.dataset.i, 10)])
+            .filter(Boolean)
+            .map(it => ({ db_id: it.db_id, hash: it.hash, name: it.name }));
+    },
+
+    async doMigrate() {
+        const tenant = (document.getElementById('mig-target-tenant')?.value || '').trim();
+        if (!tenant) { alert('请先选择迁入目标租户'); return; }
+        const items = this._selectedMigItems();
+        if (!items.length) { alert('请勾选要迁移的脚本'); return; }
+        await this._runMigrate(tenant, items, false);
+    },
+
+    async _runMigrate(tenant, items, overwrite) {
+        this._setMigStatus(overwrite ? '覆盖迁移中...' : '迁移中...');
+        try {
+            const resp = await AUTH.authFetch('/api/admin/migration/import', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ target_tenant_id: tenant, items, overwrite }),
+            });
+            if (!resp.ok) { await _alertErr(resp, '迁移失败'); this._setMigStatus('迁移失败'); return; }
+            const r = await resp.json();
+            const imported = r.imported || [], conflicts = r.conflicts || [], skipped = r.skipped || [];
+            // 有冲突且本次未覆盖 → 询问是否覆盖
+            if (conflicts.length && !overwrite) {
+                const names = conflicts.map(c => c.name || c.hash).join('、');
+                if (confirm(`以下脚本在目标租户已存在相同代码哈希：\n${names}\n是否覆盖迁移？`)) {
+                    // 覆盖：把冲突项 + 已成功项合并重发（仅冲突项需覆盖，已导入的无需重发）
+                    await this._runMigrate(tenant, conflicts.map(c => ({ db_id: c.db_id, hash: c.hash, name: c.name })), true);
+                    return;
+                }
+            }
+            let msg = `迁移完成：成功 ${imported.length}`;
+            if (conflicts.length && !overwrite) msg += `，跳过冲突 ${conflicts.length}`;
+            if (skipped.length) msg += `，失败 ${skipped.length}`;
+            this._setMigStatus(msg);
+            if (skipped.length) {
+                alert('以下未迁移：\n' + skipped.map(s => `${s.name || ''}: ${s.reason}`).join('\n'));
+            }
+            this.loadMigrationScripts();  // 刷新已迁移状态
+        } catch (e) {
+            this._setMigStatus('迁移失败: ' + e.message);
+        }
     },
 };
 

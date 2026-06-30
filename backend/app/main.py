@@ -10,6 +10,7 @@ import json
 import logging
 import asyncio
 import shutil
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -4182,6 +4183,84 @@ def _resolve_script_display_name(tenant_id: str, script_id: str, script_content:
     return sid if sid.startswith("script_") else f"script_{sid}"
 
 
+async def _run_compute_subprocess(task_id: str, buffer, params_file: str, temp_dir: str):
+    """在【独立子进程】运行 run_compute_task，读其 stdout 进度事件并转推给 SSE 缓冲。
+
+    计算用 Aspose(.NET)，pythonnet 调用持 GIL 会冻结事件循环；放子进程后父进程只做
+    管道 IO，事件循环始终空闲 → SSE/status 持续响应 → 前置 WAF 不再 502。
+    """
+    _EVT_PREFIX = "@@EVT@@"
+    _DONE = "@@DONE@@"
+    _proot = str(Path(__file__).resolve().parent.parent.parent)
+    saw_terminal = False
+    proc = None
+    try:
+        _env = os.environ.copy()
+        _env["PYTHONIOENCODING"] = "utf-8"   # 子进程 stdout 统一 UTF-8，避免 Windows GBK 导致中文乱码
+        _env["PYTHONUTF8"] = "1"
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-u", "-m", "backend.compute.compute_worker", params_file,
+            cwd=_proot,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=_env,
+        )
+        while True:
+            raw = await proc.stdout.readline()
+            if not raw:
+                break
+            line = raw.decode("utf-8", "replace").rstrip("\r\n")
+            if line.startswith(_EVT_PREFIX):
+                ev = line[len(_EVT_PREFIX):]
+                buffer.push(task_id, ev)
+                if '"complete"' in ev or '"error"' in ev:
+                    saw_terminal = True
+            elif line.startswith(_DONE):
+                pass
+            elif line.strip():
+                logger.debug(f"[compute/subproc] {line}")
+        await proc.wait()
+        if proc.returncode != 0 and not saw_terminal:
+            msg = f"计算子进程异常退出(code={proc.returncode})"
+            try:
+                buffer.push(task_id, json.dumps({"type": "error", "message": msg}, ensure_ascii=False))
+            except Exception:
+                pass
+            try:
+                from backend.database.connection import SessionLocal as _SL
+                _db = _SL()
+                try:
+                    _persist_compute_failed(_db, int(task_id), msg)
+                finally:
+                    _db.close()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"[compute/subproc] 子进程启动/读取失败: {e}", exc_info=True)
+        try:
+            buffer.push(task_id, json.dumps({"type": "error", "message": f"计算进程启动失败: {e}"}, ensure_ascii=False))
+        except Exception:
+            pass
+        try:
+            from backend.database.connection import SessionLocal as _SL
+            _db = _SL()
+            try:
+                _persist_compute_failed(_db, int(task_id), str(e))
+            finally:
+                _db.close()
+        except Exception:
+            pass
+    finally:
+        try:
+            buffer.finish(task_id)
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 async def run_compute_task(
     task_id: str,
     buffer,
@@ -4790,7 +4869,8 @@ async def run_compute_task(
             if _eff_tpl_fmt and os.path.exists(_eff_tpl_fmt):
                 from backend.utils.output_postprocess import restore_formats_from_template
                 for _of in output_files:
-                    restore_formats_from_template(str(_of), _eff_tpl_fmt)
+                    # 放线程执行：openpyxl 读写较慢，避免阻塞事件循环导致 SSE 心跳停、被代理 502
+                    await asyncio.to_thread(restore_formats_from_template, str(_of), _eff_tpl_fmt)
         except Exception as _fmt_e:
             logger.warning(f"[fmt兜底] 跳过: {_fmt_e}")
 
@@ -4844,7 +4924,11 @@ async def run_compute_task(
         try:
             if dual_output_enabled():
                 _vp = compute_dir / values_only_name(_result_name)
-                if make_values_only_copy(saved_file, _vp):
+                # 目标 sheet 白名单：纯值版只保留目标文件的目标 sheet（去掉源 sheet，含无 源_ 前缀的）
+                _es = locals().get("expected_structure")
+                _target_sheets = list((_es.get("sheets") or {}).keys()) if isinstance(_es, dict) else None
+                # 放线程执行：Aspose CalculateFormula 较重，避免阻塞事件循环导致 SSE 被代理 502
+                if await asyncio.to_thread(make_values_only_copy, str(saved_file), str(_vp), "源_", _target_sheets):
                     _values_saved = _vp
                     buffer.push(task_id, json.dumps({
                         "type": "log",
@@ -4855,14 +4939,16 @@ async def run_compute_task(
         except Exception as _ve:
             logger.warning(f"[纯值版] 生成失败（不阻断）: {_ve}")
 
-        # 统计行数（使用 Aspose 轻量读取，避免额外引入 openpyxl）
-        try:
-            from Aspose.Cells import Workbook as _CountWb
-            _cwb = _CountWb(str(saved_file))
-            rows_processed = sum(_cwb.Worksheets[i].Cells.MaxDataRow + 1
-                                 for i in range(_cwb.Worksheets.Count))
-        except Exception:
-            rows_processed = 0
+        # 统计行数（使用 Aspose 轻量读取，避免额外引入 openpyxl）；放线程避免阻塞事件循环
+        def _count_rows(path):
+            try:
+                from Aspose.Cells import Workbook as _CountWb
+                _cwb = _CountWb(str(path))
+                return sum(_cwb.Worksheets[i].Cells.MaxDataRow + 1
+                           for i in range(_cwb.Worksheets.Count))
+            except Exception:
+                return 0
+        rows_processed = await asyncio.to_thread(_count_rows, saved_file)
 
         log_msg = {
             "type": "log",
@@ -5162,21 +5248,25 @@ async def compute_submit(
         buffer = TaskLogBuffer.get_instance()
         buffer.create_task(task_id_str)
 
-        # 6. 后台启动计算
-        asyncio.create_task(run_compute_task(
-            task_id=task_id_str,
-            buffer=buffer,
-            tenant_id=tenant_id,
-            script_id=script_id,
-            script_content=script_content,
-            source_dir=source_dir,
-            salary_year=salary_year,
-            salary_month=salary_month,
-            standard_hours=standard_hours,
-            file_passwords=file_passwords,
-            pre_validated_mapping=pc_result.file_mapping,
-            precheck_auto_filled=pc_result.auto_filled,
-            template_override_path=template_override_path,
+        # 6. 后台启动计算（独立子进程：避免 Aspose/.NET 持 GIL 冻结事件循环导致 SSE 被 WAF 502）
+        _compute_params = {
+            "task_id": task_id_str,
+            "tenant_id": tenant_id,
+            "script_id": script_id,
+            "script_content": script_content,
+            "source_dir": str(source_dir),
+            "salary_year": salary_year,
+            "salary_month": salary_month,
+            "standard_hours": standard_hours,
+            "file_passwords": file_passwords,
+            "pre_validated_mapping": pc_result.file_mapping,
+            "precheck_auto_filled": pc_result.auto_filled,
+            "template_override_path": template_override_path,
+        }
+        _params_file = temp_dir / "_compute_params.json"
+        _params_file.write_text(json.dumps(_compute_params, ensure_ascii=False, default=str), encoding="utf-8")
+        asyncio.create_task(_run_compute_subprocess(
+            task_id_str, buffer, str(_params_file), str(temp_dir)
         ))
 
         logger.info(f"[compute/submit] 任务已提交: task_id={task_id_str}")
@@ -6479,15 +6569,19 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
 
         _hash_id_pattern = _re.compile(r"^script_[0-9a-f]{12}$", _re.I)
 
-        # 收集禁用脚本：FS 层 disabled_scripts.json + DB 中 is_active=False 的脚本名
+        # 收集禁用脚本：FS 层 disabled_scripts.json + DB 中 is_active=False 的脚本名/代码哈希
         disabled_ids = storage_manager.get_disabled_script_ids(tenant_id)
+        db_disabled_hashes = set()  # DB 已停用脚本的代码哈希，用于过滤其对应的 FS(script_<hash>) 条目
         try:
-            db_disabled_names = {
-                s.name for s in db.query(db_models.Script).filter(
-                    db_models.Script.tenant_id == tenant_id,
-                    db_models.Script.is_active == False,
-                ).all()
-            }
+            db_disabled_names = set()
+            for s in db.query(db_models.Script).filter(
+                db_models.Script.tenant_id == tenant_id,
+                db_models.Script.is_active == False,
+            ).all():
+                if s.name:
+                    db_disabled_names.add(s.name)
+                if s.code:
+                    db_disabled_hashes.add(_hashlib.md5(s.code.encode("utf-8")).hexdigest()[:12])
             disabled_ids = disabled_ids | db_disabled_names
         except Exception:
             pass
@@ -6527,12 +6621,12 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
                 if not script_dir.is_dir():
                     continue
                 script_id = script_dir.name
-                if script_id in disabled_ids:
-                    continue  # 禁用/删除的脚本不出现在智训/智算选择列表中
+                hash_part = script_id[len("script_"):] if script_id.startswith("script_") else ""
+                if script_id in disabled_ids or (hash_part and hash_part in db_disabled_hashes):
+                    continue  # 禁用/删除的脚本(含按代码哈希匹配到的DB停用脚本)不出现在智训/智算列表
                 fs_script_ids.add(script_id)
 
                 # 通过 hash 反查 DB 友好名
-                hash_part = script_id[len("script_"):] if script_id.startswith("script_") else ""
                 matched_db = db_by_code_hash.get(hash_part)
                 friendly_name = None
                 version = None
@@ -6604,6 +6698,8 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
                 ds_hash = _hashlib.md5(ds.code.encode("utf-8")).hexdigest()[:12]
                 if ds_hash in seen_hashes:
                     continue
+                if ("script_" + ds_hash) in disabled_ids:
+                    continue  # 该代码对应的 FS 条目已被停用 → DB 行也不再单独列出
             # 跳过 DB.name 为 hash 形式但磁盘没对应文件夹的孤立项(展示意义不大)
             display_name = ds.name if not _hash_id_pattern.match(ds.name or "") else None
             if not display_name:
@@ -6627,6 +6723,17 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
             })
             if ds_hash:
                 seen_hashes.add(ds_hash)
+
+        # 按 (名称, script_id) 去重：名称和 id 都相同视为同一脚本，只保留首条(列表已按时间倒序→保留最新)
+        _seen_name_id = set()
+        _deduped = []
+        for _e in scripts:
+            _k = (_e.get("name"), _e.get("script_id"))
+            if _k in _seen_name_id:
+                continue
+            _seen_name_id.add(_k)
+            _deduped.append(_e)
+        scripts = _deduped
 
         return {
             "tenant_id": tenant_id,

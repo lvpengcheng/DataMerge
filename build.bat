@@ -135,7 +135,8 @@ for %%f in (excel_parser.py aspose_init.py run.py split_by_banner.py requirement
     copy /Y "%%f" "%IIS_DIR%\" >nul
 )
 if exist web.config copy /Y web.config "%IIS_DIR%\" >nul
-if exist .env.example copy /Y .env.example "%IIS_DIR%\.env" >nul
+REM 只发 .env.example 模板，不打包 .env（避免泄露密钥；部署时由 install.bat 提示复制为 .env）
+if exist .env.example copy /Y .env.example "%IIS_DIR%\.env.example" >nul
 
 echo [5/6] 生成安装脚本...
 (
@@ -157,6 +158,7 @@ echo echo [1/2] 安装依赖...
 echo pip install --upgrade pip
 echo pip install -r requirements.txt
 echo.
+echo if not exist .env if exist .env.example copy /Y .env.example .env ^>nul
 echo echo [2/2] 初始化数据库...
 echo python -m backend.database.init_db
 echo.
@@ -165,7 +167,7 @@ echo echo   安装完成!
 echo echo ========================================
 echo echo.
 echo echo 下一步:
-echo echo   1. 编辑 .env 文件，配置 AI API Key
+echo echo   1. 编辑 .env 文件（已从 .env.example 生成），配置 AI API Key
 echo echo   2. 运行 start.bat 启动服务
 echo echo   3. 访问 http://localhost:8000
 echo echo.
