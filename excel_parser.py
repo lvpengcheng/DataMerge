@@ -3085,8 +3085,10 @@ class IntelligentExcelParser:
         # pythonnet 会自动转换基本类型，但 .NET DateTime 需要特殊处理
         val_type = type(val).__name__
         if val_type == 'DateTime':
+            # 返回真 python datetime（不再字符串化）：保留底层数值，供非日期列逆转回序列号；
+            # 日期关键词列在写入 源_ sheet 时再按 datetime 写成真日期，公式方可运算。
             try:
-                return f"{val.Year:04d}-{val.Month:02d}-{val.Day:02d}"
+                return datetime(val.Year, val.Month, val.Day, val.Hour, val.Minute, val.Second)
             except Exception:
                 return str(val)
         if isinstance(val, str):
@@ -3544,8 +3546,16 @@ class IntelligentExcelParser:
         """获取单元格值"""
         if cell.value is None:
             return None
+        # .NET DateTime（逐格路径 _AsposeCell 保留的原始类型；isinstance(datetime) 对它为 False）
+        # → 转 python datetime，与批量路径 _normalize_exported_value 对齐，保留底层数值。
+        if type(cell.value).__name__ == 'DateTime':
+            try:
+                dv = cell.value
+                return datetime(dv.Year, dv.Month, dv.Day, dv.Hour, dv.Minute, dv.Second)
+            except Exception:
+                return str(cell.value)
         if isinstance(cell.value, datetime):
-            return cell.value.strftime("%Y-%m-%d")
+            return cell.value
         elif isinstance(cell.value, (int, float)):
             return cell.value
         else:

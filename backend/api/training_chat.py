@@ -728,53 +728,44 @@ def list_chat_sessions(
         .all()
     )
 
-    # 收集停用脚本标识：DB is_active=False 的名称/代码哈希 + FS 禁用表（与 /api/tenant-scripts 口径一致）
-    _disabled_names = set()
-    _disabled_hashes = set()
+    # 会话隐藏规则：会话“关联的脚本” = 它生成的(source_session_id) ∪ 它绑定的(final_script_id)。
+    # 关联了脚本、且这些脚本全部被停用(无一 is_active) → 隐藏（含“生成该脚本的会话”）；
+    # 任一关联脚本仍启用（如该会话也产出了当前启用版）→ 显示；
+    # 未产出/绑定任何脚本(纯训练尝试/历史) → 显示。
+    _id_active = {}          # script.id -> is_active（供 final_script_id 反查）
+    _src_any = set()         # 生成过脚本的会话 id
+    _src_active = set()      # 生成的脚本中存在启用版的会话 id
     try:
-        import hashlib as _hl
-        for ds in db.query(Script).filter(Script.tenant_id == tenant_id, Script.is_active == False).all():
-            if ds.name:
-                _disabled_names.add(ds.name)
-            if ds.code:
-                _disabled_hashes.add(_hl.md5(ds.code.encode("utf-8")).hexdigest()[:12])
-        from ..storage.storage_manager import StorageManager
-        _disabled_names |= set(StorageManager().get_disabled_script_ids(tenant_id) or [])
+        for _sid, _src, _act in db.query(
+            Script.id, Script.source_session_id, Script.is_active
+        ).filter(Script.tenant_id == tenant_id).all():
+            _id_active[_sid] = _act
+            if _src is not None:
+                _src_any.add(_src)
+                if _act:
+                    _src_active.add(_src)
     except Exception:
         pass
 
-    def _script_disabled(scr):
-        if scr is None:
-            return False
-        if not scr.is_active:
-            return True
-        if scr.name and scr.name in _disabled_names:
-            return True
-        if scr.code:
-            import hashlib as _hl2
-            _h = _hl2.md5(scr.code.encode("utf-8")).hexdigest()[:12]
-            if _h in _disabled_hashes or ("script_" + _h) in _disabled_names:
-                return True
-        return False
+    def _session_hidden(s):
+        has_any = s.id in _src_any
+        has_active = s.id in _src_active
+        if s.final_script_id is not None and s.final_script_id in _id_active:
+            has_any = True
+            if _id_active[s.final_script_id]:
+                has_active = True
+        return has_any and not has_active
 
     result = []
     for s in sessions:
         cfg = s.config or {}
 
-        # 获取最新脚本信息
+        if _session_hidden(s):
+            continue  # 关联脚本全部已停用 → 会话不再显示
+
         script = None
         if s.final_script_id:
             script = db.query(Script).filter_by(id=s.final_script_id).first()
-            if script is None:
-                continue  # 关联脚本已被删除 → 会话不再显示
-            if _script_disabled(script):
-                continue  # 关联脚本已停用 → 会话不再显示
-
-        # 兜底：多数会话 final_script_id 为空，脚本关联在 cfg.script_name 上
-        #       → 按会话记录的脚本名判断是否已停用（停用按名生效）
-        _sname = (cfg.get("script_name") or "").strip()
-        if _sname and _sname in _disabled_names:
-            continue
 
         latest_files = cfg.get("latest_files", {})
         result.append({

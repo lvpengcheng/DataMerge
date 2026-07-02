@@ -137,9 +137,22 @@
 
                     <div class="actions" style="margin-top:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
                         <button class="btn btn-primary" id="btn-merge-execute">生成合并文件并下载</button>
-                        <span style="margin-left:16px;">保存为模版：</span>
-                        <input type="text" id="merge-template-name" placeholder="模版名称（如 月度工资合并）" style="min-width:180px;">
-                        <button type="button" class="btn" id="btn-save-template">保存为模版</button>
+                        <span style="margin-left:12px;">模版基准表：</span>
+                        <select id="merge-skeleton-base" style="min-width:160px;"></select>
+                        <button type="button" class="btn" id="btn-merge-skeleton">生成模版骨架</button>
+                        <span class="status" id="merge-tpl-fill-hint" style="color:#1565c0;"></span>
+                    </div>
+                    <div style="margin-top:6px;color:#888;font-size:12px;">
+                        模版骨架 = 以所选基准表为底：保留其标题/表头格式，删掉数据行，按当前列顺序在表头下写 <code>&amp;=DT.列名</code> 标记。
+                        下载后在 Excel 里加格式/公式，另存后作为“模版文件”随方案上传。套用带模版的方案时按模版填充（带格式与公式）；无模版则输出纯数据。
+                    </div>
+                    <div class="actions" style="margin-top:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                        <span>保存为方案：</span>
+                        <input type="text" id="merge-template-name" placeholder="方案名称（如 月度工资合并）" style="min-width:180px;">
+                        <label style="display:inline-flex;align-items:center;gap:4px;">模版文件(可选)：
+                            <input type="file" id="merge-template-file" accept=".xlsx,.xls,.xlsm" style="width:auto;">
+                        </label>
+                        <button type="button" class="btn" id="btn-save-template">保存为方案</button>
                         <span class="status" id="merge-save-status"></span>
                         <span class="status" id="merge-exec-status"></span>
                     </div>

@@ -6570,19 +6570,39 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
         _hash_id_pattern = _re.compile(r"^script_[0-9a-f]{12}$", _re.I)
 
         # 收集禁用脚本：FS 层 disabled_scripts.json + DB 中 is_active=False 的脚本名/代码哈希
+        # 名称级判定：脚本按版本迭代（同名旧版本自动 is_active=False），一个名字只有在
+        # “没有任何启用版本”时才算真正停用；否则其当前启用版不能被同名旧停用版误伤。
         disabled_ids = storage_manager.get_disabled_script_ids(tenant_id)
-        db_disabled_hashes = set()  # DB 已停用脚本的代码哈希，用于过滤其对应的 FS(script_<hash>) 条目
+        db_disabled_hashes = set()  # 已停用代码哈希（排除仍有活跃同码脚本者），用于过滤 FS(script_<hash>) 条目
         try:
+            db_active_names = set()   # 仍有启用版本的脚本名
+            db_active_hashes = set()  # 启用脚本的代码哈希
+            for s in db.query(db_models.Script).filter(
+                db_models.Script.tenant_id == tenant_id,
+                db_models.Script.is_active == True,
+            ).all():
+                if s.name:
+                    db_active_names.add(s.name)
+                if s.code:
+                    db_active_hashes.add(_hashlib.md5(s.code.encode("utf-8")).hexdigest()[:12])
             db_disabled_names = set()
             for s in db.query(db_models.Script).filter(
                 db_models.Script.tenant_id == tenant_id,
                 db_models.Script.is_active == False,
             ).all():
-                if s.name:
+                # 名字仍有启用版本 → 不算停用（避免同名旧版本连累当前启用版）
+                if s.name and s.name not in db_active_names:
                     db_disabled_names.add(s.name)
                 if s.code:
-                    db_disabled_hashes.add(_hashlib.md5(s.code.encode("utf-8")).hexdigest()[:12])
+                    _h = _hashlib.md5(s.code.encode("utf-8")).hexdigest()[:12]
+                    # 该代码仍有活跃脚本 → 不加入停用哈希（同码活跃脚本不被误杀）
+                    if _h not in db_active_hashes:
+                        db_disabled_hashes.add(_h)
             disabled_ids = disabled_ids | db_disabled_names
+            # 活跃脚本绝不算停用：即使 FS 停用表里残留同名/同码条目（停用后又重新训练出
+            # 启用版的情况），也把活跃名字与 script_<活跃哈希> 从停用集合中剔除。
+            disabled_ids = set(disabled_ids) - db_active_names
+            disabled_ids -= {("script_" + _ah) for _ah in db_active_hashes}
         except Exception:
             pass
 

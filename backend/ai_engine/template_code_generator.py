@@ -604,6 +604,8 @@ from pathlib import Path
 # 否则会报 name 'openpyxl' is not defined（智训沙箱有注入故不报）。
 import openpyxl
 from openpyxl.utils import column_index_from_string, get_column_letter
+from datetime import datetime
+from backend.utils.source_sheet_writer import is_date_keyword_column, dt_to_excel_serial, is_long_digit_text
 
 # 模板持久化路径（训练时确定，智算复用）
 TEMPLATE_PATH = {tpl_repr}
@@ -689,13 +691,30 @@ def _append_source_sheets(wb, source_data):
             suffix += 1
         ws = wb.create_sheet(title=target_name)
         cols = list(df.columns)
+        # 逐列判定是否日期列（仅按列名关键词，与 formula 模式一致）
+        _date_col_flags = [is_date_keyword_column(cname) for cname in cols]
         for ci, cname in enumerate(cols, start=1):
             ws.cell(row=1, column=ci).value = cname
         for ri, row in enumerate(df.itertuples(index=False, name=None), start=2):
             for ci, val in enumerate(row, start=1):
                 if isinstance(val, float) and val != val:
                     val = None
-                ws.cell(row=ri, column=ci).value = val
+                cell = ws.cell(row=ri, column=ci)
+                if isinstance(val, datetime):
+                    if _date_col_flags[ci - 1]:
+                        # 日期关键词列 → 写真日期 + 日期格式，公式方可运算
+                        cell.value = val
+                        cell.number_format = "yyyy-mm-dd"
+                    else:
+                        # 非日期列却为 datetime（被套了日期格式的普通数字）→ 逆转回底层序列号
+                        cell.value = dt_to_excel_serial(val)
+                elif is_long_digit_text(val):
+                    # ≥12 位纯数字串（身份证/卡号/手机）→ 文本格式，避免科学计数/丢精度
+                    cell.value = val
+                    cell.number_format = "@"
+                    cell.data_type = "s"
+                else:
+                    cell.value = val
         appended_map[sk] = target_name
         appended.append(f"{{target_name}}({{len(df)}}行x{{len(cols)}}列)")
     if appended:

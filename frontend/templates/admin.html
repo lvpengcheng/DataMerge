@@ -186,6 +186,9 @@
                 <label style="display:inline-flex; align-items:center; gap:4px;">
                     <input type="checkbox" id="mig-select-all" onchange="Admin.migToggleAll(this.checked)"> 全选
                 </label>
+                <input type="text" id="mig-filter" placeholder="按名称/租户/哈希/模式筛选"
+                       oninput="Admin.renderMigrationList()"
+                       style="padding:6px 10px; min-width:220px;">
                 <button class="btn btn-primary" onclick="Admin.doMigrate()">确认迁移所选</button>
             </div>
             <table class="data-table" id="migration-table">

@@ -1432,14 +1432,19 @@ def _remote_get(base, token, path):
     import requests
     resp = requests.get(f"{base}{path}",
                         headers={"Authorization": f"Bearer {token}"}, timeout=180)
-    resp.raise_for_status()
-    return resp.json()
+    if resp.status_code >= 400:
+        # 把远程返回的 detail/正文带出来，避免只看到 "500 Server Error" 这类无信息异常
+        raise RuntimeError(f"HTTP {resp.status_code} {path}: {resp.text[:500]}")
+    try:
+        return resp.json()
+    except Exception:
+        raise RuntimeError(f"响应非 JSON {path}: {resp.text[:200]}")
 
 
 # ---- 导出端（双环境同代码都有，被对方远程拉取）----
 
 @router.get("/migration/export-list")
-async def migration_export_list(db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+def migration_export_list(db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
     """列出本环境可迁移的已训练脚本（供其它环境拉取）。"""
     scripts = (db.query(Script).filter(Script.is_active == True)
                .order_by(Script.tenant_id, Script.name).all())
@@ -1458,7 +1463,7 @@ async def migration_export_list(db: Session = Depends(get_db), _admin: User = De
 
 
 @router.get("/migration/export/{db_id}")
-async def migration_export(db_id: int, db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+def migration_export(db_id: int, db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
     """导出单脚本完整包：Script + 训练会话 + 对话 + 迭代。"""
     s = db.query(Script).filter(Script.id == db_id).first()
     if not s:
@@ -1494,20 +1499,24 @@ class _MigrateItem(_BaseModel):
     db_id: int
     hash: str
     name: Optional[str] = ""
+    tenant_id: Optional[str] = ""     # 来源租户（空目标时用作迁入租户）
 
 
 class _MigrateReq(_BaseModel):
-    target_tenant_id: str
+    target_tenant_id: str = ""        # 空 = 沿用各脚本来源租户（自动创建）
     items: List[_MigrateItem]
     overwrite: bool = False
 
 
 @router.get("/migration/remote-scripts")
-async def migration_remote_scripts(
-    target_tenant: str = Query(..., description="迁入的目标租户"),
+def migration_remote_scripts(
+    target_tenant: str = Query("", description="迁入的目标租户；空=沿用各脚本来源租户"),
     db: Session = Depends(get_db), _admin: User = Depends(require_admin),
 ):
-    """登录测试环境→拉取其已训练脚本列表→标注已迁移/已存在。"""
+    """登录测试环境→拉取其已训练脚本列表→标注已迁移/已存在。
+
+    target_tenant 为空时，每个脚本的迁入目标即其来源租户，逐脚本按各自租户判断状态。
+    """
     base, user, pwd = _test_env_conf()
     if not (base and user and pwd):
         raise HTTPException(status_code=400, detail="未配置测试环境（TEST_ENV_BASE_URL/USERNAME/PASSWORD）")
@@ -1517,19 +1526,34 @@ async def migration_remote_scripts(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"连接测试环境失败: {e}")
     items = data.get("items", [])
-    migrated = {r.source_script_hash for r in
-                db.query(ScriptMigration).filter_by(target_tenant_id=target_tenant).all()}
-    local_hashes = {_code_hash(s.code) for s in
-                    db.query(Script).filter_by(tenant_id=target_tenant, is_active=True).all() if s.code}
+    fixed = (target_tenant or "").strip()
+    # 本环境已存在的租户集合（目录 ∪ DB 引用），用于“撞名”预警
+    existing_tenants = set()
+    _tdir = Path(__file__).resolve().parent.parent.parent / "tenants"
+    if _tdir.exists():
+        existing_tenants.update(d.name for d in _tdir.iterdir() if d.is_dir())
+    # 按租户建立“已迁移哈希”“已存在哈希”映射，兼容固定目标与沿用来源两种模式
+    migrated_by_tenant = {}
+    for r in db.query(ScriptMigration).all():
+        migrated_by_tenant.setdefault(r.target_tenant_id, set()).add(r.source_script_hash)
+    local_by_tenant = {}
+    for s in db.query(Script).filter_by(is_active=True).all():
+        existing_tenants.add(s.tenant_id)
+        if s.code:
+            local_by_tenant.setdefault(s.tenant_id, set()).add(_code_hash(s.code))
     for it in items:
+        dest = fixed or (it.get("tenant_id") or "")
         h = it.get("hash")
-        it["already_migrated"] = h in migrated
-        it["exists_by_hash"] = h in local_hashes
-    return {"total": len(items), "items": items, "source_url": base}
+        it["dest_tenant"] = dest
+        it["dest_tenant_exists"] = dest in existing_tenants
+        it["already_migrated"] = h in migrated_by_tenant.get(dest, set())
+        it["exists_by_hash"] = h in local_by_tenant.get(dest, set())
+    return {"total": len(items), "items": items, "source_url": base,
+            "use_source_tenant": not fixed}
 
 
 @router.post("/migration/import")
-async def migration_import(req: _MigrateReq, db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+def migration_import(req: _MigrateReq, db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
     """把选中的测试环境脚本+训练记录迁入当前环境的目标租户。"""
     base, user, pwd = _test_env_conf()
     if not (base and user and pwd):
@@ -1539,24 +1563,39 @@ async def migration_import(req: _MigrateReq, db: Session = Depends(get_db), _adm
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"测试环境登录失败: {e}")
 
-    tenant = req.target_tenant_id
+    fixed_tenant = (req.target_tenant_id or "").strip()   # 空 = 沿用各脚本来源租户
+    # (租户, 代码哈希) -> Script，覆盖判定按“各自租户”进行
     local_map = {}
-    for s in db.query(Script).filter_by(tenant_id=tenant, is_active=True).all():
+    for s in db.query(Script).filter_by(is_active=True).all():
         if s.code:
-            local_map.setdefault(_code_hash(s.code), s)
+            local_map.setdefault((s.tenant_id, _code_hash(s.code)), s)
 
     from ..storage.storage_manager import StorageManager
     sm = StorageManager()
     imported, conflicts, skipped = [], [], []
 
     for item in req.items:
-        existing = local_map.get(item.hash)
+        tenant = fixed_tenant or (item.tenant_id or "").strip()
+        if not tenant:
+            skipped.append({"name": item.name, "reason": "无法确定迁入租户（来源租户为空）"})
+            continue
+        existing = local_map.get((tenant, item.hash))
         if existing and not req.overwrite:
-            conflicts.append({"db_id": item.db_id, "hash": item.hash, "name": item.name})
+            conflicts.append({"db_id": item.db_id, "hash": item.hash,
+                              "name": item.name, "tenant_id": tenant})
+            continue
+        # 迁移前先确保租户目录建成；失败则跳过该脚本，避免 DB 有行而文件系统无租户
+        try:
+            scripts_dir = sm.get_tenant_dir(tenant) / "scripts"
+            scripts_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as de:
+            skipped.append({"name": item.name, "reason": f"创建租户目录失败: {de}"})
             continue
         try:
             bundle = _remote_get(base, token, f"/api/admin/migration/export/{item.db_id}")
         except Exception as e:
+            logging.getLogger(__name__).exception(
+                f"[迁移] 拉取脚本包失败 db_id={item.db_id} name={item.name}")
             skipped.append({"name": item.name, "reason": f"拉取失败: {e}"})
             continue
         sc = bundle.get("script") or {}
@@ -1627,10 +1666,8 @@ async def migration_import(req: _MigrateReq, db: Session = Depends(get_db), _adm
             if ts2:
                 ts2.final_script_id = tgt.id
 
-        # 3) 落盘 scripts/script_<hash>.py + _info.json（智算 get_script_content 据此读取）
+        # 3) 落盘 scripts/script_<hash>.py + _info.json（scripts_dir 已在前面建好）
         try:
-            scripts_dir = sm.get_tenant_dir(tenant) / "scripts"
-            scripts_dir.mkdir(parents=True, exist_ok=True)
             (scripts_dir / f"{item.hash}.py").write_text(code, encoding="utf-8")
             info = {"script_id": item.hash, "tenant_id": tenant, "name": tgt.name,
                     "score": sc.get("accuracy"), "migrated_from": base}
@@ -1642,7 +1679,8 @@ async def migration_import(req: _MigrateReq, db: Session = Depends(get_db), _adm
         # 4) 迁移记录
         db.add(ScriptMigration(source_url=base, source_script_hash=item.hash, source_db_id=item.db_id,
                                target_tenant_id=tenant, target_script_id=tgt.id, name=tgt.name))
-        imported.append({"name": tgt.name, "hash": item.hash, "overwritten": bool(existing)})
+        imported.append({"name": tgt.name, "hash": item.hash,
+                         "tenant_id": tenant, "overwritten": bool(existing)})
 
     db.commit()
     return {"imported": imported, "conflicts": conflicts, "skipped": skipped}

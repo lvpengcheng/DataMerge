@@ -26,51 +26,43 @@ def list_training_sessions(
     accessible_tenants: list = Depends(get_operable_tenants),
 ):
     """训练会话列表（按租户权限过滤；tenant_id 支持模糊包含）"""
-    # 收集"已停用"脚本的 id 集合，从会话列表中排除其会话（口径与 /api/tenant-scripts 一致：
-    # DB is_active=False / FS 禁用表(名称或 script_<hash>) / 同代码哈希的其它行 均视为停用）
-    disabled_script_ids = set()
+    # 会话隐藏规则：会话“关联脚本” = 它生成的(source_session_id) ∪ 它绑定的(final_script_id)。
+    # 关联脚本全部被停用 → 隐藏（含“生成该脚本的会话”）；任一仍启用或未产出脚本 → 保留。
+    # 先算出需隐藏的会话 id 集合，再在 SQL 中排除（保持分页 total 正确）。
+    hidden_session_ids = set()
     try:
-        import hashlib as _hl
-        from ..storage.storage_manager import StorageManager as _SM
-        _sm = _SM()
-        all_scripts = db.query(Script).filter(Script.tenant_id.in_(accessible_tenants)).all()
-        _disabled_names = set()   # FS 禁用名（含 script_<hash> 形式）
-        _disabled_hashes = set()  # 已停用代码哈希
-        _fs_cache = {}
-        for sc in all_scripts:
-            tid = sc.tenant_id
-            if tid not in _fs_cache:
-                try:
-                    _fs_cache[tid] = set(_sm.get_disabled_script_ids(tid) or [])
-                except Exception:
-                    _fs_cache[tid] = set()
-            _disabled_names |= _fs_cache[tid]
-            if (not sc.is_active) and sc.code:
-                _disabled_hashes.add(_hl.md5(sc.code.encode("utf-8")).hexdigest()[:12])
-        for _nm in list(_disabled_names):
-            if _nm.startswith("script_") and len(_nm) == len("script_") + 12:
-                _disabled_hashes.add(_nm[len("script_"):])
-        for sc in all_scripts:
-            dead = (not sc.is_active) or (sc.name in _disabled_names)
-            if not dead and sc.code:
-                if _hl.md5(sc.code.encode("utf-8")).hexdigest()[:12] in _disabled_hashes:
-                    dead = True
-            if dead:
-                disabled_script_ids.add(sc.id)
+        _id_active = {}
+        _src_any = set()
+        _src_active = set()
+        for _sid, _src, _act in db.query(
+            Script.id, Script.source_session_id, Script.is_active
+        ).filter(Script.tenant_id.in_(accessible_tenants)).all():
+            _id_active[_sid] = _act
+            if _src is not None:
+                _src_any.add(_src)
+                if _act:
+                    _src_active.add(_src)
+        for _s_id, _final in db.query(
+            TrainingSession.id, TrainingSession.final_script_id
+        ).filter(TrainingSession.tenant_id.in_(accessible_tenants)).all():
+            has_any = _s_id in _src_any
+            has_active = _s_id in _src_active
+            if _final is not None and _final in _id_active:
+                has_any = True
+                if _id_active[_final]:
+                    has_active = True
+            if has_any and not has_active:
+                hidden_session_ids.add(_s_id)
     except Exception:
-        disabled_script_ids = set()
+        hidden_session_ids = set()
 
     q = db.query(TrainingSession).filter(TrainingSession.tenant_id.in_(accessible_tenants))
     if tenant_id:
         q = q.filter(TrainingSession.tenant_id.like(f"%{tenant_id}%"))
     if status:
         q = q.filter(TrainingSession.status == status)
-    if disabled_script_ids:
-        # 保留无脚本(失败/进行中)的会话；仅排除指向已停用脚本的会话
-        q = q.filter(
-            (TrainingSession.final_script_id.is_(None))
-            | (~TrainingSession.final_script_id.in_(disabled_script_ids))
-        )
+    if hidden_session_ids:
+        q = q.filter(~TrainingSession.id.in_(hidden_session_ids))
     total = q.count()
     sessions = q.order_by(TrainingSession.started_at.desc()).offset(offset).limit(limit).all()
 

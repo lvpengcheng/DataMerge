@@ -27,6 +27,13 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 EXCEL_EXTS = {".xlsx", ".xls", ".xlsm"}
 MERGE_SESSION_ROOT = PROJECT_ROOT / "temp" / "merge_sessions"
+# 方案模版文件存储根目录（按 owner 分子目录），tenants/ 已 gitignore
+MERGE_TPL_ROOT = PROJECT_ROOT / "tenants" / "__tools_merge__" / "merge_templates"
+
+
+def _safe_seg(s: str) -> str:
+    """路径分段安全化：仅保留字母数字和 -_，防目录穿越/非法字符（如 owner 里的冒号）。"""
+    return "".join(ch for ch in str(s) if ch.isalnum() or ch in "-_") or "x"
 
 
 def _import_split_one_file():
@@ -156,6 +163,158 @@ class MergeExecuteRequest(BaseModel):
     base_file: Optional[str] = None
     normalize_keys: bool = True
     ai_provider: Optional[str] = None   # 仅缓存写回时记录用
+    template_id: Optional[int] = None   # 套用的方案 id；该方案带模版文件时按模版填充
+
+
+class MergeSkeletonRequest(BaseModel):
+    result_columns: List[dict]          # [{"name", ...}]  有序，输出列顺序
+    session_id: Optional[str] = None    # 会话 id（配合 base_file 以某上传表为模版基准）
+    base_file: Optional[str] = None     # 以哪个上传表为模版基准；空/找不到则回退空白骨架
+
+
+def _blank_skeleton_bytes(names):
+    """无基准表时：新建一个空白骨架（列名 + &=DT.列名 标记）。"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "模版"
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    for ci, name in enumerate(names, start=1):
+        h = ws.cell(row=1, column=ci, value=name)
+        h.font = Font(bold=True)
+        h.fill = header_fill
+        ws.cell(row=2, column=ci, value=f"&=DT.{name}")
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+@router.post("/merge/template-skeleton")
+async def merge_template_skeleton(req: MergeSkeletonRequest, current_user=Depends(get_current_user)):
+    """生成模版骨架 xlsx：数据行写 `&=DT.列名` 标记，供用户下载编辑后作为方案模版上传。
+
+    优先【以选中的某个上传表为基准】：保留其标题/表头行格式与列宽，删掉全部数据行，
+    在表头下第一行按【选中结果列的顺序】写 `&=DT.列名` 标记（同名列复用其表头格式/列宽，
+    新增列取对应位置格式兜底）。无基准表或解析失败时，回退到空白骨架。
+    """
+    names = [str(rc.get("name") or "").strip() for rc in (req.result_columns or [])]
+    names = [n for n in names if n]
+    if not names:
+        raise HTTPException(status_code=400, detail="没有可用的结果列")
+
+    buf = None
+    # 尝试以基准表生成
+    if req.session_id and req.base_file:
+        base_path = _session_dir(req.session_id) / req.base_file
+        if base_path.exists():
+            try:
+                buf = _skeleton_from_base(str(base_path), names)
+            except Exception as e:
+                logger.warning(f"[merge] 基准表生成骨架失败，回退空白骨架: {e}")
+                buf = None
+    if buf is None:
+        buf = _blank_skeleton_bytes(names)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="merge_template_skeleton.xlsx"'},
+    )
+
+
+def _skeleton_from_base(base_path: str, names: List[str]) -> io.BytesIO:
+    """以基准表为底生成骨架：保留标题/表头格式，删数据行，按 names 顺序写表头+`&=DT.列名` 标记。"""
+    import copy as _copy
+    from openpyxl import load_workbook
+    from openpyxl.utils import get_column_letter
+    from excel_parser import IntelligentExcelParser
+
+    # 1) 解析定位表头行
+    parser = IntelligentExcelParser()
+    results = parser.parse_excel_file(
+        base_path, read_formulas=False, calculate_formulas=False,
+        active_sheet_only=True, best_region_only=True,
+    )
+    if not results or not results[0].regions:
+        raise ValueError("基准表无法解析出表头区域")
+    region = results[0].regions[0]
+    sheet_name = getattr(results[0], "sheet_name", None)
+    hr = region.head_row_end or region.head_row_start or 1   # 表头行(1-indexed)
+    ds = region.data_row_start or (hr + 1)                    # 首个数据行(1-indexed)
+
+    # 2) openpyxl 打开（保留格式），定位到解析所用的 sheet
+    wb = load_workbook(base_path)
+    ws = wb[sheet_name] if (sheet_name and sheet_name in wb.sheetnames) else wb.active
+
+    # 3) 快照：表头行各列样式/列宽 + 首个数据行各列样式（按列名 & 按位置）。
+    #    标记行(数据行)必须用【基准数据行】的格式，否则会串入无关格式——
+    #    例如把数值列显示成日期(1900/1/5)。
+    base_by_name = {}
+    base_pos = {}
+    data_fmt_by_name = {}   # 列名 -> 数据行单元格 _style（标记行套用，保证数值列不被显示成日期）
+    maxc = ws.max_column or len(names)
+    ds_valid = ds if (ds and ds <= ws.max_row) else None
+    for c in range(1, maxc + 1):
+        L = get_column_letter(c)
+        cell = ws.cell(hr, c)
+        style = _copy.copy(cell._style)
+        width = ws.column_dimensions[L].width if L in ws.column_dimensions else None
+        base_pos[c] = (style, width)
+        v = cell.value
+        nm = str(v).strip() if (v is not None and str(v).strip()) else None
+        if nm:
+            base_by_name[nm] = (style, width)
+            if ds_valid is not None:
+                data_fmt_by_name[nm] = _copy.copy(ws.cell(ds_valid, c)._style)
+
+    # 4) 删除表头以下所有行（数据/汇总/页脚），只留标题+表头
+    if ws.max_row > hr:
+        ws.delete_rows(hr + 1, ws.max_row - hr)
+    marker_row = hr + 1
+
+    # 5) 按选中列顺序重写表头 + 写 &=DT.列名 标记；表头复用基准表头格式，
+    #    标记(数据)行复用基准【数据行】格式（数值列不会被显示成日期）。
+    N = len(names)
+    for j, name in enumerate(names, start=1):
+        L = get_column_letter(j)
+        try:
+            hcell = ws.cell(hr, j)
+            hcell.value = name
+            st = base_by_name.get(name) or base_pos.get(j)
+            if st:
+                try:
+                    hcell._style = _copy.copy(st[0])
+                except Exception:
+                    pass
+                if st[1] is not None:
+                    ws.column_dimensions[L].width = st[1]
+            mcell = ws.cell(marker_row, j)
+            mcell.value = f"&=DT.{name}"
+            # 标记行格式：仅取基准表【同名列】的数据行格式；匹配不到就强制 General。
+            # 不按位置回退——重排后位置格式不可靠，易把数值列套上日期格式(1900/1/5)。
+            dstyle = data_fmt_by_name.get(name)
+            if dstyle is not None:
+                try:
+                    mcell._style = _copy.copy(dstyle)
+                except Exception:
+                    mcell.number_format = "General"
+            else:
+                mcell.number_format = "General"
+        except Exception:
+            pass
+    # 清掉超出选中列数的多余表头单元格
+    for c in range(N + 1, maxc + 1):
+        try:
+            ws.cell(hr, c).value = None
+        except Exception:
+            pass
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
 
 
 @router.post("/merge/analyze")
@@ -317,7 +476,39 @@ async def merge_execute(req: MergeExecuteRequest, current_user=Depends(get_curre
         )
 
         out_path = sdir / "合并结果.xlsx"
-        write_merged_xlsx(result, str(out_path))
+
+        # 决定输出方式：套用的方案带模版文件 → Aspose SmartMarker 填充（带格式/公式）；
+        # 否则 → 原 openpyxl 纯数据输出（行为不变）。
+        tpl_abs = None
+        if req.template_id:
+            from ..database.models import MergeTemplate as _MT
+            owner = _tpl_owner(current_user)
+            _db = SessionLocal()
+            try:
+                _row = _db.query(_MT).filter_by(id=req.template_id, tenant_id=owner).first()
+                _tf = (_row.config or {}).get("template_file") if _row else None
+                if _tf:
+                    _cand = (PROJECT_ROOT / _tf).resolve()
+                    if _cand.exists():
+                        tpl_abs = _cand
+            finally:
+                _db.close()
+
+        if tpl_abs:
+            df = pd.DataFrame(result["rows"], columns=result["columns"])
+            # 追加列字母别名 A/B/C…（按结果列顺序），使模版可用 &=DT.A 或 &=DT.列名
+            try:
+                from openpyxl.utils import get_column_letter
+                for _i, _col in enumerate(result["columns"]):
+                    _L = get_column_letter(_i + 1)
+                    if _L not in df.columns:
+                        df[_L] = df[_col].values
+            except Exception:
+                pass
+            from ..utils.aspose_helper import generate_from_template
+            generate_from_template(str(out_path), str(tpl_abs), {"DT": df}, mode="fill")
+        else:
+            write_merged_xlsx(result, str(out_path))
         data = out_path.read_bytes()
 
         # 写回缓存：每文件 {源列 -> 规范字段名}
@@ -377,23 +568,62 @@ class MergeTemplateSaveRequest(BaseModel):
 
 
 @router.post("/merge/template/save")
-async def merge_template_save(req: MergeTemplateSaveRequest, current_user=Depends(get_current_user)):
-    """保存/覆盖当前用户的一个命名合并模版（同名 upsert）。config 按列名存，便于下月复用。"""
-    name = (req.name or "").strip()
+async def merge_template_save(
+    name: str = Form(...),
+    config: str = Form(...),                       # JSON 字符串
+    template: Optional[UploadFile] = File(None),   # 可选：带 &=DT.列名 标记的模版文件
+    current_user=Depends(get_current_user),
+):
+    """保存/覆盖当前用户的命名合并方案（同名 upsert）。
+
+    config 按列名存，便于下月复用。可选上传一个 Excel 模版文件（含 `&=DT.列名` 标记 + 用户
+    自定义格式/公式）：文件存后台，路径记入 config.template_file，套用方案执行时按模版填充。
+    不带文件时保留该方案已有的模版（若之前传过）。
+    """
+    name = (name or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="模版名称不能为空")
+    try:
+        cfg = json.loads(config) if isinstance(config, str) else (config or {})
+        if not isinstance(cfg, dict):
+            raise ValueError("config 不是对象")
+    except Exception:
+        raise HTTPException(status_code=400, detail="config 不是合法 JSON")
+
+    if template is not None and Path(template.filename or "").suffix.lower() not in EXCEL_EXTS:
+        raise HTTPException(status_code=400, detail="模版文件必须是 Excel(.xlsx/.xls/.xlsm)")
+
     from ..database.connection import SessionLocal
     from ..database.models import MergeTemplate
     owner = _tpl_owner(current_user)
     db = SessionLocal()
     try:
         row = db.query(MergeTemplate).filter_by(tenant_id=owner, name=name).first()
-        if row:
-            row.config = req.config
+        if row is None:
+            row = MergeTemplate(tenant_id=owner, name=name, config=cfg)
+            db.add(row)
+            db.commit()          # 先拿到自增 id 作为模版文件名
+            db.refresh(row)
+        # 保留旧模版引用（本次未重传时不丢）
+        prev_cfg = row.config or {}
+        if not template:
+            if prev_cfg.get("template_file"):
+                cfg["template_file"] = prev_cfg["template_file"]
+                cfg["template_original_name"] = prev_cfg.get("template_original_name")
         else:
-            db.add(MergeTemplate(tenant_id=owner, name=name, config=req.config))
+            tpl_dir = MERGE_TPL_ROOT / _safe_seg(owner)
+            tpl_dir.mkdir(parents=True, exist_ok=True)
+            ext = Path(template.filename or "tpl.xlsx").suffix.lower() or ".xlsx"
+            tpl_path = tpl_dir / f"{row.id}{ext}"
+            tpl_path.write_bytes(await template.read())
+            cfg["template_file"] = str(tpl_path.relative_to(PROJECT_ROOT)).replace("\\", "/")
+            cfg["template_original_name"] = template.filename
+        row.config = cfg
         db.commit()
-        return {"ok": True, "name": name}
+        return {"ok": True, "id": row.id, "name": name, "has_template": bool(cfg.get("template_file"))}
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         logger.exception("merge/template/save 异常")
@@ -414,6 +644,8 @@ async def merge_templates_list(current_user=Depends(get_current_user)):
                   .filter_by(tenant_id=owner)
                   .order_by(MergeTemplate.updated_at.desc()).all())
         return [{"id": r.id, "name": r.name, "config": r.config,
+                 "has_template": bool((r.config or {}).get("template_file")),
+                 "template_name": (r.config or {}).get("template_original_name"),
                  "updated_at": r.updated_at.isoformat() if r.updated_at else None} for r in rows]
     finally:
         db.close()
@@ -429,9 +661,44 @@ async def merge_template_delete(tpl_id: int, current_user=Depends(get_current_us
     try:
         row = db.query(MergeTemplate).filter_by(id=tpl_id, tenant_id=owner).first()
         if row:
+            # 清理该方案关联的模版文件（忽略失败）
+            _tf = (row.config or {}).get("template_file")
+            if _tf:
+                try:
+                    (PROJECT_ROOT / _tf).unlink(missing_ok=True)
+                except Exception:
+                    pass
             db.delete(row)
             db.commit()
             return {"ok": True}
         raise HTTPException(status_code=404, detail="模版不存在或无权删除")
     finally:
         db.close()
+
+
+@router.get("/merge/template/{tpl_id}/download")
+async def merge_template_download(tpl_id: int, current_user=Depends(get_current_user)):
+    """下载某方案已保存的模版文件（供再次编辑）。"""
+    from ..database.connection import SessionLocal
+    from ..database.models import MergeTemplate
+    owner = _tpl_owner(current_user)
+    db = SessionLocal()
+    try:
+        row = db.query(MergeTemplate).filter_by(id=tpl_id, tenant_id=owner).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="方案不存在或无权访问")
+        _tf = (row.config or {}).get("template_file")
+        if not _tf or not (PROJECT_ROOT / _tf).exists():
+            raise HTTPException(status_code=404, detail="该方案未保存模版文件")
+        data = (PROJECT_ROOT / _tf).read_bytes()
+        fname = (row.config or {}).get("template_original_name") or f"{row.name}_模版.xlsx"
+    finally:
+        db.close()
+    buf = io.BytesIO(data)
+    buf.seek(0)
+    from urllib.parse import quote
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}"},
+    )

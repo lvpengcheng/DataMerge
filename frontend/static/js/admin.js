@@ -8,6 +8,7 @@ let _orgs = [];
 let _orgsFlatMap = {};  // id -> org
 let _modalCallback = null;
 let _migItems = [];     // 测试迁移：拉取到的脚本列表
+let _migUseSourceTenant = false;   // 是否处于“沿用来源租户”模式
 
 /** 安全解析错误响应，防止非 JSON 响应（如 nginx 502/504 纯文本）导致二次报错 */
 async function _alertErr(resp, fallback) {
@@ -857,7 +858,10 @@ const Admin = {
                 const resp = await AUTH.authFetch('/api/admin/tenant-auth/tenants');
                 if (resp.ok) {
                     const tenants = await resp.json();
-                    sel.innerHTML = (tenants || []).map(t => `<option value="${t}">${t}</option>`).join('');
+                    // 首项“空租户”：迁移时沿用各脚本来源租户并自动创建
+                    const opts = ['<option value="">（空）沿用来源租户（自动创建）</option>']
+                        .concat((tenants || []).map(t => `<option value="${t}">${t}</option>`));
+                    sel.innerHTML = opts.join('');
                     sel.dataset.loaded = '1';
                 }
             } catch (_) {}
@@ -870,16 +874,18 @@ const Admin = {
     },
 
     async loadMigrationScripts() {
+        // 空值 = 沿用各脚本来源租户，属于合法选择，不再拦截
         const tenant = (document.getElementById('mig-target-tenant')?.value || '').trim();
-        if (!tenant) { alert('请先选择迁入目标租户'); return; }
         this._setMigStatus('正在连接测试环境并拉取...');
         try {
             const resp = await AUTH.authFetch(`/api/admin/migration/remote-scripts?target_tenant=${encodeURIComponent(tenant)}`);
             if (!resp.ok) { await _alertErr(resp, '拉取失败'); this._setMigStatus('拉取失败'); return; }
             const data = await resp.json();
             _migItems = data.items || [];
+            _migUseSourceTenant = !!data.use_source_tenant;
             this.renderMigrationList();
-            this._setMigStatus(`来源：${data.source_url || ''}，共 ${_migItems.length} 个脚本`);
+            const modeTip = data.use_source_tenant ? '（沿用来源租户）' : '';
+            this._setMigStatus(`来源：${data.source_url || ''}${modeTip}，共 ${_migItems.length} 个脚本`);
         } catch (e) {
             this._setMigStatus('拉取失败: ' + e.message);
         }
@@ -893,12 +899,23 @@ const Admin = {
             document.getElementById('mig-select-all').checked = false;
             return;
         }
-        tbody.innerHTML = _migItems.map((it, i) => {
+        const kw = (document.getElementById('mig-filter')?.value || '').trim().toLowerCase();
+        // 保留原始下标（data-i 指向 _migItems），过滤仅隐藏不匹配行
+        const rows = _migItems.map((it, i) => {
+            if (kw) {
+                const hay = [it.name, it.tenant_id, it.hash, it.mode]
+                    .map(v => String(v == null ? '' : v).toLowerCase()).join(' ');
+                if (!hay.includes(kw)) return '';
+            }
             const acc = (it.accuracy != null) ? (it.accuracy * 100).toFixed(1) + '%' : '-';
             let stat = '';
             if (it.already_migrated) stat = '<span style="color:#2e7d32;">已迁移</span>';
             else if (it.exists_by_hash) stat = '<span style="color:#e65100;">已存在(将覆盖)</span>';
             else stat = '<span style="color:#888;">未迁移</span>';
+            // 撞名预警：沿用来源租户模式下，目标租户在本环境已存在 → 将合并进已有租户
+            if (_migUseSourceTenant && it.dest_tenant_exists) {
+                stat += ' <span style="color:#c62828;" title="目标租户已存在，脚本将合并进该租户">⚠合并</span>';
+            }
             return `<tr>
                 <td><input type="checkbox" class="mig-cb" data-i="${i}"></td>
                 <td>${_esc(it.name)}</td>
@@ -908,7 +925,11 @@ const Admin = {
                 <td>${acc}</td>
                 <td>${stat}</td>
             </tr>`;
-        }).join('');
+        }).filter(Boolean);
+        tbody.innerHTML = rows.length ? rows.join('')
+            : '<tr><td colspan="7" style="text-align:center;color:#999;">无匹配脚本</td></tr>';
+        const selAll = document.getElementById('mig-select-all');
+        if (selAll) selAll.checked = false;
     },
 
     migToggleAll(checked) {
@@ -919,14 +940,25 @@ const Admin = {
         return Array.from(document.querySelectorAll('#migration-table .mig-cb:checked'))
             .map(cb => _migItems[parseInt(cb.dataset.i, 10)])
             .filter(Boolean)
-            .map(it => ({ db_id: it.db_id, hash: it.hash, name: it.name }));
+            .map(it => ({ db_id: it.db_id, hash: it.hash, name: it.name, tenant_id: it.tenant_id }));
     },
 
     async doMigrate() {
+        // 空值 = 沿用来源租户，属于合法选择
         const tenant = (document.getElementById('mig-target-tenant')?.value || '').trim();
-        if (!tenant) { alert('请先选择迁入目标租户'); return; }
         const items = this._selectedMigItems();
         if (!items.length) { alert('请勾选要迁移的脚本'); return; }
+        // 撞名预警：沿用来源租户模式下，若来源租户在本环境已存在 → 二次确认合并
+        if (_migUseSourceTenant) {
+            const dupTenants = [...new Set(
+                Array.from(document.querySelectorAll('#migration-table .mig-cb:checked'))
+                    .map(cb => _migItems[parseInt(cb.dataset.i, 10)])
+                    .filter(it => it && it.dest_tenant_exists)
+                    .map(it => it.dest_tenant))];
+            if (dupTenants.length) {
+                if (!confirm(`以下来源租户在本环境已存在，迁移将把脚本合并进这些已有租户（不会新建/改名）：\n${dupTenants.join('、')}\n是否继续？`)) return;
+            }
+        }
         await this._runMigrate(tenant, items, false);
     },
 
@@ -946,7 +978,7 @@ const Admin = {
                 const names = conflicts.map(c => c.name || c.hash).join('、');
                 if (confirm(`以下脚本在目标租户已存在相同代码哈希：\n${names}\n是否覆盖迁移？`)) {
                     // 覆盖：把冲突项 + 已成功项合并重发（仅冲突项需覆盖，已导入的无需重发）
-                    await this._runMigrate(tenant, conflicts.map(c => ({ db_id: c.db_id, hash: c.hash, name: c.name })), true);
+                    await this._runMigrate(tenant, conflicts.map(c => ({ db_id: c.db_id, hash: c.hash, name: c.name, tenant_id: c.tenant_id })), true);
                     return;
                 }
             }

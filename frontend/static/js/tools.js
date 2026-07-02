@@ -9,6 +9,7 @@ let _mergeFiles = [];
 let _mergeAnalysis = null;   // analyze 返回的结果
 let _mergeGroups = [];       // 当前结果列（直连 or AI 合并后）
 let _mergeTemplates = [];     // 已保存的命名模版（含 config）
+let _mergeAppliedTplId = null; // 当前套用的方案 id（带模版则生成时按模版填充）
 const _ALLOWED_EXT = new Set(['xlsx', 'xls', 'xlsm']);
 
 async function _alertErr(resp, fallback) {
@@ -204,6 +205,7 @@ const Tools = {
         document.getElementById('btn-save-template').addEventListener('click', () => this._saveMergeTemplate());
         document.getElementById('btn-apply-template').addEventListener('click', () => this._applyMergeTemplate());
         document.getElementById('btn-delete-template').addEventListener('click', () => this._deleteMergeTemplate());
+        document.getElementById('btn-merge-skeleton').addEventListener('click', () => this._downloadMergeSkeleton());
     },
 
     _addMergeFiles(fileList) {
@@ -281,6 +283,9 @@ const Tools = {
         // 基准文件
         document.getElementById('merge-base-file').innerHTML =
             files.map(f => `<option value="${_escape(f.name)}">${_escape(f.name)}</option>`).join('');
+        // 模版骨架基准表（以哪个上传表为模版底）
+        const skb = document.getElementById('merge-skeleton-base');
+        if (skb) skb.innerHTML = files.map(f => `<option value="${_escape(f.name)}">${_escape(f.name)}</option>`).join('');
 
         // 字段选择（按文件分块，标注来源 + 每文件独立全选/全不选）
         document.getElementById('merge-field-select').innerHTML = files.map((f, fi) => `
@@ -309,6 +314,8 @@ const Tools = {
         document.getElementById('merge-field-select').addEventListener('change', () => this._syncFieldsToGroups());
         this._rebuildDirectGroups();
         document.getElementById('merge-config').style.display = 'block';
+        _mergeAppliedTplId = null;   // 新一轮解析，清除上次套用的方案
+        this._setFillHint();
         this._loadMergeTemplates();
     },
 
@@ -319,7 +326,8 @@ const Tools = {
             _mergeTemplates = await resp.json();
             const sel = document.getElementById('merge-template-select');
             sel.innerHTML = '<option value="">（选择已保存的模版）</option>' +
-                _mergeTemplates.map((t, i) => `<option value="${i}">${_escape(t.name)}</option>`).join('');
+                _mergeTemplates.map((t, i) => `<option value="${i}">${_escape(t.name)}${t.has_template ? ' 🗎' : ''}</option>`).join('');
+            this._setFillHint();
         } catch (_) {}
     },
 
@@ -328,24 +336,72 @@ const Tools = {
         if (el) { el.textContent = text || ''; el.className = 'status' + (kind ? ' ' + kind : ''); }
     },
 
+    // 当前结果列（含可能改过名的输出列名）——骨架/保存/执行共用
+    _currentGroups() {
+        return (_mergeGroups || []).map((g, gi) => {
+            const inp = document.querySelector(`.mg-name[data-gi="${gi}"]`);
+            const nm = (inp && inp.value.trim()) || g.name;
+            return { name: nm, sources: g.sources };
+        });
+    },
+
+    async _downloadMergeSkeleton() {
+        const groups = this._currentGroups();
+        if (!groups.length) { this._setMergeExecStatus('请先选择结果列', 'error'); return; }
+        const btn = document.getElementById('btn-merge-skeleton');
+        const old = btn.textContent; btn.disabled = true; btn.textContent = '生成中...';
+        try {
+            const baseSel = document.getElementById('merge-skeleton-base');
+            const resp = await AUTH.authFetch('/api/tools/merge/template-skeleton', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    result_columns: groups.map(g => ({ name: g.name })),
+                    session_id: (_mergeAnalysis && _mergeAnalysis.session_id) || null,
+                    base_file: (baseSel && baseSel.value) || null,
+                }),
+            });
+            if (!resp.ok) { await _alertErr(resp, '生成骨架失败'); return; }
+            const blob = await resp.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = 'merge_template_skeleton.xlsx';
+            document.body.appendChild(a); a.click(); document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            this._setMergeExecStatus('已下载模版骨架，编辑后可作为“模版文件”随方案上传', 'ok');
+        } catch (e) { this._setMergeExecStatus('生成骨架失败: ' + e.message, 'error'); }
+        finally { btn.disabled = false; btn.textContent = old; }
+    },
+
+    _setFillHint() {
+        const el = document.getElementById('merge-tpl-fill-hint');
+        if (!el) return;
+        const tpl = (_mergeTemplates || []).find(t => t.id === _mergeAppliedTplId);
+        el.textContent = (tpl && tpl.has_template) ? `将按方案「${tpl.name}」的模版填充（带格式/公式）` : '';
+    },
+
     async _saveMergeTemplate() {
         const name = (document.getElementById('merge-template-name').value || '').trim();
-        if (!name) { this._setSaveStatus('请输入模版名称', 'error'); return; }
+        if (!name) { this._setSaveStatus('请输入方案名称', 'error'); return; }
         // 收集当前配置：主键列名（取首个文件的主键下拉值）、结果列(按列名)、模式
         const keyEls = document.querySelectorAll('.mg-key');
         const key_field = keyEls.length ? keyEls[0].value : '';
-        const groups = (_mergeGroups || []).map((g, gi) => {
-            const inp = document.querySelector(`.mg-name[data-gi="${gi}"]`);
-            const nm = (inp && inp.value.trim()) || g.name;
-            const source_cols = [...new Set(g.sources.map(s => s.col))];
-            return { name: nm, source_cols };
-        });
+        const groups = this._currentGroups().map(g => ({
+            name: g.name,
+            source_cols: [...new Set(g.sources.map(s => s.col))],
+        }));
         const config = {
             key_field,
             merge_mode: document.getElementById('merge-mode').value,
             normalize_keys: document.getElementById('merge-normalize-keys').checked,
             result_columns: groups,
         };
+        const fileInput = document.getElementById('merge-template-file');
+        const tplFile = fileInput && fileInput.files && fileInput.files[0];
+        const fd = new FormData();
+        fd.append('name', name);
+        fd.append('config', JSON.stringify(config));
+        if (tplFile) fd.append('template', tplFile);
+
         const btn = document.getElementById('btn-save-template');
         const oldText = btn.textContent;
         btn.disabled = true;
@@ -353,12 +409,15 @@ const Tools = {
         this._setSaveStatus('保存中...');
         try {
             const resp = await AUTH.authFetch('/api/tools/merge/template/save', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name, config }),
+                method: 'POST', body: fd,   // multipart，勿手动设 Content-Type
             });
             if (!resp.ok) { await _alertErr(resp, '保存失败'); this._setSaveStatus('保存失败', 'error'); return; }
-            this._setSaveStatus(`✓ 已保存模版「${name}」`, 'ok');
-            this._loadMergeTemplates();
+            const j = await resp.json();
+            this._setSaveStatus(`✓ 已保存方案「${name}」` + (j.has_template ? '（含模版）' : ''), 'ok');
+            if (fileInput) fileInput.value = '';
+            await this._loadMergeTemplates();
+            // 保存后自动视为已套用该方案
+            if (j.id != null) { _mergeAppliedTplId = j.id; this._setFillHint(); }
         } catch (e) { this._setSaveStatus('保存失败: ' + e.message, 'error'); }
         finally { btn.disabled = false; btn.textContent = oldText; }
     },
@@ -374,6 +433,7 @@ const Tools = {
         const tpl = (_mergeTemplates || [])[parseInt(idx, 10)];
         if (!tpl || !tpl.config) return;
         const cfg = tpl.config;
+        _mergeAppliedTplId = tpl.id;   // 记录套用的方案；带模版则生成时按模版填充
         const files = (_mergeAnalysis && _mergeAnalysis.files) || [];
 
         // 1) 主键：各文件里选中与 key_field 同名的列
@@ -412,6 +472,7 @@ const Tools = {
         this._setTplStatus(
             `已套用「${tpl.name}」` + (missing.length ? `（这些列在当前文件中没找到，已跳过：${missing.join('、')}）` : ''),
             missing.length ? 'error' : 'ok');
+        this._setFillHint();
     },
 
     async _deleteMergeTemplate() {
@@ -583,17 +644,15 @@ const Tools = {
     async _doMerge() {
         if (!_mergeAnalysis) return;
         // 用预览表里的（可能改过名的）结果列
-        const groups = (_mergeGroups || []).map((g, gi) => {
-            const inp = document.querySelector(`.mg-name[data-gi="${gi}"]`);
-            return { name: (inp && inp.value.trim()) || g.name, sources: g.sources };
-        });
+        const groups = this._currentGroups();
         if (!groups.length) { this._setMergeExecStatus('请至少勾选一个字段', 'error'); return; }
         const key_map = {};
         document.querySelectorAll('.mg-key').forEach(sel => { key_map[sel.dataset.file] = sel.value; });
 
+        const usingTpl = !!((_mergeTemplates || []).find(t => t.id === _mergeAppliedTplId && t.has_template));
         const btn = document.getElementById('btn-merge-execute');
         btn.disabled = true;
-        this._setMergeExecStatus('生成中...');
+        this._setMergeExecStatus(usingTpl ? '按模版填充生成中...' : '生成中...');
         try {
             const body = {
                 session_id: _mergeAnalysis.session_id,
@@ -603,6 +662,7 @@ const Tools = {
                 merge_mode: document.getElementById('merge-mode').value,
                 base_file: document.getElementById('merge-base-file').value,
                 normalize_keys: document.getElementById('merge-normalize-keys').checked,
+                template_id: _mergeAppliedTplId,
             };
             const resp = await AUTH.authFetch('/api/tools/merge/execute', {
                 method: 'POST',
@@ -618,7 +678,9 @@ const Tools = {
             a.href = url; a.download = 'merged_result.xlsx';
             document.body.appendChild(a); a.click(); document.body.removeChild(a);
             URL.revokeObjectURL(url);
-            this._setMergeExecStatus(`完成：${rows} 行，${conflicts} 个冲突主键已标红，已下载`, 'ok');
+            this._setMergeExecStatus(
+                usingTpl ? `完成：已按模版填充 ${rows} 行并下载` :
+                `完成：${rows} 行，${conflicts} 个冲突主键已标红，已下载`, 'ok');
         } catch (e) {
             this._setMergeExecStatus(`失败: ${e.message}`, 'error');
         } finally {

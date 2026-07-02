@@ -1693,6 +1693,7 @@ from openpyxl.styles import PatternFill, Font
 from openpyxl.formatting.rule import CellIsRule, FormulaRule
 from openpyxl.utils import get_column_letter, column_index_from_string
 from excel_parser import IntelligentExcelParser
+from backend.utils.source_sheet_writer import dt_to_excel_serial, is_long_digit_text
 
 
 # Excel公式中的特殊值常量（在f-string中使用，避免引号冲突）
@@ -2044,11 +2045,21 @@ def write_source_sheets(wb, source_data):
                 return v
             write_df[col_name] = write_df[col_name].apply(_safe_to_datetime)
 
+        # 1.5) 非日期列：若值为 datetime（被套了 yyyy-mm-dd 等日期格式的普通数字），
+        #      逆转回 Excel 序列号（底层数值），避免非日期列被当日期写入。
+        for col_name in write_df.columns:
+            if col_name in date_cols:
+                continue
+            _dt = write_df[col_name].dtype
+            if _dt == object or str(_dt).startswith('datetime'):
+                write_df[col_name] = write_df[col_name].apply(dt_to_excel_serial)
+
         # 2) NaN → ""
         write_df = write_df.fillna("")
 
         # 3) 识别含公式前缀的列（向量化预扫描，减少后处理范围）
         formula_risk_col_indices = []
+        long_text_col_indices = []
         for col_idx, col_name in enumerate(write_df.columns):
             col_data = write_df[col_name]
             if col_data.dtype == object:
@@ -2057,6 +2068,12 @@ def write_source_sheets(wb, source_data):
                     mask = (str_col.str.len() > 1) & (str_col.str[0].isin(['=', '+', '-']))
                     if mask.any():
                         formula_risk_col_indices.append(col_idx)
+                except Exception:
+                    pass
+                # 长数字文本列（身份证/卡号/手机）：写入时需设文本格式
+                try:
+                    if col_data.apply(is_long_digit_text).any():
+                        long_text_col_indices.append(col_idx)
                 except Exception:
                     pass
 
@@ -2090,6 +2107,15 @@ def write_source_sheets(wb, source_data):
                 for cell in ws[col_letter][1:]:  # 跳过表头
                     val = cell.value
                     if isinstance(val, str) and len(val) > 1 and val[0] in ('=', '+', '-'):
+                        cell.data_type = 's'
+
+        # 长数字文本列：设置文本格式，避免 ≥12 位纯数字串被 Excel 转科学计数/丢精度
+        if long_text_col_indices:
+            for ci in long_text_col_indices:
+                col_letter = get_column_letter(ci + 1)
+                for cell in ws[col_letter][1:]:  # 跳过表头
+                    if is_long_digit_text(cell.value):
+                        cell.number_format = '@'
                         cell.data_type = 's'
 
         source_sheets[sheet_name] = {"df": df, "ws": ws}
