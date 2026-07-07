@@ -3042,6 +3042,20 @@ class IntelligentExcelParser:
                 if col_idx < max_col:
                     val = row_values[col_idx]
                     val = self._normalize_exported_value(val)
+                    # 日期读取策略：仅当"日期关键词列 或 明确日期格式(内置日期/自定义yyyy-mm-dd)"
+                    # 才当日期读；否则按原值读取——直接取 Aspose DoubleValue（底层数字，精确无损）。
+                    # 金额列被误套 [$-409]dd/mmm/yy 时：格式不"明确"、表头非关键词 → 读回原始数字。
+                    if isinstance(val, datetime):
+                        _is_date = self._header_is_date_keyword(header)
+                        try:
+                            _c = raw_cells[region.data_row_start - 1 + row_offset, col_idx]
+                            if not _is_date:
+                                _st = _c.GetStyle()
+                                _is_date = self._fmt_is_clear_date(_st.Number, _st.Custom)
+                            if not _is_date:
+                                val = _c.DoubleValue   # 非日期 → 按原值读取
+                        except Exception:
+                            pass
                     data_row[column_letter] = val
                     if val is not None and str(val).strip():
                         has_valid = True
@@ -3076,6 +3090,41 @@ class IntelligentExcelParser:
             if data_row and self._has_valid_data(data_row):
                 region.data.append(data_row)
                 collected_rows += 1
+
+    # Excel 内置"日期类"数字格式 id（日期/日期时间/CJK 年月日；纯时间 18-21/45-47 不含）
+    _DATE_BUILTIN_FMT_IDS = frozenset({14, 15, 16, 17, 22, 27, 28, 29, 30, 31, 36,
+                                       50, 51, 52, 53, 54, 55, 56, 57, 58})
+
+    @staticmethod
+    def _fmt_is_clear_date(number_id, custom) -> bool:
+        """是否"明确的日期格式"：内置日期格式 id，或自定义 yyyy-mm-dd 式（必须含 4 位年 yyyy）。
+
+        刻意排除 [$-409]dd/mmm/yy;@ 这类 2 位年/月名 locale 格式——它常被误套到金额列上，
+        故不认作明确日期格式；这类列要走"日期关键词列"通道才会被当日期。
+        """
+        try:
+            if int(number_id) in IntelligentExcelParser._DATE_BUILTIN_FMT_IDS:
+                return True
+        except Exception:
+            pass
+        import re as _re
+        f = str(custom or "").lower()
+        f = _re.sub(r"\[[^\]]*\]", "", f)   # 去掉 [$-409] / 条件段
+        f = f.split(";")[0]                  # 只看正数段
+        if "yyyy" in f and "d" in f:         # 明确 ISO：4 位年 + 日（yyyy-mm-dd / yyyy/m/d）
+            return True
+        if "年" in f and "月" in f:           # CJK 年月日
+            return True
+        return False
+
+    @staticmethod
+    def _header_is_date_keyword(header) -> bool:
+        """列头是否日期关键词（复用 source_sheet_writer 的判定；导入失败则退化为 False）。"""
+        try:
+            from backend.utils.source_sheet_writer import is_date_keyword_column
+            return bool(is_date_keyword_column(header))
+        except Exception:
+            return False
 
     @staticmethod
     def _normalize_exported_value(val):
@@ -3551,6 +3600,13 @@ class IntelligentExcelParser:
         if type(cell.value).__name__ == 'DateTime':
             try:
                 dv = cell.value
+                # 1900 闰年 bug 兜底：year<=1900 的伪日期（被套日期格式的小数字，如金额）
+                # 用 DoubleValue 取原始序列号，避免 1900-02-29 幽灵日导致的 ±1 位差。
+                if dv.Year <= 1900:
+                    try:
+                        return cell._cell.DoubleValue
+                    except Exception:
+                        pass
                 return datetime(dv.Year, dv.Month, dv.Day, dv.Hour, dv.Minute, dv.Second)
             except Exception:
                 return str(cell.value)

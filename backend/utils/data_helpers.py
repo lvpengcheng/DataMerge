@@ -205,3 +205,27 @@ def assign_sheet_keys(file_sheet_pairs, max_len: int = 31, reserved_names=None):
             raw_key = sheet_name
         result[(file_base, sheet_name)] = make_unique_sheet_key(raw_key, used, max_len=max_len)
     return result
+
+
+def build_prefixed_sheet_names(keys, prefix: str = "源_", max_len: int = 31, reserved=None) -> dict:
+    """给定**有序** key 列表，返回 {key: 最终 sheet 名}。
+
+    统一"源_ sheet 命名"的唯一入口：智训建 _SOURCE_MAP / _SK_TO_SHEET 与智算写 sheet
+    都调它，保证同一 key 集合（顺序一致）→ 完全相同的 sheet 名，杜绝"公式引用名 ≠ 实际写入名"。
+
+    规则：final = prefix + key，超 max_len 截断，撞名（含 reserved 与已分配名）按 _2,_3... 递增。
+
+    Args:
+        keys: 有序可迭代（去重前请先按稳定顺序排好，如 sorted）；元素为已分配好的 source key。
+        prefix: sheet 名前缀，默认 "源_"。
+        max_len: 长度上限，默认 31（Excel 硬限制）。
+        reserved: 需避让的既有 sheet 名集合（如模板自带 sheet），可选。
+
+    Returns:
+        dict[key] -> final_sheet_name，保留输入顺序。
+    """
+    used = set(reserved) if reserved else set()
+    result: dict = {}
+    for k in keys:
+        result[k] = make_unique_sheet_key(f"{prefix}{k}", used, max_len=max_len)
+    return result

@@ -1562,6 +1562,7 @@ def main(source_dir, output_dir, **kwargs):
                     multi_sheet_source=config.get("multi_sheet_source", False),
                     use_history=config.get("use_history", False),
                     target_sheets=_cfg_target_sheets,
+                    expected_structure=expected_struct,
                 )
             elif _is_auto_mode:
                 _emit({"type": "status", "message": "AI 正在生成代码（自动模式 — 自由设计）..."})
@@ -2465,6 +2466,7 @@ async def send_message(
                     stream_callback=stream_cb,
                     multi_sheet_source=config.get("multi_sheet_source", False),
                     use_history=config.get("use_history", False),
+                    expected_structure=expected_struct,
                 )
             elif _is_auto_mode:
                 _emit({"type": "status", "message": "AI 正在生成代码（自动模式 — 自由设计）..."})
@@ -2867,7 +2869,28 @@ async def upload_code(
         logger.warning(f"[upload-code] 保存脚本到磁盘失败: {e}")
 
     try:
-        _script_name_db = (config.get("script_name") or "").strip() or f"script_{session.tenant_id}"
+        # 目标脚本名解析（方案A：按所选会话确定）——保证"手改上传 = 该会话脚本名下的最新版本"：
+        #   1) 优先复用本会话已产出的当前活跃脚本名（同一会话反复上传，始终 version+1 叠在同一名字上）
+        #   2) 否则用建训练时的 config.script_name
+        #   3) 兜底 script_{租户}
+        _sess_active = (
+            db.query(Script)
+            .filter_by(tenant_id=session.tenant_id, source_session_id=session_id, is_active=True)
+            .order_by(Script.version.desc())
+            .first()
+        )
+        _script_name_db = (
+            (_sess_active.name.strip() if _sess_active and _sess_active.name else "")
+            or (config.get("script_name") or "").strip()
+            or f"script_{session.tenant_id}"
+        )
+        # 回写 config，保证后续上传/列表展示始终一致地指向同一名字
+        if (config.get("script_name") or "").strip() != _script_name_db:
+            config["script_name"] = _script_name_db
+            session.config = dict(config)
+            db.commit()
+        logger.info(f"[upload-code] 目标脚本名解析为: {_script_name_db}"
+                    f"（复用会话活跃脚本={bool(_sess_active)}）")
         persistence.save_script(
             tenant_id=session.tenant_id,
             name=_script_name_db,

@@ -4156,8 +4156,13 @@ def _resolve_script_display_name(tenant_id: str, script_id: str, script_content:
             # b) 文件型 script_<hash12>：按代码 MD5 反查 DB 友好名
             if (sc is None or not _friendly(getattr(sc, "name", None))) and script_content:
                 _h = _hl.md5(script_content.encode("utf-8")).hexdigest()[:12]
+                # 与 /api/tenant-scripts 的 db_by_code_hash 选择规则保持一致：同一份代码
+                # 可能挂在多个会话名下（同 hash 多条 DB 记录）。按 created_at 倒序遍历、
+                # 优先取"最新的友好名"，保证结果文件名与列表显示一致，不再因无序遍历
+                # 随机命中另一个同码脚本名（如 xxx-其他外包）。
                 for c in (_ndb.query(_ScriptModel)
-                          .filter_by(tenant_id=tenant_id, is_active=True).all()):
+                          .filter_by(tenant_id=tenant_id, is_active=True)
+                          .order_by(_ScriptModel.created_at.desc()).all()):
                     if c.code and _hl.md5(c.code.encode("utf-8")).hexdigest()[:12] == _h:
                         if _friendly(c.name):
                             sc = c
@@ -4867,10 +4872,15 @@ async def run_compute_task(
                             if (template_override_path and os.path.exists(template_override_path))
                             else _tpl_for_fmt)
             if _eff_tpl_fmt and os.path.exists(_eff_tpl_fmt):
-                from backend.utils.output_postprocess import restore_formats_from_template
+                from backend.utils.output_postprocess import (
+                    restore_formats_from_template, normalize_source_sheet_formats,
+                )
                 for _of in output_files:
                     # 放线程执行：openpyxl 读写较慢，避免阻塞事件循环导致 SSE 心跳停、被代理 502
                     await asyncio.to_thread(restore_formats_from_template, str(_of), _eff_tpl_fmt)
+                    # 源_ sheet 兜底：修复继承模板"日期默认样式"导致数字显示成日期的问题
+                    # （覆盖旧脚本，零误伤：只拉回恰好等于模板日期默认格式的单元格）
+                    await asyncio.to_thread(normalize_source_sheet_formats, str(_of), _eff_tpl_fmt)
         except Exception as _fmt_e:
             logger.warning(f"[fmt兜底] 跳过: {_fmt_e}")
 
@@ -4924,17 +4934,22 @@ async def run_compute_task(
         try:
             if dual_output_enabled():
                 _vp = compute_dir / values_only_name(_result_name)
-                # 目标 sheet 白名单：纯值版只保留目标文件的目标 sheet（去掉源 sheet，含无 源_ 前缀的）
-                _es = locals().get("expected_structure")
-                _target_sheets = list((_es.get("sheets") or {}).keys()) if isinstance(_es, dict) else None
+                # 选择性拍平：模版原有公式保留，仅新填列公式→值；模版所有 sheet 保留（只删 源_）
+                # 用「实际生成结果所用的模版」= 上传的新模板(override) 优先，否则训练模板；
+                # 并传 sheet 反向映射，保证改过名的输出 sheet 也能对上模版公式保护名单。
+                _ov_tpl = (template_override_path
+                           if (template_override_path and os.path.exists(template_override_path))
+                           else None)
+                _tpl_for_values = _ov_tpl or _extract_template_path(script_content)
                 # 放线程执行：Aspose CalculateFormula 较重，避免阻塞事件循环导致 SSE 被代理 502
-                if await asyncio.to_thread(make_values_only_copy, str(saved_file), str(_vp), "源_", _target_sheets):
+                if await asyncio.to_thread(make_values_only_copy, str(saved_file), str(_vp),
+                                           "源_", None, _tpl_for_values, _sheet_reverse_map or None):
                     _values_saved = _vp
                     buffer.push(task_id, json.dumps({
                         "type": "log",
                         "timestamp": datetime.now().strftime("%H:%M:%S"),
                         "level": "success",
-                        "message": f"已生成纯值版（仅目标sheet）: {_vp.name}"
+                        "message": f"已生成纯值版（模版公式保留、新列转值）: {_vp.name}"
                     }, ensure_ascii=False))
         except Exception as _ve:
             logger.warning(f"[纯值版] 生成失败（不阻断）: {_ve}")

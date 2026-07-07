@@ -50,6 +50,7 @@ class TemplateCodeGenerator:
         multi_sheet_source: bool = False,
         use_history: bool = False,
         target_sheets: Optional[List[str]] = None,
+        expected_structure: Optional[Dict] = None,
     ) -> Tuple[str, str]:
         """生成模板填充模式的 Python 代码
 
@@ -97,7 +98,11 @@ class TemplateCodeGenerator:
 
         # 3. 构造 AI prompt
         log("步骤3: 构造 AI prompt...")
-        prompt = self._build_prompt(rules_content, template_struct, source_struct, use_history)
+        # 源 sheet 命名的 reserved 集合：与智算 fast_header_matcher 完全一致地取
+        # expected_structure["sheets"]；缺省才退化为模板自身 sheet 名。
+        _reserved_names = set((expected_structure or {}).get("sheets", {}).keys()) or None
+        prompt = self._build_prompt(rules_content, template_struct, source_struct, use_history,
+                                    reserved_names=_reserved_names)
         self.last_prompt = prompt
 
         # 4. 调用 AI 生成 fill_template 函数
@@ -121,6 +126,7 @@ class TemplateCodeGenerator:
             template_struct=template_struct,
             source_struct=source_struct,
             use_history=use_history,
+            reserved_names=_reserved_names,
         )
 
         # 7. 缩进修复
@@ -291,12 +297,14 @@ class TemplateCodeGenerator:
         template_struct: Dict[str, Any],
         source_struct: Dict[str, Any],
         use_history: bool,
+        reserved_names: Optional[set] = None,
     ) -> str:
         rules_short = (rules_content or "")[:30000]
 
         # ⚠️ prompt 里展示的结构必须 = 运行时 _COL_MAP/_SOURCE_MAP 的字段名
         col_map_for_prompt = self._build_col_map(template_struct)
-        source_map_for_prompt = self._build_source_map_with_letters(source_struct)
+        source_map_for_prompt, _ = self._build_source_map_with_letters(
+            source_struct, template_struct, reserved_names=reserved_names)
 
         return f"""你是 Excel 数据处理专家。任务：编写 Python 函数 `fill_template`，按规则**写公式**到模板的目标列。
 
@@ -522,51 +530,69 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
 
     SOURCE_PREFIX = "源_"
 
-    def _build_source_map_with_letters(self, source_struct: Dict[str, Any]) -> Dict[str, Any]:
-        """把 source_struct 转为骨架追加 sheet 后的实际结构：
-        {
-          "源_<原sheet名>": {
-            "header_row": 1,
-            "data_start_row": 2,          # ← 恒为 2（见下方说明）
-            "columns": [ {"letter": "A", "name": "工号"}, ... ]
-          }
-        }
+    def _build_source_map_with_letters(self, source_struct: Dict[str, Any],
+                                       template_struct: Optional[Dict[str, Any]] = None,
+                                       reserved_names: Optional[set] = None) -> Tuple[Dict[str, Any], Dict[str, str]]:
+        """把 source_struct 转为骨架追加 sheet 后的实际结构，并返回 (source_map, sk_to_sheet)。
 
-        - key 已加 `源_` 前缀（与骨架 _append_source_sheets 一致），AI 可直接用作公式中的 sheet 名
-        - 若多文件 sheet 同名则自动加 `_<文件 stem>` 后缀避免冲突
-        - ⚠️ data_start_row 恒为 2：骨架把源 DataFrame 重写为 row1=表头/row2+=数据 的干净 sheet，
-          追加后的源 sheet 与原文件的多行表头/标题行无关，数据必从第 2 行起。
+        统一命名（智训/智算同一套逻辑）：
+        1. 先用 assign_sheet_keys 给每个 (file_base, sheet) 分配 source key —— 与智算
+           fast_header_matcher 完全一致（reserved = 结果 sheet 名，撞名加 file_base 前缀）。
+        2. 再用 build_prefixed_sheet_names 加 `源_` 前缀 + 截断 + `_N` 递增去重。
+        这样智训烘焙进 `_SOURCE_MAP`（公式引用名）/`_SK_TO_SHEET` 的名字，与智算
+        `_append_source_sheets` 实际写入的 sheet 名一致，杜绝超长/撞名时的引用失配。
+
+        ⚠️ reserved_names 必须与智算一致：智算用 `expected_structure["sheets"].keys()`。
+           调用方应把同一个 expected_structure 传进来；缺省才退化为模板自身 sheet 名。
+
+        - source_map key 已是最终 `源_` sheet 名，AI 直接用作公式中的 sheet 名。
+        - data_start_row 恒为 2：骨架把源 DataFrame 重写为 row1=表头/row2+=数据。
         """
         from openpyxl.utils import get_column_letter
-        out: Dict[str, Any] = {}
-        used_names = set()
+        from backend.utils.data_helpers import assign_sheet_keys, build_prefixed_sheet_names
+
         files = source_struct.get("files", {}) or {}
+        # 1) 收集 (file_base, sheet_name) 与列，稳定排序（与智算 sorted 一致）
+        pairs: List[Tuple[str, str]] = []
+        cols_by_pair: Dict[Tuple[str, str], List[str]] = {}
         for fname, fdesc in files.items():
             if not isinstance(fdesc, dict) or "error" in fdesc:
                 continue
+            file_base = Path(fname).stem
             for sn, sinfo in fdesc.items():
-                # 兼容新结构（dict）和旧结构（list）
-                if isinstance(sinfo, dict):
-                    cols = list(sinfo.get("columns") or [])
-                else:
-                    cols = list(sinfo or [])
+                cols = list(sinfo.get("columns") or []) if isinstance(sinfo, dict) else list(sinfo or [])
+                pairs.append((file_base, sn))
+                cols_by_pair[(file_base, sn)] = cols
+        pairs.sort(key=lambda p: (str(p[0]), str(p[1])))
 
-                base_key = f"{self.SOURCE_PREFIX}{sn}"
-                final_key = base_key
-                if final_key in used_names:
-                    stem = Path(fname).stem
-                    final_key = f"{self.SOURCE_PREFIX}{stem}_{sn}"
-                final_key = final_key[:31]  # Excel sheet 名上限
-                used_names.add(final_key)
-                out[final_key] = {
-                    "header_row": 1,
-                    "data_start_row": 2,
-                    "columns": [
-                        {"letter": get_column_letter(i + 1), "name": c}
-                        for i, c in enumerate(cols)
-                    ],
-                }
-        return out
+        # 2) 分配 source key（reserved = 结果 sheet 名，与智算完全一致）
+        if reserved_names is not None:
+            reserved = set(reserved_names)
+        else:
+            reserved = set((template_struct or {}).get("sheets", {}).keys())
+        sk_map = assign_sheet_keys(pairs, reserved_names=reserved)   # {(fb,sn): sk}
+
+        # 3) 加 `源_` 前缀 + _N 去重（结果 sheet 名当 reserved 避让）
+        ordered_sk = sorted(set(sk_map.values()))
+        name_map = build_prefixed_sheet_names(ordered_sk, prefix=self.SOURCE_PREFIX, reserved=reserved)
+
+        # 4) 组装 _SOURCE_MAP（键=最终 源_名）与 _SK_TO_SHEET（sk -> 源_名）
+        out: Dict[str, Any] = {}
+        sk_to_sheet: Dict[str, str] = {}
+        for (fb, sn) in pairs:
+            sk = sk_map[(fb, sn)]
+            final_name = name_map[sk]
+            sk_to_sheet[sk] = final_name
+            cols = cols_by_pair[(fb, sn)]
+            out[final_name] = {
+                "header_row": 1,
+                "data_start_row": 2,
+                "columns": [
+                    {"letter": get_column_letter(i + 1), "name": c}
+                    for i, c in enumerate(cols)
+                ],
+            }
+        return out, sk_to_sheet
 
     # ==================== 完整脚本拼接 ====================
 
@@ -578,6 +604,7 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
         template_struct: Dict[str, Any],
         source_struct: Dict[str, Any],
         use_history: bool,
+        reserved_names: Optional[set] = None,
     ) -> str:
         """把 AI 生成的 fill_template 包到固定的脚本骨架里"""
         import pprint as _pprint
@@ -585,9 +612,11 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
 
         # ⚠️ 必须用 pprint.pformat 输出 Python 字面量（None/True/False），不能用 json.dumps
         col_map = self._build_col_map(template_struct)
-        source_map = self._build_source_map_with_letters(source_struct)
+        source_map, sk_to_sheet = self._build_source_map_with_letters(
+            source_struct, template_struct, reserved_names=reserved_names)
         col_map_literal = _pprint.pformat(col_map, width=120, sort_dicts=False)
         source_map_literal = _pprint.pformat(source_map, width=120, sort_dicts=False)
+        sk_to_sheet_literal = _pprint.pformat(sk_to_sheet, width=120, sort_dicts=False)
 
         skeleton = f'''"""
 DataMerge 自动生成 — 模板填充模式（AI 写公式 + 骨架预追加 `源_xxx` sheet）
@@ -606,6 +635,7 @@ import openpyxl
 from openpyxl.utils import column_index_from_string, get_column_letter
 from datetime import datetime
 from backend.utils.source_sheet_writer import is_date_keyword_column, dt_to_excel_serial, is_long_digit_text
+from backend.utils.data_helpers import assign_sheet_keys, build_prefixed_sheet_names
 
 # 模板持久化路径（训练时确定，智算复用）
 TEMPLATE_PATH = {tpl_repr}
@@ -628,6 +658,9 @@ _COL_MAP = {col_map_literal}
 #   _SOURCE_MAP["源_考勤明细"] = {{"header_row": 1, "data_start_row": 2,
 #                                  "columns": [{{"letter": "A", "name": "工号"}}, ...]}}
 _SOURCE_MAP = {source_map_literal}
+# 源 sheet key(assign_sheet_keys 输出) -> 实际写入的 `源_` sheet 名。
+# 智训烘焙、智算写 sheet 时直接查这张表，保证公式引用名 == 实际 sheet 名（同一套命名逻辑）。
+_SK_TO_SHEET = {sk_to_sheet_literal}
 # ==================== 列定位字典 结束 ====================
 
 # 注入：薪资参数 / 历史数据上下文（沙箱外部 globals 注入）
@@ -650,6 +683,9 @@ def load_source_data():
         return pre
 
     out = {{}}
+    # 两趟：先收集 (file_base, sheet, df)，再用 assign_sheet_keys 统一分配 key
+    # （与智训 _build_source_map_with_letters / 智算 fast_header_matcher 同一套逻辑）。
+    _collected = []
     for fname in os.listdir(input_folder):
         if not fname.lower().endswith((".xlsx", ".xls", ".xlsm")):
             continue
@@ -660,10 +696,15 @@ def load_source_data():
             xls = pd.ExcelFile(fp)
             for sn in xls.sheet_names:
                 df = pd.read_excel(fp, sheet_name=sn)
-                key = sn if sn not in out else f"{{Path(fname).stem}}_{{sn}}"
-                out[key] = {{"df": df, "columns": list(df.columns)}}
+                _collected.append((Path(fname).stem, sn, df))
         except Exception as e:
             print(f"[源数据加载警告] {{fname}}: {{e}}")
+    _collected.sort(key=lambda x: (str(x[0]), str(x[1])))
+    _reserved = set(_COL_MAP.keys())
+    _key_map = assign_sheet_keys([(fb, sn) for fb, sn, _ in _collected], reserved_names=_reserved)
+    for fb, sn, df in _collected:
+        key = _key_map[(fb, sn)]
+        out[key] = {{"df": df, "columns": list(df.columns)}}
     print(f"加载完成：{{len(out)}} 个 sheet")
     return out
 
@@ -682,19 +723,27 @@ def _append_source_sheets(wb, source_data):
         df = (sv or {{}}).get("df")
         if df is None:
             continue
-        target_name = f"{{SOURCE_PREFIX}}{{sk}}"[:31] if sk else f"{{SOURCE_PREFIX}}源数据"
-        # 若与模板已有 sheet 同名，加后缀避免冲突
-        suffix = 1
-        base_name = target_name
-        while target_name in wb.sheetnames:
-            target_name = f"{{base_name[:28]}}_{{suffix}}"
-            suffix += 1
+        target_name = _SK_TO_SHEET.get(sk) if sk else None
+        if not target_name:
+            # 兜底：未在烘焙表里的 key（智算偶发多出的 sheet）→ 用同一套命名函数现算
+            target_name = build_prefixed_sheet_names(
+                [sk or "源数据"], prefix=SOURCE_PREFIX, reserved=set(wb.sheetnames)
+            )[sk or "源数据"]
+        # 若与模板已有 sheet 同名（理论上烘焙表已避让），再兜底去重
+        if target_name in wb.sheetnames:
+            target_name = build_prefixed_sheet_names(
+                [sk or "源数据"], prefix=SOURCE_PREFIX, reserved=set(wb.sheetnames)
+            )[sk or "源数据"]
         ws = wb.create_sheet(title=target_name)
         cols = list(df.columns)
         # 逐列判定是否日期列（仅按列名关键词，与 formula 模式一致）
         _date_col_flags = [is_date_keyword_column(cname) for cname in cols]
         for ci, cname in enumerate(cols, start=1):
-            ws.cell(row=1, column=ci).value = cname
+            _hc = ws.cell(row=1, column=ci)
+            _hc.value = cname
+            # 表头强制 General：否则会继承模板"常规"样式（部分模板的默认样式被设成了
+            # 日期格式如 [$-409]dd/mmm/yy），导致新建的 源_ sheet 表头也显示成日期
+            _hc.number_format = "General"
         for ri, row in enumerate(df.itertuples(index=False, name=None), start=2):
             for ci, val in enumerate(row, start=1):
                 if isinstance(val, float) and val != val:
@@ -708,13 +757,18 @@ def _append_source_sheets(wb, source_data):
                     else:
                         # 非日期列却为 datetime（被套了日期格式的普通数字）→ 逆转回底层序列号
                         cell.value = dt_to_excel_serial(val)
+                        cell.number_format = "General"
                 elif is_long_digit_text(val):
                     # ≥12 位纯数字串（身份证/卡号/手机）→ 文本格式，避免科学计数/丢精度
                     cell.value = val
                     cell.number_format = "@"
                     cell.data_type = "s"
                 else:
+                    # 普通数字/文本：强制 General，避免继承模板默认样式里的日期格式
+                    # （根因：某些模板的 Normal 样式 numFmtId 是 [$-409]dd/mmm/yy，
+                    #  新 sheet 未显式设格式的单元格会吃到它，数字被显示成日期）
                     cell.value = val
+                    cell.number_format = "General"
         appended_map[sk] = target_name
         appended.append(f"{{target_name}}({{len(df)}}行x{{len(cols)}}列)")
     if appended:

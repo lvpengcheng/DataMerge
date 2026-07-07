@@ -316,11 +316,16 @@ async def execute_compute(
             # 保存结果到租户目录并注册为 data_asset
             from ..utils.output_postprocess import (
                 build_result_filename, values_only_name, dual_output_enabled, make_values_only_copy,
+                normalize_source_sheet_formats,
             )
             saved_assets = []
             tenant_output_dir = PROJECT_ROOT / "tenants" / task.tenant_id / "assets" / "result"
             tenant_output_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            # 模板路径（供 源_ 格式兜底与纯值版复用）
+            _m_tpl = re.search(r"TEMPLATE_PATH\s*=\s*(['\"])(.+?)\1", script.code or "")
+            _tpl_for_values = _m_tpl.group(2) if _m_tpl else None
 
             def _register_result(path, fname):
                 result_asset = DataAsset(
@@ -349,12 +354,18 @@ async def execute_compute(
 
                 dest_path = tenant_output_dir / new_filename
                 shutil.copy2(output_file, dest_path)
+                # 源_ sheet 格式兜底：修复继承模板日期默认样式导致数字显示成日期（覆盖旧脚本）
+                if _tpl_for_values:
+                    try:
+                        normalize_source_sheet_formats(str(dest_path), _tpl_for_values)
+                    except Exception as _nse:
+                        logger.warning(f"[源_格式兜底] 跳过: {_nse}")
                 _register_result(dest_path, new_filename)
 
-                # 双结果：再出纯值版（公式→值，仅目标 sheet）
+                # 双结果：再出纯值版（模版公式保留、新列公式→值；模版所有 sheet 保留）
                 if _dual:
                     _vp = tenant_output_dir / values_only_name(new_filename)
-                    if make_values_only_copy(dest_path, _vp):
+                    if make_values_only_copy(dest_path, _vp, template_path=_tpl_for_values):
                         _register_result(_vp, _vp.name)
 
             result_summary["saved_assets"] = saved_assets
