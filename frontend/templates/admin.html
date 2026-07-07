@@ -126,6 +126,9 @@
                     <option value="tenant">仅租户级</option>
                 </select>
                 <button class="btn btn-primary" onclick="Admin.showUploadRefData()">上传基础数据</button>
+                <label style="margin-left:8px;font-size:13px;color:#555;cursor:pointer;">
+                    <input type="checkbox" id="ref-show-inactive" onchange="Admin.loadRefData()"> 显示已停用
+                </label>
             </div>
             <table class="data-table" id="ref-data-table">
                 <thead>
@@ -230,6 +233,6 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260414t3"></script>
-    <script src="/static/js/admin.js?v=20260630a"></script>
+    <script src="/static/js/admin.js?v=20260707a"></script>
 </body>
 </html>

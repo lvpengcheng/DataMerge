@@ -54,6 +54,7 @@ class AssetUpdateIn(BaseModel):
     effective_from: Optional[str] = None
     effective_to: Optional[str] = None
     tags: Optional[list] = None
+    is_active: Optional[bool] = None
 
 
 class ReferenceCategoryOut(BaseModel):
@@ -272,6 +273,57 @@ async def upload_asset(
     current_user=Depends(get_current_user),
 ):
     """上传文件 → 自动解析 sheet 结构 → 存入 data_assets"""
+    asset = await _process_and_register_asset(
+        file=file, tenant_id=tenant_id, asset_type=asset_type, category_id=category_id,
+        name=name, description=description, effective_from=effective_from,
+        effective_to=effective_to, tags=tags, db=db, current_user=current_user,
+    )
+    return _asset_to_out(asset)
+
+
+@router.post("/upload-batch")
+async def upload_assets_batch(
+    files: List[UploadFile] = File(...),
+    tenant_id: Optional[str] = Form(None),
+    asset_type: str = Form("reference"),
+    category_id: Optional[int] = Form(None),
+    description: str = Form(""),
+    effective_from: Optional[str] = Form(None),
+    effective_to: Optional[str] = Form(None),
+    tags: Optional[str] = Form(None),  # JSON string
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """批量上传：每个文件以其**文件名**作为资产名称，共享分类/作用域/日期/标签。
+
+    单个文件失败不中断整体，逐个收集错误。返回 {created:[...], failed:[{filename,error}]}。
+    """
+    created, failed = [], []
+    for f in files:
+        try:
+            asset = await _process_and_register_asset(
+                file=f, tenant_id=tenant_id, asset_type=asset_type, category_id=category_id,
+                name=None,  # 恒用文件名
+                description=description, effective_from=effective_from,
+                effective_to=effective_to, tags=tags, db=db, current_user=current_user,
+            )
+            created.append(_asset_to_out(asset))
+        except Exception as e:
+            db.rollback()
+            import logging as _logging
+            _logging.getLogger(__name__).warning(f"[批量上传] 文件失败 {f.filename}: {e}")
+            failed.append({"filename": f.filename, "error": str(e)})
+    return {"created": created, "failed": failed}
+
+
+async def _process_and_register_asset(
+    *, file: UploadFile, tenant_id, asset_type, category_id, name,
+    description, effective_from, effective_to, tags, db, current_user,
+) -> DataAsset:
+    """存文件 → xls转换 → banner拆分 → 日期规范化 → 解析 → 建 DataAsset 入库，返回记录。
+
+    单传/批量/新版本共用。name 为空时用（可能被 .xls→.xlsx 修正过的）文件名。
+    """
     # 保存文件
     storage_dir = _get_asset_storage_dir(tenant_id, asset_type)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -353,7 +405,8 @@ async def upload_asset(
     db.add(asset)
     db.commit()
     db.refresh(asset)
-    return _asset_to_out(asset)
+    return asset
+
 
 
 # ==================== 动态路由 /{asset_id} ====================

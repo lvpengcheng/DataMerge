@@ -674,8 +674,10 @@ const Admin = {
     async loadRefData() {
         const categoryId = document.getElementById('ref-category-filter')?.value || '';
         const scopeVal = document.getElementById('ref-scope-filter')?.value || '';
+        const showInactive = document.getElementById('ref-show-inactive')?.checked || false;
         let url = '/api/assets?asset_type=reference';
         if (categoryId) url += `&category_id=${categoryId}`;
+        if (showInactive) url += '&is_active=false';   // 展示已停用，便于启用/删除
         // 解析作用域筛选
         if (scopeVal === 'global') {
             url += '&scope=global';
@@ -687,10 +689,19 @@ const Admin = {
         const assets = await resp.json();
         const tbody = document.querySelector('#ref-data-table tbody');
         if (!assets.length) {
-            tbody.innerHTML = '<tr><td colspan="9" class="empty-state">暂无基础数据</td></tr>';
+            tbody.innerHTML = `<tr><td colspan="9" class="empty-state">${showInactive ? '暂无已停用的基础数据' : '暂无基础数据'}</td></tr>`;
             return;
         }
-        tbody.innerHTML = assets.map(a => `<tr>
+        tbody.innerHTML = assets.map(a => {
+            const actions = a.is_active
+                ? `<button class="btn btn-sm" onclick="Admin.previewAsset(${a.id})">预览</button>
+                   <button class="btn btn-sm" onclick="Admin.updateAssetVersion(${a.id})">更新</button>
+                   <button class="btn btn-sm btn-danger" onclick="Admin.deleteAsset(${a.id})">停用</button>
+                   <button class="btn btn-sm btn-danger" onclick="Admin.hardDeleteAsset(${a.id})">删除</button>`
+                : `<button class="btn btn-sm" onclick="Admin.previewAsset(${a.id})">预览</button>
+                   <button class="btn btn-sm btn-primary" onclick="Admin.enableAsset(${a.id})">启用</button>
+                   <button class="btn btn-sm btn-danger" onclick="Admin.hardDeleteAsset(${a.id})">删除</button>`;
+            return `<tr>
             <td>${a.id}</td>
             <td>${a.name}</td>
             <td>${a.category_name || '-'}</td>
@@ -699,11 +710,9 @@ const Admin = {
             <td>v${a.version}</td>
             <td>${a.effective_from || '-'}</td>
             <td>${a.is_active ? '<span style="color:green">启用</span>' : '<span style="color:#999">停用</span>'}</td>
-            <td>
-                <button class="btn btn-sm" onclick="Admin.previewAsset(${a.id})">预览</button>
-                <button class="btn btn-sm btn-danger" onclick="Admin.deleteAsset(${a.id})">停用</button>
-            </td>
-        </tr>`).join('');
+            <td>${actions}</td>
+        </tr>`;
+        }).join('');
     },
 
     showUploadRefData() {
@@ -716,7 +725,7 @@ const Admin = {
         this.openModal('上传基础数据', `
             <div style="display:flex;flex-direction:column;gap:12px;">
                 <label>分类：<select id="ref-upload-category" style="padding:6px;border:1px solid #ddd;border-radius:4px;">${catOptions}</select></label>
-                <label>名称：<input id="ref-upload-name" type="text" placeholder="如：2025年最低工资标准" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;"></label>
+                <label>名称：<input id="ref-upload-name" type="text" placeholder="留空用文件名；多选时按各自文件名（此框忽略）" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;"></label>
                 <label>作用域：
                     <select id="ref-upload-scope" style="padding:6px;border:1px solid #ddd;border-radius:4px;">
                         <option value="">全局（所有租户可用）</option>
@@ -725,23 +734,49 @@ const Admin = {
                 </label>
                 <label>生效日期：<input id="ref-upload-from" type="date" style="padding:6px;border:1px solid #ddd;border-radius:4px;"></label>
                 <label>失效日期：<input id="ref-upload-to" type="date" style="padding:6px;border:1px solid #ddd;border-radius:4px;"></label>
-                <label>文件：<input id="ref-upload-file" type="file" accept=".xlsx,.xls"></label>
+                <label>文件：<input id="ref-upload-file" type="file" accept=".xlsx,.xls" multiple></label>
+                <div style="font-size:12px;color:#888;">可一次选多个文件批量上传，每个文件以其文件名作为基础数据名称。</div>
             </div>
         `, async () => {
             const fileInput = document.getElementById('ref-upload-file');
             if (!fileInput.files.length) return alert('请选择文件');
+            const catId = document.getElementById('ref-upload-category').value;
+            const scopeVal = document.getElementById('ref-upload-scope').value;
+            const ef = document.getElementById('ref-upload-from').value;
+            const et = document.getElementById('ref-upload-to').value;
+
+            if (fileInput.files.length > 1) {
+                // 批量上传：每个文件用自己的文件名，共享分类/作用域/日期
+                const fd = new FormData();
+                for (const f of fileInput.files) fd.append('files', f);
+                fd.append('asset_type', 'reference');
+                if (catId) fd.append('category_id', catId);
+                if (scopeVal) fd.append('tenant_id', scopeVal);
+                if (ef) fd.append('effective_from', ef);
+                if (et) fd.append('effective_to', et);
+                const resp = await AUTH.authFetch('/api/assets/upload-batch', {method: 'POST', body: fd});
+                if (resp.ok) {
+                    const r = await resp.json();
+                    this.closeModal();
+                    this.loadRefData();
+                    const failMsg = (r.failed && r.failed.length)
+                        ? '\n失败 ' + r.failed.length + ' 个：\n' + r.failed.map(x => `${x.filename}: ${x.error}`).join('\n')
+                        : '';
+                    alert(`成功上传 ${r.created ? r.created.length : 0} 个${failMsg}`);
+                } else {
+                    alert('批量上传失败: ' + (await resp.text()));
+                }
+                return;
+            }
+
+            // 单文件（保持原路径）
             const fd = new FormData();
             fd.append('file', fileInput.files[0]);
             fd.append('asset_type', 'reference');
-            fd.append('category_id', document.getElementById('ref-upload-category').value);
+            if (catId) fd.append('category_id', catId);
             fd.append('name', document.getElementById('ref-upload-name').value || fileInput.files[0].name);
-            // 作用域 → tenant_id
-            const scopeVal = document.getElementById('ref-upload-scope').value;
             if (scopeVal) fd.append('tenant_id', scopeVal);
-            // 日期
-            const ef = document.getElementById('ref-upload-from').value;
             if (ef) fd.append('effective_from', ef);
-            const et = document.getElementById('ref-upload-to').value;
             if (et) fd.append('effective_to', et);
             const resp = await AUTH.authFetch('/api/assets/upload', {method: 'POST', body: fd});
             if (resp.ok) {
@@ -772,6 +807,40 @@ const Admin = {
         if (!confirm('确定停用此数据？')) return;
         await AUTH.authFetch(`/api/assets/${assetId}`, {method: 'DELETE'});
         this.loadRefData();
+    },
+
+    async hardDeleteAsset(assetId) {
+        if (!confirm('物理删除此数据？将同时删除文件与记录，不可恢复！')) return;
+        const resp = await AUTH.authFetch(`/api/assets/${assetId}?hard=true`, {method: 'DELETE'});
+        if (!resp.ok) return alert('删除失败: ' + (await resp.text()));
+        this.loadRefData();
+    },
+
+    async enableAsset(assetId) {
+        const resp = await AUTH.authFetch(`/api/assets/${assetId}`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({is_active: true}),
+        });
+        if (!resp.ok) return alert('启用失败: ' + (await resp.text()));
+        this.loadRefData();
+    },
+
+    updateAssetVersion(assetId) {
+        // 行内选新文件 → 以新版本更新（保留历史、停用旧版）
+        const picker = document.createElement('input');
+        picker.type = 'file';
+        picker.accept = '.xlsx,.xls';
+        picker.onchange = async () => {
+            if (!picker.files.length) return;
+            const fd = new FormData();
+            fd.append('file', picker.files[0]);
+            const resp = await AUTH.authFetch(`/api/assets/${assetId}/new-version`, {method: 'POST', body: fd});
+            if (!resp.ok) return alert('更新失败: ' + (await resp.text()));
+            alert('已更新为新版本');
+            this.loadRefData();
+        };
+        picker.click();
     },
 
     // ==================== 脚本管理 ====================
