@@ -294,6 +294,8 @@ def make_values_only_copy(src_xlsx, dst_xlsx, source_sheet_prefix="源_",
     公式取舍（选择性拍平）：
       - template_path 给定时：先从**实际生成结果所用的模版**收集"原本就是公式的单元格坐标"
         作为保护名单，拍平时只把**不在名单内**的公式（= AI 新填列）转成值，模版自带公式保留。
+        **例外**：即便在保护名单内，只要公式引用了将被删除的 源_ sheet（AI 填充列的 VLOOKUP
+        恰好落在模版样例公式坐标上、或模版自带 源_ 引用），也一律拍平成值——否则删 源_ 后会变 #REF!。
       - template_path 为 None 时：退化为旧行为，全部公式拍平（向后兼容）。
       - sheet_name_map：{模版sheet名: 输出sheet名} 别名映射。当输出文件的 sheet 名与模版
         不同（上传模版 + sheet 改名场景）时，用它把保护名单的 key 同时登记到输出侧名字，
@@ -370,8 +372,16 @@ def make_values_only_copy(src_xlsx, dst_xlsx, source_sheet_prefix="源_",
                 while it.MoveNext():
                     cell = it.Current
                     try:
-                        if cell.IsFormula and (cell.Row, cell.Column) not in _pset:
-                            cell.PutValue(cell.Value)
+                        if not cell.IsFormula:
+                            continue
+                        # 模版原有公式默认保留为公式；但若该公式引用了将被删除的 源_ sheet，
+                        # 保留下来会在删 源_ 后变成 #REF!/ERR（AI 填充列常用 VLOOKUP('源_xxx'!...)，
+                        # 若恰好落在模版样例公式坐标上就会被误保护）。故这类公式也必须拍平成值。
+                        if (cell.Row, cell.Column) in _pset and not (
+                            source_sheet_prefix and source_sheet_prefix in (cell.Formula or "")
+                        ):
+                            continue  # 自包含的模版公式 → 保留
+                        cell.PutValue(cell.Value)
                     except Exception:
                         continue
             except Exception as _we:
