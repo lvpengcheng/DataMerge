@@ -434,7 +434,19 @@ async function selectSession(sessionId) {
 }
 
 async function deleteSession(sessionId) {
-    if (!confirm('确定删除此训练会话？相关的迭代数据也将被删除。')) return;
+    if (!confirm('确定删除此训练会话？\n删除后该对话历史、生成的脚本、训练文件将一并删除，且不可恢复。')) return;
+    try {
+        const resp = await AUTH.authFetch(`/api/training/chat/sessions/${sessionId}`, { method: 'DELETE' });
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            alert('删除失败: ' + (err.detail || '未知错误'));
+            return;
+        }
+    } catch (e) {
+        console.error('删除失败:', e);
+        alert('删除失败: ' + (e.message || '网络错误'));
+        return;
+    }
     if (_currentSessionId === sessionId) {
         _currentSessionId = null;
         _chatMessages = [];
@@ -444,8 +456,7 @@ async function deleteSession(sessionId) {
         const regenBtn = document.getElementById('regenerate-btn');
         if (regenBtn) regenBtn.style.display = 'none';
     }
-    _sessions = _sessions.filter(s => s.id !== sessionId);
-    _renderSessionList();
+    await loadSessions();
 }
 
 function _highlightActiveSession() {

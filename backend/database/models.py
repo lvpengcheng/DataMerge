@@ -362,6 +362,34 @@ class MergeTemplate(Base):
     )
 
 
+class IntegrateTemplate(Base):
+    """多表整合对比：命名方案。按列名+列头指纹保存配置，下月换文件名/数据、
+    列结构一致即可按指纹自动配角色(主表/对照表)并预填映射。
+
+    config 结构：
+      {
+        "main_fp": "<主表列头指纹>",
+        "source_fps": ["<对照表指纹>", ...],
+        "key_map_by_fp": {"<fp>": "关联键列名", ...},
+        "overwrite_pairs": [{"a_col","source_fp","source_col"}, ...],
+        "compare_pairs":   [{"a_col","source_fp","source_col"}, ...],
+        "name_col", "id_col", "diff_order", "output_mode", "normalize_keys"
+      }
+    """
+    __tablename__ = "integrate_templates"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(100), nullable=False, index=True, default="__tools_integrate__")
+    name = Column(String(200), nullable=False)
+    config = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "name", name="uq_integrate_tpl_name"),
+    )
+
+
 class ScriptMigration(Base):
     """测试环境脚本迁移记录：标识某个测试环境脚本（按代码哈希）是否已迁移到本环境某租户。"""
     __tablename__ = "script_migrations"

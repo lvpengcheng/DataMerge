@@ -105,10 +105,11 @@ print('>>> SUCCESS: Aspose.Cells + Workbook OK on Linux'); \
 #            前面的 apt/dotnet/字体/pip/libs/Aspose 验证全部命中缓存） ==========
 COPY backend/ ./backend/
 COPY frontend/ ./frontend/
-COPY global_assets/ ./global_assets/
 
 # ========== 8. 运行时目录 ==========
-RUN mkdir -p tenants data logs output compare_results temp
+# global_assets 与 tenants/data/... 同为 docker-compose 卷挂载的运行时目录（发布时不上传），
+# 运行时由宿主机目录遮盖镜像内容，故只需 mkdir 建目录，不 COPY（避免全新环境构建时源目录不存在而失败）。
+RUN mkdir -p tenants data logs output compare_results temp global_assets
 
 # ========== 9. 环境变量 ==========
 ENV PYTHONPATH=/app

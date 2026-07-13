@@ -8,9 +8,17 @@
        - 复制 deploy.config.example.json 为 deploy.config.json 填好（已被 .gitignore 忽略）
        - 或设环境变量 DEPLOY_HOST / DEPLOY_PORT / DEPLOY_USER / DEPLOY_PASSWORD / DEPLOY_REMOTE_PATH
        - 或命令行：python deploy.py --host x --user root --remote-path /opt/datamerge
-  3) 运行：  python deploy.py            （会先列出要做的事并要求确认）
+  3) 运行：  python deploy.py            （原 uat 环境：用 deploy.config.json，镜像 datamerge，端口 8000）
+            python deploy.py --env dev  （新 dev 环境：用 deploy.config.dev.json，镜像 datamerge_dev，端口 8100）
             python deploy.py --yes      （跳过确认）
             python deploy.py --dry-run  （只打包看看包含哪些文件，不上传）
+
+多环境说明（同机不同目录/端口）：
+  - uat＝原环境，一切不变：python deploy.py（deploy.config.json、目录/镜像/端口都不动）
+  - dev＝新环境：本地 deploy.config.dev.json（含 remote_path、image_name、health_url，已被 .gitignore 忽略）
+  - dev 目录的 .env 里须设 IMAGE_NAME / APP_CONTAINER_NAME / REDIS_CONTAINER_NAME / APP_PORT / REDIS_PORT / COMPOSE_PROJECT_NAME，
+    且 IMAGE_NAME 须与 deploy.config.dev.json 的 image_name 一致（回滚打 :prev 标签靠它定位镜像）；
+    uat 目录 .env 不用加这些——docker-compose 里都有默认值＝原来的 datamerge / 8000 / 6379
 
 安全保证：
   - 绝不上传 tenants/ data/ logs/ output/ .env 等（保留服务器上的数据与密钥，不会被覆盖）
@@ -43,7 +51,7 @@ CODE_ONLY_EXTRA_DIRS = {"libs", "fonts"}
 EXCLUDE_PATTERNS = [
     "*.pyc", "*.pyo", "*.pyd", "*.log", "*.tmp", "*.swp",
     ".env", ".env.*", "data.db", "*.db-journal",
-    "deploy.config.json", "deploy.py",  # 脚本与配置不必上服务器
+    "deploy.config.json", "deploy.config.*.json", "deploy.py",  # 脚本与配置不必上服务器
 ]
 
 
@@ -73,24 +81,39 @@ def build_tarball(out_path: Path, exclude_dirs: set) -> int:
 
 def load_config(args) -> dict:
     cfg = {}
+    # 基础配置：deploy.config.json（单环境时的默认；多环境时作为公共底座，被 env 专属文件覆盖）
     cfg_file = PROJECT_ROOT / "deploy.config.json"
     if cfg_file.exists():
         try:
             cfg.update(json.loads(cfg_file.read_text(encoding="utf-8")))
         except Exception as e:
             print(f"[警告] 读取 deploy.config.json 失败：{e}")
+    # 环境专属配置：--env dev → deploy.config.dev.json（覆盖基础配置）
+    env = getattr(args, "env", None)
+    if env:
+        env_file = PROJECT_ROOT / f"deploy.config.{env}.json"
+        if not env_file.exists():
+            print(f"[错误] 指定了 --env {env}，但找不到 {env_file.name}")
+            sys.exit(1)
+        try:
+            cfg.update(json.loads(env_file.read_text(encoding="utf-8")))
+        except Exception as e:
+            print(f"[错误] 读取 {env_file.name} 失败：{e}"); sys.exit(1)
+        cfg["env"] = env
     # 环境变量覆盖
     for k_env, k in [("DEPLOY_HOST", "host"), ("DEPLOY_PORT", "port"), ("DEPLOY_USER", "user"),
                      ("DEPLOY_PASSWORD", "password"), ("DEPLOY_REMOTE_PATH", "remote_path"),
-                     ("DEPLOY_HEALTH_URL", "health_url")]:
+                     ("DEPLOY_HEALTH_URL", "health_url"), ("DEPLOY_IMAGE_NAME", "image_name")]:
         if os.getenv(k_env):
             cfg[k] = os.getenv(k_env)
     # 命令行覆盖
-    for k in ["host", "port", "user", "password", "remote_path", "health_url"]:
+    for k in ["host", "port", "user", "password", "remote_path", "health_url", "image_name"]:
         v = getattr(args, k, None)
         if v:
             cfg[k] = v
     cfg.setdefault("port", 22)
+    # 镜像名：多环境同机必须各不相同（须与该目录 .env 里的 IMAGE_NAME 一致），默认 datamerge
+    cfg.setdefault("image_name", "datamerge")
     return cfg
 
 
@@ -155,21 +178,23 @@ def _health_cmd(url: str) -> str:
 
 
 def do_rollback(cfg: dict, yes: bool):
-    """回滚到上一个镜像 datamerge:prev（部署前自动打的标签），不重建、秒级生效。"""
+    """回滚到上一个镜像 {image}:prev（部署前自动打的标签），不重建、秒级生效。"""
     _ensure_conn(cfg)
     remote_path = cfg["remote_path"].rstrip("/")
+    img = cfg["image_name"]
     print("=" * 60)
-    print(f"回滚目标：{cfg['user']}@{cfg['host']}  →  {remote_path}")
-    print("动作：把 datamerge:prev 重新标记为 latest 并重建容器（不 build）")
+    print(f"回滚目标：{cfg['user']}@{cfg['host']}  →  {remote_path}"
+          + (f"  [env={cfg['env']}]" if cfg.get("env") else ""))
+    print(f"动作：把 {img}:prev 重新标记为 latest 并重建容器（不 build）")
     if not yes and input("确认回滚到上一版本？输入 y 继续：").strip().lower() != "y":
         print("已取消。"); return
     ssh = _connect(cfg)
     try:
         script = (
             f"cd '{remote_path}' && "
-            "if ! docker image inspect datamerge:prev >/dev/null 2>&1; then "
-            "echo '没有可回滚的 datamerge:prev 镜像（至少成功发布过一次才会有）'; exit 1; fi && "
-            "docker tag datamerge:prev datamerge:latest && "
+            f"if ! docker image inspect {img}:prev >/dev/null 2>&1; then "
+            f"echo '没有可回滚的 {img}:prev 镜像（至少成功发布过一次才会有）'; exit 1; fi && "
+            f"docker tag {img}:prev {img}:latest && "
             "if docker compose version >/dev/null 2>&1; then docker compose up -d --force-recreate; "
             "else docker-compose up -d --force-recreate; fi; "
             f"{_health_cmd(_health_url(cfg))}"
@@ -187,11 +212,15 @@ def do_rollback(cfg: dict, yes: bool):
 
 def main():
     ap = argparse.ArgumentParser(description="发布 DataMerge 到 Docker 服务器")
+    ap.add_argument("--env", choices=["dev"],
+                    help="部署到 dev 环境：读取 deploy.config.dev.json（不填=原 uat 环境，用 deploy.config.json）")
     ap.add_argument("--host")
     ap.add_argument("--port", type=int)
     ap.add_argument("--user")
     ap.add_argument("--password")
     ap.add_argument("--remote-path", dest="remote_path")
+    ap.add_argument("--image-name", dest="image_name",
+                    help="镜像名（多环境同机须各异，且与该目录 .env 的 IMAGE_NAME 一致），默认 datamerge")
     ap.add_argument("--health-url", dest="health_url", help="发布后健康检查地址（默认 http://localhost:8000/api/health）")
     ap.add_argument("--yes", action="store_true", help="跳过确认")
     ap.add_argument("--dry-run", action="store_true", help="只打包不上传")
@@ -235,7 +264,9 @@ def main():
     remote_path = cfg["remote_path"].rstrip("/")
     remote_tar = f"/tmp/{tar_name}"
     print("=" * 60)
-    print(f"目标：{cfg['user']}@{cfg['host']}:{cfg['port']}  →  {remote_path}")
+    print(f"目标：{cfg['user']}@{cfg['host']}:{cfg['port']}  →  {remote_path}"
+          + (f"  [env={cfg['env']}]" if cfg.get("env") else "")
+          + f"  镜像：{cfg['image_name']}")
     print(f"动作：备份当前代码({tar_name.replace('deploy','backup')}) + 镜像打 :prev → 上传新代码 → " +
           ("仅上传" if args.no_build else "docker compose up -d --build"))
     if not args.yes:
@@ -260,7 +291,7 @@ def main():
             "--exclude=output --exclude=temp --exclude=global_assets . 2>/dev/null || true; "
             "fi; "
             "ls -1t \"$BK\"/code_*.tar.gz 2>/dev/null | tail -n +11 | xargs -r rm -f || true; "
-            "docker image inspect datamerge:latest >/dev/null 2>&1 && docker tag datamerge:latest datamerge:prev || true; "
+            f"docker image inspect {cfg['image_name']}:latest >/dev/null 2>&1 && docker tag {cfg['image_name']}:latest {cfg['image_name']}:prev || true; "
         )
 
         build_cmd = "" if args.no_build else (

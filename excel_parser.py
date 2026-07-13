@@ -4382,7 +4382,10 @@ class IntelligentExcelParser:
 
                 # 复制行：从第0行到head_row_end-1行 (0-indexed)
                 rows_to_copy = expected_region.head_row_end
-                max_src_col = src_ws.Cells.MaxColumn + 1
+                # 用 MaxDataColumn（数据实际列数），不用 MaxColumn：后者含"空白但有样式"
+                # 的列（整列刷底色/边框、筛选区），会把列数虚高到几十上百列，
+                # 这里按此宽度做 Range.Copy 会复制大量空列 → 内存溢出/变慢。
+                max_src_col = src_ws.Cells.MaxDataColumn + 1
 
                 # 使用 Range.Copy 完全复制（值、公式、样式、合并单元格等）
                 source_range = src_ws.Cells.CreateRange(0, 0, rows_to_copy, max_src_col)
@@ -4427,7 +4430,9 @@ class IntelligentExcelParser:
                 self.logger.warning(f"未找到sheet [{sheet_name}] in {file_stem}")
                 continue
 
-            total_cols = src_ws.Cells.MaxColumn + 1
+            # 用 MaxDataColumn（数据实际列数），不用 MaxColumn：避免"空白但有样式"的列
+            # （整列刷底色/边框、筛选区）把列数虚高，导致 Range.Copy 复制大量空列 → 内存溢出。
+            total_cols = src_ws.Cells.MaxDataColumn + 1
             first_region = regions[0]
 
             if len(regions) == 1:

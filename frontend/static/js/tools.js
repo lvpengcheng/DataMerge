@@ -10,6 +10,9 @@ let _mergeAnalysis = null;   // analyze 返回的结果
 let _mergeGroups = [];       // 当前结果列（直连 or AI 合并后）
 let _mergeTemplates = [];     // 已保存的命名模版（含 config）
 let _mergeAppliedTplId = null; // 当前套用的方案 id（带模版则生成时按模版填充）
+let _integrateFiles = [];
+let _integrateAnalysis = null;   // integrate/analyze 返回的结果
+let _integrateSchemes = [];      // analyze 返回的匹配方案列表
 const _ALLOWED_EXT = new Set(['xlsx', 'xls', 'xlsm']);
 
 async function _alertErr(resp, fallback) {
@@ -39,6 +42,7 @@ const Tools = {
         this.initTabs();
         this.initSplitSheet();
         this.initDataMerge();
+        this.initDataIntegrate();
     },
 
     initTabs() {
@@ -185,6 +189,468 @@ const Tools = {
     },
 
     // ==================== 多表数据合并 ====================
+    // ==================== 多表整合对比 ====================
+    initDataIntegrate() {
+        const zone = document.getElementById('integrate-upload-zone');
+        const input = document.getElementById('integrate-file-input');
+        if (!zone || !input) return;
+        zone.addEventListener('click', () => input.click());
+        zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('dragover'); });
+        zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+        zone.addEventListener('drop', (e) => {
+            e.preventDefault(); zone.classList.remove('dragover');
+            this._addIntegrateFiles(e.dataTransfer.files);
+        });
+        input.addEventListener('change', () => this._addIntegrateFiles(input.files));
+        document.getElementById('btn-integrate-analyze').addEventListener('click', () => this._analyzeIntegrate());
+    },
+
+    _addIntegrateFiles(fileList) {
+        for (const f of Array.from(fileList || [])) {
+            const ext = (f.name.split('.').pop() || '').toLowerCase();
+            if (!_ALLOWED_EXT.has(ext)) continue;
+            if (_integrateFiles.some(x => x.name === f.name && x.size === f.size)) continue;
+            _integrateFiles.push(f);
+        }
+        this._renderIntegrateList();
+    },
+
+    _renderIntegrateList() {
+        const box = document.getElementById('integrate-file-list');
+        if (_integrateFiles.length === 0) {
+            box.innerHTML = '';
+            document.getElementById('btn-integrate-analyze').disabled = true;
+            return;
+        }
+        box.innerHTML = _integrateFiles.map((f, i) => `
+            <div class="file-row">
+                <span>📄 ${_escape(f.name)} <span style="color:#999;">(${(f.size / 1024).toFixed(1)} KB)</span></span>
+                <span class="rm" data-i="${i}">×</span>
+            </div>`).join('');
+        box.querySelectorAll('.rm').forEach(el => el.addEventListener('click', (e) => {
+            _integrateFiles.splice(parseInt(e.target.dataset.i, 10), 1);
+            this._renderIntegrateList();
+        }));
+        document.getElementById('btn-integrate-analyze').disabled = (_integrateFiles.length < 2);
+    },
+
+    _setIntegrateStatus(text, kind) {
+        const el = document.getElementById('integrate-status');
+        el.textContent = text || '';
+        el.className = 'status' + (kind ? ' ' + kind : '');
+    },
+
+    async _analyzeIntegrate() {
+        if (_integrateFiles.length < 2) { this._setIntegrateStatus('请至少上传 2 个文件', 'error'); return; }
+        const btn = document.getElementById('btn-integrate-analyze');
+        btn.disabled = true;
+        this._setIntegrateStatus('解析中...');
+        try {
+            const fd = new FormData();
+            _integrateFiles.forEach(f => fd.append('files', f));
+            fd.append('tenant_id', '__tools_integrate__');
+            const resp = await AUTH.authFetch('/api/tools/integrate/analyze', { method: 'POST', body: fd });
+            if (!resp.ok) { await _alertErr(resp, '解析失败'); this._setIntegrateStatus('解析失败', 'error'); return; }
+            _integrateAnalysis = await resp.json();
+            this._renderIntegrateConfig(_integrateAnalysis);
+            this._setIntegrateStatus('解析完成', 'ok');
+        } catch (e) {
+            this._setIntegrateStatus(`失败: ${e.message}`, 'error');
+        } finally {
+            btn.disabled = false;
+        }
+    },
+
+    // 整合对比配置向导（阶段1-3：主表/关联键/覆盖对/对比对/输出方式/生成）
+    _intFiles() { return (_integrateAnalysis && _integrateAnalysis.files) || []; },
+    _intFileMeta(name) { return this._intFiles().find(f => f.name === name) || null; },
+    _intMainFile() { const s = document.getElementById('int-main-file'); return s ? s.value : ''; },
+    _intColsOf(name) { const f = this._intFileMeta(name); return (f && f.columns) || []; },
+    _intNonMainFiles() { const m = this._intMainFile(); return this._intFiles().filter(f => f.name !== m); },
+    _optList(cols, sel) {
+        return (cols || []).map(c => `<option value="${_escape(c)}" ${c === sel ? 'selected' : ''}>${_escape(c)}</option>`).join('');
+    },
+
+    _renderIntegrateConfig(data) {
+        const files = data.files || [];
+        const box = document.getElementById('integrate-config');
+        box.style.display = 'block';
+        const fileOpts = files.map((f, i) => `<option value="${_escape(f.name)}" ${i === 0 ? 'selected' : ''}>${_escape(f.name)}</option>`).join('');
+        box.innerHTML = `
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px;padding:8px;background:#eef4fb;border-radius:6px;">
+                <span style="font-weight:600;">已保存方案：</span>
+                <select id="int-scheme-select" style="min-width:220px;"><option value="">（选择匹配当前上传表的方案）</option></select>
+                <button type="button" class="btn btn-sm" id="int-apply-scheme">套用</button>
+                <button type="button" class="btn btn-sm" id="int-delete-scheme">删除</button>
+                <span class="status" id="int-scheme-status" style="margin-left:8px;"></span>
+            </div>
+            <h3>① 选择主表（模板）</h3>
+            <div class="form-group">
+                <select id="int-main-file" style="min-width:280px;">${fileOpts}</select>
+                <span style="color:#888;font-size:12px;margin-left:8px;">主表将被原地更新（保留其余 sheet 与公式），对照表的值按关联键回填到主表。</span>
+            </div>
+
+            <h3 style="margin-top:16px;">② 关联键（每个文件）</h3>
+            <div id="int-key-map"></div>
+
+            <h3 style="margin-top:16px;">③ 覆盖字段（勾选基准列 → 匹配对照列）</h3>
+            <div id="int-ow-picker" style="border:1px solid #e3e7ed;border-radius:6px;padding:8px;max-height:150px;overflow:auto;"></div>
+            <div style="margin:6px 0;">
+                <button type="button" class="btn btn-sm" id="int-ow-match">智能匹配</button>
+                <label style="margin-left:8px;font-size:13px;"><input type="checkbox" id="int-ow-ai" style="width:auto;"> 用 AI 匹配差异命名</label>
+                <span class="status" id="int-ow-status" style="margin-left:8px;"></span>
+            </div>
+            <table class="data-table"><thead><tr><th>基准字段（主表列）</th><th>匹配的对照列（来源）</th><th style="width:32px;"></th></tr></thead>
+                <tbody id="int-ow-list-rows"></tbody></table>
+            <div style="color:#888;font-size:12px;margin-top:4px;">勾选后在下方选/改对照列。只写值不写公式；同一主表列多行时靠上优先。</div>
+
+            <h3 style="margin-top:16px;">④ 对比字段（可选，输出方式2用）</h3>
+            <div id="int-cmp-picker" style="border:1px solid #e3e7ed;border-radius:6px;padding:8px;max-height:150px;overflow:auto;"></div>
+            <div style="margin:6px 0;">
+                <button type="button" class="btn btn-sm" id="int-cmp-match">智能匹配</button>
+                <label style="margin-left:8px;font-size:13px;"><input type="checkbox" id="int-cmp-ai" style="width:auto;"> 用 AI 匹配差异命名</label>
+                <span class="status" id="int-cmp-status" style="margin-left:8px;"></span>
+            </div>
+            <table class="data-table"><thead><tr><th>基准字段（主表列）</th><th>匹配的对照列（来源）</th><th style="width:32px;"></th></tr></thead>
+                <tbody id="int-cmp-list-rows"></tbody></table>
+
+            <h3 style="margin-top:16px;">⑤ 输出方式</h3>
+            <div class="form-group">
+                <label style="margin-right:16px;"><input type="radio" name="int-output-mode" value="1" checked style="width:auto;"> 方式1：只更新主表</label>
+                <label><input type="radio" name="int-output-mode" value="2" style="width:auto;"> 方式2：主表 + 差异 sheet</label>
+            </div>
+            <div id="int-diff-settings" style="display:none;padding:8px;background:#f4f7fb;border-radius:6px;">
+                <span style="font-size:13px;">差异 sheet 定位（主表列）：</span>
+                姓名 <select id="int-name-col" style="min-width:120px;"></select>
+                身份证 <select id="int-id-col" style="min-width:120px;"></select>
+                顺序 <select id="int-diff-order"><option value="id_name">身份证,姓名</option><option value="name_id">姓名,身份证</option></select>
+            </div>
+
+            <div class="actions" style="margin-top:16px;">
+                <button class="btn btn-primary" id="int-execute">生成并下载</button>
+                <span class="status" id="int-exec-status"></span>
+            </div>
+            <div class="actions" style="margin-top:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                <span>保存为方案：</span>
+                <input type="text" id="int-scheme-name" placeholder="方案名称（如 5月工资整合）" style="min-width:200px;">
+                <button type="button" class="btn" id="int-save-scheme">保存为方案</button>
+                <span class="status" id="int-save-status"></span>
+            </div>`;
+
+        this._intRenderKeyMap();
+        this._intRenderDiffCols();
+        this._intRenderPicker('ow');
+        this._intRenderPicker('cmp');
+        document.getElementById('int-main-file').addEventListener('change', () => {
+            this._intRenderKeyMap();
+            this._intRenderDiffCols();
+            this._intRenderPicker('ow');   // 换主表 → 重列基准字段（清空已选）
+            this._intRenderPicker('cmp');
+        });
+        document.getElementById('int-ow-match').addEventListener('click', () =>
+            this._intMatchSection('ow', document.getElementById('int-ow-ai').checked));
+        document.getElementById('int-cmp-match').addEventListener('click', () =>
+            this._intMatchSection('cmp', document.getElementById('int-cmp-ai').checked));
+        document.querySelectorAll('input[name="int-output-mode"]').forEach(r =>
+            r.addEventListener('change', () => {
+                document.getElementById('int-diff-settings').style.display =
+                    (document.querySelector('input[name="int-output-mode"]:checked').value === '2') ? 'block' : 'none';
+            }));
+        document.getElementById('int-execute').addEventListener('click', () => this._doIntegrateExecute());
+
+        // 方案栏：填充匹配到的方案 + 套用/删除/保存
+        this._intPopulateSchemes(data.matched_schemes || []);
+        document.getElementById('int-apply-scheme').addEventListener('click', () => this._intApplyScheme());
+        document.getElementById('int-delete-scheme').addEventListener('click', () => this._intDeleteScheme());
+        document.getElementById('int-save-scheme').addEventListener('click', () => this._intSaveScheme());
+    },
+
+    _intPopulateSchemes(schemes) {
+        _integrateSchemes = schemes || [];
+        const sel = document.getElementById('int-scheme-select');
+        if (!sel) return;
+        sel.innerHTML = '<option value="">（选择匹配当前上传表的方案）</option>' +
+            _integrateSchemes.map((s, i) => `<option value="${i}">${_escape(s.name)}</option>`).join('');
+        const st = document.getElementById('int-scheme-status');
+        if (st) st.textContent = _integrateSchemes.length ? `${_integrateSchemes.length} 个可用方案` : '无匹配方案';
+    },
+
+    _intApplyScheme() {
+        const sel = document.getElementById('int-scheme-select');
+        const idx = sel.value;
+        if (idx === '') { alert('请先选择一个方案'); return; }
+        const scheme = _integrateSchemes[parseInt(idx, 10)];
+        if (!scheme) return;
+        const cfg = scheme.config || {};
+        const f2f = scheme.fp_to_file || {};
+
+        // 主表
+        const mainSel = document.getElementById('int-main-file');
+        mainSel.value = scheme.main_file;
+        this._intRenderKeyMap();
+        this._intRenderDiffCols();
+
+        // 关联键（按指纹→文件）
+        Object.entries(cfg.key_map_by_fp || {}).forEach(([fp, key]) => {
+            const file = f2f[fp];
+            const el = document.querySelector(`.int-key[data-file="${CSS.escape(file || '')}"]`);
+            if (el) el.value = key;
+        });
+
+        // 覆盖/对比（指纹→文件）：先重列基准字段勾选区，再按方案勾选并预填对照列（按 a_col 归并多源）
+        this._intRenderPicker('ow');
+        this._intRenderPicker('cmp');
+        const trans = (pairs) => (pairs || []).map(p => ({
+            a_col: p.a_col, source_file: f2f[p.source_fp], source_col: p.source_col,
+        })).filter(p => p.source_file);
+        const applyPairs = (pairs, kind) => {
+            const byA = {};
+            trans(pairs).forEach(p => { (byA[p.a_col] = byA[p.a_col] || []).push({ file: p.source_file, col: p.source_col }); });
+            Object.entries(byA).forEach(([a, srcs]) => {
+                const cb = document.querySelector(`.int-${kind}-pick[data-col="${CSS.escape(a)}"]`);
+                if (cb) cb.checked = true;
+                this._intAddListRow(kind, a, srcs);
+            });
+        };
+        applyPairs(cfg.overwrite_pairs, 'ow');
+        applyPairs(cfg.compare_pairs, 'cmp');
+
+        // 输出方式 + 差异定位
+        const mode = String(cfg.output_mode || 1);
+        const radio = document.querySelector(`input[name="int-output-mode"][value="${mode}"]`);
+        if (radio) { radio.checked = true; radio.dispatchEvent(new Event('change')); }
+        if (cfg.name_col) { const e = document.getElementById('int-name-col'); if (e) e.value = cfg.name_col; }
+        if (cfg.id_col) { const e = document.getElementById('int-id-col'); if (e) e.value = cfg.id_col; }
+        if (cfg.diff_order) { const e = document.getElementById('int-diff-order'); if (e) e.value = cfg.diff_order; }
+
+        document.getElementById('int-scheme-status').textContent = `已套用方案「${scheme.name}」`;
+    },
+
+    async _intDeleteScheme() {
+        const sel = document.getElementById('int-scheme-select');
+        const idx = sel.value;
+        if (idx === '') { alert('请先选择要删除的方案'); return; }
+        const scheme = _integrateSchemes[parseInt(idx, 10)];
+        if (!scheme || !confirm(`删除方案「${scheme.name}」？`)) return;
+        try {
+            const resp = await AUTH.authFetch('/api/tools/integrate/scheme/' + scheme.id, { method: 'DELETE' });
+            if (!resp.ok) { await _alertErr(resp, '删除失败'); return; }
+            _integrateSchemes.splice(parseInt(idx, 10), 1);
+            this._intPopulateSchemes(_integrateSchemes);
+        } catch (e) { alert('删除失败: ' + e.message); }
+    },
+
+    async _intSaveScheme() {
+        const name = (document.getElementById('int-scheme-name').value || '').trim();
+        if (!name) { alert('请填写方案名称'); return; }
+        const key_map = {};
+        document.querySelectorAll('.int-key').forEach(s => { key_map[s.dataset.file] = s.value; });
+        const overwrite_pairs = this._readSectionPairs('ow');
+        const compare_pairs = this._readSectionPairs('cmp');
+        const payload = {
+            session_id: _integrateAnalysis.session_id, name, main_file: this._intMainFile(), key_map,
+            overwrite_pairs, compare_pairs,
+            name_col: document.getElementById('int-name-col')?.value || null,
+            id_col: document.getElementById('int-id-col')?.value || null,
+            diff_order: document.getElementById('int-diff-order')?.value || 'id_name',
+            output_mode: parseInt(document.querySelector('input[name="int-output-mode"]:checked').value, 10),
+            normalize_keys: true,
+        };
+        const st = document.getElementById('int-save-status');
+        st.textContent = '保存中...'; st.className = 'status';
+        try {
+            const resp = await AUTH.authFetch('/api/tools/integrate/scheme/save', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+            });
+            if (!resp.ok) { await _alertErr(resp, '保存失败'); st.textContent = '保存失败'; st.className = 'status error'; return; }
+            st.textContent = '方案已保存'; st.className = 'status ok';
+        } catch (e) { st.textContent = '失败: ' + e.message; st.className = 'status error'; }
+    },
+
+    _intRenderKeyMap() {
+        const box = document.getElementById('int-key-map');
+        const main = this._intMainFile();
+        box.innerHTML = this._intFiles().map(f => {
+            const sk = f.suggested_key || (f.columns || [])[0] || '';
+            const tag = f.name === main ? '<b style="color:#1565c0;">[主表]</b> ' : '';
+            return `<div style="margin:4px 0;">
+                <span style="display:inline-block;min-width:240px;">${tag}${_escape(f.name)}：</span>
+                <select class="int-key" data-file="${_escape(f.name)}">${this._optList(f.columns, sk)}</select>
+            </div>`;
+        }).join('');
+    },
+
+    _intRenderDiffCols() {
+        const main = this._intMainFile();
+        const meta = this._intFileMeta(main) || {};
+        const cols = meta.columns || [];
+        const nameSel = document.getElementById('int-name-col');
+        const idSel = document.getElementById('int-id-col');
+        if (nameSel) nameSel.innerHTML = this._optList(cols, meta.suggested_name_col || '');
+        if (idSel) idSel.innerHTML = this._optList(cols, meta.suggested_id_col || '');
+    },
+
+    // 按多表合并习惯：所有基准列打勾 → 勾中的进下方列表 → 每行点击弹出勾选对照列（支持多表多选，靠前优先）
+    // 渲染某套(kind=ow|cmp)的基准列勾选区；勾选联动下方列表增删
+    _intRenderPicker(kind) {
+        const box = document.getElementById(`int-${kind}-picker`);
+        const listBody = document.getElementById(`int-${kind}-list-rows`);
+        if (!box) return;
+        if (listBody) listBody.innerHTML = '';
+        const cols = this._intColsOf(this._intMainFile());
+        if (!cols.length) { box.innerHTML = '<span style="color:#888;">主表无可用字段</span>'; return; }
+        box.innerHTML = cols.map(c =>
+            `<label style="display:inline-flex;align-items:center;gap:4px;margin:2px 12px 2px 0;font-size:13px;">
+                <input type="checkbox" class="int-${kind}-pick" data-col="${_escape(c)}" style="width:auto;"> ${_escape(c)}</label>`).join('');
+        box.querySelectorAll(`.int-${kind}-pick`).forEach(cb =>
+            cb.addEventListener('change', (e) => {
+                const col = e.target.dataset.col;
+                if (e.target.checked) this._intAddListRow(kind, col);
+                else {
+                    const tr = document.querySelector(`#int-${kind}-list-rows tr[data-a-col="${CSS.escape(col)}"]`);
+                    if (tr) tr.remove();
+                }
+            }));
+    },
+
+    // 列表行：对照列单元格点击弹出勾选（多表多选）；选中的对照列存于 tr.dataset.src(JSON)
+    _intAddListRow(kind, col, presetSources) {
+        const tbody = document.getElementById(`int-${kind}-list-rows`);
+        if (!tbody || tbody.querySelector(`tr[data-a-col="${CSS.escape(col)}"]`)) return;
+        const tr = document.createElement('tr');
+        tr.dataset.aCol = col;
+        tr.dataset.src = JSON.stringify(presetSources || []);
+        tr.innerHTML = `
+            <td>${_escape(col)}</td>
+            <td class="int-src-cell" style="cursor:pointer;min-width:240px;"></td>
+            <td style="text-align:center;"><span class="rm" style="cursor:pointer;color:#c00;">×</span></td>`;
+        tr.querySelector('.int-src-cell').addEventListener('click', () => this._intOpenSrcPicker(kind, tr));
+        tr.querySelector('.rm').addEventListener('click', () => {
+            const cb = document.querySelector(`.int-${kind}-pick[data-col="${CSS.escape(col)}"]`);
+            if (cb) cb.checked = false;
+            tr.remove();
+        });
+        tbody.appendChild(tr);
+        this._intUpdateSrcCell(tr);
+    },
+
+    _intUpdateSrcCell(tr) {
+        const cell = tr.querySelector('.int-src-cell');
+        let picks = [];
+        try { picks = JSON.parse(tr.dataset.src || '[]'); } catch (_) {}
+        cell.innerHTML = picks.length
+            ? picks.map(p => `<span style="background:#eef4fb;padding:1px 6px;border-radius:3px;margin:1px;display:inline-block;font-size:12px;">${_escape(p.file)} · ${_escape(p.col)}</span>`).join(' ')
+            : '<span style="color:#999;">点击选择对照列…</span>';
+    },
+
+    // 弹出勾选对照列：按对照文件分组（支持多表），可多选（靠前优先）
+    _intOpenSrcPicker(kind, tr) {
+        let selected = [];
+        try { selected = JSON.parse(tr.dataset.src || '[]'); } catch (_) {}
+        const selSet = new Set(selected.map(s => `${s.file}||${s.col}`));
+        const files = this._intNonMainFiles();
+        const body = `
+            <div style="font-size:12px;color:#888;margin-bottom:8px;">可跨多张对照表多选；勾多个时靠上的优先（取首个非空值）。</div>
+            ${files.map(f => `
+                <div style="margin-bottom:10px;">
+                    <div style="font-weight:600;color:#2c3e50;margin-bottom:4px;">📄 ${_escape(f.name)}</div>
+                    <div style="display:flex;flex-wrap:wrap;gap:4px 14px;">
+                        ${(f.columns || []).map(c => {
+                            const checked = selSet.has(`${f.name}||${c}`) ? 'checked' : '';
+                            return `<label style="display:inline-flex;align-items:center;gap:4px;font-size:13px;">
+                                <input type="checkbox" class="int-srcpick-cb" data-file="${_escape(f.name)}" data-col="${_escape(c)}" ${checked} style="width:auto;"> ${_escape(c)}</label>`;
+                        }).join('')}
+                    </div>
+                </div>`).join('')}`;
+        this.openModal(`为「${tr.dataset.aCol || ''}」选择对照列（可多选，支持多表）`, body, () => {
+            const picks = [];
+            document.querySelectorAll('#modal-body .int-srcpick-cb:checked').forEach(cb =>
+                picks.push({ file: cb.dataset.file, col: cb.dataset.col }));
+            tr.dataset.src = JSON.stringify(picks);
+            this._intUpdateSrcCell(tr);
+            this.closeModal();
+        });
+    },
+
+    // 智能匹配：对已勾选的基准列匹配对照列——命中自动选（单个），没命中留空让人工选
+    async _intMatchSection(kind, useAi) {
+        const rows = [...document.querySelectorAll(`#int-${kind}-list-rows tr`)];
+        const st = document.getElementById(`int-${kind}-status`);
+        if (!rows.length) { st.textContent = '请先在上方勾选基准字段'; st.className = 'status error'; return; }
+        const source_cols = [];
+        this._intNonMainFiles().forEach(f => (f.columns || []).forEach(c => source_cols.push({ file: f.name, col: c })));
+        st.textContent = '匹配中...'; st.className = 'status';
+        try {
+            const resp = await AUTH.authFetch('/api/tools/integrate/match', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ session_id: _integrateAnalysis.session_id, main_file: this._intMainFile(), source_cols, use_ai: !!useAi }),
+            });
+            if (!resp.ok) { await _alertErr(resp, '匹配失败'); st.textContent = '匹配失败'; st.className = 'status error'; return; }
+            const data = await resp.json();
+            const bestByA = {};
+            (data.pairs || []).forEach(p => { if (!(p.a_col in bestByA)) bestByA[p.a_col] = p; });
+            let hit = 0, kept = 0, miss = 0;
+            rows.forEach(tr => {
+                let cur = [];
+                try { cur = JSON.parse(tr.dataset.src || '[]'); } catch (_) {}
+                if (cur.length) { kept++; return; }   // 已手动选择 → 以手动为准，不被 AI 覆盖
+                const m = bestByA[tr.dataset.aCol];    // 未选的行才用 AI/精确匹配填充
+                if (m) { tr.dataset.src = JSON.stringify([{ file: m.source_file, col: m.source_col }]); hit++; }
+                else { tr.dataset.src = '[]'; miss++; }   // 匹配不到 → 留空，人工点选
+                this._intUpdateSrcCell(tr);
+            });
+            st.textContent = `AI匹配填充 ${hit} 个，保留已选 ${kept} 个${miss ? `，${miss} 个未匹配请手动选` : ''}`;
+            st.className = 'status ok';
+        } catch (e) { st.textContent = '失败: ' + e.message; st.className = 'status error'; }
+    },
+
+    _readSectionPairs(kind) {
+        const out = [];
+        document.querySelectorAll(`#int-${kind}-list-rows tr`).forEach(tr => {
+            let picks = [];
+            try { picks = JSON.parse(tr.dataset.src || '[]'); } catch (_) {}
+            picks.forEach(p => out.push({ a_col: tr.dataset.aCol, source_file: p.file, source_col: p.col }));
+        });
+        return out;
+    },
+
+    async _doIntegrateExecute() {
+        const main = this._intMainFile();
+        const key_map = {};
+        document.querySelectorAll('.int-key').forEach(s => { key_map[s.dataset.file] = s.value; });
+        const { overwrite_pairs, compare_pairs } = { overwrite_pairs: this._readSectionPairs('ow'), compare_pairs: this._readSectionPairs('cmp') };
+        const mode = parseInt(document.querySelector('input[name="int-output-mode"]:checked').value, 10);
+        if (overwrite_pairs.length === 0) { alert('请至少在「覆盖字段」里选好一列'); return; }
+        if (mode === 2 && compare_pairs.length === 0) { alert('输出方式2需在「对比字段」里选好一列'); return; }
+        const payload = {
+            session_id: _integrateAnalysis.session_id, main_file: main, key_map,
+            overwrite_pairs, compare_pairs, output_mode: mode,
+            name_col: document.getElementById('int-name-col')?.value || null,
+            id_col: document.getElementById('int-id-col')?.value || null,
+            diff_order: document.getElementById('int-diff-order')?.value || 'id_name',
+            normalize_keys: true,
+        };
+        const st = document.getElementById('int-exec-status');
+        const btn = document.getElementById('int-execute');
+        btn.disabled = true; st.textContent = '生成中...'; st.className = 'status';
+        try {
+            const resp = await AUTH.authFetch('/api/tools/integrate/execute', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            if (!resp.ok) { await _alertErr(resp, '生成失败'); st.textContent = '生成失败'; st.className = 'status error'; return; }
+            const blob = await resp.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = '整合结果_' + main;
+            document.body.appendChild(a); a.click(); a.remove();
+            URL.revokeObjectURL(url);
+            const info = `命中${resp.headers.get('X-Integrate-Matched') || 0}行 覆盖${resp.headers.get('X-Integrate-Cells') || 0}格 差异${resp.headers.get('X-Integrate-Diffs') || 0}行`;
+            st.textContent = '已生成下载（' + info + '）'; st.className = 'status ok';
+        } catch (e) { st.textContent = '失败: ' + e.message; st.className = 'status error'; }
+        finally { btn.disabled = false; }
+    },
+
     initDataMerge() {
         const zone = document.getElementById('merge-upload-zone');
         const input = document.getElementById('merge-file-input');

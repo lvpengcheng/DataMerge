@@ -316,7 +316,7 @@ async def execute_compute(
             # 保存结果到租户目录并注册为 data_asset
             from ..utils.output_postprocess import (
                 build_result_filename, values_only_name, dual_output_enabled, make_values_only_copy,
-                normalize_source_sheet_formats,
+                normalize_source_sheet_formats, normalize_key_columns_to_text,
             )
             saved_assets = []
             tenant_output_dir = PROJECT_ROOT / "tenants" / task.tenant_id / "assets" / "result"
@@ -360,6 +360,11 @@ async def execute_compute(
                         normalize_source_sheet_formats(str(dest_path), _tpl_for_values)
                     except Exception as _nse:
                         logger.warning(f"[源_格式兜底] 跳过: {_nse}")
+                # 主键归一：两端类型统一成文本，修 VLOOKUP 跨源 #N/A（在纯值版之前跑）
+                try:
+                    normalize_key_columns_to_text(str(dest_path))
+                except Exception as _ke:
+                    logger.warning(f"[主键归一] 跳过: {_ke}")
                 _register_result(dest_path, new_filename)
 
                 # 双结果：再出纯值版（模版公式保留、新列公式→值；模版所有 sheet 保留）

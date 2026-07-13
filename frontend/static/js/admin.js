@@ -270,6 +270,7 @@ const Admin = {
                 { key: 'menu.tools', label: '进入智能小工具页' },
                 { key: 'tools.split_sheet', label: '└ Sheet 拆分' },
                 { key: 'tools.data_merge', label: '└ 多表数据合并' },
+                { key: 'tools.data_integrate', label: '└ 多表整合对比' },
                 { key: 'tools.templates', label: '└ 模版管理（管理员）' },
                 { key: 'tools.training_history', label: '└ 训练历史' },
                 { key: 'tools.compute_history', label: '└ 计算历史' },
@@ -877,6 +878,7 @@ const Admin = {
             const action = s.is_active
                 ? `<button class="btn btn-sm btn-danger" onclick="Admin.disableScript(${s.id}, '${(s.name || '').replace(/'/g, "\\'")}')">停用</button>`
                 : `<button class="btn btn-sm" onclick="Admin.enableScript(${s.id}, '${(s.name || '').replace(/'/g, "\\'")}')">恢复</button>`;
+            const delBtn = `<button class="btn btn-sm btn-danger" onclick="Admin.deleteScript(${s.id}, '${(s.name || '').replace(/'/g, "\\'")}')">删除</button>`;
             return `
                 <tr>
                     <td>${s.id}</td>
@@ -888,7 +890,7 @@ const Admin = {
                     <td>${status}</td>
                     <td>${sourceLink}</td>
                     <td>${updated}</td>
-                    <td class="actions">${action}</td>
+                    <td class="actions">${action} ${delBtn}</td>
                 </tr>
             `;
         }).join('');
@@ -915,6 +917,18 @@ const Admin = {
             return;
         }
         alert(data.message || '已恢复');
+        this.loadScripts();
+    },
+
+    async deleteScript(scriptId, name) {
+        if (!confirm(`确定物理删除脚本「${name}」？\n此操作不可恢复：将删除脚本文件，并断开历史计算任务与该脚本的关联（计算历史与结果文件保留）。`)) return;
+        const resp = await AUTH.authFetch(`/api/admin/scripts/${scriptId}`, { method: 'DELETE' });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            alert(data.detail || '删除失败');
+            return;
+        }
+        alert(data.message || '已删除');
         this.loadScripts();
     },
 

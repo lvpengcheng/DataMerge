@@ -1016,10 +1016,13 @@ async def generate_report(
     # 5. 构建模版数据字典
     #    - "DataSource" = 完整数据集（模版中写 &=DataSource.列名）
     #    - 系统变量（模版中写 &=$year &=$month 等）
-    now = datetime.utcnow()
+    now = datetime.now()   # 北京时间（容器 TZ=Asia/Shanghai），不用 utcnow 以免月初跨日错月
+    # {year}/{month} 优先用薪资周期（计算历史的年月），未填才回退当前时间
+    _year = str(task.salary_year) if task.salary_year else str(now.year)
+    _month = f"{int(task.salary_month):02d}" if task.salary_month else f"{now.month:02d}"
     system_vars = {
-        "year": str(now.year),
-        "month": f"{now.month:02d}",
+        "year": _year,
+        "month": _month,
         "date": now.strftime("%Y%m%d"),
         "tenant": tenant_id,
     }
@@ -1085,7 +1088,7 @@ async def generate_report(
         if not output_name.endswith(('.xlsx', '.xls')):
             output_name += '.xlsx'
     else:
-        output_name = f"报表_{tpl.name}_{now.strftime('%Y%m%d%H%M%S')}.xlsx"
+        output_name = f"报表_{tpl.name}.xlsx"
 
     # 7. 解析加密规则（可以是固定值或参数表达式）
     password = None
@@ -1182,14 +1185,19 @@ async def generate_report(
         raise HTTPException(status_code=500, detail=f"报表生成失败: {str(e)}")
 
     # 10. 留痕 — 保存为 DataAsset
+    #     磁盘文件名带时间戳前缀（防同模版同任务重复生成时互相覆盖），
+    #     但用户可见的下载名/展示名去掉该前缀，保持干净（如 aaaaaa-202605.xlsx）。
     actual_filename = os.path.basename(output_path)
+    download_name = actual_filename
+    if len(download_name) >= 15 and download_name[:14].isdigit() and download_name[14] == "_":
+        download_name = download_name[15:]
     try:
         report_asset = DataAsset(
             tenant_id=tenant_id,
             asset_type="report",
             name=f"报表_{tpl.name}_{now.strftime('%Y%m%d')}",
             file_path=output_path,
-            file_name=actual_filename,
+            file_name=download_name,
             file_size=os.path.getsize(output_path),
             source_task_id=task_id,
             uploaded_by=admin.id,
@@ -1215,7 +1223,7 @@ async def generate_report(
     media = "application/zip" if is_zip else "application/octet-stream"
     return FileResponse(
         path=output_path,
-        filename=actual_filename,
+        filename=download_name,
         media_type=media,
     )
 
@@ -1375,6 +1383,37 @@ async def enable_script(
     except Exception:
         pass
     return {"success": True, "message": f"已启用脚本「{s.name}」(v{s.version})", "script_id": script_id}
+
+
+@router.delete("/scripts/{script_id}")
+async def delete_script(
+    script_id: int,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    """物理删除脚本：删 DB 行 + FS 文件（.py/_info.json），并断开历史计算任务引用。
+
+    引用该脚本的 compute_tasks.script_id 置空（保留计算历史与结果文件），不可恢复。
+    """
+    s = db.query(Script).filter(Script.id == script_id).first()
+    if not s:
+        raise HTTPException(status_code=404, detail="脚本不存在")
+    name, version, tenant_id, code = s.name, s.version, s.tenant_id, s.code
+    # 断开计算任务引用（保留计算历史/结果）
+    try:
+        db.query(ComputeTask).filter(ComputeTask.script_id == script_id).update(
+            {ComputeTask.script_id: None}, synchronize_session=False)
+    except Exception as e:
+        logger.warning(f"[删脚本] 断开 compute_tasks 引用失败(忽略): script_id={script_id} - {e}")
+    # 删 FS 文件
+    try:
+        from ..storage.storage_manager import StorageManager
+        StorageManager().delete_script_files_by_code(tenant_id, code or "")
+    except Exception as e:
+        logger.warning(f"[删脚本] 删脚本文件失败(忽略): script_id={script_id} - {e}")
+    db.delete(s)
+    db.commit()
+    return {"success": True, "message": f"已删除脚本「{name}」(v{version})", "script_id": script_id}
 
 
 @router.post("/tenant-scripts/{tenant_id}/{script_id}/disable")

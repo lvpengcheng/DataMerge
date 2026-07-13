@@ -1,8 +1,10 @@
 {
+  "_说明": "单环境：复制为 deploy.config.json。多环境：复制为 deploy.config.dev.json / deploy.config.uat.json，用 python deploy.py --env dev 部署。均已被 .gitignore 忽略。",
   "host": "你的服务器IP或域名",
   "port": 22,
   "user": "root",
   "password": "在此填密码（或留空运行时输入 / 用环境变量 DEPLOY_PASSWORD）",
   "remote_path": "/opt/datamerge",
-  "health_url": "https://excel.onboarding.cn/api/health"
+  "image_name": "datamerge（多环境同机须各异，如 datamerge-dev / datamerge-uat，且须与该目录 .env 的 IMAGE_NAME 一致）",
+  "health_url": "http://localhost:8000/api/health（端口须对应该环境的 APP_PORT）"
 }

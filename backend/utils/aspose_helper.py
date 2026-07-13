@@ -331,8 +331,12 @@ def flatten_formulas_to_values(src_path: str, dst_path: str = None, password: st
         ws = wb.Worksheets[si]
         cells = ws.Cells
         try:
-            max_row = cells.MaxRow
-            max_col = cells.MaxColumn
+            # 用 MaxDataRow/MaxDataColumn（仅数据范围），不用 MaxRow/MaxColumn：
+            # 后者含"空白但有样式"的行列（整行/整列刷底色、边框、筛选区等），
+            # 会把范围虚高到几十上百列/行，导致这里的双重遍历空转甚至内存溢出。
+            # 公式一定落在数据范围内，故用 MaxData* 不会漏掉任何公式。
+            max_row = cells.MaxDataRow
+            max_col = cells.MaxDataColumn
         except Exception:
             continue
         if max_row is None or max_row < 0 or max_col is None or max_col < 0:

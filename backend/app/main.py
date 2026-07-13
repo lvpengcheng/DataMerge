@@ -4863,6 +4863,15 @@ async def run_compute_task(
         for _of in output_files:
             _normalize_xlsx_content_type(_of)
 
+        # 主键归一：把所有 sheet 的主键/ID 列统一成规范文本，解决跨源类型不一致的 VLOOKUP #N/A
+        # （两端一致：源_ 键列与结果表查找键同规则归一；无论有无模板都跑）
+        try:
+            from backend.utils.output_postprocess import normalize_key_columns_to_text
+            for _of in output_files:
+                await asyncio.to_thread(normalize_key_columns_to_text, str(_of))
+        except Exception as _ke:
+            logger.warning(f"[主键归一] 跳过: {_ke}")
+
         # 模板格式兜底：把输出单元格格式刷回模板原格式（修复旧脚本里 openpyxl 写 datetime
         # 自动把常规列改成日期格式的问题）。仅模板模式（能从脚本提取 TEMPLATE_PATH）才执行，
         # 在反向 sheet 重映射前做——此时输出 sheet 名与有效模板一致。新脚本格式已对 → 幂等。

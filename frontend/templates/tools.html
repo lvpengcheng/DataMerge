@@ -27,6 +27,7 @@
         <div class="tab-nav">
             <button class="tab-btn active" data-tab="split-sheet" data-perm="tools.split_sheet">Sheet拆分</button>
             <button class="tab-btn" data-tab="data-merge" data-perm="tools.data_merge">多表合并</button>
+            <button class="tab-btn" data-tab="data-integrate" data-perm="tools.data_integrate">多表整合对比</button>
             <button class="tab-btn admin-only" data-tab="templates" data-perm="tools.templates">模版管理</button>
             <button class="tab-btn" data-tab="training-history" data-perm="tools.training_history">训练历史</button>
             <button class="tab-btn" data-tab="compute-history" data-perm="tools.compute_history">计算历史</button>
@@ -157,6 +158,29 @@
                         <span class="status" id="merge-exec-status"></span>
                     </div>
                 </div>
+            </div>
+        </div>
+
+        <!-- 多表整合对比 Tab -->
+        <div class="tab-content" id="tab-data-integrate">
+            <div class="tool-page">
+                <h2>多表整合对比</h2>
+                <div class="desc">
+                    导入 2 张 Excel（一张作为主表/模板），把对照表选定列的<strong>值</strong>按关联键回填到主表对应列（覆盖），
+                    可选对比选定列生成差异。输出保留主表整个工作簿（其他 sheet、未涉及列的公式原样保留），仅变更激活页的覆盖列。
+                </div>
+                <div class="upload-zone" id="integrate-upload-zone">
+                    <div>点击或拖拽 Excel 文件到此处（≥2 个：1 主表 + 至少 1 对照表）</div>
+                    <div style="font-size:12px;margin-top:6px;">支持 .xlsx / .xls / .xlsm，主表在下一步选定</div>
+                    <input id="integrate-file-input" type="file" accept=".xlsx,.xls,.xlsm" multiple style="display:none;">
+                </div>
+                <div class="split-file-list" id="integrate-file-list"></div>
+                <div class="actions">
+                    <button class="btn btn-primary" id="btn-integrate-analyze" disabled>解析字段</button>
+                    <span class="status" id="integrate-status"></span>
+                </div>
+
+                <div id="integrate-config" style="display:none;margin-top:20px;"></div>
             </div>
         </div>
 
@@ -307,6 +331,6 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260414t3"></script>
-    <script src="/static/js/tools.js?v=20260625d"></script>
+    <script src="/static/js/tools.js?v=20260713h"></script>
 </body>
 </html>

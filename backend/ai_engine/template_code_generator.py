@@ -351,6 +351,53 @@ class TemplateCodeGenerator:
    - **正确**：`formula = f"=IFERROR(VLOOKUP(B{{r}},'源_考勤'!A:Z,3,FALSE),{{EMPTY}})"`
    - **错误**：`formula = f'=IFERROR(VLOOKUP(...,'源_考勤'!A:Z,...),"")'`  ← 单引号嵌套立刻 SyntaxError
 
+## 数据清洗（可选 —— 默认不要输出，只在规则明确要求"增删行/按名单增减人员"时才写）
+**绝大多数模板只填列、行数固定 → 不要输出任何清洗常量。**
+只有当规则文档出现"入职/离职名单、按证件号/工号增减行、保留或删除某些人员、按名单调整行"等**结构性增删行**要求时，才在 `def fill_template` **正上方、同一个代码块内**额外输出一个模块级常量 `CLEANING_SPEC`（骨架会在填列**之前**先按它对模板做增删行，并自动保住已设公式/汇总/跨表引用）：
+
+```python
+CLEANING_SPEC = {{
+    "sheet": "本月工资明细",          # 要增删行的模板 sheet（必须在 _COL_MAP 中）
+    "key_col": "B",                  # 主键列字母（工号/证件号码所在列）
+    "group_col": "G",                # 可选：分组列字母（如成本中心/开票抬头）；新增行按分组值插进同组的汇总块内
+    "data_start_row": 4,             # 可选：数据起始行(1-based，与 _COL_MAP 一致)；不确定就省略→自动探测
+    "add": {{                         # 可选：从某源 sheet 按主键增行
+        "source": "源_入职名单",       # _SOURCE_MAP 里的源 sheet 名（带 源_ 前缀）
+        "source_key_col": "证件号码",   # 源表中"主键列"的列名
+        "source_group_col": "成本中心"  # 可选：源表中"分组值列"的列名（与 group_col 对应）
+    }},
+    "remove": {{                      # 可选：删行（下面三种可组合）
+        "source": "源_离职名单",       # ① 该源表里出现的主键 → 删
+        "source_key_col": "证件号码",
+        "keys": ["1001", "1002"],    # ② 写死要删的主键
+        "where_col": "Z", "where_equals": "离职"   # ③ 模板某列==某值 → 删
+    }}
+    # 无 group_col 时：新增行统一插到数据区"倒数第二行"（末行之前，确保落在汇总 SUM 范围内）
+}}
+```
+
+### 「以源表为准整体对齐」模式（sync_to_source）
+当规则是"**用本月名单/某源表替换模板现有人员**：不在该名单里的全删、名单里模板没有的全部新增、共有的保留"时，
+**不要**用 add/remove，改用 `sync_to_source`（一个源表同时驱动增和删，等价于按主键做差集对齐）：
+```python
+CLEANING_SPEC = {{
+    "sheet": "本月工资明细",
+    "key_col": "B",
+    "group_col": "E",                # 可选：新增行按分组值入组
+    "data_start_row": 4,
+    "sync_to_source": {{              # 以此源表主键集为准对齐模板行
+        "source": "源_本月计薪名单",
+        "source_key_col": "证件号码",
+        "source_group_col": "成本中心"  # 可选：新增行按此分组入组
+    }}
+}}
+```
+- 语义：**删** = 模板有、源表没有的主键；**增** = 源表有、模板没有的主键；**留** = 交集（公式/位置原样保留）。
+- `sync_to_source` 与 `add`/`remove` 可共存（会合并处理），但一般单独用它即可。
+- 注意：若某分组的人被整组删空，其跨表分组汇总会落空——这属规则本身要求，非本工具可代偿。
+- 不需要清洗就**完全不写** `CLEANING_SPEC`（不要输出 `CLEANING_SPEC = None`，也不要写空 dict）。
+- 一旦输出了 `CLEANING_SPEC`，`fill_template` 里对**该 sheet** 的填充**必须改用 `cleaned_rows(sheet_name)`** 逐行定位（见函数签名注释）；其余未清洗的 sheet 仍按 `_COL_MAP` 区域常规填充。
+
 ## 函数签名
 ```python
 def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
@@ -359,7 +406,18 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
     source_data: dict[sheet_key -> {{'df': DataFrame, 'columns': [...]}}]，原始 DataFrame（如果你要 Python 直接计算）
     salary_year/salary_month/monthly_hours: 上下文参数
 
-    标准套路（必须严格按这个写起始行 + 逐区域）：
+    【若输出了 CLEANING_SPEC】对该 sheet 改用 cleaned_rows() 逐行定位（行结构已由清洗阶段确定，
+    不要再用源行数驱动行数）：
+        rows = cleaned_rows(sheet_name)      # 骨架已注入的辅助函数
+        if rows is not None:                 # 该 sheet 被清洗过
+            for r, pk in rows:               # r=1-based openpyxl 行号, pk=该行主键
+                ws.cell(row=r, column=column_index_from_string("D")).value = (
+                    f"=VLOOKUP(B{{r}},'{{src_key}}'!A:Z,5,FALSE)"   # 公式仍按 B{{r}} 主键查找
+                )
+        else:
+            ... 常规逐区域填充（见下）
+
+    标准套路（未清洗的 sheet，必须严格按这个写起始行 + 逐区域）：
         from openpyxl.utils import column_index_from_string
         for sheet_name, sinfo in _COL_MAP.items():
             if sheet_name not in wb.sheetnames: continue
@@ -663,6 +721,15 @@ _SOURCE_MAP = {source_map_literal}
 _SK_TO_SHEET = {sk_to_sheet_literal}
 # ==================== 列定位字典 结束 ====================
 
+# ==================== 数据清洗（阶段0，可选） ====================
+# 默认 None = 不清洗、模板行结构完全不变（零风险）。
+# 若 AI 判定规则要求"按名单增删行"，会在下方【AI 生成】块顶部用
+#   CLEANING_SPEC = {{...}}  覆盖此默认值（详见 fill_template 上方约定）。
+CLEANING_SPEC = None
+# 阶段0 执行后的行布局：{{sheet_name: {{"key_to_row": {{主键:0based行}}, "data_start":.., "data_end":.., "removed":.., "added":..}}}}
+_ROW_LAYOUT = None
+# ==================================================================
+
 # 注入：薪资参数 / 历史数据上下文（沙箱外部 globals 注入）
 salary_year = globals().get("salary_year", None)
 salary_month = globals().get("salary_month", None)
@@ -776,6 +843,149 @@ def _append_source_sheets(wb, source_data):
     return appended_map
 
 
+def _resolve_cleaning(out_path, source_data):
+    """阶段0：按 CLEANING_SPEC 对模板 sheet 做结构化增删行（Aspose，保公式/汇总/跨表引用）。
+
+    在 openpyxl 打开模板**之前**执行；返回 {{sheet: 布局}} 或 None（未配置清洗）。
+    源表列按**列名**读取；增行主键/分组、删行主键均来自 source_data 的原始 DataFrame。
+    """
+    spec = CLEANING_SPEC
+    if not spec or not isinstance(spec, dict):
+        return None
+    try:
+        from backend.utils.template_row_planner import clean_template_rows
+    except Exception as _ie:
+        print(f"[行清洗] 无法导入 template_row_planner，跳过：{{_ie}}")
+        return None
+
+    sheet = spec.get("sheet")
+    if not sheet:
+        print("[行清洗] CLEANING_SPEC 缺少 sheet，跳过")
+        return None
+
+    def _letter_to_idx0(letter):
+        return column_index_from_string(str(letter).strip()) - 1 if letter else None
+
+    key_idx = _letter_to_idx0(spec.get("key_col"))
+    if key_idx is None:
+        print("[行清洗] CLEANING_SPEC 缺少 key_col，跳过")
+        return None
+    group_idx = _letter_to_idx0(spec.get("group_col"))
+    _dsr = spec.get("data_start_row")
+    ds0 = (int(_dsr) - 1) if isinstance(_dsr, int) and _dsr > 0 else None
+
+    # 源 sheet 名（带 源_ 前缀）→ source_data 的 key
+    _sheet_to_sk = {{v: k for k, v in _SK_TO_SHEET.items()}}
+
+    def _df_for(src_name):
+        if not src_name:
+            return None
+        sk = _sheet_to_sk.get(src_name, src_name)   # 允许直接传 source_data 的 key
+        sv = (source_data or {{}}).get(sk)
+        return (sv or {{}}).get("df") if sv else None
+
+    def _col_values(df, col_name):
+        if df is None or not col_name or col_name not in getattr(df, "columns", []):
+            return []
+        vals = []
+        for v in df[col_name].tolist():
+            if v is None or (isinstance(v, float) and v != v):   # None / NaN
+                continue
+            vals.append(v)
+        return vals
+
+    # 增行：从源表按主键（可带分组值）取
+    add_rows = []
+    add_spec = spec.get("add") or {{}}
+    if add_spec:
+        df = _df_for(add_spec.get("source"))
+        kcol = add_spec.get("source_key_col")
+        gcol = add_spec.get("source_group_col")
+        if df is not None and kcol in getattr(df, "columns", []):
+            _has_g = bool(gcol) and gcol in df.columns
+            for _, rec in df.iterrows():
+                k = rec.get(kcol)
+                if k is None or (isinstance(k, float) and k != k):
+                    continue
+                g = rec.get(gcol) if _has_g else None
+                add_rows.append({{"key": k, "group": g}})
+
+    # 删行：源表命中主键 ∪ 写死 keys ∪ where 条件（三者可组合）
+    remove_keys = []
+    where = None
+    rm = spec.get("remove") or {{}}
+    if rm:
+        for k in (rm.get("keys") or []):
+            remove_keys.append(k)
+        rdf = _df_for(rm.get("source"))
+        remove_keys.extend(_col_values(rdf, rm.get("source_key_col")))
+        if rm.get("where_col") and ("where_equals" in rm):
+            where = (_letter_to_idx0(rm.get("where_col")), rm.get("where_equals"))
+
+    # 以源表为准对齐（sync_to_source）：删=模版有源表没有；增=源表有模版没有；留=交集。
+    # 一个源表(本月名单)同时驱动增与删：keep_only 交给 helper 反向差集删，add_rows 由
+    # build_row_plan 过滤掉已存在的 → 只新增源表里模版没有的。
+    keep_only = None
+    sync = spec.get("sync_to_source") or {{}}
+    if sync:
+        sdf = _df_for(sync.get("source"))
+        skcol = sync.get("source_key_col")
+        sgcol = sync.get("source_group_col")
+        if sdf is not None and skcol in getattr(sdf, "columns", []):
+            keep_only = []
+            _sg = bool(sgcol) and sgcol in sdf.columns
+            for _, rec in sdf.iterrows():
+                k = rec.get(skcol)
+                if k is None or (isinstance(k, float) and k != k):
+                    continue
+                keep_only.append(k)
+                g = rec.get(sgcol) if _sg else None
+                add_rows.append({{"key": k, "group": g}})   # 已存在的会被 build_row_plan 过滤
+        else:
+            print("[行清洗] sync_to_source 源表/主键列无效，忽略该模式")
+
+    if not add_rows and not remove_keys and where is None and keep_only is None:
+        print("[行清洗] CLEANING_SPEC 无有效增删项，跳过")
+        return None
+
+    _rm_n = len(set(str(x) for x in remove_keys))
+    print(f"[行清洗] sheet={{sheet}} 拟新增候选 {{len(add_rows)}} / 显式删键 {{_rm_n}}"
+          + ("（含 where）" if where else "")
+          + (f"（以源表为准对齐，保留键 {{len(keep_only)}}）" if keep_only is not None else ""))
+    try:
+        layout = clean_template_rows(
+            out_path, sheet, key_idx,
+            group_col_idx=group_idx,
+            add_rows=add_rows or None,
+            remove_keys=remove_keys or None,
+            where=where,
+            keep_only_keys=keep_only,
+            data_start=ds0,
+        )
+        print(f"[行清洗] 完成：删除 {{layout.get('removed')}} / 新增 {{layout.get('added')}}"
+              f"，数据区 [{{layout.get('data_start')}}, {{layout.get('data_end')}}]")
+        return {{sheet: layout}}
+    except Exception as _ce:
+        # 清洗失败不静默吞：抛出让训练/计算暴露问题（避免拿错误行结构去填列）
+        raise RuntimeError(f"[行清洗] 执行失败 sheet={{sheet}}: {{_ce}}") from _ce
+
+
+def cleaned_rows(sheet_name):
+    """供 fill_template 使用：返回该 sheet 清洗后要填的 [(1based行号, 主键), ...]（按行序）；
+    未清洗该 sheet 时返回 None → fill_template 回退常规逐区域填充。"""
+    if not _ROW_LAYOUT:
+        return None
+    lay = _ROW_LAYOUT.get(sheet_name)
+    if not lay:
+        return None
+    ds = lay.get("data_start")
+    de = lay.get("data_end")
+    if ds is None or de is None:
+        return None
+    inv = {{r0: k for k, r0 in (lay.get("key_to_row") or {{}}).items()}}
+    return [(r0 + 1, inv.get(r0, "")) for r0 in range(ds, de + 1)]
+
+
 # ==================== AI 生成 ====================
 {fill_function}
 # ==================== AI 生成结束 ====================
@@ -856,6 +1066,7 @@ def _build_fill_report(wb, snapshot_before):
     from openpyxl.utils import get_column_letter
 
     filled_cells = []
+    filled_addresses = {{}}   # {{sheet: [addr, ...]}} —— 完整、无上限，供纯值版精确定位 AI 写入格
     summary = {{}}
 
     for ws in wb.worksheets:
@@ -877,6 +1088,7 @@ def _build_fill_report(wb, snapshot_before):
                 col_letter = get_column_letter(cell.column)
                 summary.setdefault(ws.title, {{}}).setdefault(col_letter, 0)
                 summary[ws.title][col_letter] += 1
+                filled_addresses.setdefault(ws.title, []).append(f"{{col_letter}}{{cell.row}}")
                 if len(filled_cells) < 200:
                     filled_cells.append({{
                         "sheet": ws.title,
@@ -884,8 +1096,72 @@ def _build_fill_report(wb, snapshot_before):
                         "old": _safe_repr(old_v),
                         "new": _safe_repr(new_v),
                     }})
-    return {{"filled_cells": filled_cells, "summary": summary,
+    return {{"filled_cells": filled_cells, "filled_addresses": filled_addresses, "summary": summary,
             "total_changed": sum(sum(v.values()) for v in summary.values())}}
+
+
+def _shrink_inflated_columns(path):
+    """删掉各 sheet「数据末列之后」的空列。整列刷格式/筛选会把维度撑到 XFC(16384 列)，
+    openpyxl 的 max_column 随之虚高，后续快照/报告的 iter_rows(行×列) 会内存溢出/卡死。
+    只删 MaxDataColumn 之后的列（那之后必然无数据），安全、不动任何数据/公式。
+
+    先廉价预检 <dimension>（解压+正则，几毫秒）：正常文件（列号不大）直接跳过、
+    几乎零开销；仅维度明显偏大时才真正开 Aspose 删列。"""
+    # 1) 廉价预检：读各 sheet 的 <dimension> 末列号，都不大就直接返回（不开 Aspose）
+    try:
+        import zipfile as _zf, re as _re2
+        _inflated = False
+        with _zf.ZipFile(str(path)) as _z:
+            for _n in _z.namelist():
+                if not (_n.startswith("xl/worksheets/") and _n.endswith(".xml")):
+                    continue
+                _head = _z.read(_n)[:4096].decode("utf-8", "ignore")
+                _m = _re2.search(r'<dimension\s+ref="([^"]+)"', _head)
+                if not _m:
+                    _inflated = True   # 无 dimension → 交给 Aspose 复核
+                    break
+                _last = _m.group(1).split(":")[-1]
+                _lm = _re2.match(r'([A-Za-z]+)', _last)
+                if not _lm:
+                    continue
+                _col = 0
+                for _ch in _lm.group(1).upper():
+                    _col = _col * 26 + (ord(_ch) - 64)
+                if _col > 256:         # 列号明显偏大 → 疑似虚高
+                    _inflated = True
+                    break
+        if not _inflated:
+            return
+    except Exception:
+        pass   # 预检失败不阻断，继续走 Aspose（内部还有 MaxDataColumn 安全判定）
+
+    # 2) 确有虚高：Aspose 删掉数据末列之后的空列
+    _wb = None
+    try:
+        import aspose_init
+        aspose_init.ensure_license()
+        from Aspose.Cells import Workbook as _WB
+        _wb = _WB(str(path))
+        touched = False
+        for _i in range(_wb.Worksheets.Count):
+            _c = _wb.Worksheets[_i].Cells
+            _mdc = _c.MaxDataColumn      # 0based 数据末列，-1=空
+            _mc = _c.MaxColumn           # 0based 含样式的末列
+            if _mc > _mdc and (_mc - _mdc) >= 5:   # 明显虚高才动，留余量避免误伤
+                _first = _mdc + 1 if _mdc >= 0 else 0
+                _c.DeleteColumns(_first, _mc - _first + 1, True)
+                touched = True
+        if touched:
+            _wb.Save(str(path))
+            print("[列去虚高] 已删除数据末列之后的空样式列（防 openpyxl 维度虚高致溢出）")
+    except Exception as _e:
+        print(f"[列去虚高] 处理异常（不阻断）：{{_e}}")
+    finally:
+        try:
+            if _wb is not None:
+                _wb.Dispose()
+        except Exception:
+            pass
 
 
 def main():
@@ -910,7 +1186,18 @@ def main():
     shutil.copy2(_eff_template, out_path)
     print(f"模板已复制至：{{out_path}}")
 
+    # 列去虚高：整列刷格式/筛选会把模板维度撑到上万列（XFC），openpyxl 随之虚高，
+    # 后续快照/报告按 iter_rows(行×列) 遍历会内存溢出。删掉数据末列之后的空列。
+    _shrink_inflated_columns(out_path)
+
     source_data = load_source_data()
+
+    # 阶段0（可选）：AI 输出了 CLEANING_SPEC 时，在 openpyxl 打开前先做结构化增删行
+    # （Aspose 独立 pass，含跨表引用更新；无 CLEANING_SPEC 则完全跳过，模板行结构不变）。
+    global _ROW_LAYOUT
+    if CLEANING_SPEC:
+        print("步骤：阶段0 数据清洗（按 CLEANING_SPEC 增删行，保公式/汇总/跨表引用）...")
+        _ROW_LAYOUT = _resolve_cleaning(out_path, source_data)
 
     import openpyxl
     # keep_vba 只对 .xlsm 启用：对普通 .xlsx 启用会让 openpyxl 把内容类型写成
@@ -1126,6 +1413,7 @@ if __name__ == "__main__":
    - 同样：读源 sheet 必须用 `_SOURCE_MAP[源_xxx]["data_start_row"]`
 5. **公式查找数据源分两类**：骨架追加的源文件用 `_SOURCE_MAP` 的 `源_xxx` key；模板自带 sheet（在 `_COL_MAP` 里）用其**真实 sheet 名、不加 `源_` 前缀**。sheet 名外用 `'` 单引号
 6. **跳过模板里 `has_formula=True` 的列**（保留原公式）
+7. **【若上一轮代码 `def fill_template` 上方有 `CLEANING_SPEC = {{...}}`】必须原样保留它并一并输出在函数上方**（一个字符都不改，除非用户明确要求改增删行规则）；被清洗的 sheet 继续用 `cleaned_rows(sheet_name)` 定位
 7. **【f-string 引号强约束】**：外层 f-string 用 **双引号** `f"..."`，公式中 sheet 名用 `'` 单引号；空字符串拼接 `EMPTY` 常量（=`'""'`），写法：`f"=IFERROR(VLOOKUP(B{{r}},'源_考勤'!A:Z,3,FALSE),{{EMPTY}})"`
    - **错误**：`f'=IFERROR(VLOOKUP(...,'源_考勤'!A:Z,...),"")'`  ← 单引号嵌套立即 SyntaxError
 

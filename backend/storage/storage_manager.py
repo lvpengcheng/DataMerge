@@ -541,6 +541,45 @@ class StorageManager:
     def is_script_disabled(self, tenant_id: str, script_id: str) -> bool:
         return script_id in self.get_disabled_script_ids(tenant_id)
 
+    def delete_script_files_by_code(self, tenant_id: str, script_code: str) -> Optional[str]:
+        """按脚本代码物理删除 FS 上的脚本文件。
+
+        script_id 由代码内容 MD5 派生（与 save_script 规则一致），据此删除
+        scripts/{script_id}.py 与 {script_id}_info.json，并从禁用名单移除、
+        清理指向它的 active_script.json。容错：文件不存在忽略。
+
+        返回删除的 script_id（成功计算出即返回），异常返回 None。
+        """
+        try:
+            script_hash = hashlib.md5((script_code or "").encode("utf-8")).hexdigest()[:12]
+            script_id = f"script_{script_hash}"
+            scripts_dir = self.get_tenant_dir(tenant_id) / "scripts"
+            for suffix in (f"{script_id}.py", f"{script_id}_info.json"):
+                fp = scripts_dir / suffix
+                try:
+                    if fp.exists():
+                        fp.unlink()
+                except Exception as e:
+                    self.logger.warning(f"删除脚本文件失败(忽略): {fp} - {e}")
+            # 从禁用名单移除
+            try:
+                self.set_script_disabled(tenant_id, script_id, False)
+            except Exception:
+                pass
+            # 若 active_script 指向被删脚本，清掉指针文件
+            try:
+                active_file = self.get_tenant_dir(tenant_id) / "active_script.json"
+                if active_file.exists():
+                    data = json.loads(active_file.read_text(encoding="utf-8"))
+                    if data.get("script_id") == script_id:
+                        active_file.unlink()
+            except Exception:
+                pass
+            return script_id
+        except Exception as e:
+            self.logger.warning(f"delete_script_files_by_code 失败(忽略): tenant={tenant_id} - {e}")
+            return None
+
     def _generate_batch_id(self) -> str:
         """生成批次ID"""
         import time

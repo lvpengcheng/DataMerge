@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 EXCEL_EXTS = {".xlsx", ".xls", ".xlsm"}
 MERGE_SESSION_ROOT = PROJECT_ROOT / "temp" / "merge_sessions"
+INTEGRATE_SESSION_ROOT = PROJECT_ROOT / "temp" / "integrate_sessions"
 # 方案模版文件存储根目录（按 owner 分子目录），tenants/ 已 gitignore
 MERGE_TPL_ROOT = PROJECT_ROOT / "tenants" / "__tools_merge__" / "merge_templates"
 
@@ -702,3 +703,427 @@ async def merge_template_download(tpl_id: int, current_user=Depends(get_current_
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}"},
     )
+
+
+# ==================== 多表整合对比（主表 A + 对照表 B）====================
+
+def _integrate_session_dir(session_id: str) -> Path:
+    safe = "".join(ch for ch in str(session_id) if ch.isalnum() or ch in "-_")
+    return INTEGRATE_SESSION_ROOT / safe
+
+
+def _parse_file_full(path: str):
+    """解析单文件激活页最优区域，额外返回区域坐标（供原地回填主表定位）。
+
+    返回 {sheet, columns, df, head_data{表头->列字母}, data_row_start, data_row_end}（1-based 行）。
+    """
+    from excel_parser import IntelligentExcelParser
+    parser = IntelligentExcelParser()
+    results = parser.parse_excel_file(
+        path, read_formulas=False, calculate_formulas=True,
+        active_sheet_only=True, best_region_only=True,
+    )
+    if not results or not results[0].regions:
+        return {"sheet": "", "columns": [], "df": pd.DataFrame(),
+                "head_data": {}, "data_row_start": 0, "data_row_end": 0}
+    sd = results[0]
+    region = sd.regions[0]
+    head = region.head_data or {}                       # {表头: 列字母}
+    letter_to_header = {v: k for k, v in head.items()}
+    df = pd.DataFrame(region.data or [])
+    if not df.empty:
+        df = df.rename(columns=letter_to_header)
+        ordered = [h for h in head.keys() if h in df.columns]
+        if ordered:
+            df = df[ordered]
+    return {
+        "sheet": sd.sheet_name,
+        "columns": list(head.keys()),
+        "df": df,
+        "head_data": dict(head),
+        "data_row_start": int(getattr(region, "data_row_start", 0) or 0),
+        "data_row_end": int(getattr(region, "data_row_end", 0) or 0),
+    }
+
+
+@router.post("/integrate/analyze")
+async def integrate_analyze(
+    files: List[UploadFile] = File(...),
+    tenant_id: Optional[str] = Form(None),
+    current_user=Depends(get_current_user),
+):
+    """多表整合对比第一步：上传【≥2 个】文件（1 主表 + 至少 1 对照表）→ 解析激活页
+    → 返回各文件列（带来源）+ 列头指纹 + 猜键/猜姓名/猜身份证列。不在此处调用 AI。
+    主表由用户在后续步骤从上传文件里选定（不在此处固定）。
+    """
+    if not files or len(files) < 2:
+        raise HTTPException(status_code=400, detail="请至少上传 2 个文件（1 主表 + 至少 1 对照表）")
+
+    from ..utils.merge_engine import compute_header_fingerprint, guess_key_column
+    from ..utils.integrate_engine import guess_name_column, guess_id_column
+
+    session_id = uuid.uuid4().hex
+    sdir = _integrate_session_dir(session_id)
+    sdir.mkdir(parents=True, exist_ok=True)
+
+    files_meta = []
+    try:
+        for uf in files:
+            name = uf.filename or "unnamed.xlsx"
+            if Path(name).suffix.lower() not in EXCEL_EXTS:
+                raise HTTPException(status_code=400, detail=f"{name}: 不支持的扩展名")
+            dest = sdir / name
+            dest.write_bytes(await uf.read())
+            # 上传规范化：误设日期格式的数字单元格重置为常规（避免被当日期读错）
+            try:
+                from ..utils.source_normalizer import normalize_misformatted_dates
+                normalize_misformatted_dates(str(dest))
+            except Exception as _ne:
+                logger.warning(f"[integrate] 日期格式规范化失败（继续）: {_ne}")
+            info = _parse_file_to_df(str(dest))
+            cols = info["columns"]
+            df = info.get("df")
+            files_meta.append({
+                "name": name,
+                "sheet": info["sheet"],
+                "columns": cols,
+                "fingerprint": compute_header_fingerprint(cols),
+                "suggested_key": guess_key_column(cols, df) or (cols[0] if cols else ""),
+                "suggested_name_col": guess_name_column(cols) or "",
+                "suggested_id_col": guess_id_column(cols) or "",
+            })
+
+        (sdir / "_meta.json").write_text(
+            json.dumps({"files": files_meta}, ensure_ascii=False), encoding="utf-8"
+        )
+        matched_schemes = _match_integrate_schemes(_tpl_owner(current_user), files_meta)
+        return {"session_id": session_id, "files": files_meta, "matched_schemes": matched_schemes}
+    except HTTPException:
+        shutil.rmtree(sdir, ignore_errors=True)
+        raise
+    except Exception as e:
+        shutil.rmtree(sdir, ignore_errors=True)
+        logger.exception("integrate/analyze 异常")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class IntegrateMatchRequest(BaseModel):
+    session_id: str
+    main_file: str                       # 主表 A
+    source_cols: List[dict]              # [{"file","col"}] 对照表候选列（用户勾选范围）
+    use_ai: bool = False
+    ai_provider: Optional[str] = "deepseek"
+
+
+@router.post("/integrate/match")
+async def integrate_match(req: IntegrateMatchRequest, current_user=Depends(get_current_user)):
+    """把对照表候选列匹配到主表 A 的列（覆盖/对比列对建议）：先精确同名（免 AI），
+    use_ai 时再用 AI 补差异命名。返回 pairs=[{a_col,source_file,source_col,auto,confidence}]。
+    """
+    from ..utils.merge_engine import _norm_header, _ai_map_to_canonical
+
+    sdir = _integrate_session_dir(req.session_id)
+    meta_path = sdir / "_meta.json"
+    if not meta_path.exists():
+        raise HTTPException(status_code=400, detail="会话已过期，请重新上传分析")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    cols_by_file = {f["name"]: f.get("columns", []) for f in meta.get("files", [])}
+    a_cols = cols_by_file.get(req.main_file, [])
+    if not a_cols:
+        raise HTTPException(status_code=400, detail="主表列为空或主表选择有误")
+
+    a_norm = {_norm_header(c): c for c in a_cols}
+    pairs = []
+    matched_src = set()
+    # 1) 精确同名（免 AI）
+    for s in req.source_cols or []:
+        f, c = s.get("file"), s.get("col")
+        if not f or not c or f == req.main_file:
+            continue
+        hit = a_norm.get(_norm_header(c))
+        if hit:
+            pairs.append({"a_col": hit, "source_file": f, "source_col": c, "auto": True, "confidence": 1.0})
+            matched_src.add((f, c))
+
+    # 2) AI 补差异命名（对未精确命中的候选列）
+    ai_suggestions = []
+    if req.use_ai:
+        remaining = [(s.get("file"), s.get("col")) for s in (req.source_cols or [])
+                     if (s.get("file"), s.get("col")) not in matched_src
+                     and s.get("file") != req.main_file and s.get("col")]
+        if remaining:
+            try:
+                ai_suggestions = _ai_map_to_canonical(a_cols, remaining, req.ai_provider or "deepseek")
+                for it in ai_suggestions:
+                    pairs.append({
+                        "a_col": it["suggest_group"], "source_file": it["file"],
+                        "source_col": it["col"], "auto": False,
+                        "confidence": it.get("confidence", 0.0),
+                    })
+            except Exception as e:
+                logger.warning(f"[integrate] AI 匹配失败（忽略）: {e}")
+
+    return {"pairs": pairs, "ai_suggestions": ai_suggestions}
+
+
+class IntegrateExecuteRequest(BaseModel):
+    session_id: str
+    main_file: str                       # 主表 A（上传文件二选一/多选一）
+    key_map: dict                        # {file: 关联键列名}（含主表与各对照表）
+    overwrite_pairs: List[dict]          # [{"a_col","source_file","source_col"}] 有序=优先级
+    compare_pairs: List[dict] = []       # [{"a_col","source_file","source_col"}]
+    output_mode: int = 1                 # 1 只更新主表；2 主表 + 差异 sheet
+    name_col: Optional[str] = None       # 主表姓名列（差异 sheet）
+    id_col: Optional[str] = None         # 主表身份证列（差异 sheet）
+    diff_order: str = "id_name"          # id_name | name_id
+    normalize_keys: bool = True
+
+
+@router.post("/integrate/execute")
+async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(get_current_user)):
+    """按覆盖/对比配置回填主表并输出：原地覆盖主表激活页覆盖列（只写值、保全其余 sheet/公式），
+    输出方式2 追加差异 sheet。返回更新后的主表 xlsx。
+    """
+    from ..utils.integrate_engine import build_source_indexes, compute_diffs
+    from ..utils.integrate_writer import apply_integration
+
+    sdir = _integrate_session_dir(req.session_id)
+    if not sdir.exists():
+        raise HTTPException(status_code=400, detail="会话已过期，请重新上传分析")
+
+    main_path = sdir / req.main_file
+    if not main_path.exists():
+        raise HTTPException(status_code=400, detail=f"主表文件不存在: {req.main_file}")
+
+    try:
+        # 解析：主表要区域坐标，对照表只要 df
+        main_info = _parse_file_full(str(main_path))
+        parsed = {req.main_file: {"df": main_info["df"]}}
+        for fp_path in sorted(sdir.iterdir()):
+            if fp_path.suffix.lower() not in EXCEL_EXTS or fp_path.name == req.main_file:
+                continue
+            parsed[fp_path.name] = {"df": _parse_file_to_df(str(fp_path))["df"]}
+
+        n_sources = len([f for f in parsed if f != req.main_file])
+        if n_sources < 1:
+            raise HTTPException(status_code=400, detail="至少需要 1 张对照表")
+
+        source_indexes = build_source_indexes(
+            parsed, req.key_map, req.main_file, normalize_keys=req.normalize_keys,
+        )
+
+        # 对比差异（仅输出方式2且配了对比列时）
+        diff_rows = None
+        if req.output_mode == 2 and req.compare_pairs:
+            diff_rows = compute_diffs(
+                main_info["df"], source_indexes,
+                a_key_col=req.key_map.get(req.main_file),
+                compare_pairs=req.compare_pairs,
+                a_name_col=req.name_col, a_id_col=req.id_col,
+                normalize_keys=req.normalize_keys,
+                label_source=(n_sources > 1),
+            )
+
+        out_path = sdir / f"整合结果_{req.main_file}"
+        stat = apply_integration(
+            main_path=str(main_path), out_path=str(out_path),
+            sheet_name=main_info["sheet"], head_data=main_info["head_data"],
+            a_key_col=req.key_map.get(req.main_file),
+            data_row_start=main_info["data_row_start"], data_row_end=main_info["data_row_end"],
+            overwrite_pairs=req.overwrite_pairs, source_indexes=source_indexes,
+            normalize_keys=req.normalize_keys,
+            diff_rows=diff_rows, diff_order=req.diff_order,
+        )
+
+        data = out_path.read_bytes()
+        buf = io.BytesIO(data)
+        buf.seek(0)
+        # 不删会话：支持"先下载看看，再改配置/重新生成/保存方案"等后续操作
+        try:
+            out_path.unlink(missing_ok=True)   # 仅清理本次生成的临时结果文件，保留上传的源文件与 _meta
+        except Exception:
+            pass
+        from urllib.parse import quote
+        fname = f"整合结果_{req.main_file}"
+        headers = {
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}",
+            "X-Integrate-Matched": str(stat.get("matched_rows", 0)),
+            "X-Integrate-Cells": str(stat.get("overwritten_cells", 0)),
+            "X-Integrate-Diffs": str(stat.get("diff_rows", 0)),
+        }
+        return StreamingResponse(
+            buf,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers=headers,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("integrate/execute 异常")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 多表整合对比：命名方案（按列头指纹联动）====================
+
+def _match_integrate_schemes(owner: str, files_meta: List[dict]) -> List[dict]:
+    """按列头指纹把已保存方案匹配到本次上传的文件，解析出角色(主表/各对照表)。
+
+    Returns: [{id, name, main_file, fp_to_file{fp:file}, config}]  仅返回能完整匹配的方案。
+    """
+    from ..database.connection import SessionLocal
+    from ..database.models import IntegrateTemplate
+
+    out: List[dict] = []
+    db = SessionLocal()
+    try:
+        rows = db.query(IntegrateTemplate).filter_by(tenant_id=owner).all()
+        for row in rows:
+            cfg = row.config or {}
+            main_fp = cfg.get("main_fp")
+            source_fps = cfg.get("source_fps", [])
+            if not main_fp:
+                continue
+            # 指纹 → 上传文件名（同指纹多文件时取首个未占用的）
+            used = set()
+            fp_to_file = {}
+
+            def _pick(fp):
+                for f in files_meta:
+                    if f["fingerprint"] == fp and f["name"] not in used:
+                        used.add(f["name"])
+                        return f["name"]
+                return None
+
+            mf = _pick(main_fp)
+            if not mf:
+                continue
+            fp_to_file[main_fp] = mf
+            ok = True
+            for sfp in source_fps:
+                sf = _pick(sfp)
+                if not sf:
+                    ok = False
+                    break
+                fp_to_file[sfp] = sf
+            if not ok:
+                continue
+            out.append({"id": row.id, "name": row.name, "main_file": mf,
+                        "fp_to_file": fp_to_file, "config": cfg})
+    finally:
+        db.close()
+    return out
+
+
+class IntegrateSchemeSaveRequest(BaseModel):
+    session_id: str
+    name: str
+    main_file: str
+    key_map: dict                        # {file: 关联键列名}
+    overwrite_pairs: List[dict]          # [{"a_col","source_file","source_col"}]
+    compare_pairs: List[dict] = []
+    name_col: Optional[str] = None
+    id_col: Optional[str] = None
+    diff_order: str = "id_name"
+    output_mode: int = 1
+    normalize_keys: bool = True
+
+
+@router.post("/integrate/scheme/save")
+async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=Depends(get_current_user)):
+    """保存/覆盖当前用户的整合对比方案（同名 upsert）。按列头指纹存角色，跨月复用。"""
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="方案名称不能为空")
+
+    sdir = _integrate_session_dir(req.session_id)
+    meta_path = sdir / "_meta.json"
+    if not meta_path.exists():
+        raise HTTPException(status_code=400, detail="会话已过期，请重新上传分析")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    fp_by_file = {f["name"]: f["fingerprint"] for f in meta.get("files", [])}
+    if req.main_file not in fp_by_file:
+        raise HTTPException(status_code=400, detail="主表选择有误")
+
+    main_fp = fp_by_file[req.main_file]
+    # 参与映射的对照文件（覆盖对+对比对里出现的 source_file）
+    src_files = []
+    for p in (req.overwrite_pairs or []) + (req.compare_pairs or []):
+        f = p.get("source_file")
+        if f and f != req.main_file and f in fp_by_file and f not in src_files:
+            src_files.append(f)
+    source_fps = [fp_by_file[f] for f in src_files]
+
+    def _to_fp_pairs(pairs):
+        out = []
+        for p in pairs or []:
+            f = p.get("source_file")
+            if f in fp_by_file:
+                out.append({"a_col": p.get("a_col"), "source_fp": fp_by_file[f], "source_col": p.get("source_col")})
+        return out
+
+    config = {
+        "main_fp": main_fp,
+        "source_fps": source_fps,
+        "key_map_by_fp": {fp_by_file[f]: k for f, k in (req.key_map or {}).items() if f in fp_by_file},
+        "overwrite_pairs": _to_fp_pairs(req.overwrite_pairs),
+        "compare_pairs": _to_fp_pairs(req.compare_pairs),
+        "name_col": req.name_col, "id_col": req.id_col,
+        "diff_order": req.diff_order, "output_mode": req.output_mode,
+        "normalize_keys": req.normalize_keys,
+    }
+
+    from ..database.connection import SessionLocal
+    from ..database.models import IntegrateTemplate
+    owner = _tpl_owner(current_user)
+    db = SessionLocal()
+    try:
+        row = db.query(IntegrateTemplate).filter_by(tenant_id=owner, name=name).first()
+        if row is None:
+            row = IntegrateTemplate(tenant_id=owner, name=name, config=config)
+            db.add(row)
+        else:
+            row.config = config
+        db.commit()
+        db.refresh(row)
+        return {"ok": True, "id": row.id, "name": name}
+    except Exception as e:
+        db.rollback()
+        logger.exception("integrate/scheme/save 异常")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@router.get("/integrate/schemes")
+async def integrate_schemes_list(current_user=Depends(get_current_user)):
+    """列出当前用户的整合对比方案。"""
+    from ..database.connection import SessionLocal
+    from ..database.models import IntegrateTemplate
+    owner = _tpl_owner(current_user)
+    db = SessionLocal()
+    try:
+        rows = (db.query(IntegrateTemplate)
+                  .filter_by(tenant_id=owner)
+                  .order_by(IntegrateTemplate.updated_at.desc()).all())
+        return [{"id": r.id, "name": r.name, "config": r.config,
+                 "updated_at": r.updated_at.isoformat() if r.updated_at else None} for r in rows]
+    finally:
+        db.close()
+
+
+@router.delete("/integrate/scheme/{scheme_id}")
+async def integrate_scheme_delete(scheme_id: int, current_user=Depends(get_current_user)):
+    """删除当前用户自己的整合对比方案。"""
+    from ..database.connection import SessionLocal
+    from ..database.models import IntegrateTemplate
+    owner = _tpl_owner(current_user)
+    db = SessionLocal()
+    try:
+        row = db.query(IntegrateTemplate).filter_by(id=scheme_id, tenant_id=owner).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="方案不存在或无权删除")
+        db.delete(row)
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "ignorePatterns": [
+    "libs/**",
+    "tenants/**",
+    "compare_results/**",
+    "fonts/**",
+    "docs/**",
+    "examples/**",
+    "global_assets/**",
+    "logs/**",
+    "releases/**",
+    "releaser/**",
+    "temp/**",
+    "**/*.md",
+    "!.claude/**",
+    "!CLAUDE.md"
+  ],
+  "permissions": {
+    "deny": [
+      "Read(libs/**)",
+      "Read(tenants/**)",
+      "Read(compare_results/**)",
+      "Read(fonts/**)",
+      "Read(docs/**)",
+      "Read(examples/**)",
+      "Read(global_assets/**)",
+      "Read(logs/**)",
+      "Read(releases/**)",
+      "Read(releaser/**)",
+      "Read(temp/**)",
+      "Read(**/*.xlsx)",
+      "Read(**/*.xls)",
+      "Read(**/*.ttf)",
+      "Read(**/*.ttc)",
+      "Read(**/*.dll)",
+      "Read(**/*.so)"
+    ]
+  }
+}

@@ -25,7 +25,7 @@ from pydantic import BaseModel
 
 from ..database.connection import get_db, SessionLocal
 from ..database.models import (
-    TrainingSession, TrainingIteration, TrainingMessage, Script, DataAsset,
+    TrainingSession, TrainingIteration, TrainingMessage, Script, DataAsset, ComputeTask,
 )
 from ..auth.dependencies import get_current_user, get_accessible_tenants, get_operable_tenants
 from ..utils.data_helpers import make_unique_sheet_key
@@ -2694,11 +2694,14 @@ def set_as_best(
     if body and body.iteration_id:
         iteration = db.query(TrainingIteration).filter_by(id=body.iteration_id).first()
     else:
+        # 未显式指定：取「最新一轮有代码」的迭代，即用户当前看到/刚上传的这版。
+        # （按钮语义是"将当前代码设为最佳"；手动上传的代码永远是最新一轮，
+        #   过去按 accuracy DESC 选会挑到之前分更高的旧代码，导致智算跑的不是刚上传的脚本。）
         iteration = (
             db.query(TrainingIteration)
             .filter_by(session_id=session_id)
-            .filter(TrainingIteration.accuracy.isnot(None))
-            .order_by(TrainingIteration.accuracy.desc(), TrainingIteration.iteration_num.desc())
+            .filter(TrainingIteration.generated_code.isnot(None))
+            .order_by(TrainingIteration.iteration_num.desc())
             .first()
         )
 
@@ -3068,6 +3071,98 @@ def rename_session(
     db.commit()
 
     return {"ok": True, "session_key": new_name}
+
+
+@router.delete("/sessions/{session_id}")
+def delete_session(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """物理删除训练会话：对话历史、迭代、关联脚本、训练文件一并删除，不可恢复。
+
+    - 关联脚本（source_session_id 匹配 + session.final_script_id）：删 DB 行 + FS 文件，
+      并把引用该脚本的 compute_tasks.script_id 置空（保留计算历史/结果文件）。
+    - 迭代 TrainingIteration / 消息 TrainingMessage：按 session_id 删除。
+    - 训练文件：删 training_chat/{session_id} 整个目录，兜底删 config 里的源/预期文件与模板副本。
+    """
+    import hashlib
+
+    session = db.query(TrainingSession).filter_by(id=session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    tenant_id = session.tenant_id
+    from ..storage.storage_manager import StorageManager
+    sm = StorageManager()
+
+    # 1) 关联脚本：source_session_id 匹配 + final_script_id 指向
+    script_ids = set()
+    scripts = db.query(Script).filter(Script.source_session_id == session_id).all()
+    for s in scripts:
+        script_ids.add(s.id)
+    if session.final_script_id and session.final_script_id not in script_ids:
+        fs = db.query(Script).filter(Script.id == session.final_script_id).first()
+        if fs:
+            scripts.append(fs)
+            script_ids.add(fs.id)
+
+    for s in scripts:
+        # 断开计算任务引用（保留计算历史/结果）
+        try:
+            db.query(ComputeTask).filter(ComputeTask.script_id == s.id).update(
+                {ComputeTask.script_id: None}, synchronize_session=False)
+        except Exception as e:
+            logger.warning(f"[删会话] 断开 compute_tasks 引用失败(忽略): script_id={s.id} - {e}")
+        # 删 FS 脚本文件（总是删，不检查代码哈希是否被共享）
+        try:
+            sm.delete_script_files_by_code(tenant_id, s.code or "")
+        except Exception as e:
+            logger.warning(f"[删会话] 删脚本文件失败(忽略): script_id={s.id} - {e}")
+        db.delete(s)
+
+    # 2) 迭代与消息
+    db.query(TrainingIteration).filter(TrainingIteration.session_id == session_id).delete(
+        synchronize_session=False)
+    db.query(TrainingMessage).filter(TrainingMessage.session_id == session_id).delete(
+        synchronize_session=False)
+
+    # 3) 训练文件
+    try:
+        tenant_dir = Path(sm.get_tenant_dir(tenant_id))
+        # 会话持久化目录（源/预期/规则/迭代脚本都在这里）
+        persist_dir = tenant_dir / "training_chat" / str(session_id)
+        if persist_dir.exists():
+            shutil.rmtree(persist_dir, ignore_errors=True)
+        # 模板副本 templates/{session_id}_*
+        templates_dir = tenant_dir / "templates"
+        if templates_dir.exists():
+            for tf in templates_dir.glob(f"{session_id}_*"):
+                try:
+                    tf.unlink()
+                except Exception:
+                    pass
+        # 兜底：config 里记录的源目录/预期文件（仅当路径落在租户目录内才删，避免误删外部路径）
+        cfg = session.config or {}
+        tdir_str = str(tenant_dir)
+        for key in ("source_dir",):
+            p = cfg.get(key)
+            if p and tdir_str in str(p) and os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+        ef = cfg.get("expected_file")
+        if ef and tdir_str in str(ef) and os.path.isfile(ef):
+            try:
+                os.remove(ef)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"[删会话] 清理训练文件失败(忽略): session_id={session_id} - {e}")
+
+    # 4) 删会话本体
+    db.delete(session)
+    db.commit()
+
+    return {"ok": True, "session_id": session_id}
 
 
 # ==================== 原始文件下载 ====================

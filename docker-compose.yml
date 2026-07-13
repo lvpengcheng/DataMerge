@@ -3,10 +3,12 @@ version: '3.8'
 services:
   app:
     build: .
-    image: datamerge:latest
-    container_name: datamerge-app
+    # 多环境（dev/uat 同机不同目录）：镜像名/容器名/端口都从本目录 .env 读取，
+    # 不设时回落到默认值＝原单环境行为。同机多环境必须让这些值各不相同，否则会互相覆盖/端口冲突。
+    image: ${IMAGE_NAME:-datamerge}:latest
+    container_name: ${APP_CONTAINER_NAME:-datamerge-app}
     ports:
-      - "8000:8000"
+      - "${APP_PORT:-8000}:8000"
     env_file:
       - .env
     environment:
@@ -36,11 +38,11 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: datamerge-redis
+    container_name: ${REDIS_CONTAINER_NAME:-datamerge-redis}
     environment:
       - TZ=Asia/Shanghai
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
