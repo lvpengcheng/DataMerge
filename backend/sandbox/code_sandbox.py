@@ -160,6 +160,17 @@ class CodeSandbox:
                         exec(code_obj, exec_globals)
                         output_buffer.write(f"代码编译和执行完成\n")
 
+                        # 模板模式：注入运行时模板覆盖路径 + 覆盖脚本烘焙的 TEMPLATE_PATH。
+                        # 旧脚本里写死的跨环境失效路径（如训练机 /app/tenants 绝对路径在 windows/IIS
+                        # 不存在）被当前环境定位到的有效模板替换，使 main() 的前置硬校验通过。
+                        # 与 importlib 智算入口(main.py)一致；非模板脚本无 TEMPLATE_PATH，无副作用。
+                        _tpl_override = execution_env.get('_template_override_path')
+                        if _tpl_override:
+                            exec_globals['_template_override_path'] = _tpl_override
+                            if 'TEMPLATE_PATH' in exec_globals:
+                                exec_globals['TEMPLATE_PATH'] = _tpl_override
+                            output_buffer.write(f"[模板覆盖] 已将 TEMPLATE_PATH 指向当前环境模板: {_tpl_override}\n")
+
                         # 【加密支持】如果有 file_passwords，monkey-patch IntelligentExcelParser
                         # 使其在 parse_excel_file 时自动注入对应文件的密码
                         # 注意：文件通常已在上游解密，仅对仍加密的文件注入密码

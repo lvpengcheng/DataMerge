@@ -308,6 +308,46 @@ output_folder = globals().get("output_folder", "")
 input_folder = globals().get("input_folder", r"{input_folder}")
 
 
+# ---- 键列强制文本（与 output_postprocess 主键归一同规则）----
+# 避免 pd.read_excel / 预加载把数字型工号、证件号读成 int，导致内存 join 两端类型不一致匹配失败
+_KEY_KW = ("工号", "员工工号", "员工编号", "员工号", "职工号", "人员编号", "工作证号", "员工id",
+           "身份证", "证件号", "身份证号", "银行卡", "卡号", "银行账号",
+           "社保号", "社保账号", "公积金号", "公积金账号",
+           "手机号", "联系电话", "税号", "纳税人识别号", "编号")
+_KEY_EX = ("工资", "金额", "薪资", "比例", "系数", "天数", "月数", "说明", "规则", "姓名")
+
+
+def _is_key_col(name):
+    n = str(name or "").strip().lower()
+    if not n or any(e in n for e in _KEY_EX):
+        return False
+    return any(k in n for k in _KEY_KW)
+
+
+def _canon_key(v):
+    import math
+    if v is None or isinstance(v, bool):
+        return v
+    if isinstance(v, float):
+        if math.isnan(v) or math.isinf(v):
+            return v
+        return str(int(v)) if v == int(v) else repr(v)
+    if isinstance(v, int):
+        return str(v)
+    return str(v).strip()
+
+
+def _normalize_key_columns(df):
+    """把命中主键/ID 关键词的列统一成规范文本（110.0→"110"），与输出端主键归一同规则。"""
+    try:
+        for _c in list(df.columns):
+            if _is_key_col(_c):
+                df[_c] = df[_c].map(_canon_key)
+    except Exception as _e:
+        print(f"[键列归一警告] {{_e}}")
+    return df
+
+
 def load_source_data():
     """读取 input_folder 下所有 Excel 为 {{sheet_key: {{'df': DataFrame, 'columns': [...]}}}}
 
@@ -316,6 +356,9 @@ def load_source_data():
     pre = globals().get("_pre_loaded_source_data")
     if pre:
         print(f"使用预加载源数据：{{len(pre)}} 个 sheet")
+        for _v in pre.values():
+            if isinstance(_v, dict) and _v.get("df") is not None:
+                _normalize_key_columns(_v["df"])
         return pre
 
     out = {{}}
@@ -329,6 +372,7 @@ def load_source_data():
             xls = pd.ExcelFile(fp)
             for sn in xls.sheet_names:
                 df = pd.read_excel(fp, sheet_name=sn)
+                _normalize_key_columns(df)
                 key = sn if sn not in out else f"{{Path(fname).stem}}_{{sn}}"
                 out[key] = {{"df": df, "columns": list(df.columns)}}
         except Exception as e:

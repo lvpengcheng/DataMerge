@@ -151,12 +151,16 @@ def restore_formats_from_template(output_path, template_path) -> int:
     return restored
 
 
-def _template_default_date_format(template_path):
+def _template_default_format(template_path):
     """解析模板 styles.xml，取"默认(Normal)单元格样式"的 numFmt formatCode。
 
-    仅当它是日期格式时返回该 formatCode，否则返回 None。
+    返回 (formatCode, is_date)；取不到有效格式（缺失或 General）时返回 None。
     取 cellStyleXfs[0]（Normal 样式基准），回退 cellXfs[0]（默认单元格格式）。
     直接解析 XML（不依赖 openpyxl 的 named_styles，后者跨版本 key 不稳定）。
+
+    说明：源_ sheet 新建单元格会继承这个默认样式，若它不是 General（无论是日期
+    还是别的自定义数字格式），未显式设格式的数值就会被显示成该格式。故这里返回
+    "默认格式本身"，由调用方决定把继承来的单元格拉回 General（日期列除外）。
     """
     import zipfile
     try:
@@ -180,6 +184,12 @@ def _template_default_date_format(template_path):
     numfmtid = _first_xf_numfmtid("cellStyleXfs") or _first_xf_numfmtid("cellXfs")
     if numfmtid is None:
         return None
+    # numFmtId=0 即 General，无继承问题
+    try:
+        if int(numfmtid) == 0:
+            return None
+    except Exception:
+        pass
     code = fmts.get(numfmtid)
     if code is None:
         # 内建格式（0-163）：尝试取内建 formatCode
@@ -187,39 +197,52 @@ def _template_default_date_format(template_path):
             code = BUILTIN_FORMATS.get(int(numfmtid))
         except Exception:
             code = None
-    if not code:
+    if not code or str(code).strip().lower() in ("general", ""):
         return None
     try:
-        return code if is_date_format(code) else None
+        return (code, bool(is_date_format(code)))
     except Exception:
-        return None
+        return (code, False)
 
 
-def normalize_source_sheet_formats(output_path, template_path, source_sheet_prefix="源_") -> int:
-    """修复 源_ sheet 继承模板"日期默认样式"导致数字被显示成日期的问题。
 
-    根因：部分模板的 Normal/默认单元格样式 numFmt 是日期格式（如 `[$-409]dd/mmm/yy;@`），
-    脚本用 openpyxl 追加 `源_` sheet 时，未显式设格式的单元格会继承这个默认样式，
-    于是序号/工资等**数字**被显示成日期（底层值不变，仅格式错）。
+def normalize_source_sheet_formats(output_path, template_path=None, source_sheet_prefix="源_") -> int:
+    """修复 源_ sheet 继承模板"默认(Normal)样式"导致数字被显示成错误格式的问题。
 
-    零误伤策略：仅当模板的默认(Normal)样式**本身是日期格式**时才介入，且**只把格式
-    恰好等于该默认格式**的 `源_` 单元格拉回 `General`。真正的日期列（写入时显式设为
-    `yyyy-mm-dd`）与其它任何显式格式都不动。幂等，不改值、不重算。返回修复的单元格数。
+    根因：部分模板的 Normal/默认单元格样式 numFmt 不是 General（可能是日期格式如
+    `[$-409]dd/mmm/yy;@`，也可能是时间格式 `[$-F400]h:mm:ss AM/PM` 或别的自定义数字
+    格式）。脚本用 openpyxl 追加 `源_` sheet 时，未显式设格式的单元格会继承这个默认
+    样式，于是序号/工资/津贴等**数字**被显示成该格式（底层值不变，仅格式错）。**模板
+    模式**尤其如此（它 load 模板工作簿再 create_sheet 加 源_，会吃到默认样式）；公式
+    模式用全新 Workbook、单元格本就是 General，天然不匹配、不受影响。
 
-    该兜底覆盖所有脚本（含未更新骨架的旧脚本），无需重新训练即可生效。
+    零误伤策略：仅当默认(Normal)样式**本身不是 General** 时才介入，且**只把格式恰好
+    等于该默认格式**的 `源_` 单元格拉回 `General`（日期关键词列改成 `yyyy-mm-dd`）。
+    任何显式设过的其它格式都不动。幂等，不改值、不重算。返回修复的单元格数。
+
+    该兜底覆盖所有脚本（含未更新骨架、仍会继承默认样式的旧脚本），无需重新训练即可生效。
+
+    默认格式来源：优先模板；**模板路径不可用时（跨 session/环境时脚本里烘焙的绝对
+    路径常不存在）回退用输出文件自身**——模板模式的输出是 load 模板后追加 源_ sheet
+    生成的，继承了模板的 Normal 默认样式，故自带同一默认格式。这样兜底不再依赖能否
+    在当前环境定位到模板文件，彻底解决"跨环境模板路径不存在 → 兜底静默失效"。
 
     **必须用 Aspose 改格式，不能用 openpyxl**：openpyxl `load` 会把"数字+日期格式"读成
     datetime，`save` 时 `to_excel` 又按 1900 幽灵闰日塌缩，导致 60.74→59.74 值损坏。
     Aspose 只改样式、底层 `DoubleValue` 精确保留，不会动值。
     """
-    if not template_path or not os.path.exists(template_path) or not os.path.exists(output_path):
+    if not os.path.exists(output_path):
         return 0
     if not str(output_path).lower().endswith((".xlsx", ".xlsm")):
         return 0
 
-    default_fmt = _template_default_date_format(template_path)
-    if not default_fmt:
-        return 0  # 模板默认样式不是日期格式 → 无此问题，跳过
+    # 默认格式来源：模板可用则用模板，否则回退用输出文件自身（见 docstring）
+    _fmt_src = template_path if (template_path and os.path.exists(template_path)) else output_path
+    _default = _template_default_format(_fmt_src)
+    if not _default:
+        return 0  # 默认样式是 General → 无继承问题，跳过
+    default_fmt, _default_is_date = _default
+
 
     # 列名关键词判定日期列：真日期列（入职时间/日期等）保留成日期，仅非日期列清成常规
     try:
@@ -275,7 +298,7 @@ def normalize_source_sheet_formats(output_path, template_path, source_sheet_pref
                 cell = it.Current
                 try:
                     style = cell.GetStyle()
-                    # 只动"格式恰好等于模板默认日期格式"的单元格（继承来的伪日期）
+                    # 只动"格式恰好等于模板默认样式"的单元格（继承来的伪格式）
                     if _norm_fmt(style.Custom) != _target:
                         continue
                     if cell.Row > 0 and _date_col.get(cell.Column):
@@ -289,7 +312,7 @@ def normalize_source_sheet_formats(output_path, template_path, source_sheet_pref
                     continue
         if touched:
             wb.Save(str(output_path))
-            logger.info(f"[源_格式兜底] 已规范 {fixed} 个继承模板日期默认格式的单元格"
+            logger.info(f"[源_格式兜底] 已规范 {fixed} 个继承模板默认格式的单元格"
                         f"（日期列→yyyy-mm-dd，其余→General；Aspose 保值）: {output_path}")
     except Exception as e:
         logger.warning(f"[源_格式兜底] 处理异常，按原文件: {output_path} - {e}")

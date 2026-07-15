@@ -191,6 +191,46 @@ function _showPrecheckDialog(data) {
                 </table>
             </div>`;
 
+        // 目标模板表映射块（②模板目标侧：训练固化的目标表键 → 当月模板实际 sheet）
+        const targetCandidates = data.target_candidates || [];
+        const hasTargetCandidates = targetCandidates.length > 0;
+        const targetCandidatesHtml = !hasTargetCandidates ? '' : `
+            <div style="margin-bottom:14px;padding:10px 12px;border:1px solid #ffe0b2;background:#fff3e0;border-radius:6px;">
+                <div style="font-weight:bold;color:#e65100;margin-bottom:6px;">⚠ 模板目标表无法唯一匹配，请指定对应关系</div>
+                <div style="font-size:12px;color:#5d4037;margin-bottom:8px;">
+                    训练时的目标表（左）在当月模板里找到多张结构相近的候选，无法自动判定，请为每个目标表选择对应的模板 sheet（否则该表将不被填充）。
+                </div>
+                <table style="width:100%;border-collapse:collapse;font-size:12px;">
+                    <thead><tr style="background:#fff8e1;">
+                        <th style="padding:6px;border:1px solid #ffe0b2;text-align:left;">训练目标表</th>
+                        <th style="padding:6px;border:1px solid #ffe0b2;text-align:left;">对应模板 sheet（按匹配度排序）</th>
+                    </tr></thead>
+                    <tbody>
+                    ${targetCandidates.map((tc) => {
+                        const scoreMap = {};
+                        (tc.candidates || []).forEach(c => { scoreMap[c.sheet] = c.score; });
+                        const topSheet = (tc.candidates && tc.candidates.length) ? tc.candidates[0].sheet : '';
+                        const sheetList = (tc.all_sheets && tc.all_sheets.length) ? tc.all_sheets : (tc.candidates || []).map(c => c.sheet);
+                        const opts = ['<option value="">（不映射，跳过该表）</option>']
+                            .concat(sheetList.map(sn => {
+                                const sc = scoreMap[sn];
+                                const isTop = sn === topSheet;
+                                const star = isTop ? '✨ ' : '';
+                                const scoreTxt = sc != null ? ` — 匹配度=${sc}` : '';
+                                return `<option value="${_escapeHtml(sn)}"${isTop ? ' selected' : ''}>${star}${_escapeHtml(sn)}${scoreTxt}</option>`;
+                            }))
+                            .join('');
+                        return `<tr>
+                            <td style="padding:6px;border:1px solid #ffe0b2;font-family:monospace;font-size:12px;vertical-align:top;">${_escapeHtml(tc.key)}</td>
+                            <td style="padding:4px;border:1px solid #ffe0b2;vertical-align:top;">
+                                <select data-target-key="${_escapeHtml(tc.key)}" style="width:100%;padding:4px;font-size:11px;font-family:monospace;">${opts}</select>
+                            </td>
+                        </tr>`;
+                    }).join('')}
+                    </tbody>
+                </table>
+            </div>`;
+
         // 缺失列块
         const missingColsHtml = missingColumns.length === 0 ? '' : `
             <div style="margin-bottom:14px;padding:10px 12px;border:1px solid #ffe0b2;background:#fff3e0;border-radius:6px;">
@@ -238,6 +278,7 @@ function _showPrecheckDialog(data) {
                     ${autoFilledHtml}
                     ${autoRenamedHtml}
                     ${renameCandidatesHtml}
+                    ${targetCandidatesHtml}
                     ${missingColsHtml}
                     ${aiSuggestionsHtml}
                     ${historyHtml}
@@ -263,6 +304,8 @@ function _showPrecheckDialog(data) {
                 const fileMapping = _buildFileMappingFromAiSelections(overlay, aiSuggestions, data.file_mapping);
                 // 收集用户对改名候选的选择
                 const confirmedRenames = _collectConfirmedRenames(overlay);
+                // 收集用户对目标模板表的选择（②）
+                const confirmedTargetMap = _collectConfirmedTargetMap(overlay);
                 const skipHistory = document.getElementById('_pre_skip_history')?.checked || false;
                 document.body.removeChild(overlay);
                 const out = {
@@ -271,6 +314,9 @@ function _showPrecheckDialog(data) {
                 };
                 if (Object.keys(confirmedRenames).length > 0) {
                     out.confirmed_renames = confirmedRenames;
+                }
+                if (Object.keys(confirmedTargetMap).length > 0) {
+                    out.confirmed_target_map = confirmedTargetMap;
                 }
                 resolve(out);
             };
@@ -291,6 +337,20 @@ function _collectConfirmedRenames(overlay) {
         if (uploaded && target) {
             result[uploaded] = target;
         }
+    });
+    return result;
+}
+
+/**
+ * 收集目标模板表映射下拉框的用户选择（②模板目标侧）
+ * 返回：{"<训练目标表键>": "<当月模板实际sheet名>", ...}（不含"不映射"的项）
+ */
+function _collectConfirmedTargetMap(overlay) {
+    const result = {};
+    overlay.querySelectorAll('select[data-target-key]').forEach(sel => {
+        const key = sel.dataset.targetKey;
+        const val = sel.value;
+        if (key && val) result[key] = val;
     });
     return result;
 }
@@ -783,6 +843,9 @@ async function startCompute() {
                 if (dialogResult.confirmed_renames && Object.keys(dialogResult.confirmed_renames).length > 0) {
                     formData.set('confirmed_renames', JSON.stringify(dialogResult.confirmed_renames));
                 }
+                if (dialogResult.confirmed_target_map && Object.keys(dialogResult.confirmed_target_map).length > 0) {
+                    formData.set('confirmed_target_map', JSON.stringify(dialogResult.confirmed_target_map));
+                }
                 if (dialogResult.skip_history_check) {
                     formData.set('skip_history_check', 'true');
                 }
@@ -1106,6 +1169,11 @@ function showResult(data) {
     const _label = (fn) => fn && fn.includes('_纯值') ? '纯值版' : '原版';
 
     resultCard.className = 'result-card result-success';
+    const _valWarn = data.values_copy_failed
+        ? `<div style="margin-top:10px;padding:8px 12px;background:#fff3cd;border:1px solid #ffe08a;border-radius:6px;color:#8a6d3b;font-size:13px;">
+             ⚠ 纯值版生成失败，本次仅提供原版下载。原因见服务日志中 <code>[纯值版]</code> 相关行。
+           </div>`
+        : '';
     resultCard.innerHTML = `
         <div class="result-row">
             <div class="result-item">
@@ -1121,6 +1189,7 @@ function showResult(data) {
                 <div class="value">${data.rows_processed || 'N/A'}</div>
             </div>
         </div>
+        ${_valWarn}
     `;
 
     const dlBtns = files.length

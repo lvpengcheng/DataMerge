@@ -866,7 +866,7 @@ class FastHeaderMatcher:
         与脚本 load_source_data 返回格式一致:
         {"文件名_Sheet名": {"df": DataFrame, "columns": [列名]}}
         """
-        from backend.utils.data_helpers import convert_region_to_dataframe
+        from backend.utils.data_helpers import convert_region_to_dataframe, region_formats_by_name
         import pandas as pd
 
         source_data = {}
@@ -890,6 +890,7 @@ class FastHeaderMatcher:
 
                 dfs = []
                 first_columns = None
+                first_formats = None
                 for region in sheet_data.regions:
                     # needs_rewrite 时需要映射表头名（input → train）
                     if needs_rewrite and header_mapping:
@@ -901,16 +902,20 @@ class FastHeaderMatcher:
                         mapped_region = ExcelRegion(
                             head_data=mapped_head,
                             data=region.data,
-                            formula=region.formula
+                            formula=region.formula,
+                            column_formats=getattr(region, "column_formats", None) or {}
                         )
                         df = convert_region_to_dataframe(mapped_region)
+                        _fmts = region_formats_by_name(mapped_head, mapped_region.column_formats)
                     else:
                         df = convert_region_to_dataframe(region)
+                        _fmts = region_formats_by_name(region.head_data, getattr(region, "column_formats", None) or {})
 
                     if df.empty and len(df.columns) == 0:
                         continue
                     if first_columns is None:
                         first_columns = list(df.columns)
+                        first_formats = _fmts
                     dfs.append(df)
 
                 if not dfs:
@@ -932,21 +937,23 @@ class FastHeaderMatcher:
                 except Exception:
                     pass
 
-                _collected.append((file_base, train_sheet, merged_df, first_columns))
+                _collected.append((file_base, train_sheet, merged_df, first_columns, first_formats))
 
         # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 / 撞结果 sheet → 加文件名前缀
         # 关键①：按 (file_base, sheet) 排序后再建字典，顺序确定且与训练侧一致（find_source_sheet 按首个匹配）。
         # 关键②：冲突计数用"训练期望全集"(expected_pairs)，而非仅本次匹配到的文件 —— 否则当本次只匹配到
         #         重复 sheet 的其中一个文件时会漏判冲突 → key 不加前缀(数据)，而训练是(3月_数据)，脚本就找不到源。
         _collected.sort(key=lambda x: (str(x[0]), str(x[1])))
-        _pairs_for_keys = sorted({(fb, sn) for fb, sn, _, _ in _collected} | set(expected_pairs or []))
+        _pairs_for_keys = sorted({(fb, sn) for fb, sn, _, _, _ in _collected} | set(expected_pairs or []))
         key_map = assign_sheet_keys(
             _pairs_for_keys,
             reserved_names=reserved_sheet_names,
         )
-        for file_base, train_sheet, merged_df, first_columns in _collected:
+        for file_base, train_sheet, merged_df, first_columns, first_formats in _collected:
             key = key_map[(file_base, train_sheet)]
             entry = {"df": merged_df, "columns": first_columns}
+            if first_formats:
+                entry["column_formats"] = first_formats
             source_data[key] = entry
             logger.info(f"[预加载] {key}: {len(merged_df)}行 × {len(first_columns)}列")
 

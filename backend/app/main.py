@@ -4197,36 +4197,71 @@ async def _run_compute_subprocess(task_id: str, buffer, params_file: str, temp_d
     _EVT_PREFIX = "@@EVT@@"
     _DONE = "@@DONE@@"
     _proot = str(Path(__file__).resolve().parent.parent.parent)
-    saw_terminal = False
-    proc = None
+
+    # 用同步 subprocess.Popen + 后台线程读管道，而非 asyncio.create_subprocess_exec：
+    # uvicorn 在 Windows 开发模式(reload=True)下装的是 SelectorEventLoop，不支持 asyncio
+    # 子进程（create_subprocess_exec 抛空消息的 NotImplementedError → "计算进程启动失败:"）。
+    # Popen 不依赖事件循环类型，跨平台/跨循环都可用；读操作在线程里跑，事件循环照样空闲，
+    # 仍保留"Aspose/.NET 持 GIL 不冻结事件循环 → SSE 不被 WAF 502"的原始目的。
+    import subprocess as _subprocess
+    import threading as _threading
+    loop = asyncio.get_running_loop()
+    _state = {"saw_terminal": False, "returncode": None, "start_error": None}
+    done = asyncio.Event()
+
+    def _reader():
+        proc = None
+        try:
+            _env = os.environ.copy()
+            _env["PYTHONIOENCODING"] = "utf-8"   # 子进程 stdout 统一 UTF-8，避免 Windows GBK 中文乱码
+            _env["PYTHONUTF8"] = "1"
+            proc = _subprocess.Popen(
+                [sys.executable, "-u", "-m", "backend.compute.compute_worker", params_file],
+                cwd=_proot,
+                stdout=_subprocess.PIPE,
+                stderr=_subprocess.STDOUT,
+                env=_env,
+            )
+            for raw in proc.stdout:
+                line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                if line.startswith(_EVT_PREFIX):
+                    ev = line[len(_EVT_PREFIX):]
+                    loop.call_soon_threadsafe(buffer.push, task_id, ev)
+                    if '"complete"' in ev or '"error"' in ev:
+                        _state["saw_terminal"] = True
+                elif line.startswith(_DONE):
+                    pass
+                elif line.strip():
+                    logger.debug(f"[compute/subproc] {line}")
+            proc.wait()
+            _state["returncode"] = proc.returncode
+        except Exception as e:
+            _state["start_error"] = e
+        finally:
+            loop.call_soon_threadsafe(done.set)
+
+    _t = _threading.Thread(target=_reader, name=f"compute-subproc-{task_id}", daemon=True)
+    _t.start()
     try:
-        _env = os.environ.copy()
-        _env["PYTHONIOENCODING"] = "utf-8"   # 子进程 stdout 统一 UTF-8，避免 Windows GBK 导致中文乱码
-        _env["PYTHONUTF8"] = "1"
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-u", "-m", "backend.compute.compute_worker", params_file,
-            cwd=_proot,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=_env,
-        )
-        while True:
-            raw = await proc.stdout.readline()
-            if not raw:
-                break
-            line = raw.decode("utf-8", "replace").rstrip("\r\n")
-            if line.startswith(_EVT_PREFIX):
-                ev = line[len(_EVT_PREFIX):]
-                buffer.push(task_id, ev)
-                if '"complete"' in ev or '"error"' in ev:
-                    saw_terminal = True
-            elif line.startswith(_DONE):
+        await done.wait()
+        if _state["start_error"] is not None:
+            e = _state["start_error"]
+            logger.error(f"[compute/subproc] 子进程启动/读取失败: {e}", exc_info=e)
+            try:
+                buffer.push(task_id, json.dumps({"type": "error", "message": f"计算进程启动失败: {e}"}, ensure_ascii=False))
+            except Exception:
                 pass
-            elif line.strip():
-                logger.debug(f"[compute/subproc] {line}")
-        await proc.wait()
-        if proc.returncode != 0 and not saw_terminal:
-            msg = f"计算子进程异常退出(code={proc.returncode})"
+            try:
+                from backend.database.connection import SessionLocal as _SL
+                _db = _SL()
+                try:
+                    _persist_compute_failed(_db, int(task_id), str(e))
+                finally:
+                    _db.close()
+            except Exception:
+                pass
+        elif _state["returncode"] not in (0, None) and not _state["saw_terminal"]:
+            msg = f"计算子进程异常退出(code={_state['returncode']})"
             try:
                 buffer.push(task_id, json.dumps({"type": "error", "message": msg}, ensure_ascii=False))
             except Exception:
@@ -4240,21 +4275,6 @@ async def _run_compute_subprocess(task_id: str, buffer, params_file: str, temp_d
                     _db.close()
             except Exception:
                 pass
-    except Exception as e:
-        logger.error(f"[compute/subproc] 子进程启动/读取失败: {e}", exc_info=True)
-        try:
-            buffer.push(task_id, json.dumps({"type": "error", "message": f"计算进程启动失败: {e}"}, ensure_ascii=False))
-        except Exception:
-            pass
-        try:
-            from backend.database.connection import SessionLocal as _SL
-            _db = _SL()
-            try:
-                _persist_compute_failed(_db, int(task_id), str(e))
-            finally:
-                _db.close()
-        except Exception:
-            pass
     finally:
         try:
             buffer.finish(task_id)
@@ -4280,6 +4300,7 @@ async def run_compute_task(
     pre_validated_mapping=None,
     precheck_auto_filled=None,
     template_override_path: Optional[str] = None,
+    target_sheet_manual_map=None,
 ):
     """独立的计算任务函数，由 submit 端点触发后台运行。
 
@@ -4330,6 +4351,22 @@ async def run_compute_task(
                         logger.info(f"[compute/task] 旧 .xls 训练模板已转 .xlsx 并注入: {_conv}")
             except Exception as _xt:
                 logger.warning(f"[compute/task] 训练模板 xls 转换失败（继续）: {_xt}")
+
+        # 跨环境/跨 session 可移植：若没有上传覆盖模板，用解析器按当前环境重新定位模板
+        # （按脚本烘焙的 TEMPLATE_NAME/HASH 在租户目录、全局资源里找），命中则注入为 override，
+        # 使换机器/换 session 后烘焙的绝对路径失效时仍能跑通。
+        if not template_override_path:
+            try:
+                from backend.utils.template_resolver import resolve_template_path
+                _proot = str(Path(__file__).resolve().parent.parent.parent)
+                _resolved = resolve_template_path(
+                    tenant_id=tenant_id, script_code=script_content, project_root=_proot,
+                )
+                if _resolved:
+                    template_override_path = _resolved
+                    logger.info(f"[compute/task] 模板解析器定位到模板并注入: {_resolved}")
+            except Exception as _rt:
+                logger.warning(f"[compute/task] 模板解析器失败（继续，退回烘焙路径）: {_rt}")
 
         start_msg = {
             "type": "status",
@@ -4728,9 +4765,16 @@ async def run_compute_task(
                 if pre_loaded_source_data:
                     module._pre_loaded_source_data = pre_loaded_source_data
 
-                # 模板模式：注入用户上传的新模板路径，骨架 main() 会优先用它覆盖训练模板
+                # 模板模式：注入运行时模板路径（run_compute_task 顶层已用 template_resolver 按
+                # 当前环境定位并设好 template_override_path），骨架 main() 会优先用它覆盖训练模板。
                 if template_override_path:
                     module._template_override_path = template_override_path
+
+                # 目标表映射（②）：事前校验语义解析/用户人工确认后的 {_COL_MAP键: 实际sheet名}，
+                # 骨架 _resolve_target_sheets 会优先采用它把当月模板表对齐到训练固化的键。
+                if target_sheet_manual_map:
+                    module._target_sheet_manual_map = target_sheet_manual_map
+                    logger.info(f"[目标表映射] 注入 _target_sheet_manual_map: {target_sheet_manual_map}")
 
                 spec.loader.exec_module(module)
 
@@ -4880,16 +4924,20 @@ async def run_compute_task(
             _eff_tpl_fmt = (template_override_path
                             if (template_override_path and os.path.exists(template_override_path))
                             else _tpl_for_fmt)
-            if _eff_tpl_fmt and os.path.exists(_eff_tpl_fmt):
-                from backend.utils.output_postprocess import (
-                    restore_formats_from_template, normalize_source_sheet_formats,
-                )
-                for _of in output_files:
-                    # 放线程执行：openpyxl 读写较慢，避免阻塞事件循环导致 SSE 心跳停、被代理 502
+            from backend.utils.output_postprocess import (
+                restore_formats_from_template, normalize_source_sheet_formats,
+            )
+            _tpl_ok = bool(_eff_tpl_fmt and os.path.exists(_eff_tpl_fmt))
+            for _of in output_files:
+                # 放线程执行：openpyxl 读写较慢，避免阻塞事件循环导致 SSE 心跳停、被代理 502
+                # restore_formats_from_template 依赖模板逐格刷回 → 仅模板可用时跑
+                if _tpl_ok:
                     await asyncio.to_thread(restore_formats_from_template, str(_of), _eff_tpl_fmt)
-                    # 源_ sheet 兜底：修复继承模板"日期默认样式"导致数字显示成日期的问题
-                    # （覆盖旧脚本，零误伤：只拉回恰好等于模板日期默认格式的单元格）
-                    await asyncio.to_thread(normalize_source_sheet_formats, str(_of), _eff_tpl_fmt)
+                # 源_ sheet 兜底：修复继承模板"日期/时间默认样式"导致数字显示成日期的问题
+                # （覆盖旧脚本，零误伤：只拉回恰好等于默认格式的单元格）。模板不可用时（跨环境
+                # 烘焙路径不存在）内部回退用输出文件自身默认样式，故无论模板在不在都跑。
+                await asyncio.to_thread(normalize_source_sheet_formats, str(_of),
+                                        _eff_tpl_fmt if _tpl_ok else None)
         except Exception as _fmt_e:
             logger.warning(f"[fmt兜底] 跳过: {_fmt_e}")
 
@@ -4940,6 +4988,7 @@ async def run_compute_task(
 
         # 双结果（.env COMPUTE_OUTPUT_VALUES_COPY=true）：再出一个纯值版（公式→值，仅目标 sheet）
         _values_saved = None
+        _values_copy_failed = False
         try:
             if dual_output_enabled():
                 _vp = compute_dir / values_only_name(_result_name)
@@ -4960,8 +5009,28 @@ async def run_compute_task(
                         "level": "success",
                         "message": f"已生成纯值版（模版公式保留、新列转值）: {_vp.name}"
                     }, ensure_ascii=False))
+                else:
+                    # 生成失败（内部已重试 3 次仍返回 None）→ 明确告警，别静默只剩原版
+                    _values_copy_failed = True
+                    logger.warning(f"[纯值版] 生成失败（重试后仍失败，仅提供原版）: {saved_file.name}")
+                    buffer.push(task_id, json.dumps({
+                        "type": "log",
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "level": "warning",
+                        "message": "⚠ 纯值版生成失败（已重试3次），本次仅提供原版下载。原因见服务日志中 [纯值版] 相关行"
+                    }, ensure_ascii=False))
         except Exception as _ve:
+            _values_copy_failed = True
             logger.warning(f"[纯值版] 生成失败（不阻断）: {_ve}")
+            try:
+                buffer.push(task_id, json.dumps({
+                    "type": "log",
+                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                    "level": "warning",
+                    "message": f"⚠ 纯值版生成失败（不阻断），本次仅提供原版下载：{_ve}"
+                }, ensure_ascii=False))
+            except Exception:
+                pass
 
         # 统计行数（使用 Aspose 轻量读取，避免额外引入 openpyxl）；放线程避免阻塞事件循环
         def _count_rows(path):
@@ -5015,7 +5084,8 @@ async def run_compute_task(
                 "output_files": _all_output_files,
                 "rows_processed": rows_processed,
                 "tenant_id": tenant_id,
-                "script_id": script_id
+                "script_id": script_id,
+                "values_copy_failed": _values_copy_failed
             }
         }
         buffer.push(task_id, json.dumps(final_result, ensure_ascii=False))
@@ -5060,6 +5130,7 @@ async def compute_submit(
     file_passwords: Optional[str] = Form(None),
     confirmed_mapping: Optional[str] = Form(None),
     confirmed_renames: Optional[str] = Form(None),
+    confirmed_target_map: Optional[str] = Form(None),
     skip_history_check: Optional[bool] = Form(False),
 ):
     """提交计算任务，立即返回 task_id，计算在后台运行。
@@ -5132,6 +5203,15 @@ async def compute_submit(
                     _confirmed_renames = {str(k): str(v) for k, v in _parsed.items() if k and v}
             except Exception as _cr:
                 logger.warning(f"[compute/submit] confirmed_renames 解析失败: {_cr}")
+
+        _confirmed_target_map = None
+        if confirmed_target_map:
+            try:
+                _parsed_t = json.loads(confirmed_target_map)
+                if isinstance(_parsed_t, dict):
+                    _confirmed_target_map = {str(k): str(v) for k, v in _parsed_t.items() if k and v}
+            except Exception as _ct:
+                logger.warning(f"[compute/submit] confirmed_target_map 解析失败: {_ct}")
 
         _script_info = _load_script_info_for_precheck(tenant_id, script_id)
         _source_structure = _script_info.get("source_structure")
@@ -5221,6 +5301,8 @@ async def compute_submit(
                     confirmed_renames=_confirmed_renames,
                     use_history=_use_history_flag,
                     expected_structure=_expected_structure,
+                    template_override_path=template_override_path,
+                    confirmed_target_map=_confirmed_target_map,
                 )
             finally:
                 try:
@@ -5257,6 +5339,7 @@ async def compute_submit(
                     "missing_columns": pc_result.missing_columns,
                     "ai_suggestions": pc_result.ai_suggestions,
                     "history_warnings": pc_result.history_warnings,
+                    "target_candidates": pc_result.target_candidates,
                 },
             )
 
@@ -5286,6 +5369,8 @@ async def compute_submit(
             "pre_validated_mapping": pc_result.file_mapping,
             "precheck_auto_filled": pc_result.auto_filled,
             "template_override_path": template_override_path,
+            # 目标表人工/语义映射（②）：注入脚本 globals()['_target_sheet_manual_map']
+            "target_sheet_manual_map": _confirmed_target_map or pc_result.target_map or {},
         }
         _params_file = temp_dir / "_compute_params.json"
         _params_file.write_text(json.dumps(_compute_params, ensure_ascii=False, default=str), encoding="utf-8")

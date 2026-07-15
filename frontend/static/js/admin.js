@@ -723,13 +723,16 @@ const Admin = {
         const tenantOptions = this._refTenants.map(t =>
             `<option value="${t.tenant_id}">租户: ${t.tenant_id}</option>`
         ).join('');
+        // 全局作用域仅管理员可管理（非管理员上传全局会被后端 403）
+        const _isAdmin = (AUTH.getUser() || {}).role_name === 'admin';
+        const globalOption = _isAdmin ? '<option value="">全局（所有租户可用）</option>' : '';
         this.openModal('上传基础数据', `
             <div style="display:flex;flex-direction:column;gap:12px;">
                 <label>分类：<select id="ref-upload-category" style="padding:6px;border:1px solid #ddd;border-radius:4px;">${catOptions}</select></label>
                 <label>名称：<input id="ref-upload-name" type="text" placeholder="留空用文件名；多选时按各自文件名（此框忽略）" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;"></label>
                 <label>作用域：
                     <select id="ref-upload-scope" style="padding:6px;border:1px solid #ddd;border-radius:4px;">
-                        <option value="">全局（所有租户可用）</option>
+                        ${globalOption}
                         ${tenantOptions}
                     </select>
                 </label>

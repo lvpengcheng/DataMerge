@@ -9,12 +9,13 @@ from pathlib import Path
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, UploadFile, File, Form, Query, HTTPException
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from ..database.connection import get_db
 from ..database.models import DataAsset, ReferenceCategory, TenantAuthorization
-from ..auth.dependencies import get_current_user
+from ..auth.dependencies import get_current_user, get_accessible_tenants
 
 router = APIRouter(prefix="/api/assets", tags=["数据资产"])
 
@@ -144,6 +145,29 @@ def _asset_to_out(asset: DataAsset) -> dict:
     }
 
 
+def _is_admin(user) -> bool:
+    return bool(user.role and user.role.name == "admin")
+
+
+def _assert_can_manage(tenant_id, accessible, is_admin):
+    """写操作(上传/改/删)的租户校验：非管理员禁止操作全局(None)及未授权租户。"""
+    if is_admin:
+        return
+    if tenant_id is None:
+        raise HTTPException(status_code=403, detail="无权管理全局基础数据")
+    if tenant_id not in accessible:
+        raise HTTPException(status_code=403, detail=f"无权管理租户 '{tenant_id}' 的数据")
+
+
+def _assert_can_view(tenant_id, accessible, is_admin):
+    """读操作的租户校验：全局(None)对所有人可见；租户数据须在授权内。"""
+    if is_admin or tenant_id is None:
+        return
+    if tenant_id not in accessible:
+        raise HTTPException(status_code=403, detail="无权访问该租户数据")
+
+
+
 # ==================== 静态路由（必须在 /{asset_id} 之前） ====================
 
 @router.get("/reference-categories", response_model=List[ReferenceCategoryOut])
@@ -187,6 +211,7 @@ def list_reference_assets(
     scope: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible: list = Depends(get_accessible_tenants),
 ):
     """全局 + 当前租户的基础数据列表"""
     q = db.query(DataAsset).filter(
@@ -206,6 +231,9 @@ def list_reference_assets(
             q = q.filter((DataAsset.tenant_id == tenant_id) | (DataAsset.tenant_id.is_(None)))
     if category_id:
         q = q.filter(DataAsset.category_id == category_id)
+    # 非管理员: 仅授权租户 + 全局
+    if not _is_admin(current_user):
+        q = q.filter(or_(DataAsset.tenant_id.in_(accessible), DataAsset.tenant_id.is_(None)))
     assets = q.order_by(DataAsset.created_at.desc()).all()
     return [_asset_to_out(a) for a in assets]
 
@@ -214,8 +242,12 @@ def list_reference_assets(
 def list_available_tenants(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible: list = Depends(get_accessible_tenants),
 ):
     """获取可用租户列表（用于上传基础数据时选择作用域）"""
+    # 非管理员: 仅返回授权租户
+    if not _is_admin(current_user):
+        return [{"tenant_id": t} for t in sorted(accessible)]
     from sqlalchemy import union_all, literal_column
     # 从 tenant_authorizations 和 data_assets 汇总所有租户
     q1 = db.query(TenantAuthorization.tenant_id).distinct()
@@ -237,6 +269,7 @@ def list_assets(
     is_active: bool = Query(True),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible: list = Depends(get_accessible_tenants),
 ):
     """资产列表（按 type/category/tenant/scope 筛选）"""
     q = db.query(DataAsset).filter(DataAsset.is_active == is_active)
@@ -254,6 +287,9 @@ def list_assets(
             q = q.filter((DataAsset.tenant_id == tenant_id) | (DataAsset.tenant_id.is_(None)))
     if category_id:
         q = q.filter(DataAsset.category_id == category_id)
+    # 非管理员: 仅授权租户 + 全局
+    if not _is_admin(current_user):
+        q = q.filter(or_(DataAsset.tenant_id.in_(accessible), DataAsset.tenant_id.is_(None)))
     assets = q.order_by(DataAsset.created_at.desc()).all()
     return [_asset_to_out(a) for a in assets]
 
@@ -271,8 +307,10 @@ async def upload_asset(
     tags: Optional[str] = Form(None),  # JSON string
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible: list = Depends(get_accessible_tenants),
 ):
     """上传文件 → 自动解析 sheet 结构 → 存入 data_assets"""
+    _assert_can_manage(tenant_id, accessible, _is_admin(current_user))
     asset = await _process_and_register_asset(
         file=file, tenant_id=tenant_id, asset_type=asset_type, category_id=category_id,
         name=name, description=description, effective_from=effective_from,
@@ -293,11 +331,13 @@ async def upload_assets_batch(
     tags: Optional[str] = Form(None),  # JSON string
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible: list = Depends(get_accessible_tenants),
 ):
     """批量上传：每个文件以其**文件名**作为资产名称，共享分类/作用域/日期/标签。
 
     单个文件失败不中断整体，逐个收集错误。返回 {created:[...], failed:[{filename,error}]}。
     """
+    _assert_can_manage(tenant_id, accessible, _is_admin(current_user))
     created, failed = [], []
     for f in files:
         try:
@@ -416,11 +456,13 @@ def get_asset(
     asset_id: int,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible: list = Depends(get_accessible_tenants),
 ):
     """获取单个资产详情"""
     asset = db.query(DataAsset).filter_by(id=asset_id).first()
     if not asset:
         raise HTTPException(status_code=404, detail="资产不存在")
+    _assert_can_view(asset.tenant_id, accessible, _is_admin(current_user))
     return _asset_to_out(asset)
 
 
@@ -431,12 +473,14 @@ def download_asset(
     password: Optional[str] = Query(None, description="加密密码（encrypted格式用）"),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible: list = Depends(get_accessible_tenants),
 ):
     """下载资产文件（支持原始/PDF/加密Excel）"""
     from fastapi.responses import FileResponse
     asset = db.query(DataAsset).filter_by(id=asset_id).first()
     if not asset:
         raise HTTPException(status_code=404, detail="资产不存在")
+    _assert_can_view(asset.tenant_id, accessible, _is_admin(current_user))
     if not os.path.exists(asset.file_path):
         raise HTTPException(status_code=404, detail="文件不存在")
 
@@ -488,11 +532,13 @@ def preview_asset(
     rows: int = Query(20, ge=1, le=200),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible: list = Depends(get_accessible_tenants),
 ):
     """预览资产数据（前 N 行）"""
     asset = db.query(DataAsset).filter_by(id=asset_id).first()
     if not asset:
         raise HTTPException(status_code=404, detail="资产不存在")
+    _assert_can_view(asset.tenant_id, accessible, _is_admin(current_user))
     if not os.path.exists(asset.file_path):
         raise HTTPException(status_code=404, detail="文件不存在")
 
@@ -516,11 +562,13 @@ def get_asset_parsed_data(
     asset_id: int,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible: list = Depends(get_accessible_tenants),
 ):
     """获取资产的解析数据（直接从DB读取，无需文件IO）"""
     asset = db.query(DataAsset).filter_by(id=asset_id).first()
     if not asset:
         raise HTTPException(status_code=404, detail="资产不存在")
+    _assert_can_view(asset.tenant_id, accessible, _is_admin(current_user))
     if asset.parsed_data:
         return {"source": "database", "data": asset.parsed_data}
     # 如果DB中没有，尝试现场解析并回填
@@ -539,11 +587,13 @@ def update_asset(
     data: AssetUpdateIn,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible: list = Depends(get_accessible_tenants),
 ):
     """更新资产信息"""
     asset = db.query(DataAsset).filter_by(id=asset_id).first()
     if not asset:
         raise HTTPException(status_code=404, detail="资产不存在")
+    _assert_can_manage(asset.tenant_id, accessible, _is_admin(current_user))
 
     from datetime import date
     for field, value in data.model_dump(exclude_none=True).items():
@@ -563,11 +613,13 @@ def delete_asset(
     hard: bool = Query(False),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible: list = Depends(get_accessible_tenants),
 ):
     """停用或物理删除资产"""
     asset = db.query(DataAsset).filter_by(id=asset_id).first()
     if not asset:
         raise HTTPException(status_code=404, detail="资产不存在")
+    _assert_can_manage(asset.tenant_id, accessible, _is_admin(current_user))
 
     if hard:
         # 物理删除文件 + 数据库记录
@@ -587,11 +639,13 @@ async def upload_new_version(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible: list = Depends(get_accessible_tenants),
 ):
     """上传新版本（保留历史版本）"""
     asset = db.query(DataAsset).filter_by(id=asset_id).first()
     if not asset:
         raise HTTPException(status_code=404, detail="资产不存在")
+    _assert_can_manage(asset.tenant_id, accessible, _is_admin(current_user))
 
     # 保存新文件
     storage_dir = Path(asset.file_path).parent

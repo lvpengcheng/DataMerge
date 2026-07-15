@@ -595,6 +595,22 @@ def _run_single_iteration(
         if pre_loaded_source_data is not None:
             execution_env["_pre_loaded_source_data"] = pre_loaded_source_data
 
+        # 跨环境模板定位：模板模式脚本烘焙的 TEMPLATE_PATH 常是训练机绝对路径，跨环境（开发/
+        # docker/IIS）不存在。用 template_resolver 按 名/哈希 在当前环境（租户目录/global_assets）
+        # 定位有效模板，注入 execution_env，让沙箱覆盖脚本的 TEMPLATE_PATH。非模板脚本无副作用。
+        try:
+            from pathlib import Path as _Path
+            from ..utils.template_resolver import resolve_template_path
+            _proj_root = _Path(__file__).resolve().parent.parent.parent
+            _resolved_tpl = resolve_template_path(
+                tenant_id=tenant_id, script_code=code, project_root=str(_proj_root),
+            )
+            if _resolved_tpl:
+                execution_env["_template_override_path"] = _resolved_tpl
+                logger.info(f"[模板解析] 聊天训练当前环境定位到模板: {_resolved_tpl}")
+        except Exception as _tre:
+            logger.warning(f"[模板解析] 跳过: {_tre}")
+
         # 执行代码
         start_time = time.time()
         exec_result = sandbox.execute_script(code, execution_env)
@@ -1109,7 +1125,7 @@ async def start_training(
     # 第三步：多区域 sheet 预处理（banner 拆分 / 头一致合并 / 头不一致 best-region）
     # 老版 .xls 自动转 .xlsx（解密后、预处理前）。模板(expected)也转，否则 openpyxl 加载会失败
     try:
-        from ..utils.source_normalizer import convert_xls_to_xlsx
+        from ..utils.source_normalizer import convert_xls_to_xlsx, shrink_inflated_columns
         for fn in list(os.listdir(source_dir)):
             if fn.lower().endswith(".xls"):
                 convert_xls_to_xlsx(os.path.join(source_dir, fn))
@@ -1120,6 +1136,12 @@ async def start_training(
                            if fn.endswith((".xlsx", ".xlsm")) and not fn.startswith("~")]
         if expected_file:
             all_excel_files.append((expected_file, os.path.basename(expected_file)))
+        # 列去虚高：删数据末列后的空列 + 收窄超宽 AutoFilter，避免下游 openpyxl 维度虚高致溢出
+        for _fp, _ in all_excel_files:
+            try:
+                shrink_inflated_columns(_fp)
+            except Exception as _she:
+                logger.warning(f"[chat训练] 列去虚高跳过（不阻断）: {_she}")
     except Exception as _xls_e:
         logger.warning(f"[chat训练] xls 转换失败（继续）: {_xls_e}")
 

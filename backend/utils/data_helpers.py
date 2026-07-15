@@ -115,6 +115,22 @@ def convert_region_to_dataframe(region) -> pd.DataFrame:
     return pd.DataFrame(converted_data, columns=columns)
 
 
+def region_formats_by_name(head_data, column_formats) -> dict:
+    """把 region 的"列字母→格式码"转成"列名→格式码"。
+
+    head_data: {列名: 列字母}（或 needs_rewrite 后的 mapped_head）。
+    column_formats: {列字母: 格式码}（ExcelRegion.column_formats）。
+    仅返回有格式码的列。供写回源_sheet 时按列名应用源文件原始格式。
+    """
+    cf = column_formats or {}
+    out = {}
+    for name, letter in (head_data or {}).items():
+        f = cf.get(letter)
+        if f:
+            out[name] = f
+    return out
+
+
 def normalize_emp_code(emp_code) -> str:
     """标准化工号：转换为8位字符串，不足前面补0
 

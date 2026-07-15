@@ -204,6 +204,133 @@ def convert_xls_to_xlsx(file_path: str, keep_original: bool = False) -> str:
         return file_path
 
 
+def _col_letter0(n: int) -> str:
+    """0-based 列索引 → Excel 列字母（0→A, 25→Z, 26→AA）。"""
+    s = ""
+    n += 1
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _letter_to_idx0(s: str) -> int:
+    """Excel 列字母 → 0-based 列索引（A→0, XFC→16381）。"""
+    n = 0
+    for ch in s.upper():
+        n = n * 26 + (ord(ch) - 64)
+    return n - 1
+
+
+def shrink_inflated_columns(file_path: str) -> bool:
+    """删掉各 sheet「数据末列之后」的空列，并把超宽 AutoFilter 收窄到数据范围。
+
+    整列刷格式、或把「自动筛选」误设到接近整表宽度（如 A2:XFC6），会把工作表维度
+    撑到上万列（XFC=16384）。openpyxl 的 max_column 随之虚高，后续比较器 / 快照 /
+    报告按 iter_rows(行×列) 或 range(max_column) 遍历会内存溢出、卡死或超时——
+    智训（比较预期结果）与智算（读取源文件）都会中招。
+
+    本函数只删 MaxDataColumn 之后的空列（那之后必然无数据，安全、不动任何数据/公式），
+    并把每个 sheet 的 AutoFilter 范围收窄到实际数据列（保留用户的筛选行意图）。
+
+    先廉价预检 <dimension>（解压+正则，几毫秒）：正常文件（列号不大）直接跳过、
+    几乎零开销；仅维度明显偏大时才真正开 Aspose 处理。
+
+    Returns:
+        是否对文件做了改动（并已保存）。
+    """
+    if not file_path or not os.path.exists(file_path):
+        return False
+    if not str(file_path).lower().endswith((".xlsx", ".xlsm")):
+        return False
+
+    # 1) 廉价预检：读各 sheet 的 <dimension> 末列号，都不大就直接返回（不开 Aspose）
+    try:
+        import zipfile as _zf
+        import re as _re
+        _inflated = False
+        with _zf.ZipFile(file_path) as _z:
+            for _n in _z.namelist():
+                if not (_n.startswith("xl/worksheets/") and _n.endswith(".xml")):
+                    continue
+                _head = _z.read(_n)[:4096].decode("utf-8", "ignore")
+                _m = _re.search(r'<dimension\s+ref="([^"]+)"', _head)
+                if not _m:
+                    _inflated = True   # 无 dimension → 交给 Aspose 复核
+                    break
+                _last = _m.group(1).split(":")[-1]
+                _lm = _re.match(r'([A-Za-z]+)', _last)
+                if not _lm:
+                    continue
+                if _letter_to_idx0(_lm.group(1)) > 255:   # 列号明显偏大 → 疑似虚高
+                    _inflated = True
+                    break
+        if not _inflated:
+            return False
+    except Exception:
+        pass   # 预检失败不阻断，继续走 Aspose（内部还有 MaxDataColumn 安全判定）
+
+    # 2) 确有虚高：Aspose 收窄 AutoFilter + 删掉数据末列之后的空列
+    try:
+        from Aspose.Cells import Workbook
+        import aspose_init
+        aspose_init.ensure_license()
+    except Exception as e:
+        logger.warning(f"[列去虚高] Aspose 不可用，跳过: {e}")
+        return False
+
+    import re as _re2
+    wb = None
+    try:
+        wb = Workbook(file_path)
+        touched = False
+        for i in range(wb.Worksheets.Count):
+            ws = wb.Worksheets[i]
+            cells = ws.Cells
+            mdc = cells.MaxDataColumn      # 0based 数据末列，-1=空
+            mc = cells.MaxColumn           # 0based 含样式/筛选的末列
+
+            # 2a) 收窄超宽 AutoFilter：末列超过数据列则重设到数据范围（保留筛选行）
+            try:
+                af = ws.AutoFilter
+                rng = af.Range if af is not None else None
+            except Exception:
+                rng = None
+            if rng:
+                m = _re2.match(r'([A-Za-z]+)(\d+):([A-Za-z]+)(\d+)', rng)
+                if m and mdc >= 0 and _letter_to_idx0(m.group(3)) > mdc:
+                    new_rng = f"{m.group(1)}{m.group(2)}:{_col_letter0(mdc)}{m.group(4)}"
+                    try:
+                        af.Range = new_rng
+                        touched = True
+                    except Exception:
+                        try:
+                            ws.RemoveAutoFilter()
+                            touched = True
+                        except Exception:
+                            pass
+
+            # 2b) 删掉数据末列之后的空样式列（明显虚高才动，留余量避免误伤）
+            if mc > mdc and (mc - mdc) >= 5:
+                first = mdc + 1 if mdc >= 0 else 0
+                cells.DeleteColumns(first, mc - first + 1, True)
+                touched = True
+
+        if touched:
+            wb.Save(file_path)
+            logger.info(f"[列去虚高] 已收窄超宽筛选/删除虚高空列: {os.path.basename(file_path)}")
+        return touched
+    except Exception as e:
+        logger.warning(f"[列去虚高] 处理异常（不阻断）: {file_path} - {e}")
+        return False
+    finally:
+        try:
+            if wb is not None:
+                wb.Dispose()
+        except Exception:
+            pass
+
+
 # Excel 序列号 18262 = 1950-01-01。小于此值的"日期"几乎不可能是真实业务日期，
 # 基本是被误设成日期格式的数字（社保费、比例等）。
 _REAL_DATE_SERIAL_MIN = 18262
@@ -257,6 +384,13 @@ def normalize_misformatted_dates(file_path: str, out_path: str = None) -> int:
     Returns:
         被规范化的单元格数量（0 表示无需改动）
     """
+    # 先做「列去虚高」：删数据末列之后的空列 + 收窄超宽 AutoFilter，避免下游 openpyxl
+    # （比较器/快照）因维度虚高到上万列而内存溢出/卡死。作用于源文件，输出自然干净。
+    try:
+        shrink_inflated_columns(file_path)
+    except Exception as _se:
+        logger.warning(f"[normalize] 列去虚高跳过（不阻断）: {_se}")
+
     try:
         from Aspose.Cells import Workbook, CellValueType
         import aspose_init

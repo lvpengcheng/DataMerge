@@ -354,12 +354,12 @@ async def execute_compute(
 
                 dest_path = tenant_output_dir / new_filename
                 shutil.copy2(output_file, dest_path)
-                # 源_ sheet 格式兜底：修复继承模板日期默认样式导致数字显示成日期（覆盖旧脚本）
-                if _tpl_for_values:
-                    try:
-                        normalize_source_sheet_formats(str(dest_path), _tpl_for_values)
-                    except Exception as _nse:
-                        logger.warning(f"[源_格式兜底] 跳过: {_nse}")
+                # 源_ sheet 格式兜底：修复继承模板默认样式导致数字显示成日期/时间（覆盖旧脚本）。
+                # 不再要求 _tpl_for_values：模板路径跨环境常不存在，兜底会回退用输出文件自身默认样式。
+                try:
+                    normalize_source_sheet_formats(str(dest_path), _tpl_for_values)
+                except Exception as _nse:
+                    logger.warning(f"[源_格式兜底] 跳过: {_nse}")
                 # 主键归一：两端类型统一成文本，修 VLOOKUP 跨源 #N/A（在纯值版之前跑）
                 try:
                     normalize_key_columns_to_text(str(dest_path))
@@ -372,6 +372,10 @@ async def execute_compute(
                     _vp = tenant_output_dir / values_only_name(new_filename)
                     if make_values_only_copy(dest_path, _vp, template_path=_tpl_for_values):
                         _register_result(_vp, _vp.name)
+                    else:
+                        # 生成失败（内部已重试3次）→ 明确标记，别静默只剩原版
+                        result_summary["values_copy_failed"] = True
+                        logger.warning(f"[纯值版] 生成失败（仅提供原版）: {new_filename}")
 
             result_summary["saved_assets"] = saved_assets
             task.status = "completed"

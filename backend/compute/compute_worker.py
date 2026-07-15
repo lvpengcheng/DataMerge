@@ -98,6 +98,7 @@ def main():
             pre_validated_mapping=p.get("pre_validated_mapping"),
             precheck_auto_filled=p.get("precheck_auto_filled"),
             template_override_path=p.get("template_override_path"),
+            target_sheet_manual_map=p.get("target_sheet_manual_map"),
         ))
     except Exception as e:
         err = json.dumps({"type": "error", "message": f"计算执行失败: {e}"},

@@ -667,6 +667,14 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
         """把 AI 生成的 fill_template 包到固定的脚本骨架里"""
         import pprint as _pprint
         tpl_repr = repr(str(Path(template_path).resolve()))
+        # 逻辑引用：文件名 + 内容哈希，供运行时跨环境按名/哈希重新定位（不依赖绝对路径）
+        tpl_name = Path(template_path).name
+        try:
+            import hashlib as _hl
+            with open(template_path, "rb") as _tf:
+                tpl_hash = _hl.md5(_tf.read()).hexdigest()
+        except Exception:
+            tpl_hash = ""
 
         # ⚠️ 必须用 pprint.pformat 输出 Python 字面量（None/True/False），不能用 json.dumps
         col_map = self._build_col_map(template_struct)
@@ -694,9 +702,13 @@ from openpyxl.utils import column_index_from_string, get_column_letter
 from datetime import datetime
 from backend.utils.source_sheet_writer import is_date_keyword_column, dt_to_excel_serial, is_long_digit_text
 from backend.utils.data_helpers import assign_sheet_keys, build_prefixed_sheet_names
+from backend.utils.target_sheet_resolver import resolve_target_sheets as _resolve_target_sheets_core
 
-# 模板持久化路径（训练时确定，智算复用）
+# 模板持久化路径（训练时确定，智算复用）。仅作遗留兜底：跨环境时优先用
+# 运行时注入的 _template_override_path（由 template_resolver 按名/哈希在当前环境定位）。
 TEMPLATE_PATH = {tpl_repr}
+TEMPLATE_NAME = {tpl_name!r}
+TEMPLATE_HASH = {tpl_hash!r}
 
 # ==================== Excel 公式辅助常量（避免 f-string 引号嵌套 SyntaxError） ====================
 # AI 写跨 sheet 公式时常需在 f-string 里嵌入 "" 作为 IFERROR 默认值，统一用 EMPTY 常量替代。
@@ -736,7 +748,47 @@ salary_month = globals().get("salary_month", None)
 monthly_standard_hours = globals().get("monthly_standard_hours", 174)
 monthly_hours = monthly_standard_hours
 output_folder = globals().get("output_folder", "")
-input_folder = globals().get("input_folder", r"{input_folder}")
+input_folder = globals().get("input_folder", "")
+
+
+# ---- 键列强制文本（与 output_postprocess 主键归一同规则）----
+# 避免 pd.read_excel / 预加载把数字型工号、证件号读成 int，导致内存 join 两端类型不一致匹配失败
+_KEY_KW = ("工号", "员工工号", "员工编号", "员工号", "职工号", "人员编号", "工作证号", "员工id",
+           "身份证", "证件号", "身份证号", "银行卡", "卡号", "银行账号",
+           "社保号", "社保账号", "公积金号", "公积金账号",
+           "手机号", "联系电话", "税号", "纳税人识别号", "编号")
+_KEY_EX = ("工资", "金额", "薪资", "比例", "系数", "天数", "月数", "说明", "规则", "姓名")
+
+
+def _is_key_col(name):
+    n = str(name or "").strip().lower()
+    if not n or any(e in n for e in _KEY_EX):
+        return False
+    return any(k in n for k in _KEY_KW)
+
+
+def _canon_key(v):
+    import math
+    if v is None or isinstance(v, bool):
+        return v
+    if isinstance(v, float):
+        if math.isnan(v) or math.isinf(v):
+            return v
+        return str(int(v)) if v == int(v) else repr(v)
+    if isinstance(v, int):
+        return str(v)
+    return str(v).strip()
+
+
+def _normalize_key_columns(df):
+    """把命中主键/ID 关键词的列统一成规范文本（110.0→"110"），与输出端主键归一同规则。"""
+    try:
+        for _c in list(df.columns):
+            if _is_key_col(_c):
+                df[_c] = df[_c].map(_canon_key)
+    except Exception as _e:
+        print(f"[键列归一警告] {{_e}}")
+    return df
 
 
 def load_source_data():
@@ -747,6 +799,9 @@ def load_source_data():
     pre = globals().get("_pre_loaded_source_data")
     if pre:
         print(f"使用预加载源数据：{{len(pre)}} 个 sheet")
+        for _v in pre.values():
+            if isinstance(_v, dict) and _v.get("df") is not None:
+                _normalize_key_columns(_v["df"])
         return pre
 
     out = {{}}
@@ -763,6 +818,7 @@ def load_source_data():
             xls = pd.ExcelFile(fp)
             for sn in xls.sheet_names:
                 df = pd.read_excel(fp, sheet_name=sn)
+                _normalize_key_columns(df)
                 _collected.append((Path(fname).stem, sn, df))
         except Exception as e:
             print(f"[源数据加载警告] {{fname}}: {{e}}")
@@ -790,6 +846,7 @@ def _append_source_sheets(wb, source_data):
         df = (sv or {{}}).get("df")
         if df is None:
             continue
+        col_fmts = (sv or {{}}).get("column_formats") or {{}}
         target_name = _SK_TO_SHEET.get(sk) if sk else None
         if not target_name:
             # 兜底：未在烘焙表里的 key（智算偶发多出的 sheet）→ 用同一套命名函数现算
@@ -831,11 +888,13 @@ def _append_source_sheets(wb, source_data):
                     cell.number_format = "@"
                     cell.data_type = "s"
                 else:
-                    # 普通数字/文本：强制 General，避免继承模板默认样式里的日期格式
+                    # 普通数字/文本：优先用源文件原始格式（千分位/小数/百分比/货币等），
+                    # 没有则强制 General，避免继承模板默认样式里的日期/自定义格式
                     # （根因：某些模板的 Normal 样式 numFmtId 是 [$-409]dd/mmm/yy，
                     #  新 sheet 未显式设格式的单元格会吃到它，数字被显示成日期）
                     cell.value = val
-                    cell.number_format = "General"
+                    _cf = col_fmts.get(cols[ci - 1])
+                    cell.number_format = _cf if _cf else "General"
         appended_map[sk] = target_name
         appended.append(f"{{target_name}}({{len(df)}}行x{{len(cols)}}列)")
     if appended:
@@ -1164,21 +1223,57 @@ def _shrink_inflated_columns(path):
             pass
 
 
+class _TargetSheetManualRequired(Exception):
+    """目标模板 sheet 语义匹配出现歧义/落空，需人工指定映射。
+
+    payload 携带候选，供上层（智算流程/前端）转成人工选择交互。"""
+    def __init__(self, payload):
+        self.payload = payload
+        super().__init__("目标模板 sheet 无法唯一匹配，需人工确认")
+
+
+def _resolve_target_sheets(wb):
+    """把 _COL_MAP 的目标键语义映射到 wb 里实际存在的 sheet 名，返回 {{key: 实际sheet名}}。
+
+    复用 backend.utils.target_sheet_resolver（与事前校验同一套逻辑，保证 precheck 判定
+    与运行时行为完全一致）。歧义（多候选并列）→ 抛 _TargetSheetManualRequired 交人工，
+    **绝不按位置猜**；无候选的键仅由 main() 告警跳过（本月缺该表的合法场景）。
+    人工映射从 globals()['_target_sheet_manual_map'] 读取（前端确认后注入）。
+    """
+    manual = globals().get("_target_sheet_manual_map") or {{}}
+    resolved, ambiguous, _unresolved = _resolve_target_sheets_core(
+        wb, _COL_MAP, source_prefix=SOURCE_PREFIX, manual_map=manual)
+    if ambiguous:
+        raise _TargetSheetManualRequired({{
+            "reason": "target_sheet_ambiguous",
+            "col_map_keys": list(_COL_MAP.keys()),
+            "workbook_sheets": [sn for sn in wb.sheetnames if not sn.startswith(SOURCE_PREFIX)],
+            "candidates": ambiguous,
+            "resolved": resolved,
+        }})
+    return resolved
+
+
 def main():
     print("=" * 60)
     print("模板填充模式 — 开始（AI 写公式 + 骨架追加 `源_xxx` sheet）")
     print("=" * 60)
 
-    if not os.path.exists(TEMPLATE_PATH):
-        raise FileNotFoundError(f"模板文件丢失：{{TEMPLATE_PATH}}")
-
-    # 有效模板：智算时若注入了 _template_override_path（用户上传的新模板）则优先用它；否则沿用训练时模板
+    # 有效模板：优先用运行时注入的 _template_override_path（由 template_resolver 在当前环境
+    # 按文件名/哈希定位，或用户上传的新模板）；否则退回烘焙的 TEMPLATE_PATH（仅当本机存在）。
+    # 不再在此处对 TEMPLATE_PATH 做前置硬校验——跨环境时它常不存在，硬校验会误崩。
     _override = globals().get("_template_override_path")
-    _eff_template = _override if (_override and os.path.exists(_override)) else TEMPLATE_PATH
-    if not os.path.exists(_eff_template):
-        raise FileNotFoundError(f"模板文件丢失：{{_eff_template}}")
-    if _override and _eff_template == _override:
-        print(f"使用上传的新模板：{{_override}}")
+    if _override and os.path.exists(_override):
+        _eff_template = _override
+    elif TEMPLATE_PATH and os.path.exists(TEMPLATE_PATH):
+        _eff_template = TEMPLATE_PATH
+    else:
+        raise FileNotFoundError(
+            f"模板文件无法定位。逻辑引用 名称={{TEMPLATE_NAME}} 哈希={{TEMPLATE_HASH}}；"
+            f"烘焙路径={{TEMPLATE_PATH}}；注入覆盖={{_override}}。"
+            f"请在智算时重新上传该模板，或确认模板已随脚本迁移到当前环境。")
+    if _eff_template == _override:
+        print(f"使用运行时解析/上传的模板：{{_override}}")
     else:
         print(f"使用训练时模板：{{TEMPLATE_PATH}}")
 
@@ -1205,16 +1300,40 @@ def main():
     _keep_vba = out_path.lower().endswith(".xlsm")
     wb = openpyxl.load_workbook(out_path, keep_vba=_keep_vba, data_only=False)
 
-    # 结构提示（不拦截）：新模板缺少训练时的目标 sheet 时，相关公式会落空
-    _missing = [sn for sn in _COL_MAP.keys() if sn not in wb.sheetnames]
-    if _missing:
-        print(f"[模板结构警告] 当前模板缺少训练时的目标 sheet: {{_missing}}，相关公式可能落空")
-
     print("步骤：追加源数据 sheet（前缀 `源_`，供 AI 公式引用）...")
     try:
         _append_source_sheets(wb, source_data)
     except Exception as _ap_e:
         print(f"[append_source_sheets] 异常（不阻断）：{{_ap_e}}")
+
+    # 目标表语义解析 + 改名对齐：模板主表常按月份等动态命名（如 202604），与训练时
+    # 固化的 _COL_MAP 键（如 本月）对不上，会导致 fill_template（按键名访问 sheet）
+    # 整张表被静默跳过。这里按列签名语义把实际 sheet 映射到键并临时改名对齐，使 AI
+    # 生成的 fill_template 能命中；填充完改回原名再保存，不破坏模板自带的跨表引用
+    # （openpyxl 期间公式仅为字符串、不求值，改回后引用仍有效）。
+    # 歧义（多候选并列）→ 抛错交人工指定，绝不按位置猜；无候选的键仅告警跳过。
+    _rename_back = {{}}
+    try:
+        _resolved = _resolve_target_sheets(wb)
+        for _key, _actual in _resolved.items():
+            if _actual == _key:
+                continue
+            if _key in wb.sheetnames:
+                print(f"[目标表对齐] 跳过 {{_actual}}→{{_key}}（{{_key}} 已存在于工作簿）")
+                continue
+            wb[_actual].title = _key
+            _rename_back[_key] = _actual
+            print(f"[目标表对齐] {{_actual}} → {{_key}}（列签名语义匹配，填充后改回）")
+        _still_missing = [k for k in _COL_MAP.keys() if k not in _resolved]
+        if _still_missing:
+            print(f"[模板结构警告] 当前模板未找到训练时的目标 sheet: {{_still_missing}}，相关列将落空")
+    except _TargetSheetManualRequired as _amb:
+        import json as _json2
+        _msg = _json2.dumps(_amb.payload, ensure_ascii=False)
+        print("[目标表对齐] 目标模板 sheet 无法唯一匹配，需人工指定映射：")
+        print(_json2.dumps(_amb.payload, ensure_ascii=False, indent=2))
+        # 前缀 TARGET_SHEET_MANUAL_REQUIRED: 供智算流程识别并转成前端人工选择交互
+        raise RuntimeError("TARGET_SHEET_MANUAL_REQUIRED:" + _msg)
 
     snapshot_before = _snapshot_workbook(wb)
     _fmt_snapshot = _snapshot_number_formats(wb)
@@ -1247,6 +1366,15 @@ def main():
             print(f"  · {{sn}}: {{cols_brief}}")
     except Exception as _rep_e:
         print(f"[填充报告] 生成失败（不阻断保存）: {{_rep_e}}")
+
+    # 还原目标表原名（如 本月 → 202604），保住模板自带跨表引用与用户可读的月份名
+    for _key, _actual in _rename_back.items():
+        try:
+            if _key in wb.sheetnames and _actual not in wb.sheetnames:
+                wb[_key].title = _actual
+                print(f"[目标表对齐] 改回原名 {{_key}} → {{_actual}}")
+        except Exception as _rn_e:
+            print(f"[目标表对齐] 改回原名失败（不阻断）: {{_key}}→{{_actual}}: {{_rn_e}}")
 
     wb.save(out_path)
     print(f"保存成功：{{out_path}}")

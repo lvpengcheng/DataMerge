@@ -229,6 +229,9 @@ class ExcelRegion:
     head_data: Dict[str, str] = field(default_factory=dict)
     data: List[Dict[str, Any]] = field(default_factory=list)
     formula: Dict[str, str] = field(default_factory=dict)
+    # 每列原始 number_format（key=列字母）：仅记录"非 General 且非日期"的格式码
+    # （货币/百分比/千分位/小数/文本@ 等），供写回源_sheet 时保留源文件原始显示格式。
+    column_formats: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -2792,6 +2795,12 @@ class IntelligentExcelParser:
             # 遇到汇总行
             if self._is_summary_row(worksheet, row, max_col):
                 if last_valid_data_row >= start_row:
+                    # 分组小计：小计/汇总行后若仍有同形数据（非新表头），视为表内分组小计，
+                    # 跳过它继续扫（采集阶段本就会跳过小计行），避免把一张表在小计处切断。
+                    if self._data_continues_after_summary(
+                        worksheet, row, start_row, max_row, max_col
+                    ):
+                        continue
                     # 已有数据行，汇总行标志数据结束
                     return last_valid_data_row
                 else:
@@ -2863,6 +2872,60 @@ class IntelligentExcelParser:
                 if (lo / hi >= 0.4) or (hi - lo <= 2):
                     return True
             return False
+        return False
+
+    def _data_continues_after_summary(self, worksheet: Any, summary_row: int, start_row: int,
+                                      max_row: int, max_col: int) -> bool:
+        """分组小计场景：小计/汇总行之后是否仍是【同一张表】的数据。
+
+        支持「表内按组插入小计行」结构（如 上海汇总 / 静安汇总 夹在明细中间，
+        其后还继续是同表的员工明细）：小计行后若还出现与 start_row 同结构的数据行，
+        则该小计是表内分组小计，不应在此终结区域。
+
+        同表判据用【列占用】而非 header_score：取 start_row 与前瞻行各自"有值的列集合"，
+        要求 Jaccard 重叠 ≥0.6 且【首个数据列一致】。这样能挡住"另起一张表头/数据从不同列
+        开始"的相邻表（如社保表 A/B 列空、从 C 列起），避免把两张表误并成一个区域。
+        向前最多看 LOOKAHEAD 行；跳过空行与连续堆叠的小计行（分组小计+分组小计）。
+        """
+        def _occ(r):
+            s = set()
+            for c in range(1, max_col + 1):
+                v = self._get_cell_value(worksheet.cell(r, c))
+                if v is not None and str(v).strip():
+                    s.add(c)
+            return s
+
+        start_occ = _occ(start_row)
+        if not start_occ:
+            return False
+        LOOKAHEAD = 20
+        look_limit = min(summary_row + LOOKAHEAD, max_row)
+        for r in range(summary_row + 1, look_limit + 1):
+            if self._is_empty_row(worksheet, r, max_col):
+                continue
+            if self._is_summary_row(worksheet, r, max_col):
+                continue  # 连续多个小计行 → 继续往后看
+            if self._is_title_row(worksheet, r, max_col):
+                return False  # 新标题/表头 → 新表开始，应终结
+            look_occ = _occ(r)
+            if not look_occ:
+                return False
+            inter = len(start_occ & look_occ)
+            union = len(start_occ | look_occ)
+            jacc = (inter / union) if union else 0.0
+            same_first_col = (min(start_occ) == min(look_occ))
+            if not (jacc >= 0.6 and same_first_col):
+                return False  # 列占用/起始列不一致 → 另一张表
+            # 再确认前瞻行是"数据行"而非新表的表头行：表头几乎全文本、无数字。
+            # 挡住"两张表都从同列起、列占用重叠"的相邻表（如 社保表 与 公积金表）。
+            try:
+                sf = self.row_analyzer.analyze_row_features(worksheet, start_row, max_col)
+                lf = self.row_analyzer.analyze_row_features(worksheet, r, max_col)
+                if sf.number_ratio >= 0.15 and lf.number_ratio < 0.08:
+                    return False  # 前瞻行像表头（全文本）→ 新表开始
+            except Exception:
+                pass
+            return True
         return False
 
     def _build_header_mapping(self, worksheet: Any, start_row: int, end_row: int, max_col: int) -> Dict[str, str]:
@@ -3006,6 +3069,22 @@ class IntelligentExcelParser:
             col_idx = self._get_column_number(column_letter) - 1  # 转为 0-indexed
             col_mapping.append((header, column_letter, col_idx))
 
+        # 逐列采样原始 number_format（每列一次 GetStyle，非每行）：保留源文件千分位/小数/
+        # 百分比/货币/文本等格式，供写回源_sheet 时复用。日期/General 不记录。
+        try:
+            _row0 = region.data_row_start - 1  # ExportArray 同基准，0-indexed
+            for _h, _letter, _cidx in col_mapping:
+                if _cidx >= max_col:
+                    continue
+                _fmt = self._sample_column_format(
+                    lambda r, c: raw_cells[r, c],
+                    _row0, _row0 + total_rows - 1, _cidx,
+                )
+                if _fmt:
+                    region.column_formats[_letter] = _fmt
+        except Exception:
+            pass
+
         collected_rows = 0
         for row_offset in range(total_rows):
             if max_data_rows is not None and collected_rows >= max_data_rows:
@@ -3056,6 +3135,8 @@ class IntelligentExcelParser:
                                 val = _c.DoubleValue   # 非日期 → 按原值读取
                         except Exception:
                             pass
+                    # 主键/ID 列 + >15位长数字：解析层统一成文本，保证公式匹配、防科学计数
+                    val = self._unify_key_value(header, val)
                     data_row[column_letter] = val
                     if val is not None and str(val).strip():
                         has_valid = True
@@ -3069,6 +3150,18 @@ class IntelligentExcelParser:
     def _collect_data_cell_by_cell(self, worksheet: Any, region: 'ExcelRegion', max_col: int, max_data_rows: int = None):
         """逐格读取数据行（原始方式，支持公式读取）"""
         collected_rows = 0
+        # 逐列采样原始 number_format（同 bulk 路径规则；此路径 cell 为 1-indexed）
+        try:
+            for _h, _letter in region.head_data.items():
+                _col = self._get_column_number(_letter)
+                _fmt = self._sample_column_format(
+                    lambda r, c: worksheet.cell(r, c)._cell,
+                    region.data_row_start, region.data_row_end, _col,
+                )
+                if _fmt:
+                    region.column_formats[_letter] = _fmt
+        except Exception:
+            pass
         for row in range(region.data_row_start, region.data_row_end + 1):
             if max_data_rows is not None and collected_rows >= max_data_rows:
                 break
@@ -3091,9 +3184,75 @@ class IntelligentExcelParser:
                 region.data.append(data_row)
                 collected_rows += 1
 
-    # Excel 内置"日期类"数字格式 id（日期/日期时间/CJK 年月日；纯时间 18-21/45-47 不含）
+    def _capture_col_format(self, style) -> Optional[str]:
+        """从 Aspose Style 提取"可复用的原始格式码"，仅返回非 General 且非日期的自定义码。
+
+        - 日期格式 → 返回 None（交给写入端日期列逻辑，避免数字回归成日期）。
+        - General/空 → 返回 None（普通数字，写入端保持默认）。
+        - 其余（货币/百分比/千分位/小数/文本@ 等）→ 返回清洗后的格式码，openpyxl 可直接用。
+          清洗会去掉 Excel 对齐/重复占位符（如 `0.00_` 末尾的 `_`），使 `0.00_`→`0.00`、
+          `#,##0.00_ `→`#,##0.00` —— 这些是内建"数值"格式，避免显示成"自定义"类别。
+        """
+        try:
+            num = style.Number
+            cust = style.Custom
+        except Exception:
+            return None
+        try:
+            if self._fmt_is_clear_date(num, cust):
+                return None
+        except Exception:
+            pass
+        c = str(cust or "").strip()
+        if not c or c.lower() == "general":
+            return None
+        c = self._clean_number_format(c)
+        if not c or c.lower() == "general":
+            return None
+        return c
+
+    @staticmethod
+    def _clean_number_format(code) -> str:
+        """去掉 Excel 数字格式里的对齐/重复占位符，把接近内建的自定义码还原成内建码。
+
+        `_x`（补一个 x 宽的空格用于对齐）、`*x`（用 x 重复填充）纯属排版，去掉后
+        `0.00_`→`0.00`、`#,##0.00_ `→`#,##0.00`、`0.00_);(0.00)`→`0.00;(0.00)`。
+        使 openpyxl 写出的是内建"数值/货币/百分比"格式而非"自定义"类别。
+        """
+        import re as _re
+        s = _re.sub(r"[_*].?", "", str(code or ""))
+        return s.strip()
+
+
+    def _sample_column_format(self, get_cell, row_start, row_end, col_idx) -> Optional[str]:
+        """在 [row_start, row_end] 前若干行内，取该列首个非空单元格的格式码。
+
+        get_cell(row0, col0) → Aspose cell（0-indexed）。空单元格格式不可靠，故找首个有值的。
+        """
+        limit = min(row_end, row_start + 7)   # 最多看前 8 行
+        for r in range(row_start, limit + 1):
+            try:
+                cell = get_cell(r, col_idx)
+                if cell is None or cell.Value is None:
+                    continue
+                return self._capture_col_format(cell.GetStyle())
+            except Exception:
+                continue
+        return None
+
     _DATE_BUILTIN_FMT_IDS = frozenset({14, 15, 16, 17, 22, 27, 28, 29, 30, 31, 36,
                                        50, 51, 52, 53, 54, 55, 56, 57, 58})
+
+    # 主键/ID 类列名关键词（与 backend/utils/output_postprocess 主键归一保持一致）：
+    # 这些列跨源常"一处数字一处文本"，解析时统一成规范文本，保证公式(VLOOKUP)精确匹配。
+    _KEY_COL_KEYWORDS = (
+        "工号", "员工工号", "员工编号", "员工号", "职工号", "人员编号", "工作证号", "员工id",
+        "身份证", "证件号", "身份证号", "银行卡", "卡号", "银行账号",
+        "社保号", "社保账号", "公积金号", "公积金账号",
+        "手机号", "联系电话", "税号", "纳税人识别号", "编号",
+    )
+    # 含关键词但本质是数值/需参与求和的列 → 排除，绝不 text 化
+    _KEY_COL_EXCLUDE = ("工资", "金额", "薪资", "比例", "系数", "天数", "月数", "说明", "规则", "姓名")
 
     @staticmethod
     def _fmt_is_clear_date(number_id, custom) -> bool:
@@ -3288,6 +3447,39 @@ class IntelligentExcelParser:
 
         return False
 
+    def _header_is_key_column(self, header) -> bool:
+        """按列名关键词判断是否主键/ID 列（不做数据探测）。"""
+        name = str(header or "").strip().lower()
+        if not name:
+            return False
+        if any(e in name for e in self._KEY_COL_EXCLUDE):
+            return False
+        return any(k in name for k in self._KEY_COL_KEYWORDS)
+
+    def _unify_key_value(self, header, val):
+        """解析层主键类型统一（仅供公式匹配用）：
+        - **仅**对主键/ID 列（列名关键词命中）的整数型数字 → 规范文本（1001.0→"1001"），保证跨源 VLOOKUP 精确匹配。
+        - 非主键列一律原样返回，保留其原始类型与格式（数值仍是数值，绝不改成文本/自定义格式）。
+        真文本值(str)原样保留（真身份证本就是 str → 完整保真）；金额等浮点、日期、None、bool 不动。
+        注意：主键列若源本就是数字型且 >15 位，值在 Excel 存盘时已丢精度，这里只能转成"已丢精度的文本"，无法还原真实数字。
+        """
+        if val is None or isinstance(val, bool):
+            return val
+        if not isinstance(val, (int, float)):
+            return val  # 字符串/日期等原样返回（真文本长号即 str，保真）
+        # 仅主键/ID 列才统一；其他列保留原类型与格式
+        if not self._header_is_key_column(header):
+            return val
+        if isinstance(val, float):
+            if val != val or val in (float("inf"), float("-inf")):  # NaN / Inf
+                return val
+        try:
+            if float(val) != int(val):
+                return val  # 非整数（小数）不动
+        except (ValueError, OverflowError):
+            return val
+        return str(int(val))
+
     def _collect_row_data(self, worksheet: Any, row: int, max_col: int,
                          head_data: Dict[str, str], formula_dict: Dict[str, str]) -> Dict[str, Any]:
         """收集行数据"""
@@ -3297,7 +3489,7 @@ class IntelligentExcelParser:
             col = self._get_column_number(column_letter)
             cell = worksheet.cell(row, col)
             
-            data_row[column_letter] = self._get_cell_value(cell)
+            data_row[column_letter] = self._unify_key_value(header, self._get_cell_value(cell))
             
             if cell.formula:
                 cell_address = f"{column_letter}{row}"

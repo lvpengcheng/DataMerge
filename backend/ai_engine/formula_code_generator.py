@@ -1853,12 +1853,16 @@ def load_source_data(input_folder, manual_headers):
                 # 收集同sheet下所有region的DataFrame并合并（处理同列头多区域合并场景）
                 dfs = []
                 columns = None
+                col_formats = None
                 for region in sheet_data.regions:
                     df = convert_region_to_dataframe(region)
                     if df.empty and len(df.columns) == 0:
                         continue
                     if columns is None:
                         columns = list(df.columns)
+                        # 列名→原始格式码（源文件千分位/小数/百分比等），供写回源_sheet 复用
+                        _cf = getattr(region, "column_formats", None) or {}
+                        col_formats = {_n: _cf[_l] for _n, _l in region.head_data.items() if _cf.get(_l)}
                     dfs.append(df)
 
                 if not dfs:
@@ -1877,7 +1881,7 @@ def load_source_data(input_folder, manual_headers):
                         if merged_df[_sn_col].isna().all():
                             merged_df[_sn_col] = range(1, len(merged_df) + 1)
 
-                _collected.append((file_base, sheet_data.sheet_name, merged_df, columns))
+                _collected.append((file_base, sheet_data.sheet_name, merged_df, columns, col_formats))
 
         except Exception as e:
             print(f"[错误] 解析文件 {filename} 失败: {e}")
@@ -1886,11 +1890,11 @@ def load_source_data(input_folder, manual_headers):
 
     # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 / 撞结果 sheet → 加文件名前缀
     _name_count = {}
-    for _fb, _sn, _, _ in _collected:
+    for _fb, _sn, _, _, _ in _collected:
         _name_count[_sn] = _name_count.get(_sn, 0) + 1
     _reserved = set(globals().get('_RESULT_SHEET_NAMES', []))
     _used_keys = set()
-    for file_base, sheet_name_orig, merged_df, columns in _collected:
+    for file_base, sheet_name_orig, merged_df, columns, col_formats in _collected:
         _collide_cross_file = _name_count.get(sheet_name_orig, 0) > 1
         _collide_reserved = sheet_name_orig in _reserved
         if _collide_cross_file or _collide_reserved:
@@ -1910,7 +1914,8 @@ def load_source_data(input_folder, manual_headers):
 
         source_data[sheet_name] = {
             "df": merged_df,
-            "columns": columns
+            "columns": columns,
+            "column_formats": col_formats or {}
         }
         if len(merged_df) > 0:
             print(f"加载源数据: {sheet_name}, 列: {columns}, 行数: {len(merged_df)}")
@@ -2002,6 +2007,7 @@ def write_source_sheets(wb, source_data):
             continue
         _entry_id_to_primary[_eid] = sheet_name
         df = data_info["df"]
+        col_fmts = data_info.get("column_formats") or {}
 
         # 清理列名：只去除换行符和首尾空格，保留列名内的正常空格
         import re as _re_clean
@@ -2091,6 +2097,18 @@ def write_source_sheets(wb, source_data):
         total_rows = len(write_df)
 
         # ========== 列级后处理：仅遍历需要特殊处理的列 ==========
+        # 源文件原始格式（千分位/小数/百分比/货币/文本等）：作基底写回；
+        # 日期列、长数字文本列随后的 pass 会覆盖它 → 显式日期/长文本仍胜出。
+        if col_fmts:
+            for ci, col_name in enumerate(write_df.columns):
+                fmt = col_fmts.get(col_name)
+                if not fmt:
+                    continue
+                col_letter = get_column_letter(ci + 1)
+                for cell in ws[col_letter][1:]:  # 跳过表头
+                    if cell.value != "":
+                        cell.number_format = fmt
+
         # 日期列：设置 number_format
         if date_cols:
             date_col_indices = [i for i, c in enumerate(write_df.columns) if c in date_cols]

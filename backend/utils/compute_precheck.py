@@ -43,6 +43,9 @@ class PrecheckResult:
     missing_columns: List[Dict[str, Any]] = field(default_factory=list)
     ai_suggestions: List[Dict[str, Any]] = field(default_factory=list)
     history_warnings: List[str] = field(default_factory=list)
+    # 目标模板表（②模板目标侧）：歧义时的候选，交前端人工选择；确认后的映射透传给计算
+    target_candidates: List[Dict[str, Any]] = field(default_factory=list)
+    target_map: Optional[Dict[str, str]] = None
     file_mapping: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> dict:
@@ -63,6 +66,8 @@ def precheck_compute(
     confirmed_renames: Optional[Dict[str, str]] = None,
     use_history: Optional[bool] = None,
     expected_structure: Optional[dict] = None,
+    template_override_path: Optional[str] = None,
+    confirmed_target_map: Optional[Dict[str, str]] = None,
 ) -> PrecheckResult:
     """智算事前校验主入口
 
@@ -140,6 +145,7 @@ def precheck_compute(
             result.file_mapping = confirmed_mapping.get("file_mapping") or confirmed_mapping
             # 文件已按用户确认改写，跳过表头匹配/AI 步骤
             _check_history(script_content, tenant_id, salary_year, salary_month, result, use_history)
+            _check_target_sheets(script_content, tenant_id, template_override_path, confirmed_target_map, result)
             return result
         except Exception as e:
             logger.error(f"[Precheck] 应用 confirmed_mapping 失败: {e}", exc_info=True)
@@ -187,7 +193,91 @@ def precheck_compute(
     # 步骤 5：历史数据
     _check_history(script_content, tenant_id, salary_year, salary_month, result, use_history)
 
+    # 步骤 6：目标模板表校验（②模板目标侧）——与运行时同一套 resolve_target_sheets 逻辑
+    _check_target_sheets(script_content, tenant_id, template_override_path, confirmed_target_map, result)
+
     return result
+
+
+def _extract_colmap(script_content: str) -> Optional[Dict[str, Any]]:
+    """从脚本里安全抽取 _COL_MAP 字面量（模板模式脚本训练时固化的目标表结构）。"""
+    try:
+        import ast
+        tree = ast.parse(script_content)
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id == "_COL_MAP":
+                        return ast.literal_eval(node.value)
+    except Exception as e:
+        logger.warning(f"[Precheck/Target] 提取 _COL_MAP 失败: {e}")
+    return None
+
+
+def _locate_template(tenant_id: str, script_content: str, template_override_path: Optional[str]) -> Optional[str]:
+    """定位当前环境下的模板：优先用户上传的覆盖模板，否则按名/哈希在本环境解析。"""
+    if template_override_path and os.path.exists(template_override_path):
+        return template_override_path
+    try:
+        from .template_resolver import resolve_template_path
+        proj_root = str(Path(__file__).resolve().parent.parent.parent)
+        p = resolve_template_path(tenant_id=tenant_id, script_code=script_content, project_root=proj_root)
+        if p and os.path.exists(p):
+            return p
+    except Exception as e:
+        logger.warning(f"[Precheck/Target] 定位模板失败: {e}")
+    return None
+
+
+def _check_target_sheets(
+    script_content: Optional[str],
+    tenant_id: str,
+    template_override_path: Optional[str],
+    confirmed_target_map: Optional[Dict[str, str]],
+    result: PrecheckResult,
+) -> None:
+    """校验模板里的目标表能否唯一对到训练固化的 _COL_MAP 键。
+
+    歧义（多候选并列）→ result.ok=False + target_candidates（交前端人工选择）；
+    唯一解析 → 把非同名映射记入 result.target_map（计算时注入 _target_sheet_manual_map）；
+    无候选的键（本月缺该表）仅记日志、不阻断。仅对模板模式脚本生效。
+    """
+    if not script_content or "_COL_MAP" not in script_content or "def fill_template" not in script_content:
+        return
+    col_map = _extract_colmap(script_content)
+    if not col_map:
+        return
+    tpl = _locate_template(tenant_id, script_content, template_override_path)
+    if not tpl:
+        logger.info("[Precheck/Target] 未定位到模板，跳过目标表校验（运行时兜底/报错）")
+        return
+    try:
+        import openpyxl
+        from .target_sheet_resolver import resolve_target_sheets
+        wb = openpyxl.load_workbook(tpl, read_only=False, data_only=True)
+        try:
+            resolved, ambiguous, unresolved = resolve_target_sheets(
+                wb, col_map, manual_map=(confirmed_target_map or {})
+            )
+            all_sheets = [sn for sn in wb.sheetnames if not sn.startswith("源_")]
+        finally:
+            wb.close()
+    except Exception as e:
+        logger.warning(f"[Precheck/Target] 目标表校验异常（不阻断）: {e}", exc_info=True)
+        return
+
+    if ambiguous:
+        result.ok = False
+        result.target_candidates = [
+            {"key": k, "candidates": v, "all_sheets": all_sheets}
+            for k, v in ambiguous.items()
+        ]
+        logger.warning(f"[Precheck/Target] 目标表歧义需人工确认: {list(ambiguous.keys())}")
+    else:
+        # 只记非同名映射（同名的运行时精确匹配即可），供计算注入 _target_sheet_manual_map
+        result.target_map = {k: v for k, v in resolved.items() if v != k}
+        if unresolved:
+            logger.info(f"[Precheck/Target] 目标表本月无对应（运行时落空跳过）: {unresolved}")
 
 
 # ==================== 内部工具 ====================
