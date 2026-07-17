@@ -1317,6 +1317,10 @@ const Tools = {
                     <input id="m-tpl-split-by" placeholder="如：部门（留空则不拆分文件）" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
                     <small style="color:#888;">按此列值将数据拆分到不同文件中，拆分后自动打包为 zip</small>
                 </div>
+                <div class="form-group"><label>整表带出结果Sheet</label>
+                    <input id="m-tpl-carry-sheets" placeholder="如：明细,#2（逗号分隔，可填sheet名或#序号）" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                    <small style="color:#888;">把计算结果中这些 sheet 整表(值+格式)追加到报表末尾；#N 表示结果表第 N 个 sheet。留空不带出</small>
+                </div>
                 <div id="m-tpl-mode-fields" style="display:none;">
                     <div class="form-group"><label>分组字段</label>
                         <input id="m-tpl-group-by" placeholder="如: 工号" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
@@ -1352,6 +1356,7 @@ const Tools = {
             fd.append('name_field', document.getElementById('m-tpl-name-field')?.value || '');
             fd.append('split_by', document.getElementById('m-tpl-split-by')?.value || '');
             fd.append('show_empty_period', document.getElementById('m-tpl-show-empty')?.checked ? 'true' : 'false');
+            fd.append('carry_over_sheets', document.getElementById('m-tpl-carry-sheets')?.value || '');
             const resp = await AUTH.authFetch('/api/admin/templates', { method: 'POST', body: fd });
             if (resp.ok) { this.closeModal(); this.loadTemplates(); }
             else { await _alertErr(resp, '创建失败'); }
@@ -1403,6 +1408,10 @@ const Tools = {
                     <input id="m-tpl-split-by" value="${t.split_by || ''}" placeholder="如：部门（留空则不拆分文件）" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
                     <small style="color:#888;">按此列值将数据拆分到不同文件中，拆分后自动打包为 zip</small>
                 </div>
+                <div class="form-group"><label>整表带出结果Sheet</label>
+                    <input id="m-tpl-carry-sheets" value="${(t.carry_over_sheets || '').replace(/"/g, '&quot;')}" placeholder="如：明细,#2（逗号分隔，可填sheet名或#序号）" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
+                    <small style="color:#888;">把计算结果中这些 sheet 整表(值+格式)追加到报表末尾；#N 表示结果表第 N 个 sheet。留空不带出</small>
+                </div>
                 <div id="m-tpl-mode-fields" style="display:${(t.report_mode==='block'||t.report_mode==='zip'||t.report_mode==='sheet')?'block':'none'};">
                     <div class="form-group"><label>分组字段</label>
                         <input id="m-tpl-group-by" value="${t.group_by || ''}" placeholder="如: 工号" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;">
@@ -1435,6 +1444,7 @@ const Tools = {
             fd.append('name_field', document.getElementById('m-tpl-name-field')?.value || '');
             fd.append('split_by', document.getElementById('m-tpl-split-by')?.value || '');
             fd.append('show_empty_period', document.getElementById('m-tpl-show-empty')?.checked ? 'true' : 'false');
+            fd.append('carry_over_sheets', document.getElementById('m-tpl-carry-sheets')?.value || '');
             const resp = await AUTH.authFetch(`/api/admin/templates/${id}`, { method: 'PUT', body: fd });
             if (resp.ok) { this.closeModal(); this.loadTemplates(); }
             else { await _alertErr(resp, '更新失败'); }

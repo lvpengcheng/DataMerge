@@ -5132,12 +5132,18 @@ async def compute_submit(
     confirmed_renames: Optional[str] = Form(None),
     confirmed_target_map: Optional[str] = Form(None),
     skip_history_check: Optional[bool] = Form(False),
+    current_user=Depends(get_current_user),
+    accessible_tenants: list = Depends(get_operable_tenants),
 ):
     """提交计算任务，立即返回 task_id，计算在后台运行。
 
     template_file: 模板模式可选上传新模板覆盖训练时模板；不传则用训练时模板。
     """
     try:
+        # 租户隔离：只能对有权操作的租户提交计算（后端强校验，前端灰化仅辅助）
+        if tenant_id not in accessible_tenants:
+            raise HTTPException(status_code=403, detail=f"无权访问租户 '{tenant_id}'")
+
         logger.info(f"[compute/submit] 租户={tenant_id}, 脚本={script_id}")
 
         # 0. 拒绝已禁用/删除的脚本

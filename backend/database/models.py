@@ -98,6 +98,7 @@ class Template(Base):
     name_field = Column(String(100), default="")                         # zip 文件命名字段
     split_by = Column(String(100), default="")                           # 文件级拆分字段（如：部门）
     show_empty_period = Column(Boolean, default=True)                    # 多月合并时是否显示空月份
+    carry_over_sheets = Column(Text, default="")                         # 整表搬运：从计算结果按名称/#序号带出的sheet(逗号分隔),追加到报表末尾
     is_active = Column(Boolean, default=True)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)

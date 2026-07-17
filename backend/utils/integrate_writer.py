@@ -130,6 +130,12 @@ def apply_integration(
     if diff_rows:
         n_diff = _append_diff_sheet(wb, diff_rows, diff_order)
 
+    # 写入值中可能含公式（源为计算结果文件时），Save 前先算一遍并缓存，
+    # 否则打开 Excel 时公式不自动计算、需手动按回车才出值。
+    try:
+        wb.CalculateFormula()
+    except Exception as _ce:
+        logger.warning(f"[integrate] CalculateFormula 跳过（不阻断）: {_ce}")
     wb.Save(out_path, SaveFormat.Xlsx)
     logger.info(f"[integrate] 回填完成: 命中 {matched} 行, 覆盖 {overwritten} 格, 差异 {n_diff} 行 → {out_path}")
     return {"overwritten_cells": overwritten, "matched_rows": matched, "diff_rows": n_diff}

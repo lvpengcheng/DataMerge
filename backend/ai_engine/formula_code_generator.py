@@ -3068,7 +3068,8 @@ def main():
         expected_structure: dict,
         stream_callback: callable = None,
         user_feedback: str = None,
-        iteration_num: int = 1
+        iteration_num: int = 1,
+        history_context: str = "",
     ) -> tuple:
         """精准列级修正：只修改有差异的列，保留正确列不变
 
@@ -3108,6 +3109,10 @@ def main():
                 adjustment_request += f"\n\n【参考差异（仅供辅助）】\n{auto_diff}"
         else:
             adjustment_request = self._build_adjustment_request_from_diff(field_diff_samples)
+
+        # 对话背景：仅供理解【用户修正指示】里的指代，不作为修改清单（防止未告而改）
+        if history_context:
+            adjustment_request += f"\n\n{history_context}"
 
         log(f"列级修正: {len(target_columns)}个差异列 - {', '.join(target_columns[:5])}{'...' if len(target_columns) > 5 else ''}")
 

@@ -338,6 +338,13 @@ def write_merged_xlsx(merge_result: Dict[str, Any], out_path: str) -> str:
             rep.cell(row=j, column=1, value=str(d.get("key", "")))
             rep.cell(row=j, column=2, value=", ".join(d.get("files", [])))
 
+    # openpyxl 不计算公式：若写入的合并值含公式串，打开 Excel 时需手动按回车才计算。
+    # 设置 fullCalcOnLoad 让 Excel 打开时自动全量重算。
+    try:
+        wb.calculation.fullCalcOnLoad = True
+    except Exception:
+        pass
+
     wb.save(out_path)
     return out_path
 

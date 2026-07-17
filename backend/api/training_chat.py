@@ -822,19 +822,11 @@ def get_session_messages(
         .all()
     )
 
-    # 也返回最新迭代的代码和准确率
+    # 返回最新迭代的代码和准确率（与 /code 接口、latest_files 一致：取最新一轮，非最高分那轮）
     latest_iteration = (
         db.query(TrainingIteration)
         .filter_by(session_id=session_id)
         .order_by(TrainingIteration.iteration_num.desc())
-        .first()
-    )
-
-    best_iteration = (
-        db.query(TrainingIteration)
-        .filter_by(session_id=session_id)
-        .filter(TrainingIteration.accuracy.isnot(None))
-        .order_by(TrainingIteration.accuracy.desc())
         .first()
     )
 
@@ -899,8 +891,8 @@ def get_session_messages(
             }
             for it in iterations
         ],
-        "current_code": best_iteration.generated_code if best_iteration else None,
-        "current_accuracy": best_iteration.accuracy if best_iteration else None,
+        "current_code": latest_iteration.generated_code if latest_iteration else None,
+        "current_accuracy": latest_iteration.accuracy if latest_iteration else None,
         "latest_files": {
             "script_file": bool(latest_files.get("script_file")),
             "output_file": bool(latest_files.get("output_file")),
@@ -1631,6 +1623,7 @@ def main(source_dir, output_dir, **kwargs):
                 if source_structure_desc:
                     config["source_structure_desc"] = source_structure_desc[:70000]
                     ts.config = config
+                    flag_modified(ts, "config")
                 ts.source_structure = real_source_structure
                 db.commit()
             except Exception as e:
@@ -1684,6 +1677,7 @@ def main(source_dir, output_dir, **kwargs):
             if run_result.get("detailed_diff"):
                 config["latest_detailed_diff"] = run_result["detailed_diff"][:70000]
                 ts.config = config
+                flag_modified(ts, "config")
                 db.commit()
 
             # 更新 session
@@ -1737,6 +1731,7 @@ def main(source_dir, output_dir, **kwargs):
             if saved_files:
                 config["latest_files"] = saved_files
                 ts.config = config
+                flag_modified(ts, "config")  # 关键：首轮 latest_files 就地更新须标记，否则下载指向错文件
                 db.commit()
 
             # 生成差异描述消息
@@ -1879,6 +1874,7 @@ async def send_message(
                 rules = new_rules + "\n" + rules
                 config["rules_content"] = rules[:70000]
                 session.config = config
+                flag_modified(session, "config")
                 db.commit()
 
             # 构建 AI 对话消息
@@ -1945,26 +1941,31 @@ async def send_message(
                 rules = new_rules + "\n" + rules
                 config["rules_content"] = rules[:70000]
                 session.config = config
+                flag_modified(session, "config")
                 db.commit()
 
             _emit({"type": "status", "message": "正在根据反馈修正代码..."})
 
-            # 将对话历史注入到用户反馈中，让 AI 修正代码时能看到完整讨论上下文
-            chat_history_text = ""
-            recent_msgs = context.get("recent_messages", [])
-            if recent_msgs:
-                history_lines = []
-                for m in recent_msgs:
-                    role_label = "用户" if m["role"] == "user" else "AI助手"
-                    history_lines.append(f"[{role_label}]: {m['content']}")
-                chat_history_text = "\n".join(history_lines)
+            # 对话历史：仅作为"背景"供 AI 理解本轮指示里的指代（如"这一列""刚才说要删的"），
+            # 不作为修改清单——当前 message 仍是唯一的修改指示，防止"未告而改"。
+            # recent_messages 已含刚写入的本轮 user 消息，去掉末尾以免与"当前指示"重复。
+            recent_msgs = list(context.get("recent_messages", []))
+            if (recent_msgs and recent_msgs[-1]["role"] == "user"
+                    and (recent_msgs[-1]["content"] or "").strip() == (message or "").strip()):
+                recent_msgs = recent_msgs[:-1]
+            chat_history_text = "\n".join(
+                f"[{'用户' if m['role'] == 'user' else 'AI助手'}]: {m['content']}"
+                for m in recent_msgs
+            )
 
-            # 构建包含对话上下文的完整用户反馈
-            message_with_context = message
+            # 带护栏的历史背景块：喂给精确编辑/列级修正作 extra_context，帮 AI 理解指代，
+            # 但严禁据此改未点名的内容。
+            _history_context = ""
             if chat_history_text:
-                message_with_context = (
-                    f"## 之前的对话讨论（供参考）:\n{chat_history_text}\n\n"
-                    f"## 当前修正指示:\n{message}"
+                _history_context = (
+                    "## 对话背景（仅用于理解【修改指示】里的指代，例如\"这一列\"\"刚才说要删的\"；"
+                    "这**不是**修改清单——严禁依据背景去改未在【修改指示】中点名的任何内容）\n"
+                    f"{chat_history_text}\n\n"
                 )
 
             # 获取最新代码（优先最新一轮，而非最佳准确率的一轮）
@@ -2007,30 +2008,23 @@ async def send_message(
             # 获取源数据结构描述
             source_structure_desc = config.get("source_structure_desc", "")
 
-            # 自动模式暂不支持差异修正（AutoCodeGenerator.generate_correction_code 尚未实现）
-            # 模板模式支持：走 TemplateCodeGenerator.generate_correction_code，仅改写 fill_template
             _cur_mode = (config.get("mode") or session.mode or "").lower()
-            if _cur_mode == "auto":
-                _add_message(
-                    db, session_id, "system",
-                    "自动模式不支持差异修正，请改用「重新生成」并调整规则文档；或在新会话中训练。",
-                    "status", {"mode": _cur_mode, "blocked_action": "generate"},
-                )
-                _emit({"type": "error", "message": "自动模式不支持差异修正，请使用『重新生成』"})
-                return
 
-            # 创建代码生成器（按 mode 分叉）
+            # 创建 provider / 生成器（按 mode 分叉）
             ai_provider_name = config.get("ai_provider", "deepseek")
 
             def stream_cb(msg):
                 _emit({"type": "log", "message": msg})
 
+            from ..ai_engine.ai_provider import AIProviderFactory as _AIPF
+            generator = None
             if _cur_mode == "template":
                 from ..ai_engine.template_code_generator import TemplateCodeGenerator
-                from ..ai_engine.ai_provider import AIProviderFactory as _AIPF
-                _tpl_provider = _AIPF.create_provider(ai_provider_name) if ai_provider_name else _AIPF.create_with_fallback()
-                generator = TemplateCodeGenerator(ai_provider=_tpl_provider)
-                provider = _tpl_provider
+                provider = _AIPF.create_provider(ai_provider_name) if ai_provider_name else _AIPF.create_with_fallback()
+                generator = TemplateCodeGenerator(ai_provider=provider)
+            elif _cur_mode == "auto":
+                # 自动模式无差异修正生成器，但可走"共享精确编辑"（只需 provider）
+                provider = _AIPF.create_provider(ai_provider_name) if ai_provider_name else _AIPF.create_with_fallback()
             else:
                 generator, provider = _create_formula_generator(ai_provider_name, stream_callback=stream_cb)
 
@@ -2045,9 +2039,42 @@ async def send_message(
 
             code = None
 
-            # 策略：用户提到具体列名时，使用列级精准修正；否则全量修正
-            # 模板模式没有列级修正方法，直接走全量
-            if user_mentioned_columns and _cur_mode != "template":
+            # 所有模式统一：优先"外科手术式"精确编辑（只改用户点名的内容，未点名代码零改动），
+            # 只喂"最新代码 + 用户这轮的话"（不灌对话历史）；失败再走各模式兜底。
+            _emit({"type": "status", "message": "AI 正在精确修改（只改你点名的内容，其余原样）..."})
+            logger.info(f"[chat修正] {_cur_mode} 模式：尝试精确编辑（结构化替换）")
+            try:
+                if _cur_mode == "template":
+                    # 模板模式在 fill_template 段内套用（省 token）
+                    code = generator.generate_precise_edit(
+                        original_code=original_code,
+                        user_feedback=message,   # 当前指示为唯一修改依据
+                        rules_content=rules,
+                        source_structure=source_structure_desc,
+                        stream_callback=stream_cb,
+                        iteration_num=(session.total_iterations or 0) + 1,
+                        history_context=_history_context,  # 对话背景（仅理解指代）
+                    )
+                else:
+                    # 公式 / 自动模式：对整份代码做精确替换（模式无关共享工具）
+                    from ..ai_engine.precise_edit import run_precise_edit
+                    _rules_extra = f"## 计算规则（参考）\n{(rules or '')[:20000]}\n" if rules else ""
+                    code = run_precise_edit(
+                        provider,
+                        original_code,
+                        message,   # 当前指示为唯一修改依据
+                        extra_context=_history_context + _rules_extra,  # 对话背景（仅理解指代）+ 规则
+                        stream_callback=stream_cb,
+                    )
+            except Exception as pe_err:
+                logger.warning(f"[chat修正] 精确编辑异常: {pe_err}，降级兜底")
+                code = None
+            if code:
+                _emit({"type": "status", "message": "精确修改已套用"})
+
+            # 公式模式：精确编辑没搞定且用户点到具体列 → 再试列级修正（同样只编辑最新代码、不回退）。
+            # 模板/自动模式无此路径。列级修正只喂用户这轮消息，不灌历史。
+            if not code and user_mentioned_columns and _cur_mode == "formula":
                 _emit({"type": "status",
                        "message": f"AI 正在精准修正 {len(user_mentioned_columns)} 列: {', '.join(user_mentioned_columns.keys())}..."})
                 logger.info(f"[chat修正] 用户指定列级修正: {list(user_mentioned_columns.keys())}")
@@ -2059,41 +2086,28 @@ async def send_message(
                         source_structure=source_structure_desc,
                         expected_structure=config.get("expected_structure", {}),
                         stream_callback=stream_cb,
-                        user_feedback=message_with_context,
+                        user_feedback=message,
+                        history_context=_history_context,  # 对话背景（仅理解指代）
                     )
                 except Exception as col_err:
-                    logger.warning(f"[chat修正] 列级修正失败: {col_err}, 降级为全量修正")
+                    logger.warning(f"[chat修正] 列级修正失败: {col_err}")
                     code = None
 
+            # 精确编辑（公式模式再加列级修正）都兜不住时：**不再做全量重写**。
+            # 原则（rex）：能改就精确改、其余不动；改不了就直说、代码保持原样，绝不回退。
+            # 全量重写会从规则文档重新生成整段函数、覆盖用户之前的手动修改（表现为"把上一轮删的列又长回来"），
+            # 这是错误行为——真需要整体重出请用『重新生成』。
             if not code:
-                # 全量修正（用户未提到具体列名，或列级修正失败）
-                _emit({"type": "status", "message": "AI 正在修正代码..."})
-
-                # 构建差异文本
-                comparison_result = ""
-                if diff_dict:
-                    if isinstance(diff_dict, dict):
-                        # 如果用户提到了列名但列级修正失败，仍然只传用户提到的列的差异
-                        filtered = user_mentioned_columns if user_mentioned_columns else diff_dict
-                        comparison_result = json.dumps(filtered, ensure_ascii=False, indent=2)
-                    else:
-                        comparison_result = str(diff_dict)
-                if not comparison_result:
-                    comparison_result = detailed_diff_text
-
-                # 用户反馈单独传递，不混入差异文本
-                comparison_result += f"\n\n## 用户修正指示（最高优先级，只修改用户提到的列）:\n{message_with_context}"
-
-                code = generator.generate_correction_code(
-                    original_code=original_code,
-                    comparison_result=comparison_result,
-                    rules_content=rules,
-                    source_structure=source_structure_desc,
-                    stream_callback=stream_cb,
+                _reason_style = ""
+                if _cur_mode == "template":
+                    _reason_style = "（注意：模板模式按设计不修改单元格样式/背景色/字体，此类请求无法完成）"
+                ai_msg = (
+                    "这次修改没能完成，已**保持代码原样、未做任何改动**（不会回退你之前的修改）。\n"
+                    "可能原因：\n"
+                    "1. 没能精确定位到要改的位置——请更具体地说明改哪个 sheet / 哪一列 / 怎么改；\n"
+                    f"2. 该改动超出当前能力，或与现有逻辑冲突{_reason_style}。\n"
+                    "若确需大范围改动，请使用『重新生成』（会依据规则文档整体重出，注意这会覆盖手动微调）。"
                 )
-
-            if not code:
-                ai_msg = "抱歉，我未能生成有效的修正代码。请提供更具体的指导。"
                 _add_message(db, session_id, "assistant", ai_msg, "chat")
                 _emit({"type": "assistant_message", "content": ai_msg})
                 return
@@ -2161,6 +2175,7 @@ async def send_message(
             if run_result.get("detailed_diff"):
                 config["latest_detailed_diff"] = run_result["detailed_diff"][:70000]
                 session.config = config
+                flag_modified(session, "config")  # JSON列就地变异需显式标记，否则不写库
                 db.commit()
 
             # 准确率变化检查（不回滚，始终保留新代码让 AI 继续修正）
@@ -2238,6 +2253,7 @@ async def send_message(
             if saved_files:
                 config["latest_files"] = saved_files
                 session.config = config
+                flag_modified(session, "config")  # 关键：latest_files 就地更新须标记，否则下载仍指向旧输出
                 db.commit()
 
             if run_result.get("success"):
@@ -2995,6 +3011,10 @@ def get_current_code(
 
 # ==================== 下载训练产物 ====================
 
+# 下载 URL 不带迭代号 / 内容随迭代变化（同一 URL 每轮指向不同文件），
+# 禁缓存防浏览器/代理返回旧结果。
+_NO_STORE_HEADERS = {"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"}
+
 
 @router.get("/sessions/{session_id}/download/{file_type}")
 def download_iteration_file(
@@ -3063,7 +3083,11 @@ def download_iteration_file(
     if not file_path or not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail=f"文件不存在: {file_type}")
 
-    return FileResponse(file_path, media_type=media_type, filename=filename)
+    # no-store: 下载 URL 不带迭代号（同一 URL 每轮指向不同文件），禁缓存防浏览器/代理返回旧结果
+    return FileResponse(
+        file_path, media_type=media_type, filename=filename,
+        headers=_NO_STORE_HEADERS,
+    )
 
 
 # ==================== 重命名版本 ====================
@@ -3221,13 +3245,13 @@ def download_original_file(
             filename = files[0]
         if not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail="文件不存在")
-        return FileResponse(file_path, filename=os.path.basename(file_path))
+        return FileResponse(file_path, filename=os.path.basename(file_path), headers=_NO_STORE_HEADERS)
 
     elif file_category == "expected":
         file_path = config.get("expected_file", "")
         if not file_path or not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail="预期文件不存在")
-        return FileResponse(file_path, filename=os.path.basename(file_path))
+        return FileResponse(file_path, filename=os.path.basename(file_path), headers=_NO_STORE_HEADERS)
 
     elif file_category == "rules":
         # 检查持久化的规则文件
@@ -3237,7 +3261,7 @@ def download_original_file(
             td = sm.get_tenant_dir(session.tenant_id)
             rules_file = td / "training_chat" / str(session_id) / "rules.txt"
             if rules_file.exists():
-                return FileResponse(str(rules_file), media_type="text/plain", filename="rules.txt")
+                return FileResponse(str(rules_file), media_type="text/plain", filename="rules.txt", headers=_NO_STORE_HEADERS)
         except Exception:
             pass
         # 回退：从 config 中生成
@@ -3248,7 +3272,7 @@ def download_original_file(
         tmp.write(rules)
         tmp.close()
         from fastapi.responses import FileResponse as FR
-        return FR(tmp.name, media_type="text/plain", filename="rules.txt")
+        return FR(tmp.name, media_type="text/plain", filename="rules.txt", headers=_NO_STORE_HEADERS)
 
     elif file_category == "prompt":
         # 生成训练上下文/提示词文件
@@ -3295,7 +3319,7 @@ def download_original_file(
         tmp.close()
         from fastapi.responses import FileResponse as FR
         return FR(tmp.name, media_type="text/plain",
-                  filename=f"prompt_{session.session_key}.txt")
+                  filename=f"prompt_{session.session_key}.txt", headers=_NO_STORE_HEADERS)
 
     else:
         raise HTTPException(status_code=400, detail=f"未知文件类别: {file_category}")

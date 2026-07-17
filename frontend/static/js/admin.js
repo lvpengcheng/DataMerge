@@ -981,7 +981,7 @@ const Admin = {
         const tbody = document.querySelector('#migration-table tbody');
         const _esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
         if (!_migItems.length) {
-            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#999;">无数据，请先拉取</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#999;">无数据，请先拉取</td></tr>';
             document.getElementById('mig-select-all').checked = false;
             return;
         }
@@ -1010,10 +1010,12 @@ const Admin = {
                 <td>${_esc(it.mode)}</td>
                 <td>${acc}</td>
                 <td>${stat}</td>
+                <td><input type="text" class="mig-newname" data-i="${i}" placeholder="沿用原名"
+                       value="${_esc(it.new_name || '')}" style="width:140px;"></td>
             </tr>`;
         }).filter(Boolean);
         tbody.innerHTML = rows.length ? rows.join('')
-            : '<tr><td colspan="7" style="text-align:center;color:#999;">无匹配脚本</td></tr>';
+            : '<tr><td colspan="8" style="text-align:center;color:#999;">无匹配脚本</td></tr>';
         const selAll = document.getElementById('mig-select-all');
         if (selAll) selAll.checked = false;
     },
@@ -1024,9 +1026,15 @@ const Admin = {
 
     _selectedMigItems() {
         return Array.from(document.querySelectorAll('#migration-table .mig-cb:checked'))
-            .map(cb => _migItems[parseInt(cb.dataset.i, 10)])
-            .filter(Boolean)
-            .map(it => ({ db_id: it.db_id, hash: it.hash, name: it.name, tenant_id: it.tenant_id }));
+            .map(cb => {
+                const i = parseInt(cb.dataset.i, 10);
+                const it = _migItems[i];
+                if (!it) return null;
+                const nameInput = document.querySelector(`#migration-table .mig-newname[data-i="${i}"]`);
+                const new_name = nameInput ? nameInput.value.trim() : '';
+                return { db_id: it.db_id, hash: it.hash, name: it.name, tenant_id: it.tenant_id, new_name };
+            })
+            .filter(Boolean);
     },
 
     async doMigrate() {
@@ -1064,7 +1072,12 @@ const Admin = {
                 const names = conflicts.map(c => c.name || c.hash).join('、');
                 if (confirm(`以下脚本在目标租户已存在相同代码哈希：\n${names}\n是否覆盖迁移？`)) {
                     // 覆盖：把冲突项 + 已成功项合并重发（仅冲突项需覆盖，已导入的无需重发）
-                    await this._runMigrate(tenant, conflicts.map(c => ({ db_id: c.db_id, hash: c.hash, name: c.name, tenant_id: c.tenant_id })), true);
+                    // 保留用户在原始 items 里填的 new_name（conflicts 来自后端响应，不含 new_name）
+                    await this._runMigrate(tenant, conflicts.map(c => {
+                        const orig = items.find(it => it.hash === c.hash && it.db_id === c.db_id);
+                        return { db_id: c.db_id, hash: c.hash, name: c.name, tenant_id: c.tenant_id,
+                                 new_name: orig ? (orig.new_name || '') : '' };
+                    }), true);
                     return;
                 }
             }

@@ -1618,3 +1618,52 @@ if __name__ == "__main__":
 
         log(f"=== 模板填充模式：差异修正完成（complete_code={len(complete_code)} 字符） ===")
         return complete_code
+
+    def generate_precise_edit(
+        self,
+        original_code: str,
+        user_feedback: str,
+        rules_content: str = "",
+        source_structure: str = "",
+        stream_callback: callable = None,
+        iteration_num: int = 1,
+        history_context: str = "",
+    ) -> Optional[str]:
+        """模板模式精确编辑 —— 委托共享 precise_edit 工具，仅在 fill_template 段内套用替换。
+
+        只喂"最新代码 + 用户这轮的话"，未点名代码零改动；失败返回 None 交
+        generate_correction_code 全量兜底。history_context 为对话背景（仅供理解本轮指示
+        里的指代，不作为修改清单）。
+        """
+        from .precise_edit import run_precise_edit
+        if not original_code:
+            return None
+        prev_fill, span = self._extract_existing_fill_block(original_code)
+        if not prev_fill or "def fill_template" not in prev_fill:
+            logger.info("[精确编辑] 无法抽取 fill_template，交由全量修正兜底")
+            return None
+
+        col_map_str = self._extract_map_block(original_code, "_COL_MAP")
+        source_map_str = self._extract_map_block(original_code, "_SOURCE_MAP")
+        extra = ""
+        if history_context:
+            extra += history_context
+        if col_map_str:
+            extra += f"## 模板 _COL_MAP（运行时已注入，可直接引用）\n```python\n_COL_MAP = {col_map_str}\n```\n"
+        if source_map_str:
+            extra += f"## 源数据 _SOURCE_MAP（运行时已注入，可直接引用）\n```python\n_SOURCE_MAP = {source_map_str}\n```\n"
+        if rules_content:
+            extra += f"## 计算规则（参考）\n{rules_content[:20000]}\n"
+
+        return run_precise_edit(
+            self.ai_provider,
+            original_code,
+            user_feedback,
+            code_segment=prev_fill,
+            splice_fn=lambda full, seg: self._replace_fill_block(full, span, seg),
+            code_label="当前 fill_template 函数",
+            extra_context=extra,
+            stream_callback=stream_callback,
+            indent_fixer=self._indent_fixer,
+            training_logger=self.training_logger,
+        )

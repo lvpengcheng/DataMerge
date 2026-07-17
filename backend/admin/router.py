@@ -459,6 +459,7 @@ def _build_template_resp(t: Template) -> dict:
         "name_field": getattr(t, "name_field", "") or "",
         "split_by": getattr(t, "split_by", "") or "",
         "show_empty_period": getattr(t, "show_empty_period", True),
+        "carry_over_sheets": getattr(t, "carry_over_sheets", "") or "",
         "is_active": t.is_active,
         "created_by": t.created_by,
         "creator_name": t.creator.display_name if t.creator else "",
@@ -502,6 +503,7 @@ async def create_template(
     name_field: str = Form(""),
     split_by: str = Form(""),
     show_empty_period: bool = Form(True),
+    carry_over_sheets: str = Form(""),
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
@@ -523,6 +525,7 @@ async def create_template(
         name_field=name_field,
         split_by=split_by,
         show_empty_period=show_empty_period,
+        carry_over_sheets=carry_over_sheets,
         created_by=admin.id,
     )
     db.add(tpl)
@@ -561,6 +564,7 @@ async def update_template(
     name_field: Optional[str] = Form(None),
     split_by: Optional[str] = Form(None),
     show_empty_period: Optional[bool] = Form(None),
+    carry_over_sheets: Optional[str] = Form(None),
     db: Session = Depends(get_db),
     _admin: User = Depends(require_admin),
 ):
@@ -614,6 +618,10 @@ async def update_template(
         tpl.split_by = split_by
     if show_empty_period is not None:
         tpl.show_empty_period = show_empty_period
+    if 'carry_over_sheets' in form:
+        tpl.carry_over_sheets = str(form.get('carry_over_sheets', ''))
+    elif carry_over_sheets is not None:
+        tpl.carry_over_sheets = carry_over_sheets
 
     db.commit()
     db.refresh(tpl)
@@ -916,6 +924,22 @@ async def generate_report(
     if not assets:
         raise HTTPException(status_code=400, detail="未找到计算结果")
 
+    # 去重：双结果模式(COMPUTE_OUTPUT_VALUES_COPY)下，同一输出会注册"公式版"+"纯值版(_纯值)"
+    # 两个 result 资产，二者同数据同 sheet。报表按 sheet 名拼接会使每行数据重复出现。
+    # 同一逻辑文件只保留公式版，剔除其纯值副本；仅纯值版存在时(公式版缺失)才保留纯值版。
+    try:
+        from ..utils.output_postprocess import values_only_name
+        _names = {a.file_name for a in assets}
+        # 若某资产名是另一资产的"纯值版名"，说明它是重复副本 → 剔除
+        _values_dupes = {a.id for a in assets
+                         if any(a.file_name == values_only_name(other) for other in _names)}
+        if _values_dupes:
+            _before = len(assets)
+            assets = [a for a in assets if a.id not in _values_dupes]
+            logger.info(f"[报表去重] 剔除 {_before - len(assets)} 个纯值版重复资产，剩 {len(assets)} 个")
+    except Exception as _dedup_e:
+        logger.warning(f"[报表去重] 跳过（不阻断）: {_dedup_e}")
+
     # 4. 从 DB parsed_data 读取数据（优先），无 parsed_data 时回退到读文件
     #    读取所有 sheet，按 sheet 名分组，每个 sheet 作为独立数据源
     #    use_history 模式下自动补 salary_year / salary_month / 月份 列
@@ -1183,6 +1207,27 @@ async def generate_report(
     except Exception as e:
         logger.error(f"报表生成失败: {e}")
         raise HTTPException(status_code=500, detail=f"报表生成失败: {str(e)}")
+
+    # 9.5 整表搬运：把计算结果中预设的 sheet(按名称/#序号)整表拷贝追加到报表末尾。
+    # 仅对单文件 xlsx 报表生效（zip 打包模式跳过）。源取当前任务的结果文件。
+    _carry_cfg = (getattr(tpl, "carry_over_sheets", "") or "").strip()
+    if _carry_cfg and not output_path.lower().endswith(".zip"):
+        try:
+            _specs = [s.strip() for s in re.split(r"[,，;；\n]+", _carry_cfg) if s.strip()]
+            _carry_src = next(
+                (a.file_path for a in assets
+                 if a.source_task_id == task_id and a.file_path and os.path.exists(a.file_path)),
+                None,
+            ) or next((a.file_path for a in assets if a.file_path and os.path.exists(a.file_path)), None)
+            if _carry_src and _specs:
+                _n = aspose_helper.append_carryover_sheets(
+                    output_path, _carry_src, _specs, password=password,
+                )
+                logger.info(f"[整表搬运] 追加 {_n}/{len(_specs)} 个结果 sheet 到报表: {_specs}")
+            else:
+                logger.warning(f"[整表搬运] 跳过：源结果文件缺失或未配置 sheet（cfg={_carry_cfg}）")
+        except Exception as _carry_e:
+            logger.error(f"[整表搬运] 失败（不阻断报表下载）: {_carry_e}", exc_info=True)
 
     # 10. 留痕 — 保存为 DataAsset
     #     磁盘文件名带时间戳前缀（防同模版同任务重复生成时互相覆盖），
@@ -1539,6 +1584,7 @@ class _MigrateItem(_BaseModel):
     hash: str
     name: Optional[str] = ""
     tenant_id: Optional[str] = ""     # 来源租户（空目标时用作迁入租户）
+    new_name: Optional[str] = ""      # 迁入后自定义脚本名（空 = 沿用源脚本名）
 
 
 class _MigrateReq(_BaseModel):
@@ -1675,11 +1721,14 @@ def migration_import(req: _MigrateReq, db: Session = Depends(get_db), _admin: Us
                     execution_result=itr.get("execution_result"), accuracy=itr.get("accuracy"),
                     error_details=itr.get("error_details"), duration_seconds=itr.get("duration_seconds")))
 
+        # 迁入后脚本名：优先用户指定的 new_name，否则沿用源脚本名
+        _new_name = (item.new_name or "").strip()
+
         # 2) Script（覆盖或新建）
         if existing:
             tgt = existing
             tgt.code = code
-            tgt.name = sc.get("name") or existing.name
+            tgt.name = _new_name or sc.get("name") or existing.name
             tgt.description = sc.get("description") or ""
             tgt.mode = sc.get("mode") or "formula"
             tgt.config = sc.get("config")
@@ -1693,7 +1742,7 @@ def migration_import(req: _MigrateReq, db: Session = Depends(get_db), _admin: Us
             tgt.updated_at = datetime.utcnow()
         else:
             tgt = Script(
-                tenant_id=tenant, name=sc.get("name") or item.hash, description=sc.get("description") or "",
+                tenant_id=tenant, name=_new_name or sc.get("name") or item.hash, description=sc.get("description") or "",
                 code=code, mode=sc.get("mode") or "formula", config=sc.get("config"),
                 manual_headers=sc.get("manual_headers"), source_structure=sc.get("source_structure"),
                 rules_content=sc.get("rules_content"), expected_structure=sc.get("expected_structure"),

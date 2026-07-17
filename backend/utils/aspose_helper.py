@@ -907,6 +907,82 @@ def _finalize_workbook(
     return save_as(wb, output_path)
 
 
+def append_carryover_sheets(target_path: str, source_path: str, specs: List[str],
+                            password: Optional[str] = None) -> int:
+    """把计算结果(source_path)中指定的 sheet 整表(值+格式)拷贝追加到报表(target_path)末尾。
+
+    specs: 每项为结果表的 sheet 名，或 '#N'（1-based 位置）。
+    target 若已加密需传 password 以便打开并重新保存。返回成功拷贝的 sheet 数。
+    """
+    if not specs:
+        return 0
+    if not (source_path and os.path.exists(source_path) and os.path.exists(target_path)):
+        logger.warning(f"[整表搬运] 源或目标文件缺失: src={source_path}, tgt={target_path}")
+        return 0
+
+    src_wb = _licensed_workbook(source_path)
+    if password:
+        _lo = LoadOptions()
+        _lo.Password = password
+        tgt_wb = _licensed_workbook(target_path, _lo)
+    else:
+        tgt_wb = _licensed_workbook(target_path)
+
+    src_sheets = src_wb.Worksheets
+    src_count = src_sheets.Count
+    # 源 sheet 名 → 对象（精确 + 去空格忽略大小写兜底）
+    _by_exact, _by_loose = {}, {}
+    for i in range(src_count):
+        ws = src_sheets[i]
+        _by_exact[ws.Name] = ws
+        _by_loose[str(ws.Name).strip().lower()] = ws
+
+    def _resolve(spec):
+        s = (spec or "").strip()
+        if not s:
+            return None
+        if s.startswith("#"):
+            try:
+                idx = int(s[1:]) - 1
+            except ValueError:
+                return None
+            return src_sheets[idx] if 0 <= idx < src_count else None
+        return _by_exact.get(s) or _by_loose.get(s.lower())
+
+    existing = {tgt_wb.Worksheets[i].Name for i in range(tgt_wb.Worksheets.Count)}
+    copied = 0
+    for spec in specs:
+        src_ws = _resolve(spec)
+        if src_ws is None:
+            logger.warning(f"[整表搬运] 结果表未找到 sheet: {spec}")
+            continue
+        # 唯一 sheet 名（与报表已有 sheet 不冲突）
+        base = src_ws.Name
+        name, k = base, 1
+        while name in existing:
+            name = f"{base}_{k}"
+            k += 1
+        # 新增空 sheet 再整表拷贝（Add 在不同 Aspose 版本可能返回 int 或 Worksheet）
+        res = tgt_wb.Worksheets.Add()
+        new_ws = res if hasattr(res, "Copy") else tgt_wb.Worksheets[res]
+        new_ws.Copy(src_ws)          # 值 + 样式 + 列宽 + 合并单元格 全部复制
+        new_ws.Name = name
+        existing.add(name)
+        copied += 1
+        logger.info(f"[整表搬运] 已拷贝结果 sheet '{src_ws.Name}' → 报表 '{name}'")
+
+    if copied:
+        try:
+            tgt_wb.CalculateFormula()   # 拷入的公式先算并缓存，打开无需按回车
+        except Exception as _ce:
+            logger.warning(f"[整表搬运] CalculateFormula 跳过: {_ce}")
+        if password:
+            tgt_wb.SetEncryptionOptions(EncryptionType.StrongCryptographicProvider, 128)
+            tgt_wb.Settings.Password = password
+        tgt_wb.Save(target_path, _ext_save_format(target_path))
+    return copied
+
+
 def _fuzzy_match_column(target: str, columns) -> Optional[str]:
     """模糊匹配列名：去空格、忽略大小写"""
     target_clean = target.strip().lower()

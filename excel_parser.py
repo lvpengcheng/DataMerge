@@ -2774,16 +2774,16 @@ class IntelligentExcelParser:
         confirmed_data_rows = 0
         check_interval = 1  # 初始每行检查
 
-        # 【Fix G】捕获 start_row 特征,用于在 ≥3 空行后判断是否还有同形数据(支持稀疏数据末尾)
+        # 【Fix G】捕获 start_row 特征,用于在 ≥4 空行后判断是否还有同形数据(支持稀疏数据末尾)
         start_features = self.row_analyzer.analyze_row_features(worksheet, start_row, max_col)
 
         for row in range(start_row, max_row + 1):
             if self._is_empty_row(worksheet, row, max_col):
                 consecutive_empty_rows += 1
-                # 【Fix G】30 个连续空行硬停;3 个空行触发前瞻,有同形数据则继续扫描
+                # 【Fix G】30 个连续空行硬停;4 个空行触发前瞻,有同形数据则继续扫描
                 if consecutive_empty_rows >= 30:
                     break
-                if consecutive_empty_rows == 3:
+                if consecutive_empty_rows == 4:
                     if not self._has_data_continuation_after_gap(
                         worksheet, row, max_row, max_col, start_features
                     ):
@@ -2849,7 +2849,7 @@ class IntelligentExcelParser:
     def _has_data_continuation_after_gap(self, worksheet: Any, current_row: int,
                                          max_row: int, max_col: int,
                                          start_features: 'RowFeatures') -> bool:
-        """【Fix G】3 个连续空行后,前瞻最多 LOOKAHEAD 行,判断是否还有同形数据。
+        """【Fix G】4 个连续空行后,前瞻最多 LOOKAHEAD 行,判断是否还有同形数据。
 
         判断标准: 区间内首个非空行不是 title/summary,且其 non_empty_count
         与 start_row 的 non_empty_count 相似(≥40% 比值或差 ≤2)。

@@ -9,6 +9,7 @@ let _currentEventSource = null;  // 当前 EventSource 连接
 let _lastEventId = 0;           // 最后收到的 SSE event id
 let _currentTaskId = null;      // 当前计算任务 ID
 let _permittedTenantIds = new Set();  // 当前用户有权操作的租户
+let _permittedLoaded = false;   // 可操作租户是否已成功加载（加载后才按权限过滤/校验）
 
 /**
  * 弹出密码输入对话框，为加密文件输入密码
@@ -492,6 +493,9 @@ document.addEventListener('DOMContentLoaded', function() {
 
     // 文件选择事件
     document.getElementById('source-files').addEventListener('change', () => {
+        // 数据源变更：清掉上一次计算的结果/任务/密码映射，避免旧状态污染本次计算的列映射
+        resetCompute();
+        _filePasswordsMap = null;
         updateFileList();
         checkCanCompute();
         _autoCheckEncryption(Array.from(document.getElementById('source-files').files));
@@ -553,6 +557,7 @@ async function loadTenantList() {
             const data2 = await resp2.json();
             const items = data2.items || data2.tenants || data2 || [];
             _permittedTenantIds = new Set(items.map(t => t.tenant_id || t.id || t.name).filter(Boolean));
+            _permittedLoaded = true;   // 加载成功 → 后续按权限过滤租户列表并校验
         }
     } catch (e) {
         console.warn('加载可访问租户失败:', e);
@@ -564,7 +569,7 @@ function _applyTenantPermission() {
     const btn = document.getElementById('compute-btn');
     if (!btn) return;
     const tid = currentTenantId;
-    const allowed = !tid || _permittedTenantIds.size === 0 || _permittedTenantIds.has(tid);
+    const allowed = !tid || !_permittedLoaded || _permittedTenantIds.has(tid);
     if (!allowed) {
         btn.disabled = true;
         btn.title = '您无权操作此租户';
@@ -582,9 +587,14 @@ function showTenantDropdown() {
 
 function filterTenantDropdown() {
     const input = document.getElementById('tenant-input').value.trim().toLowerCase();
+    // 租户隔离：权限加载后只列当前用户有权操作的租户（未加载时暂不过滤，后端仍会强校验）
+    let base = tenantListData;
+    if (_permittedLoaded) {
+        base = tenantListData.filter(t => _permittedTenantIds.has(t.tenant_id));
+    }
     const filtered = input
-        ? tenantListData.filter(t => t.tenant_id.toLowerCase().includes(input))
-        : tenantListData;
+        ? base.filter(t => t.tenant_id.toLowerCase().includes(input))
+        : base;
     renderTenantDropdown(filtered);
     document.getElementById('tenant-dropdown').style.display = 'block';
 }
@@ -736,7 +746,7 @@ function checkCanCompute() {
     const btn = document.getElementById('compute-btn');
     const hasFiles = document.getElementById('source-files').files.length > 0;
     const hasTenant = currentTenantId && currentScriptId;
-    const allowed = !currentTenantId || _permittedTenantIds.size === 0 || _permittedTenantIds.has(currentTenantId);
+    const allowed = !currentTenantId || !_permittedLoaded || _permittedTenantIds.has(currentTenantId);
     btn.disabled = !(hasFiles && hasTenant && allowed);
     if (!allowed) btn.title = '您无权操作此租户';
 }
