@@ -1628,19 +1628,28 @@ if __name__ == "__main__":
         stream_callback: callable = None,
         iteration_num: int = 1,
         history_context: str = "",
+        reason_sink: Optional[list] = None,
     ) -> Optional[str]:
-        """模板模式精确编辑 —— 委托共享 precise_edit 工具，仅在 fill_template 段内套用替换。
+        """模板模式精确编辑 —— 对【整份最新脚本】做外科手术式精确替换。
 
-        只喂"最新代码 + 用户这轮的话"，未点名代码零改动；失败返回 None 交
-        generate_correction_code 全量兜底。history_context 为对话背景（仅供理解本轮指示
-        里的指代，不作为修改清单）。
+        过去只截 fill_template 段喂 AI（省 token），但这导致 fill_template 之外的骨架逻辑
+        （_append_source_sheets 源数据读取/转文本、load_source_data、辅助函数等）根本没
+        喂给 AI，用户想改这些"全局代码"时永远失败；即便加了"段内失败再回退整份"的两级
+        策略，AI 也可能在 fill_template 内凑出一个能唯一匹配的改动"假成功"，导致回退不触发。
+
+        因此改为**直接把完整脚本喂给 AI**，可改任意位置。precise_edit 的三重保险仍在：
+          - `find` 必须在代码中唯一出现才替换（定位不到/多处 → 该处跳过并报原因）；
+          - 只为【修改指示】点名的内容生成替换，未点名代码零改动；
+          - 替换后整份脚本语法校验，不过则放弃、绝不写入坏码。
+
+        original_code 为调用方传入的"最新一轮代码"（用户上传的或已训练的），修改基于它进行。
+        history_context 为对话背景（仅供理解本轮指示里的指代，不作为修改清单）。
+        reason_sink 收集失败原因供上层提示用户。失败返回 None 交上层兜底（不做全量重写）。
         """
         from .precise_edit import run_precise_edit
         if not original_code:
-            return None
-        prev_fill, span = self._extract_existing_fill_block(original_code)
-        if not prev_fill or "def fill_template" not in prev_fill:
-            logger.info("[精确编辑] 无法抽取 fill_template，交由全量修正兜底")
+            if reason_sink is not None:
+                reason_sink.append("没有可修改的原始代码")
             return None
 
         col_map_str = self._extract_map_block(original_code, "_COL_MAP")
@@ -1655,15 +1664,16 @@ if __name__ == "__main__":
         if rules_content:
             extra += f"## 计算规则（参考）\n{rules_content[:20000]}\n"
 
+        # 直接对整份脚本精确编辑：填充逻辑(fill_template)、源数据读取(_append_source_sheets/
+        # load_source_data)、辅助函数等任意部分都可被点名修改。
         return run_precise_edit(
             self.ai_provider,
             original_code,
             user_feedback,
-            code_segment=prev_fill,
-            splice_fn=lambda full, seg: self._replace_fill_block(full, span, seg),
-            code_label="当前 fill_template 函数",
+            code_label="当前完整脚本（模板模式，可改填充逻辑 fill_template 与源数据读取 _append_source_sheets 等任意部分）",
             extra_context=extra,
             stream_callback=stream_callback,
             indent_fixer=self._indent_fixer,
             training_logger=self.training_logger,
+            reason_sink=reason_sink,
         )

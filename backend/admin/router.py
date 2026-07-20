@@ -1573,8 +1573,42 @@ def migration_export(db_id: int, db: Session = Depends(get_db), _admin: User = D
                 iterations.append({c: getattr(it, c) for c in (
                     "iteration_num", "status", "prompt_text", "ai_response", "generated_code",
                     "execution_result", "accuracy", "error_details", "duration_seconds")})
+    # 模板文件一并打包：模板模式脚本的模板文件跨环境不可复用（烘焙的是训练机绝对路径，
+    # 且文件名带源 session id 前缀，如 13_太保上海.xlsx）。这里把文件字节 base64 塞进包，
+    # 导入端按【原始烘焙文件名】落到目标租户 templates/ 下——resolve_template_path 按
+    # 【文件名+哈希】在租户目录递归查找，与两边 session id 是否一致无关。
+    template_blob = None
+    try:
+        from ..utils.template_resolver import extract_template_ref
+        _tname, _thash, _tbaked = extract_template_ref(s.code)
+        # 读取用的实际路径：优先会话 config 里的持久化路径，回退烘焙绝对路径（均为本机路径）
+        _tpl_file = None
+        if session and isinstance(session.get("config"), dict):
+            _cfg_tp = session["config"].get("template_path")
+            if _cfg_tp and os.path.exists(_cfg_tp):
+                _tpl_file = _cfg_tp
+        if not _tpl_file and _tbaked and os.path.exists(_tbaked):
+            _tpl_file = _tbaked
+        if _tpl_file and os.path.exists(_tpl_file):
+            _sz = os.path.getsize(_tpl_file)
+            if _sz <= 60 * 1024 * 1024:   # 60MB 上限，超大不打包（避免撑爆 JSON 传输）
+                import base64 as _b64
+                with open(_tpl_file, "rb") as _tf:
+                    _tbytes = _tf.read()
+                template_blob = {
+                    "name": _tname or os.path.basename(_tpl_file),
+                    "hash": _thash or _hashlib.md5(_tbytes).hexdigest(),
+                    "data_b64": _b64.b64encode(_tbytes).decode("ascii"),
+                }
+            else:
+                logging.getLogger(__name__).warning(
+                    f"[迁移导出] 模板过大({_sz}B)未打包，导入端需手动上传 db_id={s.id}")
+    except Exception as _te:
+        logging.getLogger(__name__).warning(f"[迁移导出] 模板打包失败 db_id={db_id}: {_te}")
+
     return {"hash": _code_hash(s.code), "source_db_id": s.id, "script": script,
-            "session": session, "messages": messages, "iterations": iterations}
+            "session": session, "messages": messages, "iterations": iterations,
+            "template": template_blob}
 
 
 # ---- 导入端（当前环境，UI 调用）----
@@ -1763,6 +1797,33 @@ def migration_import(req: _MigrateReq, db: Session = Depends(get_db), _admin: Us
                 _json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as fe:
             logging.getLogger(__name__).warning(f"[迁移] 落盘失败: {fe}")
+
+        # 3b) 模板文件落盘：把导出包里的模板字节按【原始烘焙文件名】写到目标租户 templates/。
+        # 文件名保持源环境烘焙的名字（含源 session id 前缀），resolve_template_path 按
+        # 【文件名+哈希】在租户目录递归命中，故两边 session id 不一致也能定位到，迁移后
+        # 无需手动上传模板即可直接智算。仅模板模式脚本有 template 包。
+        tpl_blob = bundle.get("template")
+        if tpl_blob and tpl_blob.get("data_b64") and tpl_blob.get("name"):
+            try:
+                import base64 as _b64
+                templates_dir = sm.get_tenant_dir(tenant) / "templates"
+                templates_dir.mkdir(parents=True, exist_ok=True)
+                _tpl_dst = templates_dir / tpl_blob["name"]
+                _tpl_bytes = _b64.b64decode(tpl_blob["data_b64"])
+                _tpl_dst.write_bytes(_tpl_bytes)
+                # 会话 config 指向新路径，训练/复算再跑也能定位（智算另有 resolver 兜底）
+                if new_session_id:
+                    _ts = db.query(TrainingSession).filter_by(id=new_session_id).first()
+                    if _ts:
+                        _c = dict(_ts.config) if _ts.config else {}
+                        _c["template_path"] = str(_tpl_dst)
+                        _ts.config = _c
+                        from sqlalchemy.orm.attributes import flag_modified
+                        flag_modified(_ts, "config")
+                logging.getLogger(__name__).info(
+                    f"[迁移] 模板落盘 -> {_tpl_dst} ({len(_tpl_bytes)}B)")
+            except Exception as _tre:
+                logging.getLogger(__name__).warning(f"[迁移] 模板落盘失败: {_tre}")
 
         # 4) 迁移记录
         db.add(ScriptMigration(source_url=base, source_script_hash=item.hash, source_db_id=item.db_id,

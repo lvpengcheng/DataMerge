@@ -430,6 +430,8 @@ def _get_session_context(db: Session, session_id: int) -> Dict[str, Any]:
         "latest_accuracy": latest_iteration.accuracy if latest_iteration else None,
         "latest_diff": latest_iteration.error_details if latest_iteration else None,
         "latest_execution_result": latest_iteration.execution_result if latest_iteration else None,
+        "latest_source": ((latest_iteration.execution_result or {}).get("source")
+                          if latest_iteration else None),
         "total_iterations": session.total_iterations or 0,
         "recent_messages": [
             {"role": m.role, "content": m.content} for m in recent_messages
@@ -451,6 +453,15 @@ def _build_chat_system_prompt(context: Dict, config: Dict, rules: str) -> str:
         "- 你可以引用当前代码中的少量关键行（不超过20行）来指出问题，但不要输出完整函数或完整代码。",
         "- 如果需要展示修改方案，只写伪代码或关键片段（不超过20行），并说明修改意图。",
         "- 当用户确认了修改方案后，请总结需要修改的要点，告知用户点击【执行修正】来生成完整代码。",
+        "",
+        "## 【执行修正】的真实能力（务必据此回答，不要凭旧印象误导用户）",
+        "点击【执行修正】时，系统会把**整份最新脚本**交给 AI 做外科手术式精确修改，"
+        "**可以修改脚本里的任意位置**——包括填充逻辑 fill_template、源数据读取与写值逻辑"
+        "（如 _append_source_sheets、load_source_data）、辅助函数等，不限于某个函数。",
+        "因此：",
+        "- **严禁**告诉用户\"这段在 fill_template 之外 / 执行修正够不到 / 只能改 fill_template\"——这是过时的错误说法；",
+        "- **严禁**建议用户手动去改 .py 文件；只要能说清改哪里、怎么改，就让用户点【执行修正】，由系统精确改；",
+        "- 唯一真正改不了的：模板单元格的样式/背景色/字体（模板模式按设计不动这些）。除此之外都可以经【执行修正】落地。",
         "请用中文回答。",
     ]
 
@@ -458,7 +469,16 @@ def _build_chat_system_prompt(context: Dict, config: Dict, rules: str) -> str:
     if context.get("latest_code"):
         code = context["latest_code"].strip()
         code_lines = code.split("\n")
-        parts.append(f"\n当前代码共 {len(code_lines)} 行:\n```python\n{code}\n```")
+        _uploaded_note = ""
+        if context.get("latest_source") == "manual_upload":
+            _uploaded_note = "（用户刚手动上传/替换了这份代码，是全新的最新版本）"
+        parts.append(
+            f"\n## 当前代码{_uploaded_note}（共 {len(code_lines)} 行）\n"
+            "这是本会话**唯一有效、最新**的代码，请严格以它为准进行分析。\n"
+            "**重要：如果上文对话历史里出现过与此不同的代码、行号或分析结论，一律以本段【当前代码】为准，"
+            "忽略历史中的旧代码——历史仅供理解用户之前的意图，不代表现在的代码。**\n"
+            f"```python\n{code}\n```"
+        )
 
     # 准确率信息
     if context.get("latest_accuracy") is not None:
@@ -642,6 +662,21 @@ def _run_single_iteration(
                 "execution_time": execution_time,
             }
         result_file = str(output_files[0])
+
+        # 源_ sheet 格式兜底（与智算 compute.py / 下载 main.py 同一处理，训练路径此前遗漏）：
+        # 模板 Normal 默认样式常被设成时间/日期格式（如 [$-F400]h:mm:ss AM/PM），openpyxl
+        # 追加 源_ sheet 时，走 "General" 兜底分支的列（序号等无显式数字格式的列）设 General
+        # 并不能覆盖继承来的默认样式，数值会显示成时间——即用户看到的"数值列变时间格式"。
+        # 这里用 Aspose 把 源_ sheet 里格式恰好等于默认样式的单元格拉回 General（日期关键词
+        # 列→yyyy-mm-dd），只改样式保值。template_path 传 None → 内部回退用输出文件自身
+        # 读默认格式（输出基于模板、继承同一 Normal 样式），故无需定位模板文件。
+        try:
+            from backend.utils.output_postprocess import normalize_source_sheet_formats
+            _fixed = normalize_source_sheet_formats(result_file, None)
+            if _fixed:
+                logger.info(f"[源_格式兜底] 训练输出已规范 {_fixed} 个继承默认样式的单元格: {result_file}")
+        except Exception as _fe:
+            logger.warning(f"[源_格式兜底] 训练路径跳过: {_fe}")
 
         # 对比 — 统一使用多sheet对比（自动处理单sheet情况，避免预先打开文件数sheet数）
         diff_output = str(output_dir / "_diff.xlsx")
@@ -2038,6 +2073,7 @@ async def send_message(
             ) if src_dir and os.path.isdir(src_dir) else None
 
             code = None
+            _edit_reasons = []  # 收集精确编辑/列级修正失败的具体原因，供兜底消息告知用户
 
             # 所有模式统一：优先"外科手术式"精确编辑（只改用户点名的内容，未点名代码零改动），
             # 只喂"最新代码 + 用户这轮的话"（不灌对话历史）；失败再走各模式兜底。
@@ -2045,7 +2081,7 @@ async def send_message(
             logger.info(f"[chat修正] {_cur_mode} 模式：尝试精确编辑（结构化替换）")
             try:
                 if _cur_mode == "template":
-                    # 模板模式在 fill_template 段内套用（省 token）
+                    # 模板模式：对整份脚本精确编辑（可改 fill_template 与 _append_source_sheets 等骨架逻辑）
                     code = generator.generate_precise_edit(
                         original_code=original_code,
                         user_feedback=message,   # 当前指示为唯一修改依据
@@ -2054,6 +2090,7 @@ async def send_message(
                         stream_callback=stream_cb,
                         iteration_num=(session.total_iterations or 0) + 1,
                         history_context=_history_context,  # 对话背景（仅理解指代）
+                        reason_sink=_edit_reasons,
                     )
                 else:
                     # 公式 / 自动模式：对整份代码做精确替换（模式无关共享工具）
@@ -2065,9 +2102,11 @@ async def send_message(
                         message,   # 当前指示为唯一修改依据
                         extra_context=_history_context + _rules_extra,  # 对话背景（仅理解指代）+ 规则
                         stream_callback=stream_cb,
+                        reason_sink=_edit_reasons,
                     )
             except Exception as pe_err:
                 logger.warning(f"[chat修正] 精确编辑异常: {pe_err}，降级兜底")
+                _edit_reasons.append(f"精确修改过程出错：{pe_err}")
                 code = None
             if code:
                 _emit({"type": "status", "message": "精确修改已套用"})
@@ -2089,8 +2128,12 @@ async def send_message(
                         user_feedback=message,
                         history_context=_history_context,  # 对话背景（仅理解指代）
                     )
+                    if not code:
+                        _edit_reasons.append(
+                            f"针对 {', '.join(user_mentioned_columns.keys())} 的列级修正也未能生成有效改动")
                 except Exception as col_err:
                     logger.warning(f"[chat修正] 列级修正失败: {col_err}")
+                    _edit_reasons.append(f"列级修正出错：{col_err}")
                     code = None
 
             # 精确编辑（公式模式再加列级修正）都兜不住时：**不再做全量重写**。
@@ -2101,11 +2144,20 @@ async def send_message(
                 _reason_style = ""
                 if _cur_mode == "template":
                     _reason_style = "（注意：模板模式按设计不修改单元格样式/背景色/字体，此类请求无法完成）"
+                # 具体原因：把精确编辑/列级修正收集到的失败原因逐条列出，替代笼统猜测
+                if _edit_reasons:
+                    _reason_lines = "\n".join(f"- {r}" for r in _edit_reasons)
+                    _reason_block = f"具体原因：\n{_reason_lines}\n"
+                else:
+                    _reason_block = (
+                        "可能原因：\n"
+                        "1. 没能精确定位到要改的位置——请更具体地说明改哪个 sheet / 哪一列 / 怎么改；\n"
+                        f"2. 该改动超出当前能力，或与现有逻辑冲突{_reason_style}。\n"
+                    )
                 ai_msg = (
                     "这次修改没能完成，已**保持代码原样、未做任何改动**（不会回退你之前的修改）。\n"
-                    "可能原因：\n"
-                    "1. 没能精确定位到要改的位置——请更具体地说明改哪个 sheet / 哪一列 / 怎么改；\n"
-                    f"2. 该改动超出当前能力，或与现有逻辑冲突{_reason_style}。\n"
+                    f"{_reason_block}"
+                    "建议：把要改的 sheet / 列名 / 期望结果说得更具体些再点【执行修正】；"
                     "若确需大范围改动，请使用『重新生成』（会依据规则文档整体重出，注意这会覆盖手动微调）。"
                 )
                 _add_message(db, session_id, "assistant", ai_msg, "chat")
@@ -2882,10 +2934,13 @@ async def upload_code(
         session.tenant_id, session_id, iteration_num,
         code_content, run_result
     )
+    # 刷新差异文本：上传的是全新代码，之前 config 里的 latest_detailed_diff 属于旧版本，
+    # 若不更新，用户随后点【执行修正】会拿到旧版差异误导修正。
+    config["latest_detailed_diff"] = (run_result.get("detailed_diff") or "")[:70000]
     if iter_files:
         config["latest_files"] = iter_files
-        session.config = dict(config)  # 触发 SQLAlchemy 变更检测
-        db.commit()
+    session.config = dict(config)  # 触发 SQLAlchemy 变更检测
+    db.commit()
 
     # 同步保存到磁盘和DB（使智算页面可用）
     mode = session.mode or "formula"

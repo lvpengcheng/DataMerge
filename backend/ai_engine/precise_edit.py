@@ -145,6 +145,7 @@ def run_precise_edit(
     stream_callback: Callable = None,
     indent_fixer=None,
     training_logger=None,
+    reason_sink: Optional[list] = None,
 ) -> Optional[str]:
     """模式无关精确编辑。
 
@@ -156,6 +157,8 @@ def run_precise_edit(
         splice_fn: (full_code, patched_segment) -> 新 full_code；None = 片段即整份
         code_label: prompt 里对代码块的称呼（如 "当前 fill_template 函数"）
         extra_context: 追加到 prompt 末尾的上下文（_COL_MAP / 规则等，可选）
+        reason_sink: 可选 list；失败返回 None 时向其追加一句人类可读的失败原因，
+                     供调用方拼进给用户的提示（不影响返回值）。
 
     Returns:
         修正后的完整脚本；无可套用替换 / 语法不过 → None（调用方兜底）。
@@ -165,8 +168,13 @@ def run_precise_edit(
         if stream_callback:
             stream_callback(msg)
 
-    if not full_code:
+    def _fail(reason: str):
+        if reason_sink is not None:
+            reason_sink.append(reason)
         return None
+
+    if not full_code:
+        return _fail("没有可修改的原始代码")
     segment = code_segment if code_segment is not None else full_code
 
     prompt = build_prompt(segment, user_feedback, code_label=code_label, extra_context=extra_context)
@@ -186,14 +194,20 @@ def run_precise_edit(
     edits = parse_precise_edits(ai_response)
     if not edits:
         log("[精确编辑] 未解析到有效替换对，交由兜底")
-        return None
+        # AI 常在无法完成时用自然语言说明原因，截一段带回给用户
+        _hint = (ai_response or "").strip().replace("\n", " ")
+        _hint = f"（AI 说明：{_hint[:200]}）" if _hint else ""
+        return _fail(f"AI 未给出可套用的精确替换，可能是指示不够具体或该改动无法用局部替换表达{_hint}")
 
     patched_segment, applied, failed = apply_precise_edits(segment, edits)
     for note, cnt in failed:
         log(f"[精确编辑] ⚠ 片段无法唯一定位（出现 {cnt} 次），已跳过: {note}")
     if not applied:
         log("[精确编辑] 无任何可套用的替换，交由兜底")
-        return None
+        _locs = "；".join(
+            f"“{note}”在代码中出现 {cnt} 次（需唯一才能定位）" for note, cnt in failed
+        ) if failed else "AI 给出的替换片段与当前代码对不上"
+        return _fail(f"要改的位置无法在当前代码里精确定位：{_locs}")
     log(f"[精确编辑] 已精确套用 {len(applied)} 处修改: {applied}；跳过 {len(failed)} 处")
 
     # 修复管线（可选，provider/indent_fixer 存在才走）
@@ -223,7 +237,7 @@ def run_precise_edit(
     syn_err = _validate_syntax(complete_code)
     if syn_err:
         log(f"[精确编辑] 语法校验未通过：{syn_err}，交由兜底")
-        return None
+        return _fail(f"改动后代码语法不通过（{syn_err}），已放弃以免写入坏代码")
 
     log(f"[精确编辑] 完成（complete_code={len(complete_code)} 字符）")
     return complete_code

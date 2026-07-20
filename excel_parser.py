@@ -3201,6 +3201,9 @@ class IntelligentExcelParser:
         try:
             if self._fmt_is_clear_date(num, cust):
                 return None
+            # 时间格式（h:mm:ss / AM-PM 等）同样不复用：源列多是数字，套时间格式会显示成时间
+            if self._fmt_is_clear_time(num, cust):
+                return None
         except Exception:
             pass
         c = str(cust or "").strip()
@@ -3243,6 +3246,11 @@ class IntelligentExcelParser:
     _DATE_BUILTIN_FMT_IDS = frozenset({14, 15, 16, 17, 22, 27, 28, 29, 30, 31, 36,
                                        50, 51, 52, 53, 54, 55, 56, 57, 58})
 
+    # 内置"时间"格式 id（h:mm / h:mm:ss / mm:ss / [h]:mm:ss / h:mm AM/PM 等）。
+    # 这些绝不能作为"可复用自定义格式"套回源_sheet：源列值多是金额等数字，
+    # 被套上时间格式后会显示成 12:00:00 AM 之类，即用户看到的"数值列变时间格式"。
+    _TIME_BUILTIN_FMT_IDS = frozenset({18, 19, 20, 21, 45, 46, 47})
+
     # 主键/ID 类列名关键词（与 backend/utils/output_postprocess 主键归一保持一致）：
     # 这些列跨源常"一处数字一处文本"，解析时统一成规范文本，保证公式(VLOOKUP)精确匹配。
     _KEY_COL_KEYWORDS = (
@@ -3253,6 +3261,30 @@ class IntelligentExcelParser:
     )
     # 含关键词但本质是数值/需参与求和的列 → 排除，绝不 text 化
     _KEY_COL_EXCLUDE = ("工资", "金额", "薪资", "比例", "系数", "天数", "月数", "说明", "规则", "姓名")
+
+    @staticmethod
+    def _fmt_is_clear_time(number_id, custom) -> bool:
+        """是否"时间格式"：内置时间 id，或自定义串含小时/秒/AM-PM 时间标记。
+
+        源列的数字（金额等）常被误套时间格式（如 [$-F400]h:mm:ss AM/PM）；这类格式不能
+        当"可复用自定义格式"套回源_sheet，否则数字显示成时间。含 yyyy 的日期时间不在此列
+        （交给日期通道），此处只认纯时间。
+        """
+        try:
+            if int(number_id) in IntelligentExcelParser._TIME_BUILTIN_FMT_IDS:
+                return True
+        except Exception:
+            pass
+        import re as _re
+        f = str(custom or "").lower()
+        f = _re.sub(r"\[[^\]]*\]", "", f)   # 去掉 [$-F400] / 条件段等方括号内容
+        f = f.split(";")[0]                  # 只看正数段
+        if "yyyy" in f:                      # 含 4 位年 → 属日期(时间)，不在此拦截
+            return False
+        # 纯时间标记：小时 h、秒 ss、上午下午 am/pm
+        if "h" in f or "ss" in f or "am/pm" in f:
+            return True
+        return False
 
     @staticmethod
     def _fmt_is_clear_date(number_id, custom) -> bool:
