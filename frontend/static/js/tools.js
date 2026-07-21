@@ -293,7 +293,7 @@ const Tools = {
             <h3 style="margin-top:16px;">② 关联键（每个文件）</h3>
             <div id="int-key-map"></div>
 
-            <h3 style="margin-top:16px;">③ 覆盖字段（勾选基准列 → 匹配对照列）</h3>
+            <h3 style="margin-top:16px;">③ 覆盖字段（勾选基准列 → 匹配对照列 / 公式）</h3>
             <div id="int-ow-picker" style="border:1px solid #e3e7ed;border-radius:6px;padding:8px;max-height:150px;overflow:auto;"></div>
             <div style="margin:6px 0;">
                 <button type="button" class="btn btn-sm" id="int-ow-match">智能匹配</button>
@@ -302,7 +302,7 @@ const Tools = {
             </div>
             <table class="data-table"><thead><tr><th>基准字段（主表列）</th><th>匹配的对照列（来源）</th><th style="width:32px;"></th></tr></thead>
                 <tbody id="int-ow-list-rows"></tbody></table>
-            <div style="color:#888;font-size:12px;margin-top:4px;">勾选后在下方选/改对照列。只写值不写公式；同一主表列多行时靠上优先。</div>
+            <div style="color:#888;font-size:12px;margin-top:4px;">点单元格可选多列并用公式(基本工资+本月奖金，支持 +-*/、括号)组合；对照表同一主键多行时各列先跨行求和再代入。多张对照表都填时靠上优先取首个非空。</div>
 
             <h3 style="margin-top:16px;">④ 对比字段（可选，输出方式2用）</h3>
             <div id="int-cmp-picker" style="border:1px solid #e3e7ed;border-radius:6px;padding:8px;max-height:150px;overflow:auto;"></div>
@@ -401,11 +401,11 @@ const Tools = {
         this._intRenderPicker('ow');
         this._intRenderPicker('cmp');
         const trans = (pairs) => (pairs || []).map(p => ({
-            a_col: p.a_col, source_file: f2f[p.source_fp], source_col: p.source_col,
+            a_col: p.a_col, source_file: f2f[p.source_fp], expr: p.source_expr || p.source_col,
         })).filter(p => p.source_file);
         const applyPairs = (pairs, kind) => {
             const byA = {};
-            trans(pairs).forEach(p => { (byA[p.a_col] = byA[p.a_col] || []).push({ file: p.source_file, col: p.source_col }); });
+            trans(pairs).forEach(p => { (byA[p.a_col] = byA[p.a_col] || []).push({ file: p.source_file, expr: p.expr }); });
             Object.entries(byA).forEach(([a, srcs]) => {
                 const cb = document.querySelector(`.int-${kind}-pick[data-col="${CSS.escape(a)}"]`);
                 if (cb) cb.checked = true;
@@ -539,36 +539,169 @@ const Tools = {
         let picks = [];
         try { picks = JSON.parse(tr.dataset.src || '[]'); } catch (_) {}
         cell.innerHTML = picks.length
-            ? picks.map(p => `<span style="background:#eef4fb;padding:1px 6px;border-radius:3px;margin:1px;display:inline-block;font-size:12px;">${_escape(p.file)} · ${_escape(p.col)}</span>`).join(' ')
+            ? picks.map(p => `<span style="background:#eef4fb;padding:1px 6px;border-radius:3px;margin:1px;display:inline-block;font-size:12px;">${_escape(p.file)} · ${_escape(p.expr || p.col || '')}</span>`).join(' ')
             : '<span style="color:#999;">点击选择对照列…</span>';
     },
 
-    // 弹出勾选对照列：按对照文件分组（支持多表），可多选（靠前优先）
+    // 公式校验：去掉本表所有列名后，只允许 +-*/、数字、括号、小数点、空白。
+    // 列名被改动/写错 → 无法识别的残余会留在 rest 里，据此判定不合法（实现「列名不可编辑」）。
+    _intCheckFx(file, expr) {
+        const cols = (this._intFileMeta(file)?.columns || []).slice().sort((a, b) => b.length - a.length);
+        let rest = expr || '';
+        cols.forEach(c => { if (c) rest = rest.split(c).join(' '); });
+        return { ok: /^[0-9eE.+\-*/()\s]*$/.test(rest), rest: rest.trim() };
+    },
+
+    // 公式分词：按已知列名（长名优先）把公式拆成 {t:'col'|'op'|'other', v} 序列，空白丢弃。
+    // 供勾选联动做增量增删列，避免整体重写冲掉用户手动写的括号/常数/运算符。
+    _intTokenize(expr, file) {
+        const cols = (this._intFileMeta(file)?.columns || []).slice().filter(Boolean).sort((a, b) => b.length - a.length);
+        const s = expr || '';
+        const toks = [];
+        const isOp = ch => '+-*/()'.indexOf(ch) >= 0;
+        const colAt = pos => cols.find(c => s.startsWith(c, pos));
+        let i = 0;
+        while (i < s.length) {
+            if (/\s/.test(s[i])) { i++; continue; }
+            const c = colAt(i);
+            if (c) { toks.push({ t: 'col', v: c }); i += c.length; continue; }
+            if (isOp(s[i])) { toks.push({ t: 'op', v: s[i] }); i++; continue; }
+            let j = i;
+            while (j < s.length && !/\s/.test(s[j]) && !isOp(s[j]) && !colAt(j)) j++;
+            toks.push({ t: 'other', v: s.slice(i, j) });
+            i = j;
+        }
+        return toks;
+    },
+
+    // 增量·勾上：公式里没有该列才在末尾用 + 追加；已存在则原样返回（不动手动公式）。
+    _intFxAddCol(expr, col, file) {
+        const cur = (expr || '').trim();
+        const toks = this._intTokenize(cur, file);
+        if (toks.some(t => t.t === 'col' && t.v === col)) return cur;
+        return cur ? `${cur}+${col}` : col;
+    },
+
+    // 增量·取消：删掉该列 token 及紧邻的一个运算符，再清理空括号/首尾悬空运算符；
+    // 删完若已无任何列则清空（对应「取消所有勾选 → 空」）。公式里本就没有该列则原样返回。
+    _intFxRemoveCol(expr, col, file) {
+        let toks = this._intTokenize(expr || '', file);
+        if (!toks.some(t => t.t === 'col' && t.v === col)) return (expr || '');
+        for (let k = toks.length - 1; k >= 0; k--) {
+            if (!(toks[k].t === 'col' && toks[k].v === col)) continue;
+            const prev = toks[k - 1], next = toks[k + 1];
+            if (prev && prev.t === 'op' && '+-*/'.indexOf(prev.v) >= 0) { toks.splice(k - 1, 2); k--; }
+            else if (next && next.t === 'op' && '+-*/'.indexOf(next.v) >= 0) { toks.splice(k, 2); }
+            else { toks.splice(k, 1); }
+        }
+        if (!toks.some(t => t.t === 'col')) return '';
+        let out = toks.map(t => t.v).join(''), prev = null;
+        while (out !== prev) {
+            prev = out;
+            out = out.replace(/\(\)/g, '')          // 空括号
+                     .replace(/^[+\-*/]+/, '')       // 首部悬空运算符
+                     .replace(/[+\-*/]+$/, '')       // 尾部悬空运算符
+                     .replace(/\(\s*[+*/]/g, '(')     // 左括号后紧跟 +*/（保留一元 -）
+                     .replace(/[+\-*/]\)/g, ')');     // 右括号前的悬空运算符
+        }
+        return out.trim();
+    },
+
+    // 公式里列名的集合签名（排序后拼接）：用于判定键盘编辑是否动了列名。
+    _intColSig(expr, file) {
+        return this._intTokenize(expr, file).filter(t => t.t === 'col').map(t => t.v).sort().join('');
+    },
+
+    // 弹出勾选对照列：按对照文件分组（支持多表）。每个对照表勾选若干列后，底部公式框自动
+    // 用「+」连接已选列，可手动改成任意四则运算(基本工资+本月奖金 / (应发-扣款)*0.8)。
+    // 每张对照表产出一条 {file, expr}；多表并存=优先级回退（靠上的先取，非空即用）。
+    // 同一主键在对照表里有多行时，公式里每个列会先跨行求和再代入（后端 eval_source_expr）。
     _intOpenSrcPicker(kind, tr) {
         let selected = [];
         try { selected = JSON.parse(tr.dataset.src || '[]'); } catch (_) {}
-        const selSet = new Set(selected.map(s => `${s.file}||${s.col}`));
+        // 归一到 {file: expr}（兼容旧格式 {file,col}）
+        const exprByFile = {};
+        selected.forEach(s => { exprByFile[s.file] = (s.expr || s.col || exprByFile[s.file] || ''); });
         const files = this._intNonMainFiles();
         const body = `
-            <div style="font-size:12px;color:#888;margin-bottom:8px;">可跨多张对照表多选；勾多个时靠上的优先（取首个非空值）。</div>
-            ${files.map(f => `
-                <div style="margin-bottom:10px;">
+            <div style="font-size:12px;color:#888;margin-bottom:8px;">
+              每张对照表勾选列 → 下方公式框自动用「+」连接，可手动改（仅支持列名与 +-*/、数字、括号）。
+              多张表都填时，靠上的优先（取首个非空）。同一主键多行会先把各列跨行求和再代入公式。
+            </div>
+            ${files.map((f, fi) => {
+                const preset = exprByFile[f.name] || '';
+                return `
+                <div class="int-fgrp" data-file="${_escape(f.name)}" style="margin-bottom:12px;padding-bottom:8px;border-bottom:1px dashed #e0e0e0;">
                     <div style="font-weight:600;color:#2c3e50;margin-bottom:4px;">📄 ${_escape(f.name)}</div>
-                    <div style="display:flex;flex-wrap:wrap;gap:4px 14px;">
+                    <div style="display:flex;flex-wrap:wrap;gap:4px 14px;margin-bottom:6px;">
                         ${(f.columns || []).map(c => {
-                            const checked = selSet.has(`${f.name}||${c}`) ? 'checked' : '';
+                            const inExpr = preset && preset.indexOf(c) >= 0 ? 'checked' : '';
                             return `<label style="display:inline-flex;align-items:center;gap:4px;font-size:13px;">
-                                <input type="checkbox" class="int-srcpick-cb" data-file="${_escape(f.name)}" data-col="${_escape(c)}" ${checked} style="width:auto;"> ${_escape(c)}</label>`;
+                                <input type="checkbox" class="int-srcpick-cb" data-file="${_escape(f.name)}" data-col="${_escape(c)}" ${inExpr} style="width:auto;"> ${_escape(c)}</label>`;
                         }).join('')}
                     </div>
-                </div>`).join('')}`;
-        this.openModal(`为「${tr.dataset.aCol || ''}」选择对照列（可多选，支持多表）`, body, () => {
+                    <div style="display:flex;align-items:flex-start;gap:6px;">
+                        <span style="font-size:12px;color:#666;white-space:nowrap;padding-top:6px;">公式：</span>
+                        <div style="flex:1;">
+                            <textarea class="int-fx" data-file="${_escape(f.name)}" rows="5"
+                                   placeholder="勾选上方列自动相加；列名不可改，只能编辑 + - * / 括号 数字（如 (基本工资+本月奖金)*0.8）"
+                                   style="width:100%;box-sizing:border-box;font-size:13px;padding:4px 6px;line-height:1.5;resize:vertical;font-family:monospace;">${_escape(preset)}</textarea>
+                            <div class="int-fx-err" data-file="${_escape(f.name)}" style="font-size:11px;color:#d32f2f;min-height:14px;margin-top:2px;"></div>
+                        </div>
+                    </div>
+                </div>`;
+            }).join('')}`;
+        this.openModal(`为「${tr.dataset.aCol || ''}」选择对照列 / 公式（可多表）`, body, () => {
             const picks = [];
-            document.querySelectorAll('#modal-body .int-srcpick-cb:checked').forEach(cb =>
-                picks.push({ file: cb.dataset.file, col: cb.dataset.col }));
+            for (const grp of document.querySelectorAll('#modal-body .int-fgrp')) {
+                const file = grp.dataset.file;
+                const fx = grp.querySelector('.int-fx');
+                const expr = (fx?.value || '').trim();
+                if (!expr) continue;
+                // 校验：列名不可修改，去掉本表所有列名后只允许 +-*/、数字、括号、小数点、空白
+                const chk = this._intCheckFx(file, expr);
+                if (!chk.ok) {
+                    alert(`「${file}」的公式含不支持的内容：列名不可修改，只能编辑 +、-、*、/、括号、数字。\n无法识别的部分：${chk.rest}`);
+                    return; // 不关闭，让用户改
+                }
+                picks.push({ file, expr });
+            }
             tr.dataset.src = JSON.stringify(picks);
             this._intUpdateSrcCell(tr);
             this.closeModal();
+        });
+        // 勾选联动（增量增删）+ 列名锁定：列名只能通过上方勾选增删；框内键盘编辑一旦改动列名集合
+        // （删/改/手动加列）立即回退，只放行 + - * / 括号 数字 的编辑。
+        document.querySelectorAll('#modal-body .int-fgrp').forEach(grp => {
+            const fx = grp.querySelector('.int-fx');
+            const err = grp.querySelector('.int-fx-err');
+            const file = grp.dataset.file;
+            let prev = fx.value;                          // 上一版已接受的公式
+            let prevSig = this._intColSig(prev, file);    // 及其列名集合签名
+            const validate = () => {
+                const expr = (fx.value || '').trim();
+                if (!expr) { err.textContent = ''; return; }
+                const chk = this._intCheckFx(file, expr);
+                err.textContent = chk.ok ? '' : `只能编辑 + - * / 括号 数字；无法识别：${chk.rest}`;
+            };
+            const accept = (val) => { fx.value = val; prev = val; prevSig = this._intColSig(val, file); validate(); };
+            // 键盘编辑：列名集合变了就回退（列名不可删/改，只能靠勾选）；只改运算符/括号/数字才放行
+            fx.addEventListener('input', () => {
+                if (this._intColSig(fx.value, file) !== prevSig) {
+                    fx.value = prev;
+                    err.textContent = '列名不可删除/修改，请用上方勾选来增删列';
+                    setTimeout(validate, 1500);
+                    return;
+                }
+                prev = fx.value;
+                validate();
+            });
+            grp.querySelectorAll('.int-srcpick-cb').forEach(cb => cb.addEventListener('change', () => {
+                accept(cb.checked
+                    ? this._intFxAddCol(fx.value, cb.dataset.col, file)
+                    : this._intFxRemoveCol(fx.value, cb.dataset.col, file));
+            }));
+            validate();
         });
     },
 
@@ -595,7 +728,7 @@ const Tools = {
                 try { cur = JSON.parse(tr.dataset.src || '[]'); } catch (_) {}
                 if (cur.length) { kept++; return; }   // 已手动选择 → 以手动为准，不被 AI 覆盖
                 const m = bestByA[tr.dataset.aCol];    // 未选的行才用 AI/精确匹配填充
-                if (m) { tr.dataset.src = JSON.stringify([{ file: m.source_file, col: m.source_col }]); hit++; }
+                if (m) { tr.dataset.src = JSON.stringify([{ file: m.source_file, expr: m.source_col }]); hit++; }
                 else { tr.dataset.src = '[]'; miss++; }   // 匹配不到 → 留空，人工点选
                 this._intUpdateSrcCell(tr);
             });
@@ -609,7 +742,12 @@ const Tools = {
         document.querySelectorAll(`#int-${kind}-list-rows tr`).forEach(tr => {
             let picks = [];
             try { picks = JSON.parse(tr.dataset.src || '[]'); } catch (_) {}
-            picks.forEach(p => out.push({ a_col: tr.dataset.aCol, source_file: p.file, source_col: p.col }));
+            picks.forEach(p => {
+                const expr = p.expr || p.col;   // 兼容旧格式 {file,col}
+                if (!expr) return;
+                // source_col 保留(=单列时的列名)，便于旧后端/方案兼容；source_expr 为求值公式
+                out.push({ a_col: tr.dataset.aCol, source_file: p.file, source_expr: expr, source_col: expr });
+            });
         });
         return out;
     },

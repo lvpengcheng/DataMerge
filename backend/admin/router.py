@@ -671,23 +671,45 @@ _RULE_PATTERN = re.compile(r'\{([^{}]+)\}')
 _SLICE_PATTERN = re.compile(r'^(.+?)\[(-?\d*):(-?\d*)\]$')
 
 
-def _stringify_df_for_report(df):
-    """将 DataFrame 所有列强制转为文本类型，避免 NaN/#N/A/error 等导致类型冲突。
+def _coerce_df_for_report(df):
+    """为 SmartMarker 填充做类型规整（优先让模板单元格自身的数字格式生效）：
 
-    - NaN / None         → ''
-    - 数值/日期/其它      → str(val)
-    - 已是字符串(含 #N/A 等 Excel 错误码)原样保留
+    - 某列非空值【本就是数值类型 int/float】→ 整列保留数值（空值→None，单元格留空）。
+      这样模板里该列若是数值格式(如 0.00) 就能正常生效，不再被写成 "0" 文本。
+      整数值转 int 避免 3→3.0（数值格式仍会把 0 显示成 0.00）。
+    - 其余列（含"数值型字符串"如工号/长编码/银行卡号，以及 #N/A 等错误码）→ 文本，
+      NaN/NaT/None→''。保留字符串是刻意的：解析层已把 ID/长数字统一成文本，
+      不能再数值化（否则丢前导零/精度）。
     """
     import pandas as pd
+
+    def _isna(v):
+        if v is None:
+            return True
+        try:
+            return bool(pd.isna(v))
+        except (TypeError, ValueError):
+            return False
+
     if df is None or df.empty:
         return df
     out = df.copy()
     for col in out.columns:
         s = out[col]
-        # 先把 NaN/NaT 转为空串
-        s = s.where(s.notna(), '')
-        # 再统一转字符串（已是字符串则不变）
-        out[col] = s.astype(str).replace({'nan': '', 'NaT': '', 'None': ''})
+        non_na = [v for v in s.tolist() if not _isna(v)]
+        is_num_col = bool(non_na) and all(
+            isinstance(v, (int, float)) and not isinstance(v, bool) for v in non_na
+        )
+        if is_num_col:
+            def _num(x):
+                if _isna(x):
+                    return None
+                f = float(x)
+                return int(f) if f.is_integer() else f
+            out[col] = s.map(_num)
+        else:
+            s2 = s.where(s.notna(), '')
+            out[col] = s2.astype(str).replace({'nan': '', 'NaT': '', 'None': ''})
     return out
 
 
@@ -1061,11 +1083,11 @@ async def generate_report(
     template_data["$date"] = system_vars["date"]
     template_data["$tenant"] = tenant_id
 
-    # 【Step 1】所有 DataFrame 强制文本化，避免 NaN/#N/A/error 等 Excel 错误码触发类型冲突
+    # 【Step 1】按列规整类型：数值列保留数值（让模板数字格式生效），其余转文本兜底 #N/A/error
     for k in list(template_data.keys()):
         v = template_data[k]
         if isinstance(v, pd.DataFrame):
-            template_data[k] = _stringify_df_for_report(v)
+            template_data[k] = _coerce_df_for_report(v)
 
     # 【Step 2 - 双别名】给每个 sheet 的字母列追加"原始拼接表头"为别名列
     # 模板可同时用 &=DT.A 和 &=DT.原始表头 两种写法

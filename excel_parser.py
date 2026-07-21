@@ -1728,9 +1728,16 @@ class IntelligentExcelParser:
         # 说明该候选属于"另一个 section"，不应在当前扫描位置返回。这避免相邻多个
         # 子区域中数据多的那个抢走 header（小区域被吞掉）。
         if len(candidates) > 1:
-            min_header_start = min(c.header_start for c in candidates)
+            # 先剔除 header_start 本身就落在 title 行上的伪候选：多行标题横幅（公司名/收款
+            # 通知书/日期等整行合并）之后才是真表头时，正向查找可能把某条横幅行误当表头，
+            # 它会把 min_header_start 拉到横幅行，导致真正的表头（横幅之后）被判成"跨越
+            # title 行"而误删、整表落空。以非 title 行的候选作基准池即可避开。
+            non_title_cands = [c for c in candidates
+                               if not self._is_title_row(worksheet, c.header_start, max_col)]
+            pool = non_title_cands if non_title_cands else candidates
+            min_header_start = min(c.header_start for c in pool)
             filtered = []
-            for c in candidates:
+            for c in pool:
                 if c.header_start <= min_header_start:
                     filtered.append(c)
                     continue
@@ -3620,6 +3627,16 @@ class IntelligentExcelParser:
         # 如果行中有多个非空单元格且包含必填标记，很可能是表头，不是标题行
         if has_required_marker and non_empty_cells >= 3:
             return False
+
+        # 全宽合并横幅（值可能是日期/数字，非文本）：单值(或合并展开为单值)且物理合并跨
+        # >=3 列 → 标题横幅，与值类型无关。必须在下面 str 类型判定之前拦截，否则像
+        # "2026-03-01" 这类整行合并的日期横幅会因非文本被判为"不是标题行"，进而被正向
+        # 查找误当表头，把真表头顶到它之后而遭"跨越 title 行"误删。
+        if first_value_col and (non_empty_cells == 1
+                                or (non_empty_cells >= 2 and len(distinct_values) == 1)):
+            _banner_mr = self._get_physical_merged_cell_range(worksheet, row, first_value_col)
+            if _banner_mr and (_banner_mr.max_col - _banner_mr.min_col + 1) >= 3:
+                return True
 
         if not first_value or not isinstance(first_value, str):
             return False

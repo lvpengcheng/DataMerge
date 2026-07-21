@@ -885,7 +885,7 @@ async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(g
     输出方式2 追加差异 sheet。返回更新后的主表 xlsx。
     """
     from ..utils.integrate_engine import build_source_indexes, compute_diffs
-    from ..utils.integrate_writer import apply_integration
+    from ..utils.integrate_writer import apply_integration, append_diff_sheet
 
     sdir = _integrate_session_dir(req.session_id)
     if not sdir.exists():
@@ -912,18 +912,8 @@ async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(g
             parsed, req.key_map, req.main_file, normalize_keys=req.normalize_keys,
         )
 
-        # 对比差异（仅输出方式2且配了对比列时）
-        diff_rows = None
-        if req.output_mode == 2 and req.compare_pairs:
-            diff_rows = compute_diffs(
-                main_info["df"], source_indexes,
-                a_key_col=req.key_map.get(req.main_file),
-                compare_pairs=req.compare_pairs,
-                a_name_col=req.name_col, a_id_col=req.id_col,
-                normalize_keys=req.normalize_keys,
-                label_source=(n_sources > 1),
-            )
-
+        # 先执行覆盖回填并生成结果文件（含公式重算）。差异对比放到生成之后，
+        # 基于【最终生成文件】的实时值比对，避免用主表覆盖前的缓存旧值。
         out_path = sdir / f"整合结果_{req.main_file}"
         stat = apply_integration(
             main_path=str(main_path), out_path=str(out_path),
@@ -932,8 +922,22 @@ async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(g
             data_row_start=main_info["data_row_start"], data_row_end=main_info["data_row_end"],
             overwrite_pairs=req.overwrite_pairs, source_indexes=source_indexes,
             normalize_keys=req.normalize_keys,
-            diff_rows=diff_rows, diff_order=req.diff_order,
+            diff_rows=None, diff_order=req.diff_order,
         )
+
+        # 对比差异（仅输出方式2且配了对比列时）：重新解析生成文件取重算后的实时值再比对。
+        # 覆盖列联动的公式（如按被覆盖列计算的合计）此时已重算，比对结果才是最终文件的真实差异。
+        if req.output_mode == 2 and req.compare_pairs:
+            final_info = _parse_file_full(str(out_path))
+            diff_rows = compute_diffs(
+                final_info["df"], source_indexes,
+                a_key_col=req.key_map.get(req.main_file),
+                compare_pairs=req.compare_pairs,
+                a_name_col=req.name_col, a_id_col=req.id_col,
+                normalize_keys=req.normalize_keys,
+                label_source=(n_sources > 1),
+            )
+            stat["diff_rows"] = append_diff_sheet(str(out_path), diff_rows, req.diff_order)
 
         data = out_path.read_bytes()
         buf = io.BytesIO(data)
@@ -1058,7 +1062,9 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
         for p in pairs or []:
             f = p.get("source_file")
             if f in fp_by_file:
-                out.append({"a_col": p.get("a_col"), "source_fp": fp_by_file[f], "source_col": p.get("source_col")})
+                _expr = p.get("source_expr") or p.get("source_col")
+                out.append({"a_col": p.get("a_col"), "source_fp": fp_by_file[f],
+                            "source_expr": _expr, "source_col": _expr})
         return out
 
     config = {

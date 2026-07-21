@@ -719,66 +719,94 @@ def _fix_smart_marker_spacing(wb) -> int:
 
 
 def _dataframe_to_datatable(df: pd.DataFrame, table_name: str):
-    """将 DataFrame 通过独立 Aspose Workbook 导出为 .NET DataTable。
+    """将 DataFrame 转为类型明确的 .NET System.Data.DataTable（供 WorkbookDesigner SmartMarker）。
 
-    使用独立临时 Workbook（不影响模板），
-    将 DataFrame 写入 → ExportDataTable() 导出原生 .NET DataTable。
+    直接按【实际值】逐列判定数值/文本并构建 typed DataTable，绕开
+    Aspose ExportDataTable 的列类型推断（首格空/文本样式残留会让整列变 string 导致数值→文本）：
+      - 某列非空值全可作数值(含 numpy 数字 与 普通数值字符串) → System.Double 列，
+        让模板单元格自身的数字格式(如 0.00)生效，0 显示成 0.00；
+      - 其余列 → System.String 列，工号/前导零/超长卡号/身份证/#N/A 原样保文本。
     """
-    temp_wb = _licensed_workbook()
-    cells = temp_wb.Worksheets[0].Cells
+    import numbers as _numbers
+    import re as _re
+    try:
+        import clr
+        clr.AddReference("System.Data")
+    except Exception:
+        pass
+    from System.Data import DataTable
+    from System import DBNull, Double as _Double, String as _String
+
+    _NUM_RE = _re.compile(r'^[+-]?\d+(?:\.\d+)?$')
+
+    def _isna(v):
+        if v is None:
+            return True
+        try:
+            return bool(pd.isna(v))
+        except (TypeError, ValueError):
+            return False
+
+    def _as_number(v):
+        """(是否可作数值, Python数值或None)。空值→(True, None) 不破坏列判定。
+        numpy/py 数字直接用；数值字符串在排除前导零/超长位数(工号/卡号/身份证)后转数值。"""
+        if _isna(v):
+            return (True, None)
+        if isinstance(v, bool):
+            return (False, None)
+        if isinstance(v, _numbers.Number):        # 含 numpy.int64/float64（isinstance int/float 会漏）
+            f = float(v)
+            return (True, int(f) if f.is_integer() else f)
+        s = str(v).strip().replace(',', '').replace('，', '')
+        if s == '':
+            return (True, None)
+        if not _NUM_RE.match(s):
+            return (False, None)
+        intpart = s.lstrip('+-').split('.')[0]
+        if len(intpart) > 1 and intpart[0] == '0':   # 前导零 → 编码/工号，保文本
+            return (False, None)
+        if len(intpart) > 15:                        # 超长 → 卡号/身份证，保文本(丢精度)
+            return (False, None)
+        f = float(s)
+        return (True, int(f) if f.is_integer() else f)
 
     n_rows = len(df)
     n_cols = len(df.columns)
 
-    # 检测是否全部为 object/string 类型 → 数据区强制文本格式 + PutValue 禁止自动转换
-    is_all_text = n_rows > 0 and all(str(d) == 'object' for d in df.dtypes)
-    if is_all_text:
-        try:
-            from Aspose.Cells import StyleFlag
-            text_style = temp_wb.CreateStyle()
-            text_style.Number = 49
-            flag = StyleFlag()
-            flag.NumberFormat = True
-            data_range = cells.CreateRange(1, 0, n_rows, n_cols)
-            data_range.ApplyStyle(text_style, flag)
-        except Exception as e:
-            logger.warning(f"[DataTable] 设置文本格式失败（不影响数据）: {e}")
+    # 逐列判定 + 缓存转换值：非空值全可作数值 且 至少含一个真数值 → 数值列
+    col_is_num = [False] * n_cols
+    col_num_cache = [None] * n_cols
+    for c in range(n_cols):
+        conv, ok, has_real = [], True, False
+        for r in range(n_rows):
+            isnum, num = _as_number(df.iloc[r, c])
+            if not isnum:
+                ok = False
+                break
+            conv.append(num)
+            if num is not None:
+                has_real = True
+        col_is_num[c] = ok and has_real
+        if col_is_num[c]:
+            col_num_cache[c] = conv
 
-    # 第 0 行: 表头
+    dt = DataTable(table_name)
     for c, col_name in enumerate(df.columns):
-        cells[0, c].PutValue(str(col_name))
+        dt.Columns.Add(str(col_name), _Double if col_is_num[c] else _String)
 
-    # 第 1~N 行: 数据
     for r in range(n_rows):
+        row = dt.NewRow()
         for c in range(n_cols):
-            val = df.iloc[r, c]
-            is_null = val is None
-            if not is_null:
-                try:
-                    is_null = pd.isna(val)
-                except (TypeError, ValueError):
-                    is_null = False
-            if not is_null:
-                if is_all_text and isinstance(val, str):
-                    # 全文本模式：禁用自动类型转换，"123.45" 不会被转回数字
-                    try:
-                        cells[r + 1, c].PutValue(val, False)
-                    except Exception:
-                        cells[r + 1, c].PutValue(val)
-                else:
-                    cells[r + 1, c].PutValue(val)
+            if col_is_num[c]:
+                num = col_num_cache[c][r]
+                row[c] = DBNull.Value if num is None else float(num)
+            else:
+                v = df.iloc[r, c]
+                row[c] = DBNull.Value if _isna(v) else (v if isinstance(v, str) else str(v))
+        dt.Rows.Add(row)
 
-    # 用 Aspose 原生方法导出 DataTable（类型完全兼容 WorkbookDesigner）
-    dt = cells.ExportDataTable(0, 0, n_rows + 1, n_cols, True)
-    dt.TableName = table_name
-
-    # 验证导出结果
-    col_names = [dt.Columns[i].ColumnName for i in range(dt.Columns.Count)]
-    logger.info(f"[DataTable] {table_name}: {dt.Rows.Count} rows x {dt.Columns.Count} cols, 列名={col_names}")
-    if dt.Rows.Count > 0:
-        first_row = [str(dt.Rows[0][i]) for i in range(min(5, dt.Columns.Count))]
-        logger.info(f"[DataTable] {table_name} 首行前5列: {first_row}")
-
+    num_cols = [str(df.columns[i]) for i in range(n_cols) if col_is_num[i]]
+    logger.info(f"[DataTable] {table_name}: {dt.Rows.Count} rows x {dt.Columns.Count} cols; 数值列={num_cols}")
     return dt
 
 

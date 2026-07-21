@@ -141,6 +141,22 @@ def apply_integration(
     return {"overwritten_cells": overwritten, "matched_rows": matched, "diff_rows": n_diff}
 
 
+def append_diff_sheet(path: str, diff_rows: Optional[List[dict]], diff_order: str = "id_name") -> int:
+    """往【已生成文件】末尾追加差异 sheet 并原地另存。
+
+    差异值须由调用方基于最终生成文件（覆盖回填 + 公式重算后）重新解析比对得出，
+    不能用主表覆盖前的缓存旧值。diff_rows 为空则不动文件、返回 0。
+    """
+    if not diff_rows:
+        return 0
+    aspose_init.ensure_license()
+    wb = Workbook(path)
+    n = _append_diff_sheet(wb, diff_rows, diff_order)
+    wb.Save(path, SaveFormat.Xlsx)
+    logger.info(f"[integrate] 追加差异 sheet: {n} 行 → {path}")
+    return n
+
+
 def _append_diff_sheet(wb, diff_rows: List[dict], diff_order: str) -> int:
     """在工作簿末尾追加差异 sheet：仅 3 列（姓名/身份证/差异类型），顺序按 diff_order。"""
     # 前两列顺序：id_name → 身份证,姓名 ; name_id → 姓名,身份证

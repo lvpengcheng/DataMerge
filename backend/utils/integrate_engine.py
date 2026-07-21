@@ -10,6 +10,9 @@
 """
 
 import logging
+import ast as _ast
+import re as _re
+import operator as _operator
 from typing import Dict, List, Any, Optional
 
 from .merge_engine import normalize_key, _norm_header, _norm_val, _is_empty
@@ -48,67 +51,219 @@ def guess_id_column(columns) -> Optional[str]:
 
 # ==================== 对照表键索引 ====================
 
-def build_key_index(df, key_col: str, normalize_keys: bool = True) -> Dict[str, dict]:
-    """把一张对照表建成 {归一化键 -> 行dict}（同键重复取首条）。"""
-    idx: Dict[str, dict] = {}
+def build_key_index(df, key_col: str, normalize_keys: bool = True) -> Dict[str, List[dict]]:
+    """把一张对照表建成 {归一化键 -> [行dict, ...]}。
+
+    同一主键的多行**全部保留**（供跨行汇总），不再只取首条。
+    """
+    idx: Dict[str, List[dict]] = {}
     if df is None or key_col is None or key_col not in getattr(df, "columns", []):
         return idx
     for _, row in df.iterrows():
         k = normalize_key(row.get(key_col), normalize_keys)
-        if k == "" or k in idx:
+        if k == "":
             continue
-        idx[k] = row.to_dict()
+        idx.setdefault(k, []).append(row.to_dict())
     return idx
 
 
 def build_source_indexes(parsed: Dict[str, dict], key_map: Dict[str, str],
-                         main_file: str, normalize_keys: bool = True) -> Dict[str, Dict[str, dict]]:
+                         main_file: str, normalize_keys: bool = True) -> Dict[str, dict]:
     """为除主表外的每张对照表建键索引。
 
     Args:
         parsed: {file: {"df": DataFrame, ...}}
         key_map: {file: 关联键列名}（含主表与各对照表）
     Returns:
-        {file: {归一化键 -> 行dict}}  仅对照表。
+        {file: {"cols": [列名...], "rows": {归一化键 -> [行dict,...]}}}  仅对照表。
+        （结构较旧版多了一层：rows 存该键的**全部行**，cols 供公式解析列名。）
     """
-    out: Dict[str, Dict[str, dict]] = {}
+    out: Dict[str, dict] = {}
     for f, fd in parsed.items():
         if f == main_file:
             continue
-        out[f] = build_key_index(fd.get("df"), key_map.get(f), normalize_keys)
+        df = fd.get("df")
+        cols = list(df.columns) if df is not None else []
+        out[f] = {"cols": cols, "rows": build_key_index(df, key_map.get(f), normalize_keys)}
     return out
 
 
-# ==================== 覆盖：按键解析覆盖值 ====================
+# ==================== 覆盖/对比取值：多行汇总 + 四则运算公式 ====================
+
+_ARITH_BINOPS = {_ast.Add: _operator.add, _ast.Sub: _operator.sub,
+                 _ast.Mult: _operator.mul, _ast.Div: _operator.truediv}
+
+
+def _to_num(v) -> Optional[float]:
+    """把值转 float；空/非数值返回 None。容忍千分位逗号、百分号、货币符号、全/半角空格。"""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        try:
+            import math
+            return None if math.isnan(v) or math.isinf(v) else float(v)
+        except Exception:
+            return float(v)
+    s = str(v).strip().replace(",", "").replace("，", "").replace(" ", "").replace("　", "")
+    if s == "":
+        return None
+    pct = s.endswith("%")
+    if pct:
+        s = s[:-1]
+    s = s.lstrip("¥$￥")
+    try:
+        n = float(s)
+        return n / 100.0 if pct else n
+    except Exception:
+        return None
+
+
+def _safe_arith_eval(expr: str) -> Optional[float]:
+    """只对 +-*/、一元正负、数字与括号求值；出现任何其它节点/名字/函数调用 → 返回 None。"""
+    try:
+        node = _ast.parse(expr, mode="eval").body
+    except Exception:
+        return None
+
+    def ev(n):
+        if isinstance(n, _ast.BinOp) and type(n.op) in _ARITH_BINOPS:
+            l, r = ev(n.left), ev(n.right)
+            if l is None or r is None:
+                return None
+            if isinstance(n.op, _ast.Div) and r == 0:
+                return None
+            return _ARITH_BINOPS[type(n.op)](l, r)
+        if isinstance(n, _ast.UnaryOp) and isinstance(n.op, (_ast.UAdd, _ast.USub)):
+            v = ev(n.operand)
+            if v is None:
+                return None
+            return v if isinstance(n.op, _ast.UAdd) else -v
+        if isinstance(n, _ast.Constant) and isinstance(n.value, (int, float)) and not isinstance(n.value, bool):
+            return float(n.value)
+        if isinstance(n, getattr(_ast, "Num", ())):   # py<3.8 兼容
+            return float(n.n)
+        return None
+
+    return ev(node)
+
+
+def _cols_by_len_desc(cols: List[str]) -> List[str]:
+    """列名按长度降序（长的先匹配，避免"工资"误配"基本工资"的子串）。"""
+    return sorted([c for c in (cols or []) if c], key=len, reverse=True)
+
+
+def _expr_columns(expr: str, cols: List[str]) -> List[str]:
+    """expr 里引用到的对照表列名（长度降序，供替换/求和）。"""
+    return [c for c in _cols_by_len_desc(cols) if c in expr]
+
+
+def _expr_has_operator(expr: str, cols: List[str]) -> bool:
+    """expr 去掉所有列名后是否还含 +-*/（判"纯单列引用"还是"公式"）。
+
+    先扣掉列名再看运算符：列名本身可能含 '-'（如"太保填写-姓名"），不能误当运算符。
+    """
+    rest = expr
+    for c in _cols_by_len_desc(cols):
+        rest = rest.replace(c, " ")
+    return any(op in rest for op in "+-*/")
+
+
+def eval_source_expr(expr, rows: List[dict], cols: List[str]):
+    """按【各列先跨行求和，再代入公式】算一个覆盖/对比值。
+
+    - expr 是纯单列名：数值列→跨行求和；含非数值→取首个非空原值（保住姓名/备注等文本列）。
+    - expr 是四则运算公式：每个被引用列跨行求和(非数值按 0)，代入 +-*/ 求值，返回数值。
+    空/无行/公式非法/引用列不存在 → 返回 None（调用方据此保留原值/跳过）。
+    """
+    expr = str(expr or "").strip()
+    if not expr or not rows:
+        return None
+    is_formula = _expr_has_operator(expr, cols)
+
+    if not is_formula:
+        col = expr if expr in cols else None
+        if col is None:
+            _refs = _expr_columns(expr, cols)
+            col = _refs[0] if _refs else expr
+        nums, first_non_empty, all_num = [], None, True
+        for row in rows:
+            v = row.get(col)
+            if _is_empty(v):
+                continue
+            if first_non_empty is None:
+                first_non_empty = v
+            n = _to_num(v)
+            if n is None:
+                all_num = False
+            else:
+                nums.append(n)
+        if first_non_empty is None:
+            return None
+        if all_num and nums:
+            return round(sum(nums), 6)
+        return first_non_empty   # 含文本 → 取首个非空，不汇总
+
+    ref_cols = _expr_columns(expr, cols)
+    if not ref_cols:
+        return None
+    subst = expr
+    for c in ref_cols:
+        s = 0.0
+        for row in rows:
+            n = _to_num(row.get(c))
+            if n is not None:
+                s += n
+        subst = subst.replace(c, f"({s})")
+    # 替换后应只剩数字/运算符/括号/小数点/空白；含其它字符 → 判为非法，返回 None
+    if not _re.fullmatch(r"[0-9eE.+\-*/()\s]*", subst):
+        return None
+    val = _safe_arith_eval(subst)
+    return None if val is None else round(val, 6)
+
 
 def resolve_overwrites(key: str,
                        overwrite_pairs: List[dict],
-                       source_indexes: Dict[str, Dict[str, dict]]) -> Dict[str, Any]:
+                       source_indexes: Dict[str, dict]) -> Dict[str, Any]:
     """给定主表某行归一化键，按覆盖对（有序=优先级）解析出各 A 列要写入的值。
 
     Args:
-        overwrite_pairs: [{"a_col","source_file","source_col"}]  有序，靠前优先。
-        source_indexes:  {file: {key -> row}}
+        overwrite_pairs: [{"a_col","source_file","source_expr"|"source_col"}]  有序，靠前优先。
+        source_indexes:  {file: {"cols":[...], "rows": {key -> [行,...]}}}
     Returns:
         {a_col: value}  仅含解析到【非空】值的列（未命中/空的列不写，保留 A 原值）。
-        同一 a_col 被多对映射时，取首个非空源值。
+        同一 a_col 被多对映射时，取首个非空源值。source_expr 支持"各列跨行求和后代入 +-*/"。
     """
     out: Dict[str, Any] = {}
     for pair in overwrite_pairs or []:
         ac = pair.get("a_col")
         if not ac or ac in out:
             continue  # 已被更高优先级填过
-        f, sc = pair.get("source_file"), pair.get("source_col")
-        row = source_indexes.get(f, {}).get(key)
-        if not row:
+        f = pair.get("source_file")
+        expr = pair.get("source_expr") or pair.get("source_col")
+        entry = source_indexes.get(f) or {}
+        rows = (entry.get("rows") or {}).get(key)
+        if not rows:
             continue
-        v = row.get(sc)
+        v = eval_source_expr(expr, rows, entry.get("cols") or [])
         if not _is_empty(v):
             out[ac] = v
     return out
 
 
 # ==================== 对比产出差异 ====================
+
+def _cmp2(v) -> str:
+    """对比/展示归一化：数值四舍五入到 2 位小数（如 60.744→"60.74"、5000→"5000.00"），
+    非数值回退 _norm_val（去空格 + 整数归一）。对比与展示用同一值，保证"所见即所比"。
+    """
+    if _is_empty(v):
+        return ""
+    n = _to_num(v)
+    if n is None:
+        return _norm_val(v)
+    s = f"{n:.2f}"
+    return "0.00" if s == "-0.00" else s
+
 
 def compute_diffs(
     a_df,
@@ -138,14 +293,18 @@ def compute_diffs(
             continue
         parts = []
         for pair in compare_pairs:
-            ac, f, sc = pair.get("a_col"), pair.get("source_file"), pair.get("source_col")
-            b_row = source_indexes.get(f, {}).get(k)
-            if not b_row:
+            ac = pair.get("a_col")
+            f = pair.get("source_file")
+            expr = pair.get("source_expr") or pair.get("source_col")
+            entry = source_indexes.get(f) or {}
+            b_rows = (entry.get("rows") or {}).get(k)
+            if not b_rows:
                 continue  # 该对照表无此键 → 该对比对跳过
-            av, bv = row.get(ac), b_row.get(sc)
-            if _norm_val(av) != _norm_val(bv):
-                old = "" if _is_empty(av) else str(av).strip()
-                new = "" if _is_empty(bv) else str(bv).strip()
+            av = row.get(ac)
+            bv = eval_source_expr(expr, b_rows, entry.get("cols") or [])   # 各列跨行求和后代入公式
+            old = _cmp2(av)   # 数值统一到 2 位小数后再比对/展示
+            new = _cmp2(bv)
+            if old != new:
                 prefix = f"[{f}] " if label_source else ""
                 parts.append(f"{prefix}{ac}: {old}→{new}")
         if parts:
