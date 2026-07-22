@@ -81,6 +81,7 @@ const Admin = {
                 <td><span class="${u.is_active ? 'status-active' : 'status-inactive'}">${u.is_active ? '启用' : '禁用'}</span></td>
                 <td class="actions">
                     <button class="btn btn-sm" onclick="Admin.showEditUser(${u.id})">编辑</button>
+                    <button class="btn btn-sm" onclick="Admin.setPassword(${u.id}, '${u.username}')">修改密码</button>
                     <button class="btn btn-sm" onclick="Admin.resetPassword(${u.id}, '${u.username}')">重置密码</button>
                     ${u.is_active ? `<button class="btn btn-sm btn-danger" onclick="Admin.disableUser(${u.id}, '${u.username}')">禁用</button>` : ''}
                 </td>
@@ -155,6 +156,24 @@ const Admin = {
         const resp = await AUTH.authFetch(`/api/admin/users/${id}/reset-password`, { method: 'POST' });
         if (resp.ok) alert('密码已重置为 123456');
         else alert('重置失败');
+    },
+
+    async setPassword(id, username) {
+        const pwd = prompt(`为用户 ${username} 设定新密码（至少 6 位）：`);
+        if (pwd === null) return;                    // 取消
+        if (!pwd || pwd.trim().length < 6) { alert('密码至少 6 位'); return; }
+        const resp = await AUTH.authFetch(`/api/admin/users/${id}/set-password`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ new_password: pwd.trim() }),
+        });
+        if (resp.ok) {
+            alert(`用户 ${username} 密码已修改`);
+        } else {
+            let detail = '修改失败';
+            try { const d = await resp.json(); if (d && d.detail) detail = d.detail; } catch (_) {}
+            alert(detail);
+        }
     },
 
     async disableUser(id, username) {

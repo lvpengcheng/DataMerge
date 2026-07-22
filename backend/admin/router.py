@@ -26,6 +26,7 @@ from ..auth.schemas import (
     RoleCreate, RoleUpdate, RoleResponse,
     OrgCreate, OrgUpdate, OrgResponse,
     TenantAuthCreate, TenantAuthResponse,
+    AdminSetPasswordRequest,
 )
 from ..auth.utils import get_password_hash
 
@@ -135,6 +136,25 @@ async def reset_password(
     user.password_hash = get_password_hash("123456")
     db.commit()
     return {"message": f"用户 {user.username} 密码已重置为 123456"}
+
+
+@router.post("/users/{user_id}/set-password")
+async def set_password(
+    user_id: int,
+    req: AdminSetPasswordRequest,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    """管理员为指定用户设定新密码"""
+    pwd = (req.new_password or "").strip()
+    if len(pwd) < 6:
+        raise HTTPException(status_code=400, detail="密码至少 6 位")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    user.password_hash = get_password_hash(pwd)
+    db.commit()
+    return {"message": f"用户 {user.username} 密码已修改"}
 
 
 # ========================= 角色管理 =========================
