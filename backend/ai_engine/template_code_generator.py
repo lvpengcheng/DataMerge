@@ -353,7 +353,9 @@ class TemplateCodeGenerator:
 
 ## 数据清洗（可选 —— 默认不要输出，只在规则明确要求"增删行/按名单增减人员"时才写）
 **绝大多数模板只填列、行数固定 → 不要输出任何清洗常量。**
-只有当规则文档出现"入职/离职名单、按证件号/工号增减行、保留或删除某些人员、按名单调整行"等**结构性增删行**要求时，才在 `def fill_template` **正上方、同一个代码块内**额外输出一个模块级常量 `CLEANING_SPEC`（骨架会在填列**之前**先按它对模板做增删行，并自动保住已设公式/汇总/跨表引用）：
+只有当规则文档出现"入职/离职名单、按证件号/工号增减行、保留或删除某些人员、按名单调整行、**按本月计薪名单/去重人数决定明细行数、行数随人数增减、删掉模板样例行再按名单铺行**"等**结构性增删行**要求时，才在 `def fill_template` **正上方、同一个代码块内**额外输出一个模块级常量 `CLEANING_SPEC`（骨架会在填列**之前**先按它对模板做增删行，并自动保住已设公式/汇总/跨表引用）：
+
+> ⚠️ **绝对不要在 `fill_template` 里用 `ws.insert_rows()` / `ws.delete_rows()` 或任何手动行移位来改变行数。** openpyxl 的插删行**只搬单元格的值/公式、不搬样式**（填充/边框/字体/数字格式绑在物理坐标上），会导致汇总行（总计/合计/小计）格式不跟随、数据行掉边框/底色。所有"行数随人数/名单增减"的需求，一律走下方 `CLEANING_SPEC`（阶段0用 Aspose 增删行，样式与跨表引用原生跟随）。
 
 ```python
 CLEANING_SPEC = {{
@@ -471,6 +473,7 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
 
 ## 输出要求
 **只输出 `def fill_template(...)` 函数体**，用 ```python 代码块包裹。不要 import 模块（除了从 openpyxl.utils 临时导入）、不要 main、不要解释文字。
+- **严禁在 `fill_template` 内用 `ws.insert_rows()` / `ws.delete_rows()` 或手动行移位改变行数**（openpyxl 插删行不搬样式，汇总行格式会丢）。需要增删行时，用函数上方的 `CLEANING_SPEC`（见"数据清洗"章节），`fill_template` 内只用 `cleaned_rows(sheet_name)` 逐行填列。
 """
 
     # ==================== AI 调用 ====================
@@ -700,7 +703,7 @@ from pathlib import Path
 import openpyxl
 from openpyxl.utils import column_index_from_string, get_column_letter
 from datetime import datetime
-from backend.utils.source_sheet_writer import is_date_keyword_column, dt_to_excel_serial, is_long_digit_text
+from backend.utils.source_sheet_writer import is_date_keyword_column, dt_to_excel_serial, is_long_digit_text, coerce_source_date
 from backend.utils.data_helpers import assign_sheet_keys, build_prefixed_sheet_names
 from backend.utils.target_sheet_resolver import resolve_target_sheets as _resolve_target_sheets_core
 
@@ -872,6 +875,10 @@ def _append_source_sheets(wb, source_data):
             for ci, val in enumerate(row, start=1):
                 if isinstance(val, float) and val != val:
                     val = None
+                # 日期关键词列：把文本日期/裸序列号也尽力还原成真日期；空值一律保持空
+                # （coerce_source_date 内部拦 None/NaN/NaT/空串/0，绝不写成 1899-12-30/NaT）
+                if _date_col_flags[ci - 1]:
+                    val = coerce_source_date(val)
                 cell = ws.cell(row=ri, column=ci)
                 if isinstance(val, datetime):
                     if _date_col_flags[ci - 1]:
@@ -1561,6 +1568,7 @@ if __name__ == "__main__":
 - 不要 import 模块（除从 openpyxl.utils 临时导入）
 - 不要 main、不要解释文字、不要 Workbook() 创建新 wb
 - 未在用户反馈中提到的列，其代码必须与上一轮完全一致
+- **严禁用 `ws.insert_rows()` / `ws.delete_rows()` 改行数**；若上一轮代码在 `fill_template` 或 `main()` 里用 openpyxl 手动增删行导致汇总行格式不跟随，本次应删除该逻辑、改在函数上方输出 `CLEANING_SPEC`（走 Aspose 阶段0，样式原生跟随），`fill_template` 内改用 `cleaned_rows(sheet_name)` 逐行填列
 """
 
         if self.training_logger and hasattr(self.training_logger, "log_full_prompt"):

@@ -53,7 +53,7 @@
                     </div>
                     <div class="chat-actions" id="chat-actions">
                         <button class="btn btn-action" id="btn-set-best" onclick="setBestCode()" style="display:none;" title="将当前代码设为最佳脚本">设为最佳</button>
-                        <button class="btn btn-action" id="btn-upload-code" onclick="showUploadCode()" style="display:none;" title="直接上传代码文件">上传代码</button>
+                        <button class="btn btn-action" id="btn-upload-code" onclick="openUploadCodeModal()" style="display:none;" title="上传代码文件（可同时附带模板）">上传代码</button>
                         <button class="btn btn-action" id="btn-download-code" onclick="downloadCode()" style="display:none;" title="下载当前最佳代码">下载代码</button>
                     </div>
                 </div>
@@ -152,8 +152,33 @@
         </div>
     </div>
 
-    <!-- 隐藏的上传代码 input -->
+    <!-- 隐藏的上传代码 input（保留兼容，实际走下方弹窗） -->
     <input type="file" id="upload-code-input" accept=".py" style="display:none;" onchange="handleUploadCode(event)">
+
+    <!-- 上传代码弹窗：代码必选 + 模板可选，一起上传 -->
+    <div class="modal-overlay" id="upload-code-modal" style="display:none;" onclick="if(event.target===this)closeUploadCodeModal()">
+        <div class="modal-dialog" style="max-width:480px;">
+            <div class="modal-header">
+                <span>上传代码</span>
+                <button class="modal-close" onclick="closeUploadCodeModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div style="margin-bottom:14px;">
+                    <label style="display:block;font-size:13px;color:#333;margin-bottom:4px;">代码文件 <span style="color:#d4380d;">*</span>（.py）</label>
+                    <input type="file" id="uc-code-file" accept=".py">
+                </div>
+                <div style="margin-bottom:6px;">
+                    <label style="display:block;font-size:13px;color:#333;margin-bottom:4px;">模板文件（可选，.xlsx/.xls）</label>
+                    <input type="file" id="uc-template-file" accept=".xlsx,.xls">
+                    <small style="display:block;color:#888;font-size:12px;margin-top:4px;">模板模式脚本：把它依赖的模板一并上传到本环境，验证与后续智算即可直接使用。公式模式可留空。</small>
+                </div>
+                <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px;">
+                    <button type="button" onclick="closeUploadCodeModal()">取消</button>
+                    <button type="button" onclick="submitUploadCode()" id="uc-submit-btn" style="background:#1677ff;color:#fff;">上传并验证</button>
+                </div>
+            </div>
+        </div>
+    </div>
 
     <!-- 目标 Sheet 选择弹窗（模板/自动模式：智训按钮触发分析后弹出） -->
     <div class="modal-overlay" id="sheet-picker-modal" style="display:none;">
@@ -180,6 +205,6 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260722a"></script>
-    <script src="/static/js/training.js?v=20260709a"></script>
+    <script src="/static/js/training.js?v=20260723b"></script>
 </body>
 </html>

@@ -15,6 +15,22 @@ let _chatStreamEl = null;   // AI 对话流式输出的 DOM 元素
 let _chatStreamBuf = '';    // AI 对话流式输出的文本缓冲
 let _pendingScriptName = null;  // 新建训练时由用户命名的脚本名（仅新建会话首次提交时使用）
 
+// ===== 对话历史分页（B 方案：初始最近 5 轮，上划加载更早）=====
+let _historyOldestId = null;        // 当前已加载最早消息的 page_start_id（上划游标）
+let _historyHasMore = false;        // 是否还有更早的消息可加载
+let _historyLoading = false;        // 上划加载中标志（防抖）
+let _historyRenderedIters = new Set();  // 已渲染的迭代号（跨页去重孤儿迭代）
+window._historyRenderedIters = _historyRenderedIters;
+let _historyScrollBound = false;    // scroll 监听是否已绑定（只绑一次）
+
+function _resetHistoryPaging() {
+    _historyOldestId = null;
+    _historyHasMore = false;
+    _historyLoading = false;
+    _historyRenderedIters = new Set();
+    window._historyRenderedIters = _historyRenderedIters;
+}
+
 // 重置上传相关状态：密码映射、文件 input、文件列表 UI、附件徽标
 // 在切租户/切会话/新建/删除/提交完成等"开始下一轮操作"前调用
 function _resetUploadState() {
@@ -379,8 +395,9 @@ async function selectSession(sessionId) {
     if (_isStreaming) return;
     _pendingScriptName = null;  // 切换到已存在会话，不再需要新建命名
     _resetUploadState();
+    _resetHistoryPaging();
     try {
-        const resp = await AUTH.authFetch(`/api/training/chat/sessions/${sessionId}/messages`);
+        const resp = await AUTH.authFetch(`/api/training/chat/sessions/${sessionId}/messages?limit_turns=5`);
         if (!resp.ok) return;
         const data = await resp.json();
 
@@ -397,8 +414,13 @@ async function selectSession(sessionId) {
         // 显示原始训练文件信息
         _showSessionFilesInfo(data);
 
-        // 合并消息 + 迭代记录，构建完整时间线
+        // 合并消息 + 迭代记录，构建完整时间线（首屏最近 5 轮）
         _renderFullHistory(data.messages || [], data.iterations || []);
+
+        // 记录分页游标，绑定上划加载更早
+        _historyOldestId = data.page_start_id;
+        _historyHasMore = !!data.has_more;
+        _bindHistoryScroll();
 
         // 显示历史训练产物的下载按钮（脚本/输出/差异 + 提示词）
         const latestFiles = data.latest_files || {};
@@ -601,8 +623,12 @@ function _renderMarkdown(text) {
 }
 
 // ==================== 对话 UI ====================
-function _addMessage(role, content, isStreaming) {
-    const container = document.getElementById('chat-messages');
+// 实时聊天容器；传入其它 target（如 DocumentFragment）时渲染到该目标且不强制滚底（用于上划分页）
+function _liveChatContainer() { return document.getElementById('chat-messages'); }
+
+function _addMessage(role, content, isStreaming, target) {
+    const live = _liveChatContainer();
+    const container = target || live;
     const placeholder = document.getElementById('chat-placeholder');
     if (placeholder) placeholder.style.display = 'none';
 
@@ -626,12 +652,13 @@ function _addMessage(role, content, isStreaming) {
     msgDiv.appendChild(label);
     msgDiv.appendChild(contentDiv);
     container.appendChild(msgDiv);
-    container.scrollTop = container.scrollHeight;
+    if (container === live) live.scrollTop = live.scrollHeight;
     return contentDiv;
 }
 
-function _addSystemMessage(content, msgType, metadata) {
-    const container = document.getElementById('chat-messages');
+function _addSystemMessage(content, msgType, metadata, target) {
+    const live = _liveChatContainer();
+    const container = target || live;
     const placeholder = document.getElementById('chat-placeholder');
     if (placeholder) placeholder.style.display = 'none';
 
@@ -667,7 +694,7 @@ function _addSystemMessage(content, msgType, metadata) {
     msgDiv.appendChild(label);
     msgDiv.appendChild(contentDiv);
     container.appendChild(msgDiv);
-    container.scrollTop = container.scrollHeight;
+    if (container === live) live.scrollTop = live.scrollHeight;
     return contentDiv;
 }
 
@@ -1449,7 +1476,7 @@ function _showSessionFilesInfo(data) {
  * 合并消息 + 迭代记录，构建完整的对话时间线
  * 迭代记录包含代码生成详情，补充消息中缺失的信息
  */
-function _renderFullHistory(messages, iterations) {
+function _renderFullHistory(messages, iterations, target) {
     // 构建迭代按 iteration_num 索引
     const iterMap = {};
     iterations.forEach(it => { iterMap[it.iteration_num] = it; });
@@ -1471,18 +1498,19 @@ function _renderFullHistory(messages, iterations) {
 
         // 渲染原始消息
         if (msg.role === 'user') {
-            _addMessage('user', msg.content);
+            _addMessage('user', msg.content, false, target);
         } else if (msg.role === 'assistant') {
-            _addMessage('assistant', msg.content);
+            _addMessage('assistant', msg.content, false, target);
         } else if (msg.role === 'system') {
-            _addSystemMessage(msg.content, msg.msg_type, msg.metadata);
+            _addSystemMessage(msg.content, msg.msg_type, msg.metadata, target);
         }
 
         // 如果这条消息是迭代结果消息，在其后追加代码摘要
         if (msgIter && iterMap[msgIter]) {
             const it = iterMap[msgIter];
             if (it.generated_code) {
-                _renderIterationCodeSummary(it);
+                _renderIterationCodeSummary(it, target);
+                if (window._historyRenderedIters) _historyRenderedIters.add(msgIter);
             }
             lastRenderedIter = msgIter;
         }
@@ -1490,17 +1518,74 @@ function _renderFullHistory(messages, iterations) {
 
     // 如果有迭代没有对应的消息（例如首轮训练后没保存足够消息），补充渲染
     iterations.forEach(it => {
-        if (!mentionedIters.has(it.iteration_num)) {
-            _renderOrphanIteration(it);
+        if (mentionedIters.has(it.iteration_num)) return;
+        if (window._historyRenderedIters && _historyRenderedIters.has(it.iteration_num)) return;
+        _renderOrphanIteration(it, target);
+        if (window._historyRenderedIters) _historyRenderedIters.add(it.iteration_num);
+    });
+}
+
+/**
+ * 绑定聊天容器的上划滚动监听（只绑一次），滚到顶部自动加载更早对话
+ */
+function _bindHistoryScroll() {
+    if (_historyScrollBound) return;
+    const c = _liveChatContainer();
+    if (!c) return;
+    c.addEventListener('scroll', () => {
+        if (c.scrollTop < 40 && _historyHasMore && !_historyLoading) {
+            _loadEarlierHistory();
         }
     });
+    _historyScrollBound = true;
+}
+
+/**
+ * 加载更早的一页对话，从顶部插入并保持视口位置
+ */
+async function _loadEarlierHistory() {
+    if (_historyLoading || !_historyHasMore || _historyOldestId == null) return;
+    _historyLoading = true;
+    const c = _liveChatContainer();
+
+    // 顶部临时加载指示
+    const spinner = document.createElement('div');
+    spinner.className = 'message system';
+    spinner.innerHTML = '<div class="message-content" style="text-align:center;opacity:.6;">加载更早对话…</div>';
+    c.insertBefore(spinner, c.firstChild);
+
+    try {
+        const resp = await AUTH.authFetch(
+            `/api/training/chat/sessions/${_currentSessionId}/messages?limit_turns=5&before_id=${_historyOldestId}`
+        );
+        if (!resp.ok) return;
+        const data = await resp.json();
+
+        // 渲染进离屏 fragment，避免逐条 reflow
+        const frag = document.createDocumentFragment();
+        _renderFullHistory(data.messages || [], data.iterations || [], frag);
+
+        // 保持滚动位置：插入前后 scrollHeight 差补偿
+        if (spinner.parentNode) c.removeChild(spinner);
+        const prevH = c.scrollHeight;
+        c.insertBefore(frag, c.firstChild);
+        c.scrollTop += c.scrollHeight - prevH;
+
+        _historyOldestId = data.page_start_id;
+        _historyHasMore = !!data.has_more;
+    } catch (e) {
+        // 忽略，下方 finally 兜底清理
+    } finally {
+        if (spinner.parentNode) c.removeChild(spinner);
+        _historyLoading = false;
+    }
 }
 
 /**
  * 渲染迭代代码摘要（折叠式，可展开查看代码）
  */
-function _renderIterationCodeSummary(iteration) {
-    const container = document.getElementById('chat-messages');
+function _renderIterationCodeSummary(iteration, target) {
+    const container = target || _liveChatContainer();
     const msgDiv = document.createElement('div');
     msgDiv.className = 'message system';
 
@@ -1534,9 +1619,7 @@ function _renderIterationCodeSummary(iteration) {
 /**
  * 渲染没有对应消息的孤立迭代记录
  */
-function _renderOrphanIteration(iteration) {
-    const container = document.getElementById('chat-messages');
-
+function _renderOrphanIteration(iteration, target) {
     // 显示迭代结果
     const acc = iteration.accuracy;
     let resultText = `第 ${iteration.iteration_num} 轮`;
@@ -1551,11 +1634,11 @@ function _renderOrphanIteration(iteration) {
         iteration: iteration.iteration_num,
         accuracy: acc
     };
-    _addSystemMessage(resultText, acc != null ? 'status' : 'status', metadata);
+    _addSystemMessage(resultText, acc != null ? 'status' : 'status', metadata, target);
 
     // 如果有代码，显示折叠摘要
     if (iteration.generated_code) {
-        _renderIterationCodeSummary(iteration);
+        _renderIterationCodeSummary(iteration, target);
     }
 }
 
@@ -1652,7 +1735,7 @@ async function _downloadOriginalFile(sessionId, category, filename) {
     }
 }
 
-// 下载"最终规则"：调用 AI 根据 原始规则+多轮对话+最佳代码 整理后下载为 .md
+// 下载"最终规则"：SSE 流式（两次 AI 调用耗时长，用心跳保活避免 504/502），完成后下载为 .md
 async function _downloadFinalRules(sessionId, btn) {
     const oldText = btn ? btn.textContent : '';
     if (btn) { btn.disabled = true; btn.textContent = '⏳ 整理中...'; }
@@ -1663,14 +1746,44 @@ async function _downloadFinalRules(sessionId, btn) {
             alert('生成最终规则失败: ' + (err.detail || `HTTP ${resp.status}`));
             return;
         }
-        const data = await resp.json();
-        const rules = data.rules || '';
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let done = null;      // 完成事件
+        let errMsg = null;    // 错误事件
+
+        while (true) {
+            const { done: streamDone, value } = await reader.read();
+            if (streamDone) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;   // 忽略心跳 ": heartbeat"
+                const jsonStr = line.slice(6).trim();
+                if (!jsonStr) continue;
+                let event;
+                try { event = JSON.parse(jsonStr); } catch (e) { continue; }
+                if (event.type === 'status') {
+                    if (btn && event.message) btn.textContent = '⏳ ' + event.message;
+                } else if (event.type === 'done') {
+                    done = event;
+                } else if (event.type === 'error') {
+                    errMsg = event.message || '未知错误';
+                }
+            }
+        }
+
+        if (errMsg) { alert('生成最终规则失败: ' + errMsg); return; }
+        const rules = done && done.rules ? done.rules : '';
         if (!rules.trim()) { alert('未生成有效规则内容'); return; }
+
         const blob = new Blob([rules], { type: 'text/markdown;charset=utf-8' });
         const objUrl = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = objUrl;
-        a.download = data.filename || `最终规则_${sessionId}.md`;
+        a.download = (done && done.filename) || `最终规则_${sessionId}.md`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -1738,16 +1851,70 @@ function showUploadCode() {
     document.getElementById('upload-code-input').click();
 }
 
+// 打开上传代码弹窗（代码必选 + 模板可选）
+function openUploadCodeModal() {
+    if (!_currentSessionId) { alert('请先选择一个训练会话'); return; }
+    const modal = document.getElementById('upload-code-modal');
+    if (!modal) {
+        // 页面 DOM 仍是旧缓存（无弹窗节点）：回退到旧的直传文件方式，避免点击无反应
+        console.warn('[上传代码] 弹窗 DOM 不存在，回退旧方式；请 Ctrl+F5 强制刷新页面');
+        const legacy = document.getElementById('upload-code-input');
+        if (legacy) { legacy.click(); return; }
+        alert('页面未更新，请按 Ctrl+F5 强制刷新后重试');
+        return;
+    }
+    const cf = document.getElementById('uc-code-file');
+    const tf = document.getElementById('uc-template-file');
+    if (cf) cf.value = '';
+    if (tf) tf.value = '';
+    // 强制 inline 样式，避免 .modal-overlay 类样式未刷新时弹窗肉眼看不见（与 sheet-picker 一致）
+    Object.assign(modal.style, {
+        display: 'flex', position: 'fixed', top: '0', left: '0', right: '0', bottom: '0',
+        background: 'rgba(0,0,0,0.45)', zIndex: '9999',
+        justifyContent: 'center', alignItems: 'flex-start', paddingTop: '8vh', overflowY: 'auto',
+    });
+    const dialog = modal.querySelector('.modal-dialog');
+    if (dialog) Object.assign(dialog.style, {
+        background: '#fff', borderRadius: '12px', boxShadow: '0 8px 32px rgba(0,0,0,0.18)',
+        width: '90vw', maxWidth: '480px', minHeight: 'auto', padding: '0',
+    });
+}
+
+function closeUploadCodeModal() {
+    const modal = document.getElementById('upload-code-modal');
+    if (modal) modal.style.display = 'none';
+}
+
+// 提交弹窗：代码文件 + 可选模板文件一起上传
+async function submitUploadCode() {
+    const codeFile = document.getElementById('uc-code-file').files[0];
+    const templateFile = document.getElementById('uc-template-file').files[0];
+    if (!codeFile) { alert('请选择代码文件（.py）'); return; }
+    closeUploadCodeModal();
+    await _doUploadCode(codeFile, templateFile);
+}
+
+// 兼容旧的隐藏 input 直传（仅代码）
 async function handleUploadCode(event) {
     const file = event.target.files[0];
+    event.target.value = '';
     if (!file || !_currentSessionId) return;
+    await _doUploadCode(file, null);
+}
+
+async function _doUploadCode(codeFile, templateFile) {
+    if (!codeFile || !_currentSessionId) return;
 
     const formData = new FormData();
-    formData.append('code_file', file);
+    formData.append('code_file', codeFile);
+    if (templateFile) formData.append('template_file', templateFile);
 
     try {
         _setUIStreaming(true);
-        _addSystemMessage(`正在上传并验证代码文件: ${file.name}`, 'status');
+        const tip = templateFile
+            ? `正在上传并验证代码文件: ${codeFile.name}（含模板: ${templateFile.name}）`
+            : `正在上传并验证代码文件: ${codeFile.name}`;
+        _addSystemMessage(tip, 'status');
 
         const resp = await AUTH.authFetch(`/api/training/chat/sessions/${_currentSessionId}/upload-code`, {
             method: 'POST',
@@ -1777,7 +1944,6 @@ async function handleUploadCode(event) {
         _addSystemMessage('上传代码失败: ' + e.message, 'status', { error: true });
     } finally {
         _setUIStreaming(false);
-        event.target.value = '';
     }
 }
 

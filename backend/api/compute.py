@@ -317,6 +317,7 @@ async def execute_compute(
             from ..utils.output_postprocess import (
                 build_result_filename, values_only_name, dual_output_enabled, make_values_only_copy,
                 normalize_source_sheet_formats, normalize_key_columns_to_text,
+                restore_template_region_format, restore_summary_format_enabled,
             )
             saved_assets = []
             tenant_output_dir = PROJECT_ROOT / "tenants" / task.tenant_id / "assets" / "result"
@@ -360,6 +361,13 @@ async def execute_compute(
                     normalize_source_sheet_formats(str(dest_path), _tpl_for_values)
                 except Exception as _nse:
                     logger.warning(f"[源_格式兜底] 跳过: {_nse}")
+                # 汇总行格式兜底：老脚本 openpyxl 增删行致汇总行格式不跟随 → Aspose 按模板重刷
+                # （只对单一底部汇总行 sheet 生效，多区域小计 sheet 自动跳过）。须在源_兜底之后跑。
+                try:
+                    if _tpl_for_values and os.path.exists(_tpl_for_values) and restore_summary_format_enabled():
+                        restore_template_region_format(str(dest_path), _tpl_for_values, script.code)
+                except Exception as _sfe:
+                    logger.warning(f"[汇总格式] 跳过: {_sfe}")
                 # 主键归一：两端类型统一成文本，修 VLOOKUP 跨源 #N/A（在纯值版之前跑）
                 try:
                     normalize_key_columns_to_text(str(dest_path))

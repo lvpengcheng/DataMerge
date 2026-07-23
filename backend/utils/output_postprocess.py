@@ -32,6 +32,46 @@ def _addr_to_rc0(addr):
     return (row - 1, col - 1)
 
 
+_WARN_CB = None
+
+
+def _silent_load_options():
+    """构造挂了"吞警告回调"的 LoadOptions；Aspose 不可用时返回 None。
+
+    根因：Aspose 载入某些经 openpyxl 重新保存过的 xlsx 时，会在载入阶段抛出一个
+    IO 类警告（Description 恰为 "Object reference not set to an instance of an
+    object."）。默认**未设 WarningCallback** 时，Aspose 内部的警告分发路径会解引用
+    空对象 → 直接把这个警告升级成致命的 NullReferenceException，令整个
+    `Workbook(path)` 构造失败（纯值版/格式兜底全部报 "Object reference not set…"）。
+
+    只要挂一个自定义 IWarningCallback，Aspose 就把警告投递给它、不再走那条空引用
+    路径，文件即可正常载入（该警告本身无害，直接吞掉）。回调实例缓存复用，LoadOptions
+    每次新建（廉价，避免跨线程共享配置对象）。
+    """
+    try:
+        from Aspose.Cells import LoadOptions, IWarningCallback
+    except Exception:
+        return None
+    global _WARN_CB
+    if _WARN_CB is None:
+        class _SilentWarnings(IWarningCallback):
+            __namespace__ = "datamerge.aspose"
+
+            def Warning(self, info):
+                return
+        _WARN_CB = _SilentWarnings()
+    lo = LoadOptions()
+    lo.WarningCallback = _WARN_CB
+    return lo
+
+
+def _open_workbook(path):
+    """打开工作簿，绕过 Aspose 载入警告触发的空引用崩溃（见 _silent_load_options）。"""
+    from Aspose.Cells import Workbook
+    lo = _silent_load_options()
+    return Workbook(str(path), lo) if lo is not None else Workbook(str(path))
+
+
 def _safe_name(s, fallback="result", max_bytes=120):
     s = (str(s) if s else "").strip() or fallback
     s = _ILLEGAL.sub("_", s)
@@ -99,7 +139,7 @@ def restore_formats_from_template(output_path, template_path) -> int:
         logger.warning(f"[fmt兜底] Aspose 不可用，跳过: {e}")
         return 0
     try:
-        tpl = Workbook(str(template_path))
+        tpl = _open_workbook(template_path)
     except Exception as e:
         logger.warning(f"[fmt兜底] 打开模板失败，跳过: {template_path} - {e}")
         return 0
@@ -107,7 +147,7 @@ def restore_formats_from_template(output_path, template_path) -> int:
     restored = 0
     out = None
     try:
-        out = Workbook(str(output_path))
+        out = _open_workbook(output_path)
         # 模板 sheet 名 -> worksheet
         tpl_by_name = {str(tpl.Worksheets[ti].Name): tpl.Worksheets[ti]
                        for ti in range(tpl.Worksheets.Count)}
@@ -128,8 +168,14 @@ def restore_formats_from_template(output_path, template_path) -> int:
                     tstyle = tcell.GetStyle()
                     ostyle = ocell.GetStyle()
                     if ostyle.Number != tstyle.Number or (ostyle.Custom or "") != (tstyle.Custom or ""):
-                        ostyle.Number = tstyle.Number
-                        ostyle.Custom = tstyle.Custom
+                        # 关键：模板用【内置格式】(如 mm-dd-yy=14) 时 Custom 是空串，若先设 Number
+                        # 再把 Custom 赋成 "" 会在 Aspose 里把刚设的格式打回 General(Number=0)——
+                        # 内置日期列因此恢复失败、输出成数值。故：模板 Custom 非空才设 Custom，
+                        # 否则只设 Number（含 0=General），绝不写空 Custom 覆盖。
+                        if tstyle.Custom:
+                            ostyle.Custom = tstyle.Custom
+                        else:
+                            ostyle.Number = tstyle.Number
                         ocell.SetStyle(ostyle)
                         restored += 1
                         touched = True
@@ -149,6 +195,243 @@ def restore_formats_from_template(output_path, template_path) -> int:
             except Exception:
                 pass
     return restored
+
+
+def restore_summary_format_enabled() -> bool:
+    """读取 .env 开关：是否启用"汇总行格式随行跟随"的后处理兜底（默认 true）。
+    显式设为 false/0/no/off 可关闭（老脚本若已重训走 Aspose 引擎则无需兜底）。"""
+    val = os.getenv("RESTORE_SUMMARY_FORMAT", "true").strip().lower()
+    return val not in ("false", "0", "no", "off", "")
+
+
+def extract_col_map(script_code):
+    """从脚本源码里抽取 `_COL_MAP` 字典字面量（含每个 sheet 各 region 的 data_start_row）。
+
+    仅用 ast.literal_eval 解析纯字面量，安全不执行代码；失败返回 None。
+    供 restore_template_region_format 拿到权威的数据区起始行，避免脆弱的表头猜测。
+    """
+    if not script_code:
+        return None
+    try:
+        import ast
+        tree = ast.parse(script_code)
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id == "_COL_MAP":
+                        return ast.literal_eval(node.value)
+    except Exception as e:
+        logger.debug(f"[汇总格式] 抽取 _COL_MAP 失败: {e}")
+    return None
+
+
+def _scan_summary_rows(cells, max_row, max_col):
+    """扫描汇总行：前置若干列命中 合计/总计/小计/汇总 等关键字的行。返回 0-based 行号列表。"""
+    from backend.utils.template_row_planner import _is_summary_key
+    rows = []
+    scan_cols = min(max_col, 8) if max_col is not None and max_col >= 0 else 0
+    for r in range(0, (max_row or 0) + 1):
+        for c in range(0, scan_cols + 1):
+            v = cells[r, c].Value
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s and _is_summary_key(s):
+                rows.append(r)
+                break
+    return rows
+
+
+def restore_template_region_format(output_path, template_path, script_code=None) -> int:
+    """把"汇总行 + 数据区"的格式按模板重刷，让汇总行格式随行数变化正确跟随（模版模式兜底）。
+
+    背景：老脚本在 openpyxl 里手动 insert_rows/delete_rows 改行数，openpyxl 插删行**只搬
+    值/公式、不搬样式**——汇总行（总计/合计）位移后样式留在老坐标（下方留白带）、新插入的
+    数据行掉底色/边框。本函数用 Aspose 事后按模板样板重刷样式（不改值、不重算，保底层数值）。
+
+    **只对"单一底部汇总行"的 sheet 生效**（如 本月工资明细）：
+      - 护栏1：输出该 sheet 恰好 1 个汇总行，模板也恰好 1 个 → 才处理；多区域分组小计
+        的 sheet（如 请款书，几十个小计）直接跳过，避免误刷。
+      - 护栏2：仅当"输出汇总行位置 ≠ 模板"（即发生过增删行）才刷；固定行数模板零改动。
+
+    重刷内容（逐列，跨 workbook 用 Style.Copy 拷全属性：填充/边框/字体/对齐/数字格式）：
+      - 数据行 [data_start, o_sr-1]：套模板数据样板行样式 → 修数据行掉样式。
+      - 汇总行 o_sr：套模板汇总行样式 + 行高 → 修汇总行格式。
+      - 汇总行下方无值的残留带：重置为默认样式（遇到首个有值的页脚即停，保住脚注）。
+
+    返回重刷的单元格数（0 表示未触发/无改动）。
+    """
+    if not str(output_path).lower().endswith((".xlsx", ".xlsm")):
+        return 0
+    if not template_path or not os.path.exists(template_path) or not os.path.exists(output_path):
+        return 0
+    try:
+        from Aspose.Cells import Workbook
+        import aspose_init
+        aspose_init.ensure_license()
+    except Exception as e:
+        logger.warning(f"[汇总格式] Aspose 不可用，跳过: {e}")
+        return 0
+
+    # 权威数据区起始行（0-based）：sheet 名 -> data_start（多 region 取最小值）
+    ds_by_sheet = {}
+    cm = extract_col_map(script_code) if script_code else None
+    if isinstance(cm, dict):
+        for _sn, _info in cm.items():
+            try:
+                regions = (_info or {}).get("regions") or []
+                starts = [int(r["data_start_row"]) for r in regions if r.get("data_start_row")]
+                if starts:
+                    ds_by_sheet[str(_sn)] = min(starts) - 1   # 1-based -> 0-based
+            except Exception:
+                continue
+
+    restored = 0
+    tpl = None
+    out = None
+    try:
+        tpl = _open_workbook(template_path)
+        out = _open_workbook(output_path)
+        tpl_by_name = {str(tpl.Worksheets[ti].Name): tpl.Worksheets[ti]
+                       for ti in range(tpl.Worksheets.Count)}
+        touched = False
+
+        for oi in range(out.Worksheets.Count):
+            ows = out.Worksheets[oi]
+            tws = tpl_by_name.get(str(ows.Name))
+            if tws is None:
+                continue
+            ocells = ows.Cells
+            tcells = tws.Cells
+            o_maxr, o_maxc = ocells.MaxDataRow, ocells.MaxDataColumn
+            t_maxr, t_maxc = tcells.MaxDataRow, tcells.MaxDataColumn
+            if o_maxr is None or o_maxr < 0 or t_maxr is None or t_maxr < 0:
+                continue
+
+            # 护栏1：两侧都恰好 1 个汇总行（单底部总计），否则跳过（多区域小计不碰）
+            o_sums = _scan_summary_rows(ocells, o_maxr, o_maxc)
+            t_sums = _scan_summary_rows(tcells, t_maxr, t_maxc)
+            if len(o_sums) != 1 or len(t_sums) != 1:
+                continue
+            o_sr, t_sr = o_sums[0], t_sums[0]
+
+            # 护栏2：位置未变（没增删行）→ 零改动
+            if o_sr == t_sr:
+                continue
+
+            # 数据区起始行：优先 _COL_MAP 权威值，回退"汇总行上方连续数据块"检测
+            ds = ds_by_sheet.get(str(ows.Name))
+            if ds is None or ds < 0 or ds >= o_sr:
+                ds = _fallback_data_start(ocells, o_sr, o_maxc)
+            if ds is None or ds < 0 or ds >= o_sr:
+                continue
+
+            ncols = max(o_maxc, t_maxc)
+            if ncols is None or ncols < 0:
+                continue
+
+            # 模板样板样式：数据样板取模板数据区中段一行（避开首/尾行的特殊边框）
+            t_de = t_sr - 1
+            t_sample = ds + (t_de - ds) // 2 if t_de > ds else ds
+            data_styles = [tcells[t_sample, c].GetStyle() for c in range(ncols + 1)]
+            sum_styles = [tcells[t_sr, c].GetStyle() for c in range(ncols + 1)]
+            try:
+                sum_h = tcells.GetRowHeight(t_sr)
+            except Exception:
+                sum_h = None
+
+            # 重刷数据行 [ds, o_sr-1]
+            for r in range(ds, o_sr):
+                for c in range(ncols + 1):
+                    if _apply_style(ocells[r, c], data_styles[c]):
+                        restored += 1
+                        touched = True
+            # 重刷汇总行 + 行高
+            for c in range(ncols + 1):
+                if _apply_style(ocells[o_sr, c], sum_styles[c]):
+                    restored += 1
+                    touched = True
+            if sum_h:
+                try:
+                    ocells.SetRowHeight(o_sr, sum_h)
+                except Exception:
+                    pass
+
+            # 清理汇总行下方的残留格式带（无值行才清，遇到首个有值行即停，保住脚注）
+            def_style = out.CreateStyle()
+            for r in range(o_sr + 1, (o_maxr or 0) + 1):
+                has_val = False
+                for c in range(ncols + 1):
+                    v = ocells[r, c].Value
+                    if v is not None and str(v).strip() != "":
+                        has_val = True
+                        break
+                if has_val:
+                    break
+                for c in range(ncols + 1):
+                    if _apply_style(ocells[r, c], def_style):
+                        restored += 1
+                        touched = True
+
+        if touched:
+            out.Save(str(output_path))
+            logger.info(f"[汇总格式] 已按模板重刷 {restored} 个单元格（汇总行随行跟随，Aspose 保值）: {output_path}")
+    except Exception as e:
+        logger.warning(f"[汇总格式] 处理异常，按原文件: {output_path} - {e}")
+        return 0
+    finally:
+        for _wb in (out, tpl):
+            try:
+                if _wb is not None:
+                    _wb.Dispose()
+            except Exception:
+                pass
+    return restored
+
+
+def _fallback_data_start(cells, sr, max_col):
+    """无 _COL_MAP 时兜底：从汇总行上方逐行上溯，取"证件/序号锚点列连续有值"块的顶行。
+
+    锚点列 = 汇总行之上区域中"有值单元格最多"的那一列（通常是 序号/证件号码/姓名，
+    数据行必填、表头稀疏），据此定位数据块顶部；找不到返回 None。
+    """
+    if sr is None or sr <= 0 or max_col is None or max_col < 0:
+        return None
+    scan_cols = min(max_col, 8)
+    # 选锚点列
+    best_col, best_cnt = 0, -1
+    for c in range(0, scan_cols + 1):
+        cnt = 0
+        for r in range(0, sr):
+            v = cells[r, c].Value
+            if v is not None and str(v).strip() != "":
+                cnt += 1
+        if cnt > best_cnt:
+            best_col, best_cnt = c, cnt
+    if best_cnt <= 0:
+        return None
+    # 从 sr-1 上溯，锚点列连续有值的顶行
+    top = sr
+    for r in range(sr - 1, -1, -1):
+        v = cells[r, best_col].Value
+        if v is None or str(v).strip() == "":
+            break
+        top = r
+    return top if top < sr else None
+
+
+def _apply_style(cell, tstyle):
+    """把模板样式（另一 workbook 的 Style）整体套到输出单元格；有变化返回 True。
+
+    跨 workbook 用 Style.Copy 拷全部属性（颜色为 RGB 值、字体按名，均可移植）。
+    """
+    try:
+        ostyle = cell.GetStyle()
+        ostyle.Copy(tstyle)
+        cell.SetStyle(ostyle)
+        return True
+    except Exception:
+        return False
 
 
 def _template_default_format(template_path):
@@ -268,7 +551,7 @@ def normalize_source_sheet_formats(output_path, template_path=None, source_sheet
 
     fixed = 0
     try:
-        wb = Workbook(str(output_path))
+        wb = _open_workbook(output_path)
     except Exception as e:
         logger.warning(f"[源_格式兜底] 打开失败，跳过: {output_path} - {e}")
         return 0
@@ -390,7 +673,7 @@ def normalize_key_columns_to_text(output_path, source_sheet_prefix="源_") -> in
 
     changed = 0
     try:
-        wb = Workbook(str(output_path))
+        wb = _open_workbook(output_path)
     except Exception as e:
         logger.warning(f"[主键归一] 打开失败，跳过: {output_path} - {e}")
         return 0
@@ -506,7 +789,7 @@ def make_values_only_copy(src_xlsx, dst_xlsx, source_sheet_prefix="源_",
 
     def _attempt():
         """单次尝试：打开→拍平→删源sheet→Save。成功返回 dst 路径；任何异常向外抛出以触发重试。"""
-        wb = Workbook(str(src_xlsx))
+        wb = _open_workbook(src_xlsx)
         try:
             try:
                 wb.CalculateFormula()
@@ -519,7 +802,7 @@ def make_values_only_copy(src_xlsx, dst_xlsx, source_sheet_prefix="源_",
             protected = {}
             if filled_by_sheet is None and template_path:
                 try:
-                    _twb = Workbook(str(template_path))
+                    _twb = _open_workbook(template_path)
                     try:
                         for _ti in range(_twb.Worksheets.Count):
                             _tws = _twb.Worksheets[_ti]

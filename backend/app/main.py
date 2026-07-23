@@ -4127,6 +4127,47 @@ def _extract_template_path(script_content: str):
     return m.group(2) if m else None
 
 
+def _pick_result_output(output_files, template_path=None):
+    """从 output_dir 里 glob 到的 xlsx 中挑出【真正的结果文件】。
+
+    背景：某些（AI 定制的）模板骨架会先把模板 copy2 成工作副本 out_path，最后却把填充
+    后的工作簿【另存成带时间戳的新文件名】，于是输出目录里同时留下 [模板原样副本, 真实结果]
+    两个文件。上层若按 glob 顺序取 output_files[0]，可能取到那份原样副本 → 用户下载到空模板
+    （fill_report 明明显示改了很多格）。
+
+    策略：① 若知道有效模板且能算哈希，剔除与模板字节完全相同的原样副本；② 再按修改时间
+    倒序取最新——真实结果最后 save，mtime 最新；copy2 出来的副本继承模板的旧 mtime。
+    单靠 mtime 已足以规避本问题；哈希剔除是更强的双保险。返回单个 Path 或 None。
+    """
+    files = list(output_files or [])
+    if len(files) <= 1:
+        return files[0] if files else None
+    try:
+        if template_path and os.path.exists(template_path):
+            import hashlib as _hl
+
+            def _md5(p):
+                _h = _hl.md5()
+                with open(p, "rb") as _fp:
+                    for _chunk in iter(lambda: _fp.read(1 << 20), b""):
+                        _h.update(_chunk)
+                return _h.hexdigest()
+
+            _tpl_md5 = _md5(template_path)
+            _non_tpl = [f for f in files if _md5(str(f)) != _tpl_md5]
+            if _non_tpl:
+                files = _non_tpl
+            else:
+                logger.warning("[输出选择] 所有输出文件都与模板字节相同，可能填充未落盘")
+    except Exception as _pe:
+        logger.warning(f"[输出选择] 剔除模板副本失败（忽略）: {_pe}")
+    try:
+        files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    except Exception:
+        pass
+    return files[0]
+
+
 def _resolve_script_display_name(tenant_id: str, script_id: str, script_content: str = None):
     """解析脚本的"友好显示名"，用于固化结果文件名。
 
@@ -4902,6 +4943,21 @@ async def run_compute_task(
         if not output_files:
             raise Exception("未生成输出文件")
 
+        # 选出真实结果：有的定制骨架会把模板原样副本也留在输出目录（详见 _pick_result_output），
+        # 若误取到那份副本，用户下载到的就是空模板。此处剔除模板副本 + 取最新，收窄到真实结果，
+        # 再往下的后处理/命名也只作用于它。
+        try:
+            _tpl_for_pick = (template_override_path
+                             if (template_override_path and os.path.exists(template_override_path))
+                             else _extract_template_path(script_content))
+            _picked = _pick_result_output(output_files, _tpl_for_pick)
+            if _picked is not None:
+                if len(output_files) > 1:
+                    logger.info(f"[输出选择] 多个输出文件 {[f.name for f in output_files]}，选定真实结果: {_picked.name}")
+                output_files = [_picked]
+        except Exception as _pick_e:
+            logger.warning(f"[输出选择] 选定结果文件失败（保持原列表）: {_pick_e}")
+
         # 兜底修复：早期模板脚本 keep_vba=True 保存出的 .xlsx 内容类型被错标为 macroEnabled，
         # Excel 会报"文件损坏或扩展名无效"。此处统一改回普通 xlsx 类型，救活旧脚本产物。
         for _of in output_files:
@@ -4940,6 +4996,20 @@ async def run_compute_task(
                                         _eff_tpl_fmt if _tpl_ok else None)
         except Exception as _fmt_e:
             logger.warning(f"[fmt兜底] 跳过: {_fmt_e}")
+
+        # 汇总行格式兜底：老脚本用 openpyxl 手动增删行导致汇总行（总计/合计）格式不随行跟随、
+        # 数据行掉底色边框。此处用 Aspose 按模板重刷汇总行+数据区样式（只对单一底部汇总行 sheet
+        # 生效，多区域小计 sheet 自动跳过）。须在坐标法 restore_formats_from_template 之后、改名之前跑。
+        try:
+            from backend.utils.output_postprocess import (
+                restore_template_region_format, restore_summary_format_enabled,
+            )
+            if _tpl_ok and restore_summary_format_enabled():
+                for _of in output_files:
+                    await asyncio.to_thread(restore_template_region_format,
+                                            str(_of), _eff_tpl_fmt, script_content)
+        except Exception as _sfe:
+            logger.warning(f"[汇总格式] 跳过: {_sfe}")
 
         # 【模板 sheet 重映射 · 改名出】把结果文件里临时对齐的训练 sheet 名改回上传模板的原名
         if _sheet_reverse_map:

@@ -571,6 +571,7 @@ def _run_single_iteration(
     pre_loaded_source_data: Dict = None,
     rules_content: str = None,
     expected_structure: Dict = None,
+    template_override_path: str = None,
 ) -> Dict[str, Any]:
     """执行单轮训练：运行代码 → 对比 → 返回结果（与 TrainingEngine._execute_and_validate 一致）"""
     from ..sandbox.code_sandbox import CodeSandbox
@@ -618,16 +619,22 @@ def _run_single_iteration(
         # 跨环境模板定位：模板模式脚本烘焙的 TEMPLATE_PATH 常是训练机绝对路径，跨环境（开发/
         # docker/IIS）不存在。用 template_resolver 按 名/哈希 在当前环境（租户目录/global_assets）
         # 定位有效模板，注入 execution_env，让沙箱覆盖脚本的 TEMPLATE_PATH。非模板脚本无副作用。
+        # 若调用方显式传入 template_override_path（如"上传代码"时随手上传的模板），则优先直接用它，
+        # 不再按名解析——这样上传的新模板即便文件名/哈希与烘焙的不一致也能立即生效验证。
         try:
-            from pathlib import Path as _Path
-            from ..utils.template_resolver import resolve_template_path
-            _proj_root = _Path(__file__).resolve().parent.parent.parent
-            _resolved_tpl = resolve_template_path(
-                tenant_id=tenant_id, script_code=code, project_root=str(_proj_root),
-            )
-            if _resolved_tpl:
-                execution_env["_template_override_path"] = _resolved_tpl
-                logger.info(f"[模板解析] 聊天训练当前环境定位到模板: {_resolved_tpl}")
+            if template_override_path and os.path.exists(template_override_path):
+                execution_env["_template_override_path"] = template_override_path
+                logger.info(f"[模板解析] 使用显式上传模板: {template_override_path}")
+            else:
+                from pathlib import Path as _Path
+                from ..utils.template_resolver import resolve_template_path
+                _proj_root = _Path(__file__).resolve().parent.parent.parent
+                _resolved_tpl = resolve_template_path(
+                    tenant_id=tenant_id, script_code=code, project_root=str(_proj_root),
+                )
+                if _resolved_tpl:
+                    execution_env["_template_override_path"] = _resolved_tpl
+                    logger.info(f"[模板解析] 聊天训练当前环境定位到模板: {_resolved_tpl}")
         except Exception as _tre:
             logger.warning(f"[模板解析] 跳过: {_tre}")
 
@@ -839,25 +846,147 @@ def list_chat_sessions(
     return {"sessions": result}
 
 
+def _serialize_iterations(iterations):
+    """迭代记录 → dict 列表（含完整代码，供前端折叠代码摘要用）"""
+    return [
+        {
+            "iteration_num": it.iteration_num,
+            "status": it.status,
+            "accuracy": it.accuracy,
+            "generated_code": it.generated_code,
+            "ai_response": (it.ai_response or "")[:2000],
+            "execution_result": it.execution_result,
+            "error_details": it.error_details,
+            "created_at": it.started_at.isoformat() if it.started_at else None,
+        }
+        for it in iterations
+    ]
+
+
 @router.get("/sessions/{session_id}/messages")
 def get_session_messages(
     session_id: int,
+    limit_turns: int = Query(5, ge=1, le=50),
+    before_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """获取会话的所有消息"""
+    """获取会话消息（游标分页）。
+
+    - 一"轮" = 一条 user 消息 + 其后到下一条 user 消息之间的所有消息。
+    - 首屏（before_id 为空）：返回最近 limit_turns 轮 + 会话级大字段（current_code 等）。
+    - 上划（before_id 有值）：返回该 id 之前的更早 limit_turns 轮，仅含 messages/iterations/分页游标。
+    - 迭代代码按页下发：只返回本页消息引用的迭代；真孤儿迭代仅在最老一页附带。
+    """
     session = db.query(TrainingSession).filter_by(id=session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="会话不存在")
 
-    messages = (
-        db.query(TrainingMessage)
-        .filter_by(session_id=session_id)
-        .order_by(TrainingMessage.created_at)
-        .all()
-    )
+    is_first_page = before_id is None
 
-    # 返回最新迭代的代码和准确率（与 /code 接口、latest_files 一致：取最新一轮，非最高分那轮）
+    # 过滤集：本会话 且（若上划）id < before_id
+    base = db.query(TrainingMessage).filter(TrainingMessage.session_id == session_id)
+    if before_id is not None:
+        base = base.filter(TrainingMessage.id < before_id)
+
+    # 定位页起点：过滤集中最新 limit_turns 条 user 消息的最小 id
+    recent_user_ids = [
+        row[0]
+        for row in base.filter(TrainingMessage.role == "user")
+        .with_entities(TrainingMessage.id)
+        .order_by(TrainingMessage.id.desc())
+        .limit(limit_turns)
+        .all()
+    ]
+    if recent_user_ids:
+        page_start_id = min(recent_user_ids)
+    else:
+        # 不足 limit_turns 条 user 消息 → 返回过滤集内剩余全部
+        first_row = (
+            base.with_entities(TrainingMessage.id)
+            .order_by(TrainingMessage.id.asc())
+            .first()
+        )
+        page_start_id = first_row[0] if first_row else None
+
+    # 页消息（升序）
+    if page_start_id is None:
+        page_messages = []
+    else:
+        page_messages = (
+            base.filter(TrainingMessage.id >= page_start_id)
+            .order_by(TrainingMessage.id.asc())
+            .all()
+        )
+
+    # has_more：page_start_id 之前是否还有更早消息
+    has_more = False
+    if page_start_id is not None:
+        has_more = (
+            db.query(TrainingMessage.id)
+            .filter(TrainingMessage.session_id == session_id, TrainingMessage.id < page_start_id)
+            .first()
+            is not None
+        )
+
+    # 本页迭代 = 页消息 metadata.iteration 引用的迭代
+    page_iter_nums = set()
+    for m in page_messages:
+        meta = m.metadata_ or {}
+        it_num = meta.get("iteration") if isinstance(meta, dict) else None
+        if it_num:
+            page_iter_nums.add(it_num)
+
+    # 最老一页额外附带"真孤儿"迭代（从无任何消息引用的迭代，通常是首轮）
+    if not has_more:
+        mentioned_all = set()
+        for (meta,) in db.query(TrainingMessage.metadata_).filter(
+            TrainingMessage.session_id == session_id
+        ).all():
+            if isinstance(meta, dict) and meta.get("iteration"):
+                mentioned_all.add(meta["iteration"])
+        orphan_nums = {
+            row[0]
+            for row in db.query(TrainingIteration.iteration_num)
+            .filter(TrainingIteration.session_id == session_id)
+            .all()
+        } - mentioned_all
+        page_iter_nums |= orphan_nums
+
+    iterations = []
+    if page_iter_nums:
+        iterations = (
+            db.query(TrainingIteration)
+            .filter(
+                TrainingIteration.session_id == session_id,
+                TrainingIteration.iteration_num.in_(page_iter_nums),
+            )
+            .order_by(TrainingIteration.iteration_num)
+            .all()
+        )
+
+    result = {
+        "messages": [
+            {
+                "id": m.id,
+                "role": m.role,
+                "content": m.content,
+                "msg_type": m.msg_type,
+                "metadata": m.metadata_,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            }
+            for m in page_messages
+        ],
+        "iterations": _serialize_iterations(iterations),
+        "has_more": has_more,
+        "page_start_id": page_start_id,
+    }
+
+    # 上划的更早页到此为止（避免重复下发 current_code 等大字段）
+    if not is_first_page:
+        return result
+
+    # ===== 首屏：附加会话级大字段 =====
     latest_iteration = (
         db.query(TrainingIteration)
         .filter_by(session_id=session_id)
@@ -870,7 +999,6 @@ def get_session_messages(
     src_dir = cfg.get("source_dir", "")
     exp_file = cfg.get("expected_file", "")
 
-    # 获取原始文件名称列表
     source_file_names = []
     expected_file_name = None
     try:
@@ -881,15 +1009,7 @@ def get_session_messages(
     except Exception:
         pass
 
-    # 获取所有迭代记录（用于补充对话历史中缺失的代码和执行细节）
-    iterations = (
-        db.query(TrainingIteration)
-        .filter_by(session_id=session_id)
-        .order_by(TrainingIteration.iteration_num)
-        .all()
-    )
-
-    return {
+    result.update({
         "session": {
             "id": session.id,
             "tenant_id": session.tenant_id,
@@ -902,30 +1022,6 @@ def get_session_messages(
             "has_source_files": bool(src_dir and os.path.isdir(src_dir)),
             "has_expected_file": bool(exp_file and os.path.exists(exp_file)),
         },
-        "messages": [
-            {
-                "id": m.id,
-                "role": m.role,
-                "content": m.content,
-                "msg_type": m.msg_type,
-                "metadata": m.metadata_,
-                "created_at": m.created_at.isoformat() if m.created_at else None,
-            }
-            for m in messages
-        ],
-        "iterations": [
-            {
-                "iteration_num": it.iteration_num,
-                "status": it.status,
-                "accuracy": it.accuracy,
-                "generated_code": it.generated_code,
-                "ai_response": (it.ai_response or "")[:2000],
-                "execution_result": it.execution_result,
-                "error_details": it.error_details,
-                "created_at": it.started_at.isoformat() if it.started_at else None,
-            }
-            for it in iterations
-        ],
         "current_code": latest_iteration.generated_code if latest_iteration else None,
         "current_accuracy": latest_iteration.accuracy if latest_iteration else None,
         "latest_files": {
@@ -936,7 +1032,8 @@ def get_session_messages(
         "source_file_names": source_file_names,
         "expected_file_name": expected_file_name,
         "has_rules": bool(cfg.get("rules_content")),
-    }
+    })
+    return result
 
 
 # ==================== 模板 sheet 预览（智训前弹出选择） ====================
@@ -2878,10 +2975,11 @@ async def upload_code(
     session_id: int,
     code: str = Form(None),
     code_file: UploadFile = File(None),
+    template_file: UploadFile = File(None),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """直接上传代码，执行并验证"""
+    """直接上传代码，执行并验证。可选随代码一起上传模板文件（模板模式脚本用）。"""
     session = db.query(TrainingSession).filter_by(id=session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="会话不存在")
@@ -2895,6 +2993,30 @@ async def upload_code(
         raise HTTPException(status_code=400, detail="请提供代码内容或代码文件")
 
     config = session.config or {}
+
+    # 可选：随代码一起上传的模板文件。按脚本里烘焙的 TEMPLATE_NAME 存到当前租户 templates/，
+    # 这样以后智算按【名+哈希】也能命中；同时作为显式 override 传给本次验证，立即生效。
+    _tpl_override = None
+    if template_file and template_file.filename:
+        try:
+            from ..utils.template_resolver import extract_template_ref
+            from ..storage.storage_manager import StorageManager
+            _tpl_bytes = await template_file.read()
+            _baked_name, _, _ = extract_template_ref(code_content)
+            _save_name = (_baked_name or template_file.filename).replace(" ", "_")
+            _tpl_dir = StorageManager().get_tenant_dir(session.tenant_id) / "templates"
+            _tpl_dir.mkdir(parents=True, exist_ok=True)
+            _tpl_path = _tpl_dir / _save_name
+            _tpl_path.write_bytes(_tpl_bytes)
+            _tpl_override = str(_tpl_path)
+            # 回写会话 config，训练/复算再跑也能定位
+            config["template_path"] = _tpl_override
+            session.config = dict(config)
+            db.commit()
+            logger.info(f"[upload-code] 已保存随代码上传的模板: {_tpl_path}"
+                        f"（存为烘焙名={bool(_baked_name)}）")
+        except Exception as _te:
+            logger.warning(f"[upload-code] 保存上传模板失败: {_te}")
 
     # 执行验证（放入线程池，避免阻塞事件循环导致 Windows 反向代理 502）
     iteration_num = (session.total_iterations or 0) + 1
@@ -2910,6 +3032,7 @@ async def upload_code(
         file_passwords=config.get("file_passwords"),
         rules_content=config.get("rules_content", ""),
         expected_structure=config.get("expected_structure"),
+        template_override_path=_tpl_override,
     )
 
     from ..api.training_persistence import TrainingPersistence
@@ -3381,16 +3504,18 @@ def download_original_file(
 
 
 @router.get("/sessions/{session_id}/final-rules")
-def generate_final_rules(
+async def generate_final_rules(
     session_id: int,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """根据【原始规则 + 多轮对话 + 当前最佳代码】，用 AI 整理出一份"最终规则"。
+    """根据【原始规则 + 多轮对话 + 当前代码（最新一轮）】，用 AI 整理出一份"最终规则"。
 
     目的：训练经过多轮对话才逼近最优，用户想改逻辑时不必从最原始规则重来——
     用这份整理好的最终规则作为下次训练的初始规则，可一步到位接近当前轮次的效果。
-    返回 {rules, filename}，前端据此下载 .md。
+
+    以 SSE 流式返回（两次串行 AI 调用耗时长，普通请求会被反向代理按读超时掐断成 504/502；
+    这里用 15s 心跳保活）：过程 emit status，完成 emit {type:done, rules, filename}。
     """
     session = db.query(TrainingSession).filter_by(id=session_id).first()
     if not session:
@@ -3410,16 +3535,18 @@ def generate_final_rules(
     if not original_rules:
         original_rules = config.get("rules_content", "") or (session.rules_content or "")
 
-    # 2) 当前最佳代码（按准确率最高、轮次最新）
-    best_iteration = (
+    # 2) 当前代码（最新一轮有代码的那一轮，与 current_code / 智算 / 设为最佳 口径一致）：
+    #    逆向分析的是"当前生效的这份代码"，而非历史最高分那一轮——用户在哪个状态点击就逆向哪份代码。
+    cur_iteration = (
         db.query(TrainingIteration)
         .filter_by(session_id=session_id)
-        .filter(TrainingIteration.accuracy.isnot(None))
-        .order_by(TrainingIteration.accuracy.desc(), TrainingIteration.iteration_num.desc())
+        .filter(TrainingIteration.generated_code.isnot(None))
+        .filter(TrainingIteration.generated_code != "")
+        .order_by(TrainingIteration.iteration_num.desc())
         .first()
     )
-    best_code = best_iteration.generated_code if best_iteration else ""
-    best_accuracy = best_iteration.accuracy if best_iteration else None
+    best_code = cur_iteration.generated_code if cur_iteration else ""
+    best_accuracy = cur_iteration.accuracy if cur_iteration else None
 
     # 3) 全量对话（user + assistant），按时间正序
     msgs = (
@@ -3432,7 +3559,7 @@ def generate_final_rules(
     if not (original_rules or msgs or best_code):
         raise HTTPException(status_code=400, detail="该会话暂无可整理的规则/对话/代码")
 
-    # 控制长度，避免超出上下文窗口（对话取每条前 1500 字，代码取前 12000 字）
+    # 控制长度，避免超出上下文窗口（对话取每条前 1500 字，代码取前 80000 字）
     convo_lines = []
     for m in msgs:
         role_cn = "用户" if m.role == "user" else "AI"
@@ -3453,74 +3580,90 @@ def generate_final_rules(
     except Exception:
         exp_struct_txt = "（无）"
 
-    try:
-        from ..ai_engine.ai_provider import AIProviderFactory
-        ai_provider_name = config.get("ai_provider") or os.environ.get("AI_PROVIDER", "deepseek")
-        provider = AIProviderFactory.create_provider(ai_provider_name)
-
-        # ===== 阶段 A：从最终代码逆向出"系统当前真实逻辑"（权威依据）=====
-        stage_a_system = (
-            "你是资深数据/薪酬计算逻辑逆向分析专家。下面是一段经过多轮调试、已达到最佳准确率的"
-            "生产脚本。请你逐字段/逐输出列地**逆向还原它实际执行的业务逻辑**（这是系统当前真实"
-            "行为的唯一权威依据）。\n"
-            "对每个输出列/字段，尽量给出：①取数来源（哪个源表/源列）②计算公式或取值规则"
-            "（含系数、四舍五入位数、单位换算）③触发条件/分支（如某类人群不同算法）④过滤、"
-            "去重、汇总、补零、类型转换等清洗动作 ⑤特殊情况/边界处理。\n"
-            "只陈述代码**确实做了什么**，不要臆测；代码没体现的不要编。用中文，可用列表/表格，"
-            "尽量精确，不要贴大段代码。"
-        )
-        stage_a_user = (
-            f"# 输出文件结构（目标列参考）\n{exp_struct_txt}\n\n"
-            f"# 源数据结构\n{src_struct_desc or '（无）'}\n\n"
-            f"# 最终脚本\n```python\n{code_for_prompt}\n```\n\n"
-            "请输出【代码真实逻辑】的逐字段分析。"
-        )
-        code_logic = (provider.chat([
-            {"role": "system", "content": stage_a_system},
-            {"role": "user", "content": stage_a_user},
-        ]) or "").strip()
-
-        # ===== 阶段 B：交叉校正——以代码逻辑为准，融合原始规则与对话意图，输出最终规则 =====
-        stage_b_system = (
-            "你是数据整合规则的总编。现在要产出一份**最终规则**，作为下次训练的初始规则，目标是"
-            "让下次几乎一步到位复现当前最佳结果。你手里有三份材料，权威级别不同：\n"
-            "1）【代码真实逻辑】= 系统当前实际行为，**最高权威**，凡冲突以它为准；\n"
-            "2）【多轮对话】= 需求演进与修正，用于理解*为什么*这么算、术语口径、易错点；"
-            "其中被后续推翻的说法要丢弃，只取最终生效的意图；\n"
-            "3）【初始规则】= 最初意图，可能已过时，仅作背景与术语补充。\n\n"
-            "请做**深度整合与修正**，而不是拼接：\n"
-            "- 以代码逻辑为骨架，逐输出列写明：取数来源、精确计算公式（系数/小数位/单位）、"
-            "适用条件与分支、清洗/汇总/补位规则、特殊情况处理；\n"
-            "- 用对话与初始规则补全业务含义、命名口径、边界约定，并**显式纠正**初始规则中与代码"
-            "不一致的地方（不必保留错误旧规则，但可在结尾用一小节『与初始规则的差异』点出关键修正）；\n"
-            "- 消除矛盾、补齐缺口，使整份规则自洽、可执行、无歧义；\n"
-            "- 中文 Markdown，业务语言描述（不要贴代码），结构清晰；只输出规则正文，不要寒暄/过程描述。"
-        )
-        stage_b_user = (
-            f"# 代码真实逻辑（最高权威）\n{code_logic or '（无）'}\n\n"
-            f"# 多轮对话（按时间正序，理解意图与修正）\n{conversation}\n\n"
-            f"# 初始规则（可能过时，仅作背景）\n{original_rules or '（无）'}\n\n"
-            "请输出深度整合与修正后的【最终规则】Markdown 正文。"
-        )
-        final_rules = provider.chat([
-            {"role": "system", "content": stage_b_system},
-            {"role": "user", "content": stage_b_user},
-        ])
-    except Exception as e:
-        logger.exception("生成最终规则失败")
-        raise HTTPException(status_code=500, detail=f"生成最终规则失败: {e}")
-
-    final_rules = (final_rules or "").strip()
-    if not final_rules:
-        raise HTTPException(status_code=500, detail="AI 未返回有效规则内容")
-
+    ai_provider_name = config.get("ai_provider") or os.environ.get("AI_PROVIDER", "deepseek")
     safe_key = str(getattr(session, "session_key", None) or session_id)
-    return {
-        "rules": final_rules,
-        "filename": f"最终规则_{safe_key}.md",
-        "best_accuracy": best_accuracy,
-        "based_on_iterations": session.total_iterations or 0,
-    }
+    based_on_iterations = session.total_iterations or 0
+
+    # ===== 提示词（DB 读取已在上方完成，AI 调用放后台线程，避免跨线程用 db）=====
+    stage_a_system = (
+        "你是资深数据/薪酬计算逻辑逆向分析专家。下面是一段经过多轮调试的**当前生产脚本**。"
+        "请你逐字段/逐输出列地**逆向还原它实际执行的业务逻辑**（这是系统当前真实"
+        "行为的唯一权威依据）。\n"
+        "对每个输出列/字段，尽量给出：①取数来源（哪个源表/源列）②计算公式或取值规则"
+        "（含系数、四舍五入位数、单位换算）③触发条件/分支（如某类人群不同算法）④过滤、"
+        "去重、汇总、补零、类型转换等清洗动作 ⑤特殊情况/边界处理。\n"
+        "只陈述代码**确实做了什么**，不要臆测；代码没体现的不要编。用中文，可用列表/表格，"
+        "尽量精确，不要贴大段代码。"
+    )
+    stage_a_user = (
+        f"# 输出文件结构（目标列参考）\n{exp_struct_txt}\n\n"
+        f"# 源数据结构\n{src_struct_desc or '（无）'}\n\n"
+        f"# 最终脚本\n```python\n{code_for_prompt}\n```\n\n"
+        "请输出【代码真实逻辑】的逐字段分析。"
+    )
+    stage_b_system = (
+        "你是数据整合规则的总编。现在要产出一份**最终规则**，作为下次训练的初始规则，目标是"
+        "让下次几乎一步到位复现当前最佳结果。你手里有三份材料，权威级别不同：\n"
+        "1）【代码真实逻辑】= 系统当前实际行为，**最高权威**，凡冲突以它为准；\n"
+        "2）【多轮对话】= 需求演进与修正，用于理解*为什么*这么算、术语口径、易错点；"
+        "其中被后续推翻的说法要丢弃，只取最终生效的意图；\n"
+        "3）【初始规则】= 最初意图，可能已过时，仅作背景与术语补充。\n\n"
+        "请做**深度整合与修正**，而不是拼接：\n"
+        "- 以代码逻辑为骨架，逐输出列写明：取数来源、精确计算公式（系数/小数位/单位）、"
+        "适用条件与分支、清洗/汇总/补位规则、特殊情况处理；\n"
+        "- 用对话与初始规则补全业务含义、命名口径、边界约定，并**显式纠正**初始规则中与代码"
+        "不一致的地方（不必保留错误旧规则，但可在结尾用一小节『与初始规则的差异』点出关键修正）；\n"
+        "- 消除矛盾、补齐缺口，使整份规则自洽、可执行、无歧义；\n"
+        "- 中文 Markdown，业务语言描述（不要贴代码），结构清晰；只输出规则正文，不要寒暄/过程描述。"
+    )
+
+    loop = asyncio.get_event_loop()
+    queue, _emit, event_generator = _create_sse_stream(loop)
+
+    def _worker():
+        try:
+            from ..ai_engine.ai_provider import AIProviderFactory
+            provider = AIProviderFactory.create_provider(ai_provider_name)
+
+            # 阶段 A：逆向出"代码真实逻辑"
+            _emit({"type": "status", "message": "① 正在逆向分析当前代码的真实逻辑…"})
+            code_logic = (provider.chat([
+                {"role": "system", "content": stage_a_system},
+                {"role": "user", "content": stage_a_user},
+            ]) or "").strip()
+
+            # 阶段 B：融合原始规则与对话意图，输出最终规则
+            _emit({"type": "status", "message": "② 正在整合原始规则、对话意图与代码逻辑…"})
+            stage_b_user = (
+                f"# 代码真实逻辑（最高权威）\n{code_logic or '（无）'}\n\n"
+                f"# 多轮对话（按时间正序，理解意图与修正）\n{conversation}\n\n"
+                f"# 初始规则（可能过时，仅作背景）\n{original_rules or '（无）'}\n\n"
+                "请输出深度整合与修正后的【最终规则】Markdown 正文。"
+            )
+            final_rules = (provider.chat([
+                {"role": "system", "content": stage_b_system},
+                {"role": "user", "content": stage_b_user},
+            ]) or "").strip()
+
+            if not final_rules:
+                _emit({"type": "error", "message": "AI 未返回有效规则内容"})
+                return
+
+            _emit({
+                "type": "done",
+                "rules": final_rules,
+                "filename": f"最终规则_{safe_key}.md",
+                "best_accuracy": best_accuracy,
+                "based_on_iterations": based_on_iterations,
+            })
+        except Exception as e:
+            logger.exception("生成最终规则失败")
+            _emit({"type": "error", "message": f"生成最终规则失败: {e}"})
+        finally:
+            _emit(None)
+
+    loop.run_in_executor(None, _worker)
+    return StreamingResponse(event_generator, media_type="text/event-stream")
 
 
 # ==================== 辅助函数 ====================

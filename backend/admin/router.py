@@ -1133,6 +1133,17 @@ async def generate_report(
         elif sheet_name in template_data:
             template_sheets[sheet_name] = template_data[sheet_name]
 
+    # 位置别名：按 sheet 顺序追加 DT1/DT2…（第 2 个 sheet=DT1、第 3 个=DT2，以此类推；
+    # 第 1 个 sheet 已是 DT）。与真实 sheet 名【并存】——老模板写 &=<sheet名>.列 仍可用，
+    # 新模板可写 &=DT1.列 按位置引用，不必关心 sheet 叫什么名字。指向已规整+双别名后的数据。
+    for _idx, _sn in enumerate(template_sheets.keys()):
+        if _idx == 0:
+            continue   # 第一个就是 DT
+        _alias = f"DT{_idx}"
+        if _alias not in template_data:   # 不覆盖恰好真名叫 DT1 的 sheet
+            template_data[_alias] = template_sheets[_sn]
+            logger.info(f"[报表] 位置别名 {_alias} -> sheet '{_sn}'")
+
     # 【Step 2】header_map 用于调试和模板设计预览
     if header_map:
         logger.info("=== header_map（列字母 → 原始拼接表头）===")
@@ -1369,10 +1380,13 @@ async def preview_template_headers(
     sheets_out = []
     for idx, (sn, mapping) in enumerate(merged.items()):
         items = sorted(mapping.items(), key=lambda kv: (len(kv[0]), kv[0]))
+        # 位置别名：第1个=DT、第2个=DT1、第3个=DT2…；sheet 真名同样可用（并存，向后兼容）
+        _pos_alias = "DT" if idx == 0 else f"DT{idx}"
         sheets_out.append({
             "sheet_name": sn,
             "is_primary": idx == 0,
-            "alias": "DT" if idx == 0 else sn,
+            "alias": _pos_alias,
+            "sheet_alias": sn,   # 老写法：&=<sheet名>.列 仍可用
             "columns": [{"letter": k, "header": v} for k, v in items],
         })
     return {"template_id": template_id, "task_id": task_id, "sheets": sheets_out}
@@ -1631,6 +1645,19 @@ def migration_export(db_id: int, db: Session = Depends(get_db), _admin: User = D
                 _tpl_file = _cfg_tp
         if not _tpl_file and _tbaked and os.path.exists(_tbaked):
             _tpl_file = _tbaked
+        # 跨环境兜底：config/烘焙路径都是外机绝对路径时（如导出机是 Windows、烘焙的是 Docker
+        # /app/... 路径），按【文件名+哈希】在当前环境的租户目录/全局资源里递归定位真实文件，
+        # 确保迁移包能把模版带上（否则 template_blob 为空，导入端无模版可落盘）。
+        if not _tpl_file:
+            try:
+                from ..utils.template_resolver import resolve_template_path
+                _hit = resolve_template_path(
+                    tenant_id=s.tenant_id, script_code=s.code, project_root=_PROJECT_ROOT)
+                if _hit and os.path.exists(_hit):
+                    _tpl_file = _hit
+            except Exception as _rte:
+                logging.getLogger(__name__).warning(
+                    f"[迁移导出] 模板解析器兜底失败 db_id={s.id}: {_rte}")
         if _tpl_file and os.path.exists(_tpl_file):
             _sz = os.path.getsize(_tpl_file)
             if _sz <= 60 * 1024 * 1024:   # 60MB 上限，超大不打包（避免撑爆 JSON 传输）

@@ -34,7 +34,8 @@
       "Read(**/*.ttf)",
       "Read(**/*.ttc)",
       "Read(**/*.dll)",
-      "Read(**/*.so)"
+      "Read(**/*.so)",
+      "Read(**/*.db)"
     ]
   }
 }

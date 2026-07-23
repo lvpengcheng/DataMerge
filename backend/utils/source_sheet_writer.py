@@ -10,7 +10,7 @@
 非日期关键词列即使套了日期格式，也读其底层数值（用 dt_to_excel_serial 逆转）。
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # 排除误匹配（如"工作日数"、"节日"等）；"工作/加班/出勤时间"等是时长(数字)不是日期
 _DATE_EXCLUDE_KEYWORDS = ['日数', '日常', '日志', '日报', '日均', '节日', '假日', '工日',
@@ -50,6 +50,44 @@ def dt_to_excel_serial(v):
     if isinstance(v, datetime):
         d = v - _EXCEL_EPOCH
         return d.days + d.seconds / 86400.0
+    return v
+
+
+def coerce_source_date(v):
+    """把日期关键词列的值尽力还原成真 datetime；空值一律返回 None（保持空单元格）。
+
+    用于模板模式写 源_ sheet：源里日期列可能存成文本（"2020-06-22"）或裸 Excel 序列号
+    （42430），pandas 读成 str/int/float，不会被当日期。这里对日期关键词列统一还原：
+      - 各种空（None/NaN/NaT/空串/纯空格）→ None（→ 空单元格，绝不写成 1899-12-30 或 NaT）
+      - 已是 datetime → 原样返回
+      - 文本 → pd.to_datetime 解析；解析不出则**保留原文本**（不丢数据、不误判）
+      - 数字 → 按 Excel 纪元还原成日期；<=0 视为空（0=1899-12-30 基本是占位空）
+
+    注意：pd.NaT 是 datetime 子类，isinstance(NaT, datetime) 为 True，必须先拦掉。
+    """
+    import pandas as pd
+    if v is None or v is pd.NaT:
+        return None
+    if isinstance(v, float) and v != v:   # NaN（float 自身不等于自身）
+        return None
+    if isinstance(v, datetime):           # 已是日期（含 pd.Timestamp 子类）→ 原样
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:                         # 空串/纯空格 → 空
+            return None
+        try:
+            ts = pd.to_datetime(s, errors="coerce")
+        except Exception:
+            return v
+        return ts.to_pydatetime() if pd.notna(ts) else v   # 解析不出 → 保留原文本
+    if isinstance(v, (int, float)):
+        if v <= 0:                        # 0/负数 → 空（避免 0→1899-12-30）
+            return None
+        try:
+            return _EXCEL_EPOCH + timedelta(days=float(v))
+        except Exception:
+            return None
     return v
 
 
