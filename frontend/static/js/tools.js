@@ -292,6 +292,17 @@ const Tools = {
 
             <h3 style="margin-top:16px;">② 关联键（每个文件）</h3>
             <div id="int-key-map"></div>
+            <div class="form-group" style="margin-top:6px;">
+                <label style="font-size:13px;">日期关联键归一：</label>
+                <select id="int-date-mode">
+                    <option value="off" selected>关闭（纯文本原样比较）</option>
+                    <option value="yearmonthday">按年月日（2026-02-26，精确到日）</option>
+                    <option value="yearmonth">按年月（2026-02，区分年度）</option>
+                    <option value="month">按月（忽略年/日）</option>
+                    <option value="day">按日（忽略年）</option>
+                </select>
+                <span style="color:#888;font-size:12px;margin-left:8px;">关联键是日期/月份时用：把 datetime、2026-02、2月26日 等归到同一粒度再匹配，两边同粒度才对得上。</span>
+            </div>
 
             <h3 style="margin-top:16px;">③ 覆盖字段（勾选基准列 → 匹配对照列 / 公式）</h3>
             <div id="int-ow-picker" style="border:1px solid #e3e7ed;border-radius:6px;padding:8px;max-height:150px;overflow:auto;"></div>
@@ -422,6 +433,7 @@ const Tools = {
         if (cfg.name_col) { const e = document.getElementById('int-name-col'); if (e) e.value = cfg.name_col; }
         if (cfg.id_col) { const e = document.getElementById('int-id-col'); if (e) e.value = cfg.id_col; }
         if (cfg.diff_order) { const e = document.getElementById('int-diff-order'); if (e) e.value = cfg.diff_order; }
+        if (cfg.date_key_mode) { const e = document.getElementById('int-date-mode'); if (e) e.value = cfg.date_key_mode; }
 
         document.getElementById('int-scheme-status').textContent = `已套用方案「${scheme.name}」`;
     },
@@ -455,6 +467,7 @@ const Tools = {
             diff_order: document.getElementById('int-diff-order')?.value || 'id_name',
             output_mode: parseInt(document.querySelector('input[name="int-output-mode"]:checked').value, 10),
             normalize_keys: true,
+            date_key_mode: document.getElementById('int-date-mode')?.value || 'off',
         };
         const st = document.getElementById('int-save-status');
         st.textContent = '保存中...'; st.className = 'status';
@@ -767,6 +780,7 @@ const Tools = {
             id_col: document.getElementById('int-id-col')?.value || null,
             diff_order: document.getElementById('int-diff-order')?.value || 'id_name',
             normalize_keys: true,
+            date_key_mode: document.getElementById('int-date-mode')?.value || 'off',
         };
         const st = document.getElementById('int-exec-status');
         const btn = document.getElementById('int-execute');
@@ -872,15 +886,19 @@ const Tools = {
     _renderMergeConfig(data) {
         const files = data.files || [];
 
-        // 主键下拉（每文件）——默认选中 suggested_key（身份证/工号等唯一标识列）
+        // 主键（每文件，可多选组成复合主键）——默认勾选 suggested_key（身份证/工号等唯一标识列）
         document.getElementById('merge-key-map').innerHTML = files.map(f => {
             const sk = f.suggested_key || (f.columns || [])[0] || '';
             return `
-            <div style="margin:4px 0;">
-                <span style="display:inline-block;min-width:160px;">${_escape(f.name)}：</span>
-                <select class="mg-key" data-file="${_escape(f.name)}">
-                    ${(f.columns || []).map(c => `<option value="${_escape(c)}" ${c === sk ? 'selected' : ''}>${_escape(c)}</option>`).join('')}
-                </select>
+            <div style="margin:4px 0;display:flex;align-items:flex-start;gap:8px;">
+                <span style="display:inline-block;min-width:160px;padding-top:2px;">${_escape(f.name)}：</span>
+                <div style="display:flex;flex-wrap:wrap;gap:4px 14px;">
+                    ${(f.columns || []).map(c => `
+                        <label style="display:inline-flex;align-items:center;gap:4px;font-size:13px;">
+                            <input type="checkbox" class="mg-key" data-file="${_escape(f.name)}" data-col="${_escape(c)}" ${c === sk ? 'checked' : ''}>
+                            ${_escape(c)}
+                        </label>`).join('')}
+                </div>
             </div>`;
         }).join('');
 
@@ -1251,7 +1269,15 @@ const Tools = {
         const groups = this._currentGroups();
         if (!groups.length) { this._setMergeExecStatus('请至少勾选一个字段', 'error'); return; }
         const key_map = {};
-        document.querySelectorAll('.mg-key').forEach(sel => { key_map[sel.dataset.file] = sel.value; });
+        document.querySelectorAll('.mg-key:checked').forEach(cb => {
+            (key_map[cb.dataset.file] = key_map[cb.dataset.file] || []).push(cb.dataset.col);
+        });
+        // 校验：每个文件都要至少选一个主键列
+        const missing = (_mergeAnalysis.files || []).filter(f => !(key_map[f.name] || []).length);
+        if (missing.length) {
+            this._setMergeExecStatus(`请为每个文件至少选一个主键列（缺：${missing.map(f => f.name).join('、')}）`, 'error');
+            return;
+        }
 
         const usingTpl = !!((_mergeTemplates || []).find(t => t.id === _mergeAppliedTplId && t.has_template));
         const btn = document.getElementById('btn-merge-execute');
@@ -1266,6 +1292,7 @@ const Tools = {
                 merge_mode: document.getElementById('merge-mode').value,
                 base_file: document.getElementById('merge-base-file').value,
                 normalize_keys: document.getElementById('merge-normalize-keys').checked,
+                date_key_mode: document.getElementById('merge-date-mode').value,
                 template_id: _mergeAppliedTplId,
             };
             const resp = await AUTH.authFetch('/api/tools/merge/execute', {

@@ -1254,6 +1254,9 @@ async def generate_report(
             name_field=name_field_val,
             show_empty_period=show_empty,
             split_by=split_by_field,
+            # sheet 名占位符：DT/DT1… → 第 idx 个数据源 sheet 名；{year}/{month}/{date}/{tenant} 子串替换
+            sheet_source_names=list(all_sheet_dfs.keys()),
+            sheet_vars=system_vars,
         )
         # 实际输出路径可能和请求路径不同（如 zip 回退到 fill 时扩展名变为 .xlsx）
         output_path = actual_output_path

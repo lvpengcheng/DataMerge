@@ -771,18 +771,19 @@ class BaseAIProvider(ABC):
         # 从右到左尝试修复每个 f-string
         for pos in reversed(positions):
             search_start = pos + 2
-            close_pos = line.rfind('"', search_start)
-            if close_pos <= search_start:
-                continue
-            content = line[pos + 2:close_pos]
-            if "'" in content and "{" not in content:
-                continue  # 内部有单引号且无变量，换过去也会冲突
-            candidate = line[:pos] + "f'" + content + "'" + line[close_pos + 1:]
-            try:
-                ast.parse(candidate)
-                return candidate
-            except SyntaxError:
-                continue
+            # 候选结束引号：该 f-string 之后的每一个 "，从右到左逐个试到能 parse。
+            # （贪心 rfind 只试最后一个，遇到 f-string 后还跟代码/字符串时会取错收尾引号。）
+            close_candidates = [i for i in range(len(line) - 1, search_start - 1, -1) if line[i] == '"']
+            for close_pos in close_candidates:
+                content = line[pos + 2:close_pos]
+                if "'" in content and "{" not in content:
+                    continue  # 内部有单引号且无变量，换过去也会冲突
+                candidate = line[:pos] + "f'" + content + "'" + line[close_pos + 1:]
+                try:
+                    ast.parse(candidate)
+                    return candidate
+                except SyntaxError:
+                    continue
 
         return line
 
@@ -807,17 +808,19 @@ class BaseAIProvider(ABC):
         # 从右到左尝试修复每个 f-string
         for pos in reversed(positions):
             search_start = pos + 2
-            close_pos = line.rfind("'", search_start)
-            if close_pos <= search_start:
-                continue
-            content = line[pos + 2:close_pos]
-            escaped_content = content.replace('"', '\\"')
-            candidate = line[:pos] + 'f"' + escaped_content + '"' + line[close_pos + 1:]
-            try:
-                ast.parse(candidate)
-                return candidate
-            except SyntaxError:
-                continue
+            # 候选结束引号：该 f-string 之后的每一个 '，从右到左逐个试到能 parse。
+            # 修复 `f'=IF(D,'{s}'!B)'.replace('x','y')` 这类"f-string 后还跟带引号代码"的场景
+            # （贪心 rfind 会取到 .replace('x','y') 里的引号 → 修复失败）。
+            close_candidates = [i for i in range(len(line) - 1, search_start - 1, -1) if line[i] == "'"]
+            for close_pos in close_candidates:
+                content = line[pos + 2:close_pos]
+                escaped_content = content.replace('"', '\\"')
+                candidate = line[:pos] + 'f"' + escaped_content + '"' + line[close_pos + 1:]
+                try:
+                    ast.parse(candidate)
+                    return candidate
+                except SyntaxError:
+                    continue
 
         return line
 

@@ -19,6 +19,8 @@
 import hashlib
 import json
 import logging
+import re
+from datetime import datetime, date
 from typing import Dict, List, Any, Optional, Tuple
 
 import pandas as pd
@@ -89,13 +91,99 @@ def guess_key_column(columns, df=None):
 
 # ==================== 主键归一化 ====================
 
-def normalize_key(val, enabled: bool = True) -> str:
-    """主键归一化：NaN/空→""；浮点整数 1.0→"1"；去首尾空格。enabled=False 时仅 str+strip。"""
+# 日期解析：仅在能明确识别为日期时返回 (year|None, month|None, day|None)，否则 None。
+# 姓名/裸数字等不含日期结构的值一律不命中，落回普通字符串归一。
+_DATE_PATTERNS = [
+    # YYYY年M月D日 / YYYY年M月
+    (re.compile(r"^(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]?$"), ("y", "m", "d")),
+    (re.compile(r"^(\d{4})\s*年\s*(\d{1,2})\s*月$"), ("y", "m")),
+    # M月D日 / M月D号 / M月（无年）
+    (re.compile(r"^(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]$"), ("m", "d")),
+    (re.compile(r"^(\d{1,2})\s*月$"), ("m",)),
+    # YYYY-MM-DD [HH:MM:SS] / YYYY/MM/DD（含时间兜底 datetime 落成字符串）
+    (re.compile(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T]\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)?$"), ("y", "m", "d")),
+    # YYYY-MM / YYYY/MM
+    (re.compile(r"^(\d{4})[-/](\d{1,2})$"), ("y", "m")),
+    # YYYYMMDD / YYYYMM（无分隔纯数字，如 20260226 / 202602）
+    (re.compile(r"^(\d{4})(\d{2})(\d{2})$"), ("y", "m", "d")),
+    (re.compile(r"^(\d{4})(\d{2})$"), ("y", "m")),
+]
+
+
+def _parse_date_parts(val) -> Optional[Tuple[Optional[int], Optional[int], Optional[int]]]:
+    """把日期型值解析成 (year, month, day)（缺失位为 None）；非日期返回 None。"""
+    if val is None:
+        return None
+    # datetime / date / pandas.Timestamp（Timestamp 是 datetime 子类）
+    if isinstance(val, (datetime, date)):
+        return (val.year, val.month, val.day)
+    try:
+        if isinstance(val, float) and pd.isna(val):
+            return None
+    except Exception:
+        pass
+    s = str(val).strip()
+    if not s:
+        return None
+    # 浮点整数字符串（202602.0 → 202602），避免 Excel 把数字月份读成 float 后无法匹配纯数字模式
+    if re.match(r"^\d+\.0+$", s):
+        s = s.split(".")[0]
+    for pat, keys in _DATE_PATTERNS:
+        m = pat.match(s)
+        if not m:
+            continue
+        got = {k: int(g) for k, g in zip(keys, m.groups())}
+        y, mo, d = got.get("y"), got.get("m"), got.get("d")
+        if mo is not None and not (1 <= mo <= 12):
+            return None
+        if d is not None and not (1 <= d <= 31):
+            return None
+        return (y, mo, d)
+    return None
+
+
+def normalize_key(val, enabled: bool = True, date_mode: str = "off") -> str:
+    """主键归一化：NaN/空→""；浮点整数 1.0→"1"；去首尾空格。enabled=False 时仅 str+strip。
+
+    date_mode（日期主键归一，默认 "off" 关闭=纯文本原样比较，零回归）：
+    - "yearmonthday"：日期值取年-月-日 → "2026-02-26"（精确到日、含年；缺日退年月，缺年退月-日）
+    - "yearmonth"：日期值取年-月 → "2026-02"（含年，能区分年度；无年退回按月）
+    - "month"：日期值只取月份 → "02"（忽略年/日）
+    - "day"：日期值取月-日 → "02-26"（忽略年；无"日"退回按月）
+    非日期值（如姓名）不受影响，仍走下面的字符串/浮点逻辑。
+    """
     try:
         if val is None or (isinstance(val, float) and pd.isna(val)):
             return ""
     except Exception:
         pass
+    # 日期归一：在字符串化之前解析原始值（可能是 datetime）
+    if date_mode and date_mode != "off":
+        parts = _parse_date_parts(val)
+        if parts is not None:
+            y, mo, d = parts
+            if date_mode == "yearmonthday":
+                if y and mo and d:
+                    return f"{y:04d}-{mo:02d}-{d:02d}"
+                if y and mo:              # 缺"日"→ 退到年月粒度
+                    return f"{y:04d}-{mo:02d}"
+                if mo and d:              # 缺"年"→ 退到月-日（跨年无法对齐，属预期）
+                    return f"{mo:02d}-{d:02d}"
+                return f"{mo:02d}" if mo else ""
+            if date_mode == "yearmonth":
+                if y and mo:
+                    return f"{y:04d}-{mo:02d}"
+                if mo:
+                    return f"{mo:02d}"
+                return ""
+            if date_mode == "month":
+                return f"{mo:02d}" if mo else ""
+            if date_mode == "day":
+                if mo and d:
+                    return f"{mo:02d}-{d:02d}"
+                if mo:
+                    return f"{mo:02d}"
+                return ""
     s = str(val).strip()
     if s == "" or s.lower() == "nan":
         return ""
@@ -161,39 +249,47 @@ def group_columns_exact(files_columns: Dict[str, List[str]],
 
 def merge_tables(
     parsed_files: Dict[str, Dict[str, Any]],
-    key_map: Dict[str, str],
+    key_map: Dict[str, Any],
     result_columns: List[Dict[str, Any]],
     merge_mode: str = "union",
     base_file: Optional[str] = None,
     normalize_keys: bool = True,
+    date_key_mode: str = "off",
 ) -> Dict[str, Any]:
     """按结果列映射 + 主键归并多表。
 
     Args:
         parsed_files: {file_name: {"df": DataFrame, ...}}
-        key_map: {file_name: 主键列名}
+        key_map: {file_name: 主键列名 或 主键列名列表}（列表=复合主键）
         result_columns: [{"name": 结果列名, "sources": [{"file","col"}, ...]}]
         merge_mode: "union" | "base" | "conflict_only"
         base_file: 基准文件名（base 模式定 id 范围；所有模式里冲突取值优先用它）
         normalize_keys: 主键是否归一化
+        date_key_mode: 日期主键归一 "off"|"month"|"day"（对能识别成日期的主键列生效）
     Returns:
         {"columns": [...], "rows": [dict...], "red_rows": set(行下标), "report": {...}}
     """
-    # 1. 建每文件 索引：归一化 key -> [行(dict)]
+    # 1. 建每文件 索引：归一化 key -> [行(dict)]；支持复合主键（多列）
     file_index: Dict[str, Dict[str, List[dict]]] = {}
     file_row_counts: Dict[str, int] = {}
     for fname, fdata in parsed_files.items():
         df = fdata.get("df")
-        keycol = key_map.get(fname)
+        keycols = key_map.get(fname)
+        if isinstance(keycols, str):          # 向后兼容：单列 str → [str]
+            keycols = [keycols] if keycols else []
+        keycols = keycols or []
         idx: Dict[str, List[dict]] = {}
         n = 0
-        if df is not None and keycol is not None and keycol in df.columns:
-            for _, row in df.iterrows():
-                k = normalize_key(row.get(keycol), normalize_keys)
-                if k == "":
-                    continue
-                idx.setdefault(k, []).append(row.to_dict())
-                n += 1
+        if df is not None and keycols:
+            valid = [c for c in keycols if c in df.columns]
+            if valid:
+                for _, row in df.iterrows():
+                    parts = [normalize_key(row.get(c), normalize_keys, date_key_mode) for c in valid]
+                    if any(p == "" for p in parts):   # 复合主键要求各段都非空
+                        continue
+                    k = "\x1f".join(sorted(parts))    # sorted：与勾选/列位置顺序无关，跨文件对齐
+                    idx.setdefault(k, []).append(row.to_dict())
+                    n += 1
         file_index[fname] = idx
         file_row_counts[fname] = n
 

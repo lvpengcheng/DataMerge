@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>智能小工具 - 数据整合平台</title>
+    <title>智能小工具 - 智算</title>
     <link rel="stylesheet" href="/static/css/admin.css?v=20260414t">
     <link rel="stylesheet" href="/static/css/tools.css?v=20260616a">
 </head>
@@ -102,9 +102,19 @@
                             <input type="checkbox" id="merge-normalize-keys" checked style="width:auto;">
                             <label for="merge-normalize-keys" style="margin:0;cursor:pointer;">主键归一化（1.0=1）</label>
                         </div>
+                        <div class="form-group">
+                            <label>日期主键归一：</label>
+                            <select id="merge-date-mode">
+                                <option value="off" selected>关闭（纯文本原样比较）</option>
+                                <option value="yearmonthday">按年月日（2026-02-26，精确到日）</option>
+                                <option value="yearmonth">按年月（2026-02，区分年度）</option>
+                                <option value="month">按月（忽略年/日）</option>
+                                <option value="day">按日（忽略年）</option>
+                            </select>
+                        </div>
                     </div>
                     <div class="form-group" style="margin-top:8px;">
-                        <label>匹配项（每个文件）：</label>
+                        <label>匹配项（每个文件，可多选组成复合主键）：</label>
                         <div id="merge-key-map"></div>
                     </div>
 
@@ -331,6 +341,6 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260722a"></script>
-    <script src="/static/js/tools.js?v=20260721d"></script>
+    <script src="/static/js/tools.js?v=20260727c"></script>
 </body>
 </html>

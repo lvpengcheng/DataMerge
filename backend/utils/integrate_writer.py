@@ -78,6 +78,7 @@ def apply_integration(
     normalize_keys: bool = True,
     diff_rows: Optional[List[dict]] = None,
     diff_order: str = "id_name",
+    date_key_mode: str = "off",
 ) -> Dict[str, Any]:
     """原地回填主表并（可选）追加差异 sheet，另存到 out_path。
 
@@ -111,7 +112,7 @@ def apply_integration(
     for row1 in range(ds, de + 1):
         r0 = row1 - 1
         raw_key = _read_cell_str(cells[r0, key_ci])
-        k = normalize_key(raw_key, normalize_keys)
+        k = normalize_key(raw_key, normalize_keys, date_key_mode)
         if k == "":
             continue
         vals = resolve_overwrites(k, overwrite_pairs, source_indexes)

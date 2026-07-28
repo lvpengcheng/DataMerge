@@ -1768,6 +1768,31 @@ class IntelligentExcelParser:
             final_end = best_candidate.header_end
             if self._is_sparse_group_above_dense_fields(worksheet, final_end, max_row, max_col):
                 final_end = final_end + 1
+
+            # 【填空档后处理】表头行(final_end) 与"真正第一条数据行"之间若夹着纯文本行
+            #   （中英文双语的第二行表头、单位行"元/人"、说明行等），把它们并入表头，
+            #   避免被当成第一条数据。仅在存在空档(first_data_row - final_end > 1)时触发；
+            #   普通表两者紧邻(空档=0)，此段不动，纯文本文件的表头判断不受影响。
+            _first_data = self._find_first_data_row(
+                worksheet, start_row, min(start_row + 20, max_row), max_col)
+            if _first_data is not None and _first_data - final_end > 1:
+                _gap_row = final_end + 1
+                while _gap_row < _first_data:
+                    if self._is_empty_row(worksheet, _gap_row, max_col):
+                        break
+                    # 数值主导行更像数据、title/summary 行也不并入 → 停止扩展
+                    _gap_feats = self.row_analyzer.analyze_row_features(worksheet, _gap_row, max_col)
+                    if (_gap_feats.number_ratio >= 0.2
+                            or self._is_title_row(worksheet, _gap_row, max_col)
+                            or self._is_summary_row(worksheet, _gap_row, max_col)):
+                        break
+                    final_end = _gap_row
+                    _gap_row += 1
+                if final_end != best_candidate.header_end:
+                    self.logger.debug(
+                        f"[填空档] 表头下延至 {best_candidate.header_start}-{final_end}"
+                        f"（并入 header_end↔first_data_row 之间的纯文本夹层行）")
+
             return HeaderInfo(start_row=best_candidate.header_start, end_row=final_end)
 
         return None

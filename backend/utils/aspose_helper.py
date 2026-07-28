@@ -738,6 +738,12 @@ def _dataframe_to_datatable(df: pd.DataFrame, table_name: str):
     from System import DBNull, Double as _Double, String as _String
 
     _NUM_RE = _re.compile(r'^[+-]?\d+(?:\.\d+)?$')
+    # 财务表"无金额"占位符：视作空值(None)，不让它把整列数值列拖成文本列
+    #  → 这样 O/Q/R… 等金额列仍以真数字写入，SmartMarker 公式可直接计算。
+    _PLACEHOLDER_EMPTY = {
+        '-', '−', '—', '–', '－', '/', '／', '\\', '＼',
+        'n/a', '#n/a', 'na', 'null', 'none', 'nan', '无', '空', '/-',
+    }
 
     def _isna(v):
         if v is None:
@@ -748,7 +754,7 @@ def _dataframe_to_datatable(df: pd.DataFrame, table_name: str):
             return False
 
     def _as_number(v):
-        """(是否可作数值, Python数值或None)。空值→(True, None) 不破坏列判定。
+        """(是否可作数值, Python数值或None)。空值/占位符→(True, None) 不破坏列判定。
         numpy/py 数字直接用；数值字符串在排除前导零/超长位数(工号/卡号/身份证)后转数值。"""
         if _isna(v):
             return (True, None)
@@ -759,6 +765,8 @@ def _dataframe_to_datatable(df: pd.DataFrame, table_name: str):
             return (True, int(f) if f.is_integer() else f)
         s = str(v).strip().replace(',', '').replace('，', '')
         if s == '':
+            return (True, None)
+        if s.lower() in _PLACEHOLDER_EMPTY:          # -、／、N/A、无… 等无金额占位符 → 空
             return (True, None)
         if not _NUM_RE.match(s):
             return (False, None)
@@ -802,12 +810,86 @@ def _dataframe_to_datatable(df: pd.DataFrame, table_name: str):
                 row[c] = DBNull.Value if num is None else float(num)
             else:
                 v = df.iloc[r, c]
-                row[c] = DBNull.Value if _isna(v) else (v if isinstance(v, str) else str(v))
+                # 空值 / 纯空白串统一写 DBNull（真空白）：文本空串 "" 进入数值公式
+                # (如 =O+X) 会被当文本操作数导致 #VALUE!，真空白才会被当 0 参与计算。
+                if _isna(v) or (isinstance(v, str) and v.strip() == ''):
+                    row[c] = DBNull.Value
+                else:
+                    row[c] = v if isinstance(v, str) else str(v)
         dt.Rows.Add(row)
 
     num_cols = [str(df.columns[i]) for i in range(n_cols) if col_is_num[i]]
     logger.info(f"[DataTable] {table_name}: {dt.Rows.Count} rows x {dt.Columns.Count} cols; 数值列={num_cols}")
     return dt
+
+
+# ── sheet 名占位符 ─────────────────────────────────────
+
+_DT_SHEET_TOKEN = re.compile(r"^DT(\d*)$", re.IGNORECASE)
+
+
+def _rename_sheets_by_token(wb, source_sheet_names=None, sys_vars=None) -> None:
+    """把报表模版里的占位符 sheet 名替换成实际名（就地改 wb，不返回）。
+
+    规则（仅单文件模式 fill/block/sheet 调用）：
+      - 整名精确匹配 ``^DT(\\d*)$`` → 数据源第 idx 个 sheet 名（DT=idx0、DT1=idx1…）。
+        越界则保留原名并告警。
+      - 名字里含 ``{`` → 用 sys_vars 的 year/month/date/tenant 做 {token} 子串替换；
+        未知 {xxx} 原样保留。
+      - 其余不动。
+    产出名经 _sanitize_sheet_name 合法化 + 去重；与原名相同则跳过。
+    """
+    source_sheet_names = source_sheet_names or []
+    sys_vars = sys_vars or {}
+    try:
+        count = wb.Worksheets.Count
+    except Exception:
+        return
+
+    # 先收集当前所有 sheet 名（去重时排除自身，避免把自己算成"已占用"）
+    taken = set()
+    for i in range(count):
+        try:
+            taken.add(str(wb.Worksheets[i].Name))
+        except Exception:
+            pass
+
+    for i in range(count):
+        try:
+            ws = wb.Worksheets[i]
+            old = str(ws.Name)
+        except Exception:
+            continue
+
+        new = None
+        m = _DT_SHEET_TOKEN.match(old.strip())
+        if m:
+            idx = int(m.group(1)) if m.group(1) else 0
+            if idx < len(source_sheet_names) and source_sheet_names[idx]:
+                new = str(source_sheet_names[idx])
+            else:
+                logger.warning(
+                    f"[报表·sheet名] '{old}' 需数据源第 {idx + 1} 个 sheet，"
+                    f"但仅有 {len(source_sheet_names)} 个，保留原名")
+                continue
+        elif "{" in old:
+            new = old
+            for key in ("year", "month", "date", "tenant"):
+                if key in sys_vars and sys_vars[key] is not None:
+                    new = new.replace("{" + key + "}", str(sys_vars[key]))
+
+        if not new or new == old:
+            continue
+
+        taken.discard(old)              # 原名腾出，供其它 sheet 去重时复用
+        final = _sanitize_sheet_name(new, taken)   # 内部已把 final 加入 taken
+        try:
+            ws.Name = final
+            logger.info(f"[报表·sheet名] '{old}' -> '{final}'")
+        except Exception as _re:
+            taken.discard(final)        # 改名失败，撤销占位并恢复原名
+            taken.add(old)
+            logger.warning(f"[报表·sheet名] '{old}' -> '{final}' 改名失败（忽略）: {_re}")
 
 
 def generate_from_template(
@@ -822,6 +904,8 @@ def generate_from_template(
     name_field: str = "",
     show_empty_period: bool = True,
     split_by: str = "",
+    sheet_source_names: Optional[List[str]] = None,
+    sheet_vars: Optional[Dict] = None,
 ) -> str:
     """
     使用 Aspose WorkbookDesigner（SmartMarker 引擎）填充模板生成文件。
@@ -847,6 +931,10 @@ def generate_from_template(
       fill/block/sheet → output_path (xlsx)
       zip / 有split_by → output_path (zip)
     """
+    # sheet 名占位符仅在单文件模式生效；zip/split 打包模式本期不处理
+    if (split_by or mode == "zip") and (sheet_source_names or sheet_vars):
+        logger.info("[报表·sheet名] sheet 名占位符在 zip/split 打包模式下暂不处理")
+
     # 如果有 split_by，走文件级拆分包装器
     if split_by:
         return _generate_with_split(
@@ -864,6 +952,7 @@ def generate_from_template(
             group_by=group_by, skip_rows=skip_rows,
             password=password, watermark_text=watermark_text,
             show_empty_period=show_empty_period,
+            sheet_source_names=sheet_source_names, sheet_vars=sheet_vars,
         )
     elif mode == "zip":
         return _generate_zip(
@@ -878,11 +967,13 @@ def generate_from_template(
             group_by=group_by,
             password=password, watermark_text=watermark_text,
             show_empty_period=show_empty_period,
+            sheet_source_names=sheet_source_names, sheet_vars=sheet_vars,
         )
     else:
         return _generate_fill(
             output_path, template_path, data,
             password=password, watermark_text=watermark_text,
+            sheet_source_names=sheet_source_names, sheet_vars=sheet_vars,
         )
 
 
@@ -939,7 +1030,8 @@ def append_carryover_sheets(target_path: str, source_path: str, specs: List[str]
                             password: Optional[str] = None) -> int:
     """把计算结果(source_path)中指定的 sheet 整表(值+格式)拷贝追加到报表(target_path)末尾。
 
-    specs: 每项为结果表的 sheet 名，或 '#N'（1-based 位置）。
+    specs: 每项为结果表的 sheet 名，或 '#N'（0-based 位置：#0=第一个 sheet）。
+           可加 '@M' 后缀指定插入到报表的目标位置（0-based，如 '工资明细@0' 插到最前）。
     target 若已加密需传 password 以便打开并重新保存。返回成功拷贝的 sheet 数。
     """
     if not specs:
@@ -971,16 +1063,28 @@ def append_carryover_sheets(target_path: str, source_path: str, specs: List[str]
             return None
         if s.startswith("#"):
             try:
-                idx = int(s[1:]) - 1
+                idx = int(s[1:])          # 0 基：#0=第一个源 sheet，与插入位置 @N 一致
             except ValueError:
                 return None
             return src_sheets[idx] if 0 <= idx < src_count else None
         return _by_exact.get(s) or _by_loose.get(s.lower())
 
+    def _split_pos(spec):
+        """拆出可选的插入位置后缀 '@N'（0 基目标位置）。
+        返回 (源spec, 目标位置或None)。'工资明细@0'→('工资明细',0)、'#2'→('#2',None)。"""
+        s = (spec or "").strip()
+        if "@" in s:
+            left, _, right = s.rpartition("@")
+            right = right.strip()
+            if right.lstrip("+-").isdigit():
+                return left.strip(), int(right)
+        return s, None
+
     existing = {tgt_wb.Worksheets[i].Name for i in range(tgt_wb.Worksheets.Count)}
     copied = 0
     for spec in specs:
-        src_ws = _resolve(spec)
+        src_spec, insert_pos = _split_pos(spec)
+        src_ws = _resolve(src_spec)
         if src_ws is None:
             logger.warning(f"[整表搬运] 结果表未找到 sheet: {spec}")
             continue
@@ -995,13 +1099,28 @@ def append_carryover_sheets(target_path: str, source_path: str, specs: List[str]
         new_ws = res if hasattr(res, "Copy") else tgt_wb.Worksheets[res]
         new_ws.Copy(src_ws)          # 值 + 样式 + 列宽 + 合并单元格 全部复制
         new_ws.Name = name
+        # 指定了插入位置 → 从末尾移动到目标索引（越界则钳到合法范围）
+        if insert_pos is not None:
+            try:
+                _cnt = tgt_wb.Worksheets.Count
+                _dst = max(0, min(insert_pos, _cnt - 1))
+                new_ws.MoveTo(_dst)
+                logger.info(f"[整表搬运] '{name}' 插入到位置 {_dst}（请求 @{insert_pos}）")
+            except Exception as _me:
+                logger.warning(f"[整表搬运] '{name}' 移动到位置 {insert_pos} 失败（保留在末尾）: {_me}")
         existing.add(name)
         copied += 1
         logger.info(f"[整表搬运] 已拷贝结果 sheet '{src_ws.Name}' → 报表 '{name}'")
 
     if copied:
         try:
+            # 强制全量重算：新增 sheet 产生的跨表引用不在原计算链(calcChain)里，
+            # 普通 CalculateFormula() 会依链跳过 → 报表引用该 sheet 的公式仍是旧缓存值
+            # (搬运前该 sheet 不存在时算出的坏值)，Excel 打开需手工回车才刷新。
+            tgt_wb.Settings.ForceFullCalculate = True
             tgt_wb.CalculateFormula()   # 拷入的公式先算并缓存，打开无需按回车
+            # 双保险：写入 fullCalcOnLoad 标记，Excel 打开时也强制重算一遍
+            tgt_wb.Settings.ReCalculateOnOpen = True
         except Exception as _ce:
             logger.warning(f"[整表搬运] CalculateFormula 跳过: {_ce}")
         if password:
@@ -1025,10 +1144,12 @@ def _fuzzy_match_column(target: str, columns) -> Optional[str]:
 def _generate_fill(
     output_path: str, template_path: str, data: Dict,
     password: Optional[str] = None, watermark_text: Optional[str] = None,
+    sheet_source_names: Optional[List[str]] = None, sheet_vars: Optional[Dict] = None,
 ) -> str:
     """整个 DataFrame 一次性填入模板"""
     logger.info(f"[报表生成] fill 模式: {template_path}")
     wb = _smartmarker_fill(template_path, data)
+    _rename_sheets_by_token(wb, sheet_source_names, sheet_vars)
     return _finalize_workbook(wb, output_path, password, watermark_text)
 
 
@@ -1039,6 +1160,7 @@ def _generate_block(
     group_by: str = "", skip_rows: int = 1,
     password: Optional[str] = None, watermark_text: Optional[str] = None,
     show_empty_period: bool = True,
+    sheet_source_names: Optional[List[str]] = None, sheet_vars: Optional[Dict] = None,
 ) -> str:
     """按 group_by 分组，每组用 SmartMarker 填充模板，合并到一个文件。"""
     # 找到主数据源（非 $ 开头的第一个 DataFrame）
@@ -1053,7 +1175,8 @@ def _generate_block(
 
     if not group_by or group_by not in full_df.columns:
         logger.warning(f"[block] group_by='{group_by}' 不在列 {list(full_df.columns)} 中，回退到 fill 模式")
-        return _generate_fill(output_path, template_path, data, password, watermark_text)
+        return _generate_fill(output_path, template_path, data, password, watermark_text,
+                              sheet_source_names=sheet_source_names, sheet_vars=sheet_vars)
 
     groups = full_df.groupby(group_by, sort=False)
     logger.info(f"[报表生成] block 模式: {len(groups)} 组, group_by={group_by}, skip_rows={skip_rows}")
@@ -1094,6 +1217,7 @@ def _generate_block(
 
         logger.info(f"[block] 组 {group_idx+1}/{len(groups)}: {group_key}, {len(group_df)} 行数据, 块={block_rows} 行")
 
+    _rename_sheets_by_token(result_wb, sheet_source_names, sheet_vars)
     return _finalize_workbook(result_wb, output_path, password, watermark_text)
 
 
@@ -1104,6 +1228,7 @@ def _generate_sheet(
     group_by: str = "",
     password: Optional[str] = None, watermark_text: Optional[str] = None,
     show_empty_period: bool = True,
+    sheet_source_names: Optional[List[str]] = None, sheet_vars: Optional[Dict] = None,
 ) -> str:
     """按 group_by 分组，每组生成一个独立 sheet，sheet 名取自分组值。"""
     ds_name, full_df, vars_data, extra_dfs = _extract_datasource(data)
@@ -1117,7 +1242,8 @@ def _generate_sheet(
 
     if not group_by or group_by not in full_df.columns:
         logger.warning(f"[sheet] group_by='{group_by}' 不在列 {list(full_df.columns)} 中，回退到 fill 模式")
-        return _generate_fill(output_path, template_path, data, password, watermark_text)
+        return _generate_fill(output_path, template_path, data, password, watermark_text,
+                              sheet_source_names=sheet_source_names, sheet_vars=sheet_vars)
 
     groups = full_df.groupby(group_by, sort=False)
     logger.info(f"[报表生成] sheet 模式: {len(groups)} 组, group_by={group_by}")
@@ -1149,6 +1275,7 @@ def _generate_sheet(
 
         logger.info(f"[sheet] 组 {group_idx+1}/{len(groups)}: sheet='{sheet_name}', {len(group_df)} 行数据")
 
+    _rename_sheets_by_token(result_wb, sheet_source_names, sheet_vars)
     return _finalize_workbook(result_wb, output_path, password, watermark_text)
 
 

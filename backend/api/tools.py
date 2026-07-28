@@ -158,11 +158,12 @@ def _session_dir(session_id: str) -> Path:
 class MergeExecuteRequest(BaseModel):
     session_id: str
     tenant_id: Optional[str] = None
-    key_map: dict                       # {file_name: 主键列名}
+    key_map: dict                       # {file_name: 主键列名 或 主键列名列表(复合主键)}
     result_columns: List[dict]          # [{"name", "sources":[{"file","col"}]}]
     merge_mode: str = "union"           # union | base | conflict_only
     base_file: Optional[str] = None
     normalize_keys: bool = True
+    date_key_mode: str = "off"          # 日期主键归一：off | month | day
     ai_provider: Optional[str] = None   # 仅缓存写回时记录用
     template_id: Optional[int] = None   # 套用的方案 id；该方案带模版文件时按模版填充
 
@@ -474,6 +475,7 @@ async def merge_execute(req: MergeExecuteRequest, current_user=Depends(get_curre
             merge_mode=req.merge_mode,
             base_file=req.base_file,
             normalize_keys=req.normalize_keys,
+            date_key_mode=req.date_key_mode,
         )
 
         out_path = sdir / "合并结果.xlsx"
@@ -877,6 +879,7 @@ class IntegrateExecuteRequest(BaseModel):
     id_col: Optional[str] = None         # 主表身份证列（差异 sheet）
     diff_order: str = "id_name"          # id_name | name_id
     normalize_keys: bool = True
+    date_key_mode: str = "off"           # 日期关联键归一 off|yearmonth|month|day
 
 
 @router.post("/integrate/execute")
@@ -910,6 +913,7 @@ async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(g
 
         source_indexes = build_source_indexes(
             parsed, req.key_map, req.main_file, normalize_keys=req.normalize_keys,
+            date_key_mode=req.date_key_mode,
         )
 
         # 先执行覆盖回填并生成结果文件（含公式重算）。差异对比放到生成之后，
@@ -923,6 +927,7 @@ async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(g
             overwrite_pairs=req.overwrite_pairs, source_indexes=source_indexes,
             normalize_keys=req.normalize_keys,
             diff_rows=None, diff_order=req.diff_order,
+            date_key_mode=req.date_key_mode,
         )
 
         # 对比差异（仅输出方式2且配了对比列时）：重新解析生成文件取重算后的实时值再比对。
@@ -936,6 +941,7 @@ async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(g
                 a_name_col=req.name_col, a_id_col=req.id_col,
                 normalize_keys=req.normalize_keys,
                 label_source=(n_sources > 1),
+                date_key_mode=req.date_key_mode,
             )
             stat["diff_rows"] = append_diff_sheet(str(out_path), diff_rows, req.diff_order)
 
@@ -1030,6 +1036,7 @@ class IntegrateSchemeSaveRequest(BaseModel):
     diff_order: str = "id_name"
     output_mode: int = 1
     normalize_keys: bool = True
+    date_key_mode: str = "off"
 
 
 @router.post("/integrate/scheme/save")
@@ -1076,6 +1083,7 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
         "name_col": req.name_col, "id_col": req.id_col,
         "diff_order": req.diff_order, "output_mode": req.output_mode,
         "normalize_keys": req.normalize_keys,
+        "date_key_mode": req.date_key_mode,
     }
 
     from ..database.connection import SessionLocal

@@ -129,11 +129,10 @@ class TemplateCodeGenerator:
             reserved_names=_reserved_names,
         )
 
-        # 7. 缩进修复
-        try:
-            complete_code = self._indent_fixer.fix(complete_code)
-        except Exception as e:
-            logger.warning(f"缩进修复异常（不阻断）: {e}")
+        # 7. 缩进修复：交给下面 7.5 的 validate_and_fix_code_format 统一处理。
+        #    ⚠️ 不要在这里无条件跑 fix_general——此时引号冲突还没修（引号修复在 7.5），
+        #    对无法解析的代码强行重排缩进会把正常行搞成 unexpected indent。
+        #    7.5 会在【引号修好之后】才按需（parse 失败时）做 fix_general/fix_sandbox_pipeline，顺序才对。
 
         # 7.5 接入公式模式同款的"通用代码修复管线"（4层兜底，借用 ai_provider 实现）
         #     做：① _fix_invalid_paths ② _fix_fstring_quotes（4策略轮试 swap/escape/strip-f）
@@ -398,7 +397,18 @@ CLEANING_SPEC = {{
 - `sync_to_source` 与 `add`/`remove` 可共存（会合并处理），但一般单独用它即可。
 - 注意：若某分组的人被整组删空，其跨表分组汇总会落空——这属规则本身要求，非本工具可代偿。
 - 不需要清洗就**完全不写** `CLEANING_SPEC`（不要输出 `CLEANING_SPEC = None`，也不要写空 dict）。
-- 一旦输出了 `CLEANING_SPEC`，`fill_template` 里对**该 sheet** 的填充**必须改用 `cleaned_rows(sheet_name)`** 逐行定位（见函数签名注释）；其余未清洗的 sheet 仍按 `_COL_MAP` 区域常规填充。
+- 一旦输出了 `CLEANING_SPEC`，`fill_template` 里对**该 sheet** 的填充**必须改用 `cleaned_rows(sheet_name)`** 逐行定位（见函数签名注释），并用 `if rows is not None: …清洗逐行填… else: …常规逐区域填充…` 的**双分支**（⛔ 绝不能 `if rows is None: return`，否则清洗意外落空时整表全空）；其余未清洗的 sheet 仍按 `_COL_MAP` 区域常规填充。
+
+> 🚨 **最常见的致命错误——「行来源只配了增量名单」：**
+> `add` 是**增量**（在既有基准名单之上追加的新人），**绝不能当作整表的唯一行来源**。
+> 若一张明细表的**整份行/人员都靠 `cleaned_rows` 铺**（模板本身没有预置名单、或你会覆盖 D 列姓名），
+> 那么 `CLEANING_SPEC` **必须提供本月「全量在册名单」的来源**：
+> - 用 `sync_to_source` 指向本月**全量**名单源表（如"本月计薪名单/花名册/上月同名明细"），
+> - 或把该全量名单作为主 `add`，再叠加"入职-New Comer"这类增量。
+>
+> **反例（禁止）**：只写 `"add": {{"source": "源_…入职-New Comer", ...}}` 而没有任何全量基准源。
+> 后果：**新人为空的月份 → `add_rows` 为空 → 清洗判定"无有效增删项"跳过 → `cleaned_rows` 返回 None → `fill_template` 整表一格都不填**（本工具真实踩过的坑）。
+> 判断口诀：**"这张表这个月有哪些人"若答案来自某份全量名单，就用 `sync_to_source` 指它；"入职/离职"名单只是它的增/删增量。**
 
 ## 函数签名
 ```python
@@ -418,6 +428,11 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
                 )
         else:
             ... 常规逐区域填充（见下）
+
+    ⛔ **严禁写 `if rows is None: return`（或任何在 cleaned_rows 为 None 时直接 return/跳过整表的写法）。**
+       清洗阶段可能因源表本月为空、配置落空等原因返回 None；一旦你直接 return，**整张表一格都不会填**
+       （本工具真实踩过：新人名单空 → 清洗跳过 → 整表空）。**必须**用 `if rows is not None: <清洗逐行填> else: <常规逐区域填充>`
+       的双分支——None 时回退到常规逐区域填充（用模板现有数据行 + VLOOKUP 按主键查源），绝不空转返回。
 
     标准套路（未清洗的 sheet，必须严格按这个写起始行 + 逐区域）：
         from openpyxl.utils import column_index_from_string
@@ -937,8 +952,27 @@ def _resolve_cleaning(out_path, source_data):
         print("[行清洗] CLEANING_SPEC 缺少 key_col，跳过")
         return None
     group_idx = _letter_to_idx0(spec.get("group_col"))
+
+    # 数据起始行：**优先用骨架已固化的 _COL_MAP**（生成时我们自己解析真实模板得到的权威值），
+    # 而不是信任 AI 在 CLEANING_SPEC 里猜的 data_start_row 字面量。分工原则：
+    #   · "数据从第几行开始" = 纯结构事实 → 生成时已解析入 _COL_MAP，AI 不该再猜；
+    #   · "哪一列是主键身份" = 语义判断 → 仍由 AI 的 key_col 决定。
+    # 这样即便 AI 把起始行猜偏（多行表头/该月表头行数变化/样例行位移），也不会圈不到数据区。
     _dsr = spec.get("data_start_row")
-    ds0 = (int(_dsr) - 1) if isinstance(_dsr, int) and _dsr > 0 else None
+    _ai_ds0 = (int(_dsr) - 1) if isinstance(_dsr, int) and _dsr > 0 else None
+    _map_ds0 = None
+    try:
+        _regs = (_COL_MAP.get(sheet) or {{}}).get("regions") or []
+        if _regs:
+            _rds = _regs[0].get("data_start_row")
+            if isinstance(_rds, int) and _rds > 0:
+                _map_ds0 = _rds - 1
+    except Exception:
+        _map_ds0 = None
+    ds0 = _map_ds0 if _map_ds0 is not None else _ai_ds0
+    if _map_ds0 is not None and _ai_ds0 is not None and _map_ds0 != _ai_ds0:
+        print(f"[行清洗] data_start 以模板解析(_COL_MAP)为准：行{{_map_ds0 + 1}}"
+              f"（AI 在 CLEANING_SPEC 猜的是 行{{_ai_ds0 + 1}}，已覆盖）")
 
     # 源 sheet 名（带 源_ 前缀）→ source_data 的 key
     _sheet_to_sk = {{v: k for k, v in _SK_TO_SHEET.items()}}
@@ -1011,8 +1045,29 @@ def _resolve_cleaning(out_path, source_data):
             print("[行清洗] sync_to_source 源表/主键列无效，忽略该模式")
 
     if not add_rows and not remove_keys and where is None and keep_only is None:
-        print("[行清洗] CLEANING_SPEC 无有效增删项，跳过")
+        # 区分两种「无增删」：① 压根没配行来源（良性，安静跳过）；
+        # ② 配了 add/sync/remove 源但**全部解析为空**（危险：极可能整表落空——如"入职名单"
+        #    本月 0 行且没配全量在册名单来源）。后者必须**高调告警**，避免静默产出空表被误当成功。
+        _configured_src = bool(
+            (add_spec.get("source") if add_spec else None)
+            or (sync.get("source") if sync else None)
+            or (rm.get("source") if rm else None)
+            or (rm.get("keys") if rm else None)
+        )
+        if _configured_src:
+            print("=" * 60)
+            print(f"⚠️ [行清洗] CLEANING_SPEC 为 sheet=「{{sheet}}」配置了行来源，但**全部解析为 0 行**！")
+            print(f"    add.source={{add_spec.get('source') if add_spec else None}}  "
+                  f"sync_to_source.source={{sync.get('source') if sync else None}}")
+            print("    最可能的原因：行来源只配了『增量名单（入职-New Comer 等）』且本月为空，")
+            print("    却没有配『本月全量在册名单』来源 → 该 sheet 将整表落空。")
+            print("    请把行来源改为 sync_to_source 指向全量名单（入职/离职名单只作增/删增量）。")
+            print("    本轮回退：cleaned_rows 返回 None，交由 fill_template 的常规逐区域填充兜底。")
+            print("=" * 60)
+        else:
+            print("[行清洗] CLEANING_SPEC 无有效增删项，跳过")
         return None
+
 
     _rm_n = len(set(str(x) for x in remove_keys))
     print(f"[行清洗] sheet={{sheet}} 拟新增候选 {{len(add_rows)}} / 显式删键 {{_rm_n}}"
@@ -1032,8 +1087,21 @@ def _resolve_cleaning(out_path, source_data):
               f"，数据区 [{{layout.get('data_start')}}, {{layout.get('data_end')}}]")
         return {{sheet: layout}}
     except Exception as _ce:
-        # 清洗失败不静默吞：抛出让训练/计算暴露问题（避免拿错误行结构去填列）
-        raise RuntimeError(f"[行清洗] 执行失败 sheet={{sheet}}: {{_ce}}") from _ce
+        # 清洗失败**不再硬崩整轮**：高调告警后回退（返回 None → cleaned_rows 返回 None →
+        # fill_template 走常规逐区域填充兜底）。硬崩会让整份 main() 挂掉、用户拿不到任何输出；
+        # 而清洗失败时并没有产生"错误行结构"（layout 未生成），回退到区域填充是安全降级。
+        # 最常见诱因："无法圈定数据区" —— key_col / data_start_row 与该 sheet 实际不符。
+        import traceback as _tb
+        print("=" * 60)
+        print(f"⚠️ [行清洗] 执行失败 sheet=「{{sheet}}」：{{_ce}}")
+        print(f"    key_col_idx={{key_idx}}  data_start(0based)={{ds0}}")
+        print("    若为『无法圈定数据区』：多半是 CLEANING_SPEC 的 key_col / data_start_row 与该")
+        print("    sheet 实际主键列/首数据行不符（如主键列写错、或该月主表改名/表头行数变化）。")
+        print("    本轮回退：cleaned_rows 返回 None，交由 fill_template 的常规逐区域填充兜底。")
+        print("    详细堆栈：")
+        print(_tb.format_exc())
+        print("=" * 60)
+        return None
 
 
 def cleaned_rows(sheet_name):
@@ -1549,6 +1617,8 @@ if __name__ == "__main__":
 5. **公式查找数据源分两类**：骨架追加的源文件用 `_SOURCE_MAP` 的 `源_xxx` key；模板自带 sheet（在 `_COL_MAP` 里）用其**真实 sheet 名、不加 `源_` 前缀**。sheet 名外用 `'` 单引号
 6. **跳过模板里 `has_formula=True` 的列**（保留原公式）
 7. **【若上一轮代码 `def fill_template` 上方有 `CLEANING_SPEC = {{...}}`】必须原样保留它并一并输出在函数上方**（一个字符都不改，除非用户明确要求改增删行规则）；被清洗的 sheet 继续用 `cleaned_rows(sheet_name)` 定位
+   - **例外——整表落空必须修 `CLEANING_SPEC`**：若差异显示被清洗的那张 sheet **整表/整块的行几乎全空**（姓名等主键列都没填上），多半是 `CLEANING_SPEC` 的**行来源只配了增量名单**（如"入职-New Comer"），而该增量源本月为空 → 清洗跳过 → `cleaned_rows` 返回 None → 整表一格不填。此时**必须**把行来源改成本月**全量在册名单**：用 `sync_to_source` 指向全量名单源表（如"本月计薪名单/上月同名明细"），"入职/离职"名单只作增/删增量。
+   - **同时修填充分支**：被清洗 sheet 的填充**必须**是 `if rows is not None: …逐行填… else: …常规逐区域填充…` 双分支；⛔ 若上一轮写成 `if rows is None: return`（或任何 None 即整表跳过的写法），本次必须改掉，改为 None 时回退常规逐区域填充。
 7. **【f-string 引号强约束】**：外层 f-string 用 **双引号** `f"..."`，公式中 sheet 名用 `'` 单引号；空字符串拼接 `EMPTY` 常量（=`'""'`），写法：`f"=IFERROR(VLOOKUP(B{{r}},'源_考勤'!A:Z,3,FALSE),{{EMPTY}})"`
    - **错误**：`f'=IFERROR(VLOOKUP(...,'源_考勤'!A:Z,...),"")'`  ← 单引号嵌套立即 SyntaxError
 
@@ -1591,11 +1661,8 @@ if __name__ == "__main__":
             log("[修正失败] AI 响应中未找到 fill_template，回退原代码")
             return original_code
 
-        # 6. 应用与 generate_code 同款的修复管线
-        try:
-            new_fill = self._indent_fixer.fix(new_fill)
-        except Exception as e:
-            logger.warning(f"缩进修复异常（不阻断）: {e}")
+        # 6. 应用与 generate_code 同款的修复管线（缩进交给下面的 validate_and_fix_code_format
+        #    在引号修好之后按需处理；此处不预跑 fix_general，避免误伤正常缩进）
 
         try:
             if hasattr(self.ai_provider, "validate_and_fix_code_format"):

@@ -3018,18 +3018,41 @@ async def upload_code(
         except Exception as _te:
             logger.warning(f"[upload-code] 保存上传模板失败: {_te}")
 
+    # 【全量加载源数据】与自动训练循环（_run_single_iteration 调用处）一致：
+    # 用 IntelligentExcelParser 智能识别每个源 sheet 的真实表头行，产出列名正确的 DataFrame。
+    # 缺了这步，脚本会回退到自带 load_source_data 的朴素 pd.read_excel(header=0)，
+    # 把标题横幅行当表头 → 列名全成 'Unnamed: N' → 按列名查找（如 '姓名'）全落空 →
+    # fill_template 构造的 order 为空 → 一个 cell 都不填，却因空结果与空模板对比而显示 100%。
+    _src_dir = config.get("source_dir", "")
+    _full_source_data = None
+    if _src_dir and os.path.isdir(_src_dir):
+        try:
+            _full_source_data = await run_in_threadpool(
+                _load_full_source_data,
+                _src_dir,
+                config.get("manual_headers"),
+                config.get("multi_sheet_source", False),
+                config.get("file_passwords"),
+                set((config.get("expected_structure") or {}).get("sheets", {}).keys()),
+            )
+            if _full_source_data:
+                logger.info(f"[upload-code] 全量源数据加载完成，共 {len(_full_source_data)} 个 sheet")
+        except Exception as _le:
+            logger.warning(f"[upload-code] 全量源数据加载失败，脚本将自行解析: {_le}")
+
     # 执行验证（放入线程池，避免阻塞事件循环导致 Windows 反向代理 502）
     iteration_num = (session.total_iterations or 0) + 1
     run_result = await run_in_threadpool(
         _run_single_iteration,
         session_id, code_content, session.tenant_id,
-        config.get("source_dir", ""),
+        _src_dir,
         config.get("expected_file", ""),
         iteration_num,
         salary_year=config.get("salary_year"),
         salary_month=config.get("salary_month"),
         monthly_standard_hours=config.get("monthly_standard_hours"),
         file_passwords=config.get("file_passwords"),
+        pre_loaded_source_data=_full_source_data,
         rules_content=config.get("rules_content", ""),
         expected_structure=config.get("expected_structure"),
         template_override_path=_tpl_override,

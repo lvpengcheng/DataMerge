@@ -51,16 +51,19 @@ def guess_id_column(columns) -> Optional[str]:
 
 # ==================== 对照表键索引 ====================
 
-def build_key_index(df, key_col: str, normalize_keys: bool = True) -> Dict[str, List[dict]]:
+def build_key_index(df, key_col: str, normalize_keys: bool = True,
+                    date_key_mode: str = "off") -> Dict[str, List[dict]]:
     """把一张对照表建成 {归一化键 -> [行dict, ...]}。
 
     同一主键的多行**全部保留**（供跨行汇总），不再只取首条。
+    date_key_mode 对能识别成日期的键列生效（off/yearmonth/month/day），
+    使 datetime / "2026-02" / "2月26日" 等归到同一粒度后可跨表对齐。
     """
     idx: Dict[str, List[dict]] = {}
     if df is None or key_col is None or key_col not in getattr(df, "columns", []):
         return idx
     for _, row in df.iterrows():
-        k = normalize_key(row.get(key_col), normalize_keys)
+        k = normalize_key(row.get(key_col), normalize_keys, date_key_mode)
         if k == "":
             continue
         idx.setdefault(k, []).append(row.to_dict())
@@ -68,12 +71,14 @@ def build_key_index(df, key_col: str, normalize_keys: bool = True) -> Dict[str, 
 
 
 def build_source_indexes(parsed: Dict[str, dict], key_map: Dict[str, str],
-                         main_file: str, normalize_keys: bool = True) -> Dict[str, dict]:
+                         main_file: str, normalize_keys: bool = True,
+                         date_key_mode: str = "off") -> Dict[str, dict]:
     """为除主表外的每张对照表建键索引。
 
     Args:
         parsed: {file: {"df": DataFrame, ...}}
         key_map: {file: 关联键列名}（含主表与各对照表）
+        date_key_mode: 日期主键归一 off/yearmonth/month/day（与主表侧同参，保证两边同粒度）
     Returns:
         {file: {"cols": [列名...], "rows": {归一化键 -> [行dict,...]}}}  仅对照表。
         （结构较旧版多了一层：rows 存该键的**全部行**，cols 供公式解析列名。）
@@ -84,7 +89,7 @@ def build_source_indexes(parsed: Dict[str, dict], key_map: Dict[str, str],
             continue
         df = fd.get("df")
         cols = list(df.columns) if df is not None else []
-        out[f] = {"cols": cols, "rows": build_key_index(df, key_map.get(f), normalize_keys)}
+        out[f] = {"cols": cols, "rows": build_key_index(df, key_map.get(f), normalize_keys, date_key_mode)}
     return out
 
 
@@ -274,12 +279,14 @@ def compute_diffs(
     a_id_col: Optional[str],
     normalize_keys: bool = True,
     label_source: bool = False,
+    date_key_mode: str = "off",
 ) -> List[dict]:
     """按键 join，逐对比列对比 A/B 值，产出差异行。
 
     Args:
         compare_pairs: [{"a_col","source_file","source_col"}]
         label_source: True 时在差异类型里标出对照文件名（多对照表时区分）。
+        date_key_mode: 日期主键归一 off/yearmonth/month/day（与对照表侧同参）。
     Returns:
         [{"姓名","身份证","差异类型"}]  仅含有差异的键。
         差异类型：以【对比字段的 A 列名】为字段名，旧=A 值、新=对照值，`字段名: 旧→新`，多项分号拼接。
@@ -288,7 +295,7 @@ def compute_diffs(
     if a_df is None or not compare_pairs:
         return diffs
     for _, row in a_df.iterrows():
-        k = normalize_key(row.get(a_key_col), normalize_keys)
+        k = normalize_key(row.get(a_key_col), normalize_keys, date_key_mode)
         if k == "":
             continue
         parts = []

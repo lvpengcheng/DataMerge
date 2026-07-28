@@ -748,6 +748,17 @@ class CodeSandbox:
         """
         import re
 
+        # 0. 前置 AST 闸门：代码进来时若已能 compile，直接原样返回，不跑下面任何启发式"修复"。
+        # 关键：生成端（_fix_fstring_quotes）会把 Excel 公式里的内层双引号转义成 \"（合法 Python，
+        # 已 compile 校验通过）。而下面 2.5/3 节的 `\"`->`""` 反向替换是给"坏代码"兜底的，若对这种
+        # 已修好的合法代码再跑一遍，会把 MATCH(\"城市\",...) 拆回 MATCH(""城市"",...)，f-string 当场
+        # 重新崩掉（历史 bug：line 1269 invalid syntax）。已合法就零改动，避免"越修越坏"。
+        try:
+            compile(code, '<sandbox_precheck>', 'exec')
+            return code
+        except SyntaxError:
+            pass
+
         # 1. 中文全角字符转换为英文半角字符（仅替换字符串字面量之外的部分）
         # 注意：不能全局替换，因为字符串字面量中的全角字符可能是文件名/sheet名的一部分
         fullwidth_to_halfwidth = {
