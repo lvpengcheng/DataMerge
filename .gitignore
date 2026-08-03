@@ -6,6 +6,8 @@
 /venv
 /releases
 /compare_results
+/_pptx_extract
+/temp
 nul
 # 部署配置（含服务器密码，勿提交）
 deploy.config.json

@@ -48,16 +48,31 @@ const Tools = {
     initTabs() {
         document.querySelectorAll('.tab-btn').forEach(btn => {
             btn.addEventListener('click', () => {
-                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-                btn.classList.add('active');
-                const tab = btn.dataset.tab;
-                document.getElementById('tab-' + tab).classList.add('active');
-                if (tab === 'templates') this.loadTemplateTenants().then(() => this.loadTemplates());
-                else if (tab === 'training-history') this.loadTrainingHistory();                else if (tab === 'compute-history') this.loadComputeHistory();
-                else if (tab === 'data-compare') this.loadCompareHistory();
+                this._activateTab(btn.dataset.tab);
             });
         });
+        // 刷新后恢复上次所在页签（无记录/该页签无权限则用默认激活项）
+        let saved = null;
+        try { saved = localStorage.getItem('tools_active_tab'); } catch (e) {}
+        const savedBtn = saved && document.querySelector('.tab-btn[data-tab="' + saved + '"]');
+        if (savedBtn && savedBtn.offsetParent !== null) {   // offsetParent==null → 被 display:none 隐藏(无权限)
+            this._activateTab(saved);
+        }
+    },
+
+    _activateTab(tab) {
+        const btn = document.querySelector('.tab-btn[data-tab="' + tab + '"]');
+        const content = document.getElementById('tab-' + tab);
+        if (!btn || !content) return;
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        btn.classList.add('active');
+        content.classList.add('active');
+        try { localStorage.setItem('tools_active_tab', tab); } catch (e) {}
+        if (tab === 'templates') this.loadTemplateTenants().then(() => this.loadTemplates());
+        else if (tab === 'training-history') this.loadTrainingHistory();
+        else if (tab === 'compute-history') this.loadComputeHistory();
+        else if (tab === 'data-compare') this.loadCompareHistory();
     },
 
     // ==================== 弹窗工具 ====================
@@ -295,8 +310,8 @@ const Tools = {
             <div class="form-group" style="margin-top:6px;">
                 <label style="font-size:13px;">日期关联键归一：</label>
                 <select id="int-date-mode">
-                    <option value="off" selected>关闭（纯文本原样比较）</option>
-                    <option value="yearmonthday">按年月日（2026-02-26，精确到日）</option>
+                    <option value="off">关闭（纯文本原样比较）</option>
+                    <option value="yearmonthday" selected>按年月日（2026-02-26，精确到日）</option>
                     <option value="yearmonth">按年月（2026-02，区分年度）</option>
                     <option value="month">按月（忽略年/日）</option>
                     <option value="day">按日（忽略年）</option>

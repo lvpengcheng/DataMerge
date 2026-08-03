@@ -123,30 +123,60 @@ async def split_by_banner(
 
 # ==================== 多表数据合并 ====================
 
-def _parse_file_to_df(path: str):
-    """用 excel_parser 解析单文件（激活 sheet、最优区域、先算公式），返回 {sheet, columns, df}。
+def _regions_to_df(sd):
+    """把一个 sheet 的多个【同结构】区域纵向拼接成一张 df。
 
-    df 列名为表头名（excel_parser 的 region.data 按列字母键，这里用 head_data 反查改回表头名）。
+    同结构判定按【列位置(字母)集合一致】——堆叠的多块通常占同一批列(A..N)，即使某列表头文字
+    不同(如把人名/基本工资写进表头)也算同结构；据此按【列字母对齐】拼接，再统一用基准块的表头名，
+    列不会错位。列位置不同的区域(汇总/说明块)忽略，避免乱拼。单区域文件行为与旧版一致(零回归)。
+    像"按人分块堆叠"的文件(每人一块=一个区域)，旧版 best_region_only 只取一块会漏掉其余人的行
+    (如某人的"2月26日"落在第二块)，此处把所有同结构块都读进来，按日期/姓名做主键才能命中全部。
+    """
+    regions = [r for r in (sd.regions or []) if (r.head_data or r.data)]
+    if not regions:
+        return {"sheet": sd.sheet_name, "columns": [], "df": pd.DataFrame()}
+    # 基准：列数最多、其次行数最多的区域，定义列位置(字母)->表头名 及列顺序
+    base = max(regions, key=lambda r: (len(r.head_data or {}), len(r.data or [])))
+    base_head = base.head_data or {}                    # {表头: 字母}
+    base_l2h = {v: k for k, v in base_head.items()}     # {字母: 表头}
+    base_letters = frozenset(base_head.values())
+    base_cols = list(base_head.keys())                  # 表头名(基准顺序)
+    frames, n = [], 0
+    for region in regions:
+        if frozenset((region.head_data or {}).values()) != base_letters:
+            continue                                    # 列位置不同 → 非同结构块
+        n += 1
+        df = pd.DataFrame(region.data or [])            # 列名=列字母
+        if not df.empty:
+            frames.append(df)
+    if frames:
+        out_df = pd.concat(frames, ignore_index=True)   # 按列字母对齐拼接
+        out_df = out_df.rename(columns=base_l2h)        # 字母 → 基准表头名
+        ordered = [c for c in base_cols if c in out_df.columns]
+        if ordered:
+            out_df = out_df[ordered]
+    else:
+        out_df = pd.DataFrame(columns=base_cols)
+    if n > 1:
+        logger.info(f"[parse] sheet「{sd.sheet_name}」按列对齐合并 {n} 个同结构区域 → 共 {len(out_df)} 行")
+    return {"sheet": sd.sheet_name, "columns": base_cols, "df": out_df}
+
+
+def _parse_file_to_df(path: str):
+    """用 excel_parser 解析单文件（激活 sheet、先算公式），返回 {sheet, columns, df}。
+
+    读【全部区域】：同结构的多个区域（如按人堆叠的块）纵向拼接成一张 df，避免只命中一块。
+    df 列名为表头名（excel_parser 的 region.data 按列字母键，反查 head_data 改回表头名）。
     """
     from excel_parser import IntelligentExcelParser
     parser = IntelligentExcelParser()
     results = parser.parse_excel_file(
         path, read_formulas=False, calculate_formulas=True,
-        active_sheet_only=True, best_region_only=True,
+        active_sheet_only=True, best_region_only=False,
     )
     if not results or not results[0].regions:
         return {"sheet": "", "columns": [], "df": pd.DataFrame()}
-    sd = results[0]
-    region = sd.regions[0]
-    head = region.head_data or {}                       # {表头: 列字母}
-    letter_to_header = {v: k for k, v in head.items()}
-    df = pd.DataFrame(region.data or [])                # 列名为列字母
-    if not df.empty:
-        df = df.rename(columns=letter_to_header)
-        ordered = [h for h in head.keys() if h in df.columns]
-        if ordered:
-            df = df[ordered]
-    return {"sheet": sd.sheet_name, "columns": list(head.keys()), "df": df}
+    return _regions_to_df(results[0])
 
 
 def _session_dir(session_id: str) -> Path:
@@ -163,7 +193,7 @@ class MergeExecuteRequest(BaseModel):
     merge_mode: str = "union"           # union | base | conflict_only
     base_file: Optional[str] = None
     normalize_keys: bool = True
-    date_key_mode: str = "off"          # 日期主键归一：off | month | day
+    date_key_mode: str = "yearmonthday"  # 日期主键归一：off|yearmonthday|yearmonth|month|day（默认按年月日）
     ai_provider: Optional[str] = None   # 仅缓存写回时记录用
     template_id: Optional[int] = None   # 套用的方案 id；该方案带模版文件时按模版填充
 
@@ -879,7 +909,7 @@ class IntegrateExecuteRequest(BaseModel):
     id_col: Optional[str] = None         # 主表身份证列（差异 sheet）
     diff_order: str = "id_name"          # id_name | name_id
     normalize_keys: bool = True
-    date_key_mode: str = "off"           # 日期关联键归一 off|yearmonth|month|day
+    date_key_mode: str = "yearmonthday"  # 日期关联键归一 off|yearmonthday|yearmonth|month|day（默认按年月日）
 
 
 @router.post("/integrate/execute")
@@ -1036,7 +1066,7 @@ class IntegrateSchemeSaveRequest(BaseModel):
     diff_order: str = "id_name"
     output_mode: int = 1
     normalize_keys: bool = True
-    date_key_mode: str = "off"
+    date_key_mode: str = "yearmonthday"
 
 
 @router.post("/integrate/scheme/save")

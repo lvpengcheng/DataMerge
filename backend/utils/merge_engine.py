@@ -110,11 +110,18 @@ _DATE_PATTERNS = [
 ]
 
 
-def _parse_date_parts(val) -> Optional[Tuple[Optional[int], Optional[int], Optional[int]]]:
-    """把日期型值解析成 (year, month, day)（缺失位为 None）；非日期返回 None。"""
+def _parse_date_parts(val, strict: bool = False) -> Optional[Tuple[Optional[int], Optional[int], Optional[int]]]:
+    """把日期型值解析成 (year, month, day)（缺失位为 None）；非日期返回 None。
+
+    strict=True（值对比用）：只认【本身就是日期类型的值】——datetime 对象（Excel 日期/自定义日期
+    格式单元格都被解析成 datetime），或【带日期分隔符/年月日号的字符串】（如 2025-02-01、2025/2/1、
+    2月26日）。裸数字串（20250201、202602、工号编码等）**不**当日期，避免把普通数字/编码误判成日期。
+    strict=False（主键归一用，用户已显式勾了日期粒度档=主动声明这列是日期）：沿用宽松规则，
+    连 8 位/6 位纯数字也识别。
+    """
     if val is None:
         return None
-    # datetime / date / pandas.Timestamp（Timestamp 是 datetime 子类）
+    # datetime / date / pandas.Timestamp（Timestamp 是 datetime 子类）→ 无论严格与否都是日期
     if isinstance(val, (datetime, date)):
         return (val.year, val.month, val.day)
     try:
@@ -124,6 +131,9 @@ def _parse_date_parts(val) -> Optional[Tuple[Optional[int], Optional[int], Optio
         pass
     s = str(val).strip()
     if not s:
+        return None
+    # 严格模式：字符串必须含日期分隔符/年月日号才继续（裸数字串不当日期）
+    if strict and not re.search(r"[-/年月日号]", s):
         return None
     # 浮点整数字符串（202602.0 → 202602），避免 Excel 把数字月份读成 float 后无法匹配纯数字模式
     if re.match(r"^\d+\.0+$", s):
@@ -218,7 +228,51 @@ def _norm_val(v) -> str:
     return s
 
 
-# ==================== 精确同名归组（免 AI 的一级匹配）====================
+def _to_num(v) -> Optional[float]:
+    """把值转 float；空/非数值返回 None。容忍千分位逗号、百分号、货币符号、全/半角空格。"""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        try:
+            import math
+            return None if math.isnan(v) or math.isinf(v) else float(v)
+        except Exception:
+            return float(v)
+    s = str(v).strip().replace(",", "").replace("，", "").replace(" ", "").replace("　", "")
+    if s == "":
+        return None
+    pct = s.endswith("%")
+    if pct:
+        s = s[:-1]
+    s = s.lstrip("¥$￥")
+    try:
+        n = float(s)
+        return n / 100.0 if pct else n
+    except Exception:
+        return None
+
+
+def norm_compare(v) -> str:
+    """统一值对比归一（多表合并冲突判定 / 多表整合对比 共用同一套语义）：
+
+    1) **仅当值本身是日期类型**（datetime 对象，或带分隔符/年月日号的日期字符串如 2025-02-01、
+       2月26日）→ 折算成规范日期 YYYY-MM-DD（相当于取"常规"值）：同一日历日期不论显示/文本格式
+       如何，归一后一致。裸数字串（20250201、工号编码等）**不**当日期，仍按数值/文本处理；
+    2) 数值 → 四舍五入到 2 位小数（60.744→"60.74"、5000→"5000.00"）；
+    3) 其余文本 → 去空格 + 浮点整数归一（沿用 _norm_val）。
+    空值 → ""。对比与展示用同一值，保证"所见即所比"。
+
+    ⚠️ 日期判定（strict）必须在数值之前：datetime/日期串先折算成 YYYY-MM-DD，普通数字才走 2 位小数。
+    """
+    if _is_empty(v):
+        return ""
+    if _parse_date_parts(v, strict=True) is not None:
+        return normalize_key(v, True, "yearmonthday")
+    n = _to_num(v)
+    if n is not None:
+        s = f"{n:.2f}"
+        return "0.00" if s == "-0.00" else s
+    return _norm_val(v)
 
 def group_columns_exact(files_columns: Dict[str, List[str]],
                         cache_map: Optional[Dict[str, Dict[str, str]]] = None) -> List[Dict[str, Any]]:
@@ -326,7 +380,8 @@ def merge_tables(
                     if c in row0:
                         per_file[f] = row0.get(c)
             col_values[rc["name"]] = per_file
-            distinct = {_norm_val(v) for v in per_file.values() if not _is_empty(v)}
+            # 冲突判定用统一归一：同一日期的不同格式、同一数值的不同小数表现都不算冲突
+            distinct = {norm_compare(v) for v in per_file.values() if not _is_empty(v)}
             if len(distinct) >= 2:
                 conflict = True
 

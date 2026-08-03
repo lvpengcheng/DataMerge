@@ -15,7 +15,9 @@ import re as _re
 import operator as _operator
 from typing import Dict, List, Any, Optional
 
-from .merge_engine import normalize_key, _norm_header, _norm_val, _is_empty
+from .merge_engine import (
+    normalize_key, _norm_header, _is_empty, _to_num, norm_compare,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,30 +99,6 @@ def build_source_indexes(parsed: Dict[str, dict], key_map: Dict[str, str],
 
 _ARITH_BINOPS = {_ast.Add: _operator.add, _ast.Sub: _operator.sub,
                  _ast.Mult: _operator.mul, _ast.Div: _operator.truediv}
-
-
-def _to_num(v) -> Optional[float]:
-    """把值转 float；空/非数值返回 None。容忍千分位逗号、百分号、货币符号、全/半角空格。"""
-    if v is None or isinstance(v, bool):
-        return None
-    if isinstance(v, (int, float)):
-        try:
-            import math
-            return None if math.isnan(v) or math.isinf(v) else float(v)
-        except Exception:
-            return float(v)
-    s = str(v).strip().replace(",", "").replace("，", "").replace(" ", "").replace("　", "")
-    if s == "":
-        return None
-    pct = s.endswith("%")
-    if pct:
-        s = s[:-1]
-    s = s.lstrip("¥$￥")
-    try:
-        n = float(s)
-        return n / 100.0 if pct else n
-    except Exception:
-        return None
 
 
 def _safe_arith_eval(expr: str) -> Optional[float]:
@@ -258,16 +236,9 @@ def resolve_overwrites(key: str,
 # ==================== 对比产出差异 ====================
 
 def _cmp2(v) -> str:
-    """对比/展示归一化：数值四舍五入到 2 位小数（如 60.744→"60.74"、5000→"5000.00"），
-    非数值回退 _norm_val（去空格 + 整数归一）。对比与展示用同一值，保证"所见即所比"。
-    """
-    if _is_empty(v):
-        return ""
-    n = _to_num(v)
-    if n is None:
-        return _norm_val(v)
-    s = f"{n:.2f}"
-    return "0.00" if s == "-0.00" else s
+    """对比/展示归一化：统一委托给 merge_engine.norm_compare（日期→规范日期、数值→2位小数、
+    其余→去空格整数归一），与多表合并冲突判定同一套语义。"""
+    return norm_compare(v)
 
 
 def compute_diffs(
