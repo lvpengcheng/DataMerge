@@ -383,6 +383,9 @@ class IntegrateTemplate(Base):
     tenant_id = Column(String(100), nullable=False, index=True, default="__tools_integrate__")
     name = Column(String(200), nullable=False)
     config = Column(JSON, nullable=False)
+    org_id = Column(Integer, index=True, nullable=True)          # 创建人组织，用于组织树可见性过滤
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)  # 创建人，用于展示+改删鉴权
+    creator = relationship("User")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

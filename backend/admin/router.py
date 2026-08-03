@@ -20,7 +20,7 @@ from ..database.models import (
     User, Role, Organization, TenantAuthorization, Template, ComputeTask, DataAsset, Script,
     TrainingSession, TrainingMessage, TrainingIteration, ScriptMigration,
 )
-from ..auth.dependencies import require_admin, get_current_user
+from ..auth.dependencies import require_admin, get_current_user, get_accessible_tenants
 from ..auth.schemas import (
     UserCreate, UserUpdate, UserResponse,
     RoleCreate, RoleUpdate, RoleResponse,
@@ -493,9 +493,11 @@ async def list_templates(
     tenant_id: Optional[str] = Query(None),
     include_global: bool = Query(False),
     db: Session = Depends(get_db),
-    _admin: User = Depends(require_admin),
+    current_user: User = Depends(get_current_user),
+    accessible_tenants: List[str] = Depends(get_accessible_tenants),
 ):
-    """获取模版列表"""
+    """获取模版列表（组织级可见：全局模板 + 本组织及子组织可访问租户的模板）"""
+    is_admin = current_user.role and current_user.role.name == "admin"
     query = db.query(Template).filter(Template.is_active == True)
     if tenant_id:
         if tenant_id == "__global__":
@@ -504,6 +506,9 @@ async def list_templates(
             query = query.filter(or_(Template.tenant_id == tenant_id, Template.tenant_id.is_(None)))
         else:
             query = query.filter(Template.tenant_id == tenant_id)
+    # 非管理员：只能看全局模板 + 自己有权访问租户的模板
+    if not is_admin:
+        query = query.filter(or_(Template.tenant_id.is_(None), Template.tenant_id.in_(accessible_tenants)))
     templates = query.order_by(Template.id.desc()).all()
     return [_build_template_resp(t) for t in templates]
 
@@ -667,12 +672,16 @@ async def delete_template(
 async def download_template(
     template_id: int,
     db: Session = Depends(get_db),
-    _admin: User = Depends(require_admin),
+    current_user: User = Depends(get_current_user),
+    accessible_tenants: List[str] = Depends(get_accessible_tenants),
 ):
-    """下载模版文件"""
+    """下载模版文件（组织级：全局模板或本组织可访问租户的模板）"""
     tpl = db.query(Template).filter(Template.id == template_id).first()
     if not tpl:
         raise HTTPException(status_code=404, detail="模版不存在")
+    is_admin = current_user.role and current_user.role.name == "admin"
+    if not is_admin and tpl.tenant_id is not None and tpl.tenant_id not in accessible_tenants:
+        raise HTTPException(status_code=403, detail="无权访问该模版")
     if not os.path.exists(tpl.file_path):
         raise HTTPException(status_code=404, detail="模版文件不存在")
     return FileResponse(
@@ -875,16 +884,21 @@ async def generate_report(
     period_from: Optional[str] = Form(None),
     period_to: Optional[str] = Form(None),
     db: Session = Depends(get_db),
-    admin: User = Depends(require_admin),
+    admin: User = Depends(get_current_user),
+    accessible_tenants: List[str] = Depends(get_accessible_tenants),
 ):
-    """基于模版 + 计算结果生成报表"""
+    """基于模版 + 计算结果生成报表（组织级：模版与任务须属本组织可访问租户）"""
     import pandas as pd
     from ..utils import aspose_helper
+
+    is_admin = admin.role and admin.role.name == "admin"
 
     # 1. 查模版
     tpl = db.query(Template).filter(Template.id == template_id).first()
     if not tpl:
         raise HTTPException(status_code=404, detail="模版不存在")
+    if not is_admin and tpl.tenant_id is not None and tpl.tenant_id not in accessible_tenants:
+        raise HTTPException(status_code=403, detail="无权使用该模版")
     if not os.path.exists(tpl.file_path):
         raise HTTPException(status_code=404, detail="模版文件不存在")
 
@@ -892,6 +906,8 @@ async def generate_report(
     task = db.query(ComputeTask).filter(ComputeTask.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="计算任务不存在")
+    if not is_admin and task.tenant_id not in accessible_tenants:
+        raise HTTPException(status_code=403, detail="无权访问该计算任务")
     tenant_id = task.tenant_id
 
     # 3. 收集数据资产

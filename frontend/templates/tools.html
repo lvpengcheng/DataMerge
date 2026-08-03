@@ -175,22 +175,52 @@
         <div class="tab-content" id="tab-data-integrate">
             <div class="tool-page">
                 <h2>多表整合对比</h2>
-                <div class="desc">
-                    导入 2 张 Excel（一张作为主表/模板），把对照表选定列的<strong>值</strong>按关联键回填到主表对应列（覆盖），
-                    可选对比选定列生成差异。输出保留主表整个工作簿（其他 sheet、未涉及列的公式原样保留），仅变更激活页的覆盖列。
-                </div>
-                <div class="upload-zone" id="integrate-upload-zone">
-                    <div>点击或拖拽 Excel 文件到此处（≥2 个：1 主表 + 至少 1 对照表）</div>
-                    <div style="font-size:12px;margin-top:6px;">支持 .xlsx / .xls / .xlsm，主表在下一步选定</div>
-                    <input id="integrate-file-input" type="file" accept=".xlsx,.xls,.xlsm" multiple style="display:none;">
-                </div>
-                <div class="split-file-list" id="integrate-file-list"></div>
-                <div class="actions">
-                    <button class="btn btn-primary" id="btn-integrate-analyze" disabled>解析字段</button>
-                    <span class="status" id="integrate-status"></span>
+
+                <!-- 视图A：方案列表 -->
+                <div id="integrate-scheme-list-view">
+                    <div class="desc">同组织/子组织创建的整合对比方案。可新增方案，或对已有方案应用（按方案配置回填计算）、修改、删除。</div>
+                    <div class="actions" style="margin:12px 0;">
+                        <button class="btn btn-primary" id="btn-int-new-scheme" data-perm="tools.data_integrate.create">+ 新增方案</button>
+                        <span class="status" id="int-list-status"></span>
+                    </div>
+                    <table class="data-table" id="integrate-scheme-table">
+                        <thead>
+                            <tr>
+                                <th>方案名称</th>
+                                <th>参与表数</th>
+                                <th>创建人</th>
+                                <th>创建时间</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
                 </div>
 
-                <div id="integrate-config" style="display:none;margin-top:20px;"></div>
+                <!-- 视图B：上传 + 向导（新增/应用/修改共用） -->
+                <div id="integrate-work-view" style="display:none;">
+                    <div style="margin:6px 0 12px;display:flex;align-items:center;gap:10px;">
+                        <button class="btn btn-sm" id="btn-int-back">← 返回方案列表</button>
+                        <span id="int-work-title" style="font-weight:600;"></span>
+                    </div>
+                    <div class="desc">
+                        导入 2 张 Excel（一张作为主表/模板），把对照表选定列的<strong>值</strong>按关联键回填到主表对应列（覆盖），
+                        可选对比选定列生成差异。输出保留主表整个工作簿（其他 sheet、未涉及列的公式原样保留），仅变更激活页的覆盖列。
+                    </div>
+                    <div id="int-apply-reasons" style="display:none;margin:10px 0;padding:10px 12px;background:#fdecec;border:1px solid #f5b5b5;border-radius:6px;color:#a3271f;"></div>
+                    <div class="upload-zone" id="integrate-upload-zone">
+                        <div>点击或拖拽 Excel 文件到此处（≥2 个：1 主表 + 至少 1 对照表）</div>
+                        <div style="font-size:12px;margin-top:6px;">支持 .xlsx / .xls / .xlsm，主表在下一步选定</div>
+                        <input id="integrate-file-input" type="file" accept=".xlsx,.xls,.xlsm" multiple style="display:none;">
+                    </div>
+                    <div class="split-file-list" id="integrate-file-list"></div>
+                    <div class="actions">
+                        <button class="btn btn-primary" id="btn-integrate-analyze" disabled>解析字段</button>
+                        <span class="status" id="integrate-status"></span>
+                    </div>
+
+                    <div id="integrate-config" style="display:none;margin-top:20px;"></div>
+                </div>
             </div>
         </div>
 
@@ -341,6 +371,6 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260722a"></script>
-    <script src="/static/js/tools.js?v=20260728b"></script>
+    <script src="/static/js/tools.js?v=20260803a"></script>
 </body>
 </html>

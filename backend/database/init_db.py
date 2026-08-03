@@ -141,6 +141,9 @@ def _migrate_add_columns():
         ("scripts", "source_structure", "TEXT"),
         ("scripts", "rules_content", "TEXT"),
         ("scripts", "expected_structure", "TEXT"),
+        # ---------- integrate_templates（多表整合对比方案化）----------
+        ("integrate_templates", "org_id", "INTEGER"),
+        ("integrate_templates", "created_by", "INTEGER"),
     ]
 
     with engine.connect() as conn:

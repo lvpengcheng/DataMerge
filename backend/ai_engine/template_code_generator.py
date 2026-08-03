@@ -823,7 +823,14 @@ def load_source_data():
         return pre
 
     out = {{}}
-    # 两趟：先收集 (file_base, sheet, df)，再用 assign_sheet_keys 统一分配 key
+    # 【与智训/智算预加载一致】回退路径也走 IntelligentExcelParser 区域检测（剥标题横幅、
+    #   合并双语表头、多区域拼接、带原始列格式），而非朴素 pd.read_excel —— 否则预加载
+    #   缺失时 源_ sheet 会带 title 横幅 + Unnamed 列 + 未合并双语表头，与智训产出不一致。
+    #   懒加载：仅在真正回退时 import，不影响预加载已注入的常规路径。
+    from excel_parser import IntelligentExcelParser
+    from backend.utils.data_helpers import convert_region_to_dataframe, region_formats_by_name
+    parser = IntelligentExcelParser()
+    # 两趟：先收集 (file_base, sheet, merged_df, columns, formats)，再用 assign_sheet_keys 统一分配 key
     # （与智训 _build_source_map_with_letters / 智算 fast_header_matcher 同一套逻辑）。
     _collected = []
     for fname in os.listdir(input_folder):
@@ -833,19 +840,49 @@ def load_source_data():
             continue
         fp = os.path.join(input_folder, fname)
         try:
-            xls = pd.ExcelFile(fp)
-            for sn in xls.sheet_names:
-                df = pd.read_excel(fp, sheet_name=sn)
-                _normalize_key_columns(df)
-                _collected.append((Path(fname).stem, sn, df))
+            _results = parser.parse_excel_file(
+                fp,
+                active_sheet_only=False,   # 与旧回退一致：读全部 sheet
+                best_region_only=True,
+                read_formulas=False,
+                calculate_formulas=True,   # 含公式无缓存值的源先算，否则读到空
+            )
+            for _sheet_data in (_results or []):
+                _dfs = []
+                _cols = None
+                _fmts = None
+                for _region in _sheet_data.regions:
+                    _df = convert_region_to_dataframe(_region)
+                    if _df.empty and len(_df.columns) == 0:
+                        continue
+                    if _cols is None:
+                        _cols = list(_df.columns)
+                        _fmts = region_formats_by_name(_region.head_data, getattr(_region, "column_formats", None) or {{}})
+                    _dfs.append(_df)
+                if not _dfs:
+                    continue
+                _merged = _dfs[0] if len(_dfs) == 1 else pd.concat(_dfs, ignore_index=True)
+                # 序号/S/N 全空列补 1..N（与智训 _load_full_source_data 对齐，防清洗滤空）
+                try:
+                    _sn_cands = [c for c in _merged.columns if '序号' in str(c) or 'S/N' in str(c).upper()]
+                    for _sn in _sn_cands:
+                        if len(_merged) > 0 and _merged[_sn].isna().all():
+                            _merged[_sn] = range(1, len(_merged) + 1)
+                except Exception:
+                    pass
+                _normalize_key_columns(_merged)
+                _collected.append((Path(fname).stem, _sheet_data.sheet_name, _merged, _cols, _fmts))
         except Exception as e:
             print(f"[源数据加载警告] {{fname}}: {{e}}")
     _collected.sort(key=lambda x: (str(x[0]), str(x[1])))
     _reserved = set(_COL_MAP.keys())
-    _key_map = assign_sheet_keys([(fb, sn) for fb, sn, _ in _collected], reserved_names=_reserved)
-    for fb, sn, df in _collected:
+    _key_map = assign_sheet_keys([(fb, sn) for fb, sn, _, _, _ in _collected], reserved_names=_reserved)
+    for fb, sn, _merged, _cols, _fmts in _collected:
         key = _key_map[(fb, sn)]
-        out[key] = {{"df": df, "columns": list(df.columns)}}
+        _entry = {{"df": _merged, "columns": _cols if _cols is not None else list(_merged.columns)}}
+        if _fmts:
+            _entry["column_formats"] = _fmts
+        out[key] = _entry
     print(f"加载完成：{{len(out)}} 个 sheet")
     return out
 

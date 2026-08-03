@@ -828,7 +828,7 @@ async def integrate_analyze(
         (sdir / "_meta.json").write_text(
             json.dumps({"files": files_meta}, ensure_ascii=False), encoding="utf-8"
         )
-        matched_schemes = _match_integrate_schemes(_tpl_owner(current_user), files_meta)
+        matched_schemes = _match_integrate_schemes(current_user, files_meta)
         return {"session_id": session_id, "files": files_meta, "matched_schemes": matched_schemes}
     except HTTPException:
         shutil.rmtree(sdir, ignore_errors=True)
@@ -1005,18 +1005,66 @@ async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(g
 
 # ==================== 多表整合对比：命名方案（按列头指纹联动）====================
 
-def _match_integrate_schemes(owner: str, files_meta: List[dict]) -> List[dict]:
-    """按列头指纹把已保存方案匹配到本次上传的文件，解析出角色(主表/各对照表)。
+def _is_admin(user) -> bool:
+    return bool(getattr(user, "role", None) and getattr(user.role, "name", None) == "admin")
+
+
+def _user_org_tree_ids(db, current_user) -> List[int]:
+    """当前用户所属组织 + 所有子组织 ID。无组织返回空。"""
+    from ..auth.dependencies import _get_org_and_children_ids
+    oid = getattr(current_user, "org_id", None)
+    if not oid:
+        return []
+    return _get_org_and_children_ids(db, oid)
+
+
+def _visible_integrate_schemes(db, current_user):
+    """当前用户可见的整合方案行：
+    - admin：全部；
+    - 其他：本组织+子组织(org_id) ∪ 本人创建(created_by) ∪ 旧私有方案(tenant_id==user:{id})。
+    """
+    from ..database.models import IntegrateTemplate
+    from sqlalchemy import or_
+    q = db.query(IntegrateTemplate)
+    if _is_admin(current_user):
+        return q.all()
+    uid = getattr(current_user, "id", None)
+    org_ids = _user_org_tree_ids(db, current_user)
+    conds = []
+    if org_ids:
+        conds.append(IntegrateTemplate.org_id.in_(org_ids))
+    if uid is not None:
+        conds.append(IntegrateTemplate.created_by == uid)
+        conds.append(IntegrateTemplate.tenant_id == f"user:{uid}")
+    if not conds:
+        return []
+    return q.filter(or_(*conds)).all()
+
+
+def _can_edit_scheme(row, current_user) -> bool:
+    """仅创建人 + 管理员可改/删。"""
+    if _is_admin(current_user):
+        return True
+    uid = getattr(current_user, "id", None)
+    if uid is not None and row.created_by == uid:
+        return True
+    # 兼容旧私有方案（created_by 为空、tenant_id==user:{id}）
+    if row.created_by is None and row.tenant_id == f"user:{uid}":
+        return True
+    return False
+
+
+def _match_integrate_schemes(current_user, files_meta: List[dict]) -> List[dict]:
+    """按列头指纹把【当前用户可见】方案匹配到本次上传的文件，解析出角色(主表/各对照表)。
 
     Returns: [{id, name, main_file, fp_to_file{fp:file}, config}]  仅返回能完整匹配的方案。
     """
     from ..database.connection import SessionLocal
-    from ..database.models import IntegrateTemplate
 
     out: List[dict] = []
     db = SessionLocal()
     try:
-        rows = db.query(IntegrateTemplate).filter_by(tenant_id=owner).all()
+        rows = _visible_integrate_schemes(db, current_user)
         for row in rows:
             cfg = row.config or {}
             main_fp = cfg.get("main_fp")
@@ -1067,11 +1115,14 @@ class IntegrateSchemeSaveRequest(BaseModel):
     output_mode: int = 1
     normalize_keys: bool = True
     date_key_mode: str = "yearmonthday"
+    scheme_id: Optional[int] = None      # 传则为"修改已有方案"，不传为"新建"
 
 
 @router.post("/integrate/scheme/save")
 async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=Depends(get_current_user)):
-    """保存/覆盖当前用户的整合对比方案（同名 upsert）。按列头指纹存角色，跨月复用。"""
+    """保存整合对比方案。新建需 create 权限、方案名在本组织内唯一；修改需 edit 权限且仅创建人/管理员。
+    按列头指纹存角色，跨月复用；同时存各角色列名(cols_by_fp)供应用校验时列级 diff。"""
+    from ..auth.dependencies import has_permission
     name = (req.name or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="方案名称不能为空")
@@ -1082,6 +1133,7 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
         raise HTTPException(status_code=400, detail="会话已过期，请重新上传分析")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     fp_by_file = {f["name"]: f["fingerprint"] for f in meta.get("files", [])}
+    cols_by_file = {f["name"]: f.get("columns", []) for f in meta.get("files", [])}
     if req.main_file not in fp_by_file:
         raise HTTPException(status_code=400, detail="主表选择有误")
 
@@ -1104,9 +1156,15 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
                             "source_expr": _expr, "source_col": _expr})
         return out
 
+    # 各角色列名（供应用校验时列级 diff）：主表 + 各对照表
+    cols_by_fp = {main_fp: cols_by_file.get(req.main_file, [])}
+    for f in src_files:
+        cols_by_fp[fp_by_file[f]] = cols_by_file.get(f, [])
+
     config = {
         "main_fp": main_fp,
         "source_fps": source_fps,
+        "cols_by_fp": cols_by_fp,
         "key_map_by_fp": {fp_by_file[f]: k for f, k in (req.key_map or {}).items() if f in fp_by_file},
         "overwrite_pairs": _to_fp_pairs(req.overwrite_pairs),
         "compare_pairs": _to_fp_pairs(req.compare_pairs),
@@ -1118,18 +1176,39 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
 
     from ..database.connection import SessionLocal
     from ..database.models import IntegrateTemplate
-    owner = _tpl_owner(current_user)
+    uid = getattr(current_user, "id", None)
+    org_id = getattr(current_user, "org_id", None)
+    # 有组织归属到 org:{org_id}（方案名按组织唯一），否则退回旧私有 user:{uid}
+    tenant_id = f"org:{org_id}" if org_id else f"user:{uid}"
     db = SessionLocal()
     try:
-        row = db.query(IntegrateTemplate).filter_by(tenant_id=owner, name=name).first()
-        if row is None:
-            row = IntegrateTemplate(tenant_id=owner, name=name, config=config)
-            db.add(row)
-        else:
+        if req.scheme_id is not None:
+            # 修改已有方案：需 edit 权限 + 仅创建人/管理员
+            row = db.query(IntegrateTemplate).filter_by(id=req.scheme_id).first()
+            if not row:
+                raise HTTPException(status_code=404, detail="方案不存在")
+            if not has_permission(current_user, "tools.data_integrate.edit"):
+                raise HTTPException(status_code=403, detail="缺少权限: 修改方案")
+            if not _can_edit_scheme(row, current_user):
+                raise HTTPException(status_code=403, detail="只有创建人或管理员可以修改该方案")
+            row.name = name
             row.config = config
+        else:
+            # 新建：需 create 权限 + 组织内方案名唯一
+            if not has_permission(current_user, "tools.data_integrate.create"):
+                raise HTTPException(status_code=403, detail="缺少权限: 新增方案")
+            dup = db.query(IntegrateTemplate).filter_by(tenant_id=tenant_id, name=name).first()
+            if dup:
+                raise HTTPException(status_code=400, detail="同组织内已存在同名方案，请换个名称")
+            row = IntegrateTemplate(tenant_id=tenant_id, name=name, config=config,
+                                    org_id=org_id, created_by=uid)
+            db.add(row)
         db.commit()
         db.refresh(row)
         return {"ok": True, "id": row.id, "name": name}
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         logger.exception("integrate/scheme/save 异常")
@@ -1140,34 +1219,135 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
 
 @router.get("/integrate/schemes")
 async def integrate_schemes_list(current_user=Depends(get_current_user)):
-    """列出当前用户的整合对比方案。"""
+    """列出当前用户可见（同组织+子组织，或本人创建）的整合对比方案。"""
     from ..database.connection import SessionLocal
-    from ..database.models import IntegrateTemplate
-    owner = _tpl_owner(current_user)
     db = SessionLocal()
     try:
-        rows = (db.query(IntegrateTemplate)
-                  .filter_by(tenant_id=owner)
-                  .order_by(IntegrateTemplate.updated_at.desc()).all())
-        return [{"id": r.id, "name": r.name, "config": r.config,
-                 "updated_at": r.updated_at.isoformat() if r.updated_at else None} for r in rows]
+        rows = _visible_integrate_schemes(db, current_user)
+        rows = sorted(rows, key=lambda r: r.updated_at or r.created_at, reverse=True)
+        out = []
+        for r in rows:
+            cfg = r.config or {}
+            n_files = 1 + len(cfg.get("source_fps", []))   # 主表 + 对照表数
+            creator_name = ""
+            try:
+                creator_name = r.creator.display_name if r.creator else ""
+            except Exception:
+                creator_name = ""
+            out.append({
+                "id": r.id, "name": r.name, "config": cfg,
+                "file_count": n_files,
+                "creator_name": creator_name,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+                "can_edit": _can_edit_scheme(r, current_user),
+            })
+        return out
     finally:
         db.close()
 
 
 @router.delete("/integrate/scheme/{scheme_id}")
 async def integrate_scheme_delete(scheme_id: int, current_user=Depends(get_current_user)):
-    """删除当前用户自己的整合对比方案。"""
+    """删除整合对比方案：需 delete 权限，且仅创建人/管理员可删。"""
+    from ..auth.dependencies import has_permission
     from ..database.connection import SessionLocal
     from ..database.models import IntegrateTemplate
-    owner = _tpl_owner(current_user)
     db = SessionLocal()
     try:
-        row = db.query(IntegrateTemplate).filter_by(id=scheme_id, tenant_id=owner).first()
+        row = db.query(IntegrateTemplate).filter_by(id=scheme_id).first()
         if not row:
-            raise HTTPException(status_code=404, detail="方案不存在或无权删除")
+            raise HTTPException(status_code=404, detail="方案不存在")
+        if not has_permission(current_user, "tools.data_integrate.delete"):
+            raise HTTPException(status_code=403, detail="缺少权限: 删除方案")
+        if not _can_edit_scheme(row, current_user):
+            raise HTTPException(status_code=403, detail="只有创建人或管理员可以删除该方案")
         db.delete(row)
         db.commit()
         return {"ok": True}
+    except HTTPException:
+        db.rollback()
+        raise
     finally:
         db.close()
+
+
+class IntegrateApplyValidateRequest(BaseModel):
+    session_id: str
+    scheme_id: int
+
+
+@router.post("/integrate/scheme/apply-validate")
+async def integrate_scheme_apply_validate(req: IntegrateApplyValidateRequest, current_user=Depends(get_current_user)):
+    """应用方案前校验：上传文件数 + 表头结构是否与原方案一致（硬阻断，列出不一致理由）。
+    通过后前端用 analyze 返回的 matched_schemes 里对应方案（含 fp_to_file）套用并执行。"""
+    from ..auth.dependencies import has_permission
+    from ..utils.merge_engine import _norm_header
+    from ..database.connection import SessionLocal
+
+    if not has_permission(current_user, "tools.data_integrate.apply"):
+        raise HTTPException(status_code=403, detail="缺少权限: 应用方案")
+
+    sdir = _integrate_session_dir(req.session_id)
+    meta_path = sdir / "_meta.json"
+    if not meta_path.exists():
+        raise HTTPException(status_code=400, detail="会话已过期，请重新上传分析")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    uploaded = meta.get("files", [])   # [{name, columns, fingerprint}]
+
+    db = SessionLocal()
+    try:
+        # 只允许校验用户可见的方案
+        visible_ids = {r.id: r for r in _visible_integrate_schemes(db, current_user)}
+        row = visible_ids.get(req.scheme_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="方案不存在或无权访问")
+        cfg = row.config or {}
+    finally:
+        db.close()
+
+    main_fp = cfg.get("main_fp")
+    source_fps = cfg.get("source_fps", [])
+    cols_by_fp = cfg.get("cols_by_fp", {})
+    expected = [("主表", main_fp)] + [(f"对照表{i + 1}", fp) for i, fp in enumerate(source_fps)]
+
+    reasons: List[str] = []
+    # 1) 文件数校验
+    if len(uploaded) != len(expected):
+        reasons.append(f"方案需要 {len(expected)} 张表，实际上传 {len(uploaded)} 张")
+
+    # 2) 表头结构校验：逐个期望角色找同指纹上传文件（消耗式），找不到则对最接近文件做列级 diff
+    used = set()
+    for label, fp in expected:
+        hit = next((f for f in uploaded if f.get("fingerprint") == fp and f["name"] not in used), None)
+        if hit:
+            used.add(hit["name"])
+            continue
+        exp_cols = cols_by_fp.get(fp) or []
+        # 在未占用文件里按列名重合度找最接近的
+        best, best_score = None, -1.0
+        exp_norm = {_norm_header(c) for c in exp_cols}
+        for f in uploaded:
+            if f["name"] in used:
+                continue
+            up_norm = {_norm_header(c) for c in f.get("columns", [])}
+            inter = len(exp_norm & up_norm)
+            union = len(exp_norm | up_norm) or 1
+            score = inter / union
+            if score > best_score:
+                best_score, best = score, f
+        if best is not None and exp_cols:
+            up_norm = {_norm_header(c) for c in best.get("columns", [])}
+            missing = [c for c in exp_cols if _norm_header(c) not in up_norm]
+            extra = [c for c in best.get("columns", []) if _norm_header(c) not in exp_norm]
+            detail = []
+            if extra:
+                detail.append("多了 " + "、".join(map(str, extra)))
+            if missing:
+                detail.append("缺了 " + "、".join(map(str, missing)))
+            tail = ("；最接近的是【" + best["name"] + "】：" + "；".join(detail)) if detail else ""
+            reasons.append(f"缺少表头结构为【{label}】的表" + tail)
+        else:
+            reasons.append(f"缺少表头结构为【{label}】的表")
+
+    return {"ok": len(reasons) == 0, "reasons": reasons, "scheme_id": req.scheme_id, "scheme_name": row.name}

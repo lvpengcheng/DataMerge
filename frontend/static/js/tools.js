@@ -13,6 +13,10 @@ let _mergeAppliedTplId = null; // 当前套用的方案 id（带模版则生成�
 let _integrateFiles = [];
 let _integrateAnalysis = null;   // integrate/analyze 返回的结果
 let _integrateSchemes = [];      // analyze 返回的匹配方案列表
+let _integrateSchemeList = [];   // 方案列表页数据（GET /schemes）
+let _intMode = 'create';         // create | apply | edit
+let _intEditingSchemeId = null;  // edit 模式：正在修改的方案 id
+let _intApplyTarget = null;      // apply 模式：目标方案 {id,name}
 const _ALLOWED_EXT = new Set(['xlsx', 'xls', 'xlsm']);
 
 async function _alertErr(resp, fallback) {
@@ -73,6 +77,7 @@ const Tools = {
         else if (tab === 'training-history') this.loadTrainingHistory();
         else if (tab === 'compute-history') this.loadComputeHistory();
         else if (tab === 'data-compare') this.loadCompareHistory();
+        else if (tab === 'data-integrate') this.loadIntegrateSchemes();
     },
 
     // ==================== 弹窗工具 ====================
@@ -218,6 +223,122 @@ const Tools = {
         });
         input.addEventListener('change', () => this._addIntegrateFiles(input.files));
         document.getElementById('btn-integrate-analyze').addEventListener('click', () => this._analyzeIntegrate());
+        const btnNew = document.getElementById('btn-int-new-scheme');
+        if (btnNew) btnNew.addEventListener('click', () => this._intShowWork('create'));
+        const btnBack = document.getElementById('btn-int-back');
+        if (btnBack) btnBack.addEventListener('click', () => this._intShowList());
+    },
+
+    // ==================== 整合对比：方案列表页 ====================
+    _intSetListStatus(text, kind) {
+        const el = document.getElementById('int-list-status');
+        if (el) { el.textContent = text || ''; el.className = 'status' + (kind ? ' ' + kind : ''); }
+    },
+
+    async loadIntegrateSchemes() {
+        this._intShowList();
+        this._intSetListStatus('加载中...');
+        try {
+            const resp = await AUTH.authFetch('/api/tools/integrate/schemes');
+            if (!resp.ok) { await _alertErr(resp, '加载方案失败'); this._intSetListStatus('加载失败', 'error'); return; }
+            _integrateSchemeList = await resp.json();
+            this._intRenderSchemeList();
+            this._intSetListStatus(_integrateSchemeList.length ? `${_integrateSchemeList.length} 个方案` : '暂无方案', 'ok');
+        } catch (e) {
+            this._intSetListStatus('失败: ' + e.message, 'error');
+        }
+    },
+
+    _intRenderSchemeList() {
+        const tbody = document.querySelector('#integrate-scheme-table tbody');
+        if (!tbody) return;
+        if (!_integrateSchemeList.length) {
+            tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#999;">暂无方案，点击「新增方案」创建</td></tr>';
+            return;
+        }
+        const canApply = AUTH.hasPerm('tools.data_integrate.apply');
+        const canEditPerm = AUTH.hasPerm('tools.data_integrate.edit');
+        const canDelPerm = AUTH.hasPerm('tools.data_integrate.delete');
+        tbody.innerHTML = _integrateSchemeList.map((s, i) => {
+            const t = (s.created_at || '').replace('T', ' ').slice(0, 19);
+            const btns = [];
+            if (canApply) btns.push(`<button class="btn btn-sm btn-primary int-row-apply" data-i="${i}">应用</button>`);
+            if (canEditPerm && s.can_edit) btns.push(`<button class="btn btn-sm int-row-edit" data-i="${i}">修改</button>`);
+            if (canDelPerm && s.can_edit) btns.push(`<button class="btn btn-sm int-row-del" data-i="${i}">删除</button>`);
+            return `<tr>
+                <td>${_escape(s.name)}</td>
+                <td style="text-align:center;">${s.file_count || ''}</td>
+                <td>${_escape(s.creator_name || '')}</td>
+                <td>${_escape(t)}</td>
+                <td style="white-space:nowrap;">${btns.join(' ') || '<span style="color:#bbb;">无权限</span>'}</td>
+            </tr>`;
+        }).join('');
+        tbody.querySelectorAll('.int-row-apply').forEach(b =>
+            b.addEventListener('click', () => this._intStartApply(_integrateSchemeList[parseInt(b.dataset.i, 10)])));
+        tbody.querySelectorAll('.int-row-edit').forEach(b =>
+            b.addEventListener('click', () => this._intStartEdit(_integrateSchemeList[parseInt(b.dataset.i, 10)])));
+        tbody.querySelectorAll('.int-row-del').forEach(b =>
+            b.addEventListener('click', () => this._intDeleteSchemeRow(_integrateSchemeList[parseInt(b.dataset.i, 10)])));
+    },
+
+    _intResetWork() {
+        _integrateFiles = [];
+        _integrateAnalysis = null;
+        _integrateSchemes = [];
+        this._renderIntegrateList();
+        const cfg = document.getElementById('integrate-config');
+        if (cfg) { cfg.style.display = 'none'; cfg.innerHTML = ''; }
+        this._setIntegrateStatus('');
+        const rz = document.getElementById('int-apply-reasons');
+        if (rz) { rz.style.display = 'none'; rz.innerHTML = ''; }
+    },
+
+    _intShowList() {
+        _intMode = 'create'; _intEditingSchemeId = null; _intApplyTarget = null;
+        const lv = document.getElementById('integrate-scheme-list-view');
+        const wv = document.getElementById('integrate-work-view');
+        if (lv) lv.style.display = '';
+        if (wv) wv.style.display = 'none';
+        this._intResetWork();
+    },
+
+    _intShowWork(mode, scheme) {
+        _intMode = mode;
+        _intEditingSchemeId = (mode === 'edit' && scheme) ? scheme.id : null;
+        _intApplyTarget = (mode === 'apply' && scheme) ? { id: scheme.id, name: scheme.name } : null;
+        const lv = document.getElementById('integrate-scheme-list-view');
+        const wv = document.getElementById('integrate-work-view');
+        if (lv) lv.style.display = 'none';
+        if (wv) wv.style.display = '';
+        this._intResetWork();
+        const titleMap = {
+            create: '新增方案',
+            apply: '应用方案' + (scheme ? `：${scheme.name}` : ''),
+            edit: '修改方案' + (scheme ? `：${scheme.name}` : ''),
+        };
+        const tt = document.getElementById('int-work-title');
+        if (tt) tt.textContent = titleMap[mode] || '';
+    },
+
+    _intStartApply(scheme) {
+        if (!scheme) return;
+        this._intShowWork('apply', scheme);
+        this._setIntegrateStatus('请上传本次要计算的数据文件后点「解析字段」', '');
+    },
+
+    _intStartEdit(scheme) {
+        if (!scheme) return;
+        this._intShowWork('edit', scheme);
+        this._setIntegrateStatus('请上传与该方案结构一致的文件后点「解析字段」，回填后可调整并保存修改', '');
+    },
+
+    async _intDeleteSchemeRow(scheme) {
+        if (!scheme || !confirm(`删除方案「${scheme.name}」？`)) return;
+        try {
+            const resp = await AUTH.authFetch('/api/tools/integrate/scheme/' + scheme.id, { method: 'DELETE' });
+            if (!resp.ok) { await _alertErr(resp, '删除失败'); return; }
+            this.loadIntegrateSchemes();
+        } catch (e) { alert('删除失败: ' + e.message); }
     },
 
     _addIntegrateFiles(fileList) {
@@ -269,10 +390,60 @@ const Tools = {
             _integrateAnalysis = await resp.json();
             this._renderIntegrateConfig(_integrateAnalysis);
             this._setIntegrateStatus('解析完成', 'ok');
+            if (_intMode === 'apply') await this._intRunApply();
+            else if (_intMode === 'edit') this._intPrefillForEdit();
         } catch (e) {
             this._setIntegrateStatus(`失败: ${e.message}`, 'error');
         } finally {
             btn.disabled = false;
+        }
+    },
+
+    _intFindMatched(id) {
+        return (_integrateAnalysis.matched_schemes || []).find(s => s.id === id) || null;
+    },
+
+    // apply 模式：analyze 后调 apply-validate；不一致硬阻断并列出理由；一致则回填 + 直接生成下载
+    async _intRunApply() {
+        if (!_intApplyTarget) return;
+        const rz = document.getElementById('int-apply-reasons');
+        try {
+            const resp = await AUTH.authFetch('/api/tools/integrate/scheme/apply-validate', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ session_id: _integrateAnalysis.session_id, scheme_id: _intApplyTarget.id }),
+            });
+            if (!resp.ok) { await _alertErr(resp, '校验失败'); return; }
+            const res = await resp.json();
+            if (!res.ok) {
+                if (rz) {
+                    rz.style.display = 'block';
+                    rz.innerHTML = `<strong>上传文件与方案「${_escape(_intApplyTarget.name)}」不一致，无法应用：</strong>` +
+                        '<ul style="margin:6px 0 0 18px;">' +
+                        (res.reasons || []).map(r => `<li>${_escape(r)}</li>`).join('') + '</ul>';
+                }
+                this._setIntegrateStatus('校验未通过', 'error');
+                return;
+            }
+            if (rz) { rz.style.display = 'none'; rz.innerHTML = ''; }
+            const scheme = this._intFindMatched(_intApplyTarget.id);
+            if (!scheme) { this._setIntegrateStatus('方案未能匹配到上传文件', 'error'); return; }
+            this._intFillFromScheme(scheme);
+            this._setIntegrateStatus('校验通过，正在生成结果...', 'ok');
+            await this._doIntegrateExecute();
+        } catch (e) {
+            this._setIntegrateStatus('应用失败: ' + e.message, 'error');
+        }
+    },
+
+    // edit 模式：若上传文件结构与原方案匹配则回填配置供修改，否则从空白配置起
+    _intPrefillForEdit() {
+        if (!_intEditingSchemeId) return;
+        const scheme = this._intFindMatched(_intEditingSchemeId);
+        if (scheme) {
+            this._intFillFromScheme(scheme);
+            this._setIntegrateStatus('已回填原方案配置，可调整后保存修改', 'ok');
+        } else {
+            this._setIntegrateStatus('上传文件结构与原方案不同，将按当前配置另存为该方案', '');
         }
     },
 
@@ -292,13 +463,6 @@ const Tools = {
         box.style.display = 'block';
         const fileOpts = files.map((f, i) => `<option value="${_escape(f.name)}" ${i === 0 ? 'selected' : ''}>${_escape(f.name)}</option>`).join('');
         box.innerHTML = `
-            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px;padding:8px;background:#eef4fb;border-radius:6px;">
-                <span style="font-weight:600;">已保存方案：</span>
-                <select id="int-scheme-select" style="min-width:220px;"><option value="">（选择匹配当前上传表的方案）</option></select>
-                <button type="button" class="btn btn-sm" id="int-apply-scheme">套用</button>
-                <button type="button" class="btn btn-sm" id="int-delete-scheme">删除</button>
-                <span class="status" id="int-scheme-status" style="margin-left:8px;"></span>
-            </div>
             <h3>① 选择主表（模板）</h3>
             <div class="form-group">
                 <select id="int-main-file" style="min-width:280px;">${fileOpts}</select>
@@ -322,6 +486,8 @@ const Tools = {
             <h3 style="margin-top:16px;">③ 覆盖字段（勾选基准列 → 匹配对照列 / 公式）</h3>
             <div id="int-ow-picker" style="border:1px solid #e3e7ed;border-radius:6px;padding:8px;max-height:150px;overflow:auto;"></div>
             <div style="margin:6px 0;">
+                <button type="button" class="btn btn-sm" id="int-ow-all">全选</button>
+                <button type="button" class="btn btn-sm" id="int-ow-none">全不选</button>
                 <button type="button" class="btn btn-sm" id="int-ow-match">智能匹配</button>
                 <label style="margin-left:8px;font-size:13px;"><input type="checkbox" id="int-ow-ai" style="width:auto;"> 用 AI 匹配差异命名</label>
                 <span class="status" id="int-ow-status" style="margin-left:8px;"></span>
@@ -333,6 +499,8 @@ const Tools = {
             <h3 style="margin-top:16px;">④ 对比字段（可选，输出方式2用）</h3>
             <div id="int-cmp-picker" style="border:1px solid #e3e7ed;border-radius:6px;padding:8px;max-height:150px;overflow:auto;"></div>
             <div style="margin:6px 0;">
+                <button type="button" class="btn btn-sm" id="int-cmp-all">全选</button>
+                <button type="button" class="btn btn-sm" id="int-cmp-none">全不选</button>
                 <button type="button" class="btn btn-sm" id="int-cmp-match">智能匹配</button>
                 <label style="margin-left:8px;font-size:13px;"><input type="checkbox" id="int-cmp-ai" style="width:auto;"> 用 AI 匹配差异命名</label>
                 <span class="status" id="int-cmp-status" style="margin-left:8px;"></span>
@@ -356,8 +524,8 @@ const Tools = {
                 <button class="btn btn-primary" id="int-execute">生成并下载</button>
                 <span class="status" id="int-exec-status"></span>
             </div>
-            <div class="actions" style="margin-top:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                <span>保存为方案：</span>
+            <div class="actions" id="int-save-row" style="margin-top:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                <span id="int-save-label">保存为方案：</span>
                 <input type="text" id="int-scheme-name" placeholder="方案名称（如 5月工资整合）" style="min-width:200px;">
                 <button type="button" class="btn" id="int-save-scheme">保存为方案</button>
                 <span class="status" id="int-save-status"></span>
@@ -377,6 +545,10 @@ const Tools = {
             this._intMatchSection('ow', document.getElementById('int-ow-ai').checked));
         document.getElementById('int-cmp-match').addEventListener('click', () =>
             this._intMatchSection('cmp', document.getElementById('int-cmp-ai').checked));
+        document.getElementById('int-ow-all').addEventListener('click', () => this._intToggleAllPick('ow', true));
+        document.getElementById('int-ow-none').addEventListener('click', () => this._intToggleAllPick('ow', false));
+        document.getElementById('int-cmp-all').addEventListener('click', () => this._intToggleAllPick('cmp', true));
+        document.getElementById('int-cmp-none').addEventListener('click', () => this._intToggleAllPick('cmp', false));
         document.querySelectorAll('input[name="int-output-mode"]').forEach(r =>
             r.addEventListener('change', () => {
                 document.getElementById('int-diff-settings').style.display =
@@ -384,28 +556,23 @@ const Tools = {
             }));
         document.getElementById('int-execute').addEventListener('click', () => this._doIntegrateExecute());
 
-        // 方案栏：填充匹配到的方案 + 套用/删除/保存
-        this._intPopulateSchemes(data.matched_schemes || []);
-        document.getElementById('int-apply-scheme').addEventListener('click', () => this._intApplyScheme());
-        document.getElementById('int-delete-scheme').addEventListener('click', () => this._intDeleteScheme());
-        document.getElementById('int-save-scheme').addEventListener('click', () => this._intSaveScheme());
+        // 保存区：按模式调整（create=保存为方案；edit=保存修改；apply=隐藏，不保存）
+        const saveRow = document.getElementById('int-save-row');
+        const saveBtn = document.getElementById('int-save-scheme');
+        const nameInp = document.getElementById('int-scheme-name');
+        if (_intMode === 'apply') {
+            if (saveRow) saveRow.style.display = 'none';
+        } else if (_intMode === 'edit') {
+            const cur = _integrateSchemeList.find(s => s.id === _intEditingSchemeId);
+            if (nameInp && cur) nameInp.value = cur.name;
+            if (saveBtn) saveBtn.textContent = '保存修改';
+            const lbl = document.getElementById('int-save-label');
+            if (lbl) lbl.textContent = '保存修改到方案：';
+        }
+        if (saveBtn) saveBtn.addEventListener('click', () => this._intSaveScheme());
     },
 
-    _intPopulateSchemes(schemes) {
-        _integrateSchemes = schemes || [];
-        const sel = document.getElementById('int-scheme-select');
-        if (!sel) return;
-        sel.innerHTML = '<option value="">（选择匹配当前上传表的方案）</option>' +
-            _integrateSchemes.map((s, i) => `<option value="${i}">${_escape(s.name)}</option>`).join('');
-        const st = document.getElementById('int-scheme-status');
-        if (st) st.textContent = _integrateSchemes.length ? `${_integrateSchemes.length} 个可用方案` : '无匹配方案';
-    },
-
-    _intApplyScheme() {
-        const sel = document.getElementById('int-scheme-select');
-        const idx = sel.value;
-        if (idx === '') { alert('请先选择一个方案'); return; }
-        const scheme = _integrateSchemes[parseInt(idx, 10)];
+    _intFillFromScheme(scheme) {
         if (!scheme) return;
         const cfg = scheme.config || {};
         const f2f = scheme.fp_to_file || {};
@@ -449,22 +616,6 @@ const Tools = {
         if (cfg.id_col) { const e = document.getElementById('int-id-col'); if (e) e.value = cfg.id_col; }
         if (cfg.diff_order) { const e = document.getElementById('int-diff-order'); if (e) e.value = cfg.diff_order; }
         if (cfg.date_key_mode) { const e = document.getElementById('int-date-mode'); if (e) e.value = cfg.date_key_mode; }
-
-        document.getElementById('int-scheme-status').textContent = `已套用方案「${scheme.name}」`;
-    },
-
-    async _intDeleteScheme() {
-        const sel = document.getElementById('int-scheme-select');
-        const idx = sel.value;
-        if (idx === '') { alert('请先选择要删除的方案'); return; }
-        const scheme = _integrateSchemes[parseInt(idx, 10)];
-        if (!scheme || !confirm(`删除方案「${scheme.name}」？`)) return;
-        try {
-            const resp = await AUTH.authFetch('/api/tools/integrate/scheme/' + scheme.id, { method: 'DELETE' });
-            if (!resp.ok) { await _alertErr(resp, '删除失败'); return; }
-            _integrateSchemes.splice(parseInt(idx, 10), 1);
-            this._intPopulateSchemes(_integrateSchemes);
-        } catch (e) { alert('删除失败: ' + e.message); }
     },
 
     async _intSaveScheme() {
@@ -484,6 +635,7 @@ const Tools = {
             normalize_keys: true,
             date_key_mode: document.getElementById('int-date-mode')?.value || 'off',
         };
+        if (_intMode === 'edit' && _intEditingSchemeId) payload.scheme_id = _intEditingSchemeId;
         const st = document.getElementById('int-save-status');
         st.textContent = '保存中...'; st.className = 'status';
         try {
@@ -491,7 +643,8 @@ const Tools = {
                 method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
             });
             if (!resp.ok) { await _alertErr(resp, '保存失败'); st.textContent = '保存失败'; st.className = 'status error'; return; }
-            st.textContent = '方案已保存'; st.className = 'status ok';
+            st.textContent = _intMode === 'edit' ? '修改已保存' : '方案已保存'; st.className = 'status ok';
+            setTimeout(() => this.loadIntegrateSchemes(), 600);   // 保存后返回方案列表
         } catch (e) { st.textContent = '失败: ' + e.message; st.className = 'status error'; }
     },
 
@@ -539,6 +692,16 @@ const Tools = {
                     if (tr) tr.remove();
                 }
             }));
+    },
+
+    // 全选/全不选基准列：改 checked 后必须触发 change，以复用上面的 _intAddListRow 联动（增删下方列表行）
+    _intToggleAllPick(kind, checked) {
+        document.querySelectorAll(`.int-${kind}-pick`).forEach(cb => {
+            if (cb.checked !== checked) {
+                cb.checked = checked;
+                cb.dispatchEvent(new Event('change'));
+            }
+        });
     },
 
     // 列表行：对照列单元格点击弹出勾选（多表多选）；选中的对照列存于 tr.dataset.src(JSON)
