@@ -47,6 +47,7 @@ const Tools = {
         this.initSplitSheet();
         this.initDataMerge();
         this.initDataIntegrate();
+        this.initSop();
     },
 
     initTabs() {
@@ -78,13 +79,17 @@ const Tools = {
         else if (tab === 'compute-history') this.loadComputeHistory();
         else if (tab === 'data-compare') this.loadCompareHistory();
         else if (tab === 'data-integrate') this.loadIntegrateSchemes();
+        else if (tab === 'sop') this.loadSops();
     },
 
     // ==================== 弹窗工具 ====================
-    openModal(title, bodyHtml, onConfirm) {
+    openModal(title, bodyHtml, onConfirm, opts) {
         document.getElementById('modal-title').textContent = title;
         document.getElementById('modal-body').innerHTML = bodyHtml;
         document.getElementById('modal-overlay').style.display = 'flex';
+        // 内容较宽的弹窗用 modal--wide 加宽
+        const modalEl = document.getElementById('modal');
+        if (modalEl) modalEl.classList.toggle('modal--wide', !!(opts && opts.wide));
         _modalCallback = onConfirm;
     },
 
@@ -403,7 +408,59 @@ const Tools = {
         return (_integrateAnalysis.matched_schemes || []).find(s => s.id === id) || null;
     },
 
-    // apply 模式：analyze 后调 apply-validate；不一致硬阻断并列出理由；一致则回填 + 直接生成下载
+    // 同结构表歧义：上传文件里存在表头结构相同的表（一个角色可对应多个文件），
+    // 无法自动确定对应关系，弹出匹配框让操作人员手动指定"方案角色 ↔ 上传文件"。
+    // 确认后更新 scheme.fp_to_file；取消返回 false。
+    _intAskMatchMapping(scheme, ambiguous) {
+        return new Promise(resolve => {
+            const rows = ambiguous.map((a, i) => {
+                const cur = (a.role_index != null && scheme.role_files && scheme.role_files[a.role_index])
+                    ? scheme.role_files[a.role_index]
+                    : ((scheme.fp_to_file || {})[a.fp] || (a.candidates || [])[0] || '');
+                const saved = a.saved_file ? `（保存时：${_escape(a.saved_file)}）` : '';
+                const opts = (a.candidates || []).map(c =>
+                    `<option value="${_escape(c)}" ${c === cur ? 'selected' : ''}>${_escape(c)}</option>`).join('');
+                return `<div style="margin-bottom:10px;display:flex;align-items:center;gap:8px;">
+                    <label style="font-weight:500;min-width:130px;">${_escape(a.label)}${saved}：</label>
+                    <select id="int-amb-${i}" style="min-width:280px;">${opts}</select>
+                </div>`;
+            }).join('');
+            this.openModal('存在相同结构的表，请确认对应关系', `
+                <div style="font-size:13px;color:#555;margin-bottom:12px;">
+                    上传的文件中存在表头结构相同的表，无法自动确定与方案中角色的对应关系。
+                    请为每个角色指定实际对应的上传文件（每个文件只能指定给一个角色）：
+                </div>
+                ${rows}
+                <div style="margin-top:12px;display:flex;justify-content:flex-end;gap:8px;">
+                    <button class="btn" onclick="Tools._intAmbResolve(false)">取消</button>
+                    <button class="btn btn-primary" onclick="Tools._intAmbResolve(true)">确定匹配</button>
+                </div>
+            `, null);
+            this._intAmbResolve = (ok) => {
+                if (!ok) { this.closeModal(); resolve(false); return; }
+                const mapping = {};
+                const fileUsed = new Set();
+                let dup = null;
+                ambiguous.forEach((a, i) => {
+                    const el = document.getElementById(`int-amb-${i}`);
+                    if (!el) return;
+                    const sel = el.value;
+                    if (fileUsed.has(sel)) dup = sel;
+                    fileUsed.add(sel);
+                    // 以角色索引为准（同结构角色指纹相同，fp 键会互相覆盖）
+                    if (a.role_index != null && scheme.role_files) scheme.role_files[a.role_index] = sel;
+                    mapping[a.fp] = sel;
+                });
+                if (dup) { alert(`文件「${dup}」被指定给了多个角色，请重新确认`); return; }
+                Object.assign(scheme.fp_to_file, mapping);
+                this.closeModal();
+                resolve(true);
+            };
+        });
+    },
+
+    // apply 模式：analyze 后调 apply-validate；不一致硬阻断并列出理由；一致则回填 + 直接生成下载。
+    // 存在同结构表歧义时，先弹匹配框让操作人员手动确认对应关系，再回填执行。
     async _intRunApply() {
         if (!_intApplyTarget) return;
         const rz = document.getElementById('int-apply-reasons');
@@ -427,6 +484,11 @@ const Tools = {
             if (rz) { rz.style.display = 'none'; rz.innerHTML = ''; }
             const scheme = this._intFindMatched(_intApplyTarget.id);
             if (!scheme) { this._setIntegrateStatus('方案未能匹配到上传文件', 'error'); return; }
+            const ambiguous = (scheme.ambiguous || []).filter(a => (a.candidates || []).length > 0);
+            if (ambiguous.length) {
+                const ok = await this._intAskMatchMapping(scheme, ambiguous);
+                if (!ok) { this._setIntegrateStatus('已取消应用', ''); return; }
+            }
             this._intFillFromScheme(scheme);
             this._setIntegrateStatus('校验通过，正在生成结果...', 'ok');
             await this._doIntegrateExecute();
@@ -484,7 +546,6 @@ const Tools = {
             </div>
 
             <h3 style="margin-top:16px;">③ 覆盖字段（勾选基准列 → 匹配对照列 / 公式）</h3>
-            <div id="int-ow-picker" style="border:1px solid #e3e7ed;border-radius:6px;padding:8px;max-height:150px;overflow:auto;"></div>
             <div style="margin:6px 0;">
                 <button type="button" class="btn btn-sm" id="int-ow-all">全选</button>
                 <button type="button" class="btn btn-sm" id="int-ow-none">全不选</button>
@@ -492,12 +553,12 @@ const Tools = {
                 <label style="margin-left:8px;font-size:13px;"><input type="checkbox" id="int-ow-ai" style="width:auto;"> 用 AI 匹配差异命名</label>
                 <span class="status" id="int-ow-status" style="margin-left:8px;"></span>
             </div>
+            <div id="int-ow-picker" style="border:1px solid #e3e7ed;border-radius:6px;padding:8px;max-height:150px;overflow:auto;"></div>
             <table class="data-table"><thead><tr><th>基准字段（主表列）</th><th>匹配的对照列（来源）</th><th style="width:32px;"></th></tr></thead>
                 <tbody id="int-ow-list-rows"></tbody></table>
             <div style="color:#888;font-size:12px;margin-top:4px;">点单元格可选多列并用公式(基本工资+本月奖金，支持 +-*/、括号)组合；对照表同一主键多行时各列先跨行求和再代入。多张对照表都填时靠上优先取首个非空。</div>
 
             <h3 style="margin-top:16px;">④ 对比字段（可选，输出方式2用）</h3>
-            <div id="int-cmp-picker" style="border:1px solid #e3e7ed;border-radius:6px;padding:8px;max-height:150px;overflow:auto;"></div>
             <div style="margin:6px 0;">
                 <button type="button" class="btn btn-sm" id="int-cmp-all">全选</button>
                 <button type="button" class="btn btn-sm" id="int-cmp-none">全不选</button>
@@ -505,6 +566,7 @@ const Tools = {
                 <label style="margin-left:8px;font-size:13px;"><input type="checkbox" id="int-cmp-ai" style="width:auto;"> 用 AI 匹配差异命名</label>
                 <span class="status" id="int-cmp-status" style="margin-left:8px;"></span>
             </div>
+            <div id="int-cmp-picker" style="border:1px solid #e3e7ed;border-radius:6px;padding:8px;max-height:150px;overflow:auto;"></div>
             <table class="data-table"><thead><tr><th>基准字段（主表列）</th><th>匹配的对照列（来源）</th><th style="width:32px;"></th></tr></thead>
                 <tbody id="int-cmp-list-rows"></tbody></table>
 
@@ -528,6 +590,7 @@ const Tools = {
                 <span id="int-save-label">保存为方案：</span>
                 <input type="text" id="int-scheme-name" placeholder="方案名称（如 5月工资整合）" style="min-width:200px;">
                 <button type="button" class="btn" id="int-save-scheme">保存为方案</button>
+                <button type="button" class="btn" id="int-save-as" style="display:none;">另存为</button>
                 <span class="status" id="int-save-status"></span>
             </div>`;
 
@@ -556,9 +619,10 @@ const Tools = {
             }));
         document.getElementById('int-execute').addEventListener('click', () => this._doIntegrateExecute());
 
-        // 保存区：按模式调整（create=保存为方案；edit=保存修改；apply=隐藏，不保存）
+        // 保存区：按模式调整（create=保存为方案；edit=保存修改+另存为；apply=隐藏，不保存）
         const saveRow = document.getElementById('int-save-row');
         const saveBtn = document.getElementById('int-save-scheme');
+        const saveAsBtn = document.getElementById('int-save-as');
         const nameInp = document.getElementById('int-scheme-name');
         if (_intMode === 'apply') {
             if (saveRow) saveRow.style.display = 'none';
@@ -566,10 +630,12 @@ const Tools = {
             const cur = _integrateSchemeList.find(s => s.id === _intEditingSchemeId);
             if (nameInp && cur) nameInp.value = cur.name;
             if (saveBtn) saveBtn.textContent = '保存修改';
+            if (saveAsBtn) saveAsBtn.style.display = 'inline-block';   // 另存为：原方案不动，按修改后的配置新建一个方案
             const lbl = document.getElementById('int-save-label');
             if (lbl) lbl.textContent = '保存修改到方案：';
         }
-        if (saveBtn) saveBtn.addEventListener('click', () => this._intSaveScheme());
+        if (saveBtn) saveBtn.addEventListener('click', () => this._intSaveScheme(false));
+        if (saveAsBtn) saveAsBtn.addEventListener('click', () => this._intSaveScheme(true));
     },
 
     _intFillFromScheme(scheme) {
@@ -583,18 +649,31 @@ const Tools = {
         this._intRenderKeyMap();
         this._intRenderDiffCols();
 
-        // 关联键（按指纹→文件）
-        Object.entries(cfg.key_map_by_fp || {}).forEach(([fp, key]) => {
-            const file = f2f[fp];
-            const el = document.querySelector(`.int-key[data-file="${CSS.escape(file || '')}"]`);
-            if (el) el.value = key;
-        });
+        // 关联键：新方案按角色索引（同结构角色指纹相同，fp 不可作键）；旧方案回退按指纹
+        const roleFiles = scheme.role_files || [];
+        const keyByRole = cfg.key_map_by_role || {};
+        if (Object.keys(keyByRole).length) {
+            Object.entries(keyByRole).forEach(([idx, key]) => {
+                const file = roleFiles[parseInt(idx, 10)];
+                const el = file && document.querySelector(`.int-key[data-file="${CSS.escape(file)}"]`);
+                if (el) el.value = key;
+            });
+        } else {
+            Object.entries(cfg.key_map_by_fp || {}).forEach(([fp, key]) => {
+                const file = f2f[fp];
+                const el = document.querySelector(`.int-key[data-file="${CSS.escape(file || '')}"]`);
+                if (el) el.value = key;
+            });
+        }
 
-        // 覆盖/对比（指纹→文件）：先重列基准字段勾选区，再按方案勾选并预填对照列（按 a_col 归并多源）
+        // 覆盖/对比：新方案按 source_role 角色索引取文件（同结构角色各配各的），旧方案回退按指纹
         this._intRenderPicker('ow');
         this._intRenderPicker('cmp');
         const trans = (pairs) => (pairs || []).map(p => ({
-            a_col: p.a_col, source_file: f2f[p.source_fp], expr: p.source_expr || p.source_col,
+            a_col: p.a_col,
+            source_file: (p.source_role != null && roleFiles[p.source_role])
+                ? roleFiles[p.source_role] : f2f[p.source_fp],
+            expr: p.source_expr || p.source_col,
         })).filter(p => p.source_file);
         const applyPairs = (pairs, kind) => {
             const byA = {};
@@ -618,9 +697,14 @@ const Tools = {
         if (cfg.date_key_mode) { const e = document.getElementById('int-date-mode'); if (e) e.value = cfg.date_key_mode; }
     },
 
-    async _intSaveScheme() {
+    // 保存方案：asNew=true 为「另存为」（不带 scheme_id，按修改后的配置新建方案，原方案不动）
+    async _intSaveScheme(asNew) {
         const name = (document.getElementById('int-scheme-name').value || '').trim();
         if (!name) { alert('请填写方案名称'); return; }
+        if (asNew && _intMode === 'edit' && _intEditingSchemeId) {
+            const cur = _integrateSchemeList.find(s => s.id === _intEditingSchemeId);
+            if (cur && name === cur.name) { alert('另存为需使用新的方案名称，请修改后再保存'); return; }
+        }
         const key_map = {};
         document.querySelectorAll('.int-key').forEach(s => { key_map[s.dataset.file] = s.value; });
         const overwrite_pairs = this._readSectionPairs('ow');
@@ -635,7 +719,8 @@ const Tools = {
             normalize_keys: true,
             date_key_mode: document.getElementById('int-date-mode')?.value || 'off',
         };
-        if (_intMode === 'edit' && _intEditingSchemeId) payload.scheme_id = _intEditingSchemeId;
+        // 另存为不带 scheme_id（走新建分支）；保存修改才带
+        if (!asNew && _intMode === 'edit' && _intEditingSchemeId) payload.scheme_id = _intEditingSchemeId;
         const st = document.getElementById('int-save-status');
         st.textContent = '保存中...'; st.className = 'status';
         try {
@@ -643,7 +728,8 @@ const Tools = {
                 method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
             });
             if (!resp.ok) { await _alertErr(resp, '保存失败'); st.textContent = '保存失败'; st.className = 'status error'; return; }
-            st.textContent = _intMode === 'edit' ? '修改已保存' : '方案已保存'; st.className = 'status ok';
+            st.textContent = asNew ? '已另存为新方案' : (_intMode === 'edit' ? '修改已保存' : '方案已保存');
+            st.className = 'status ok';
             setTimeout(() => this.loadIntegrateSchemes(), 600);   // 保存后返回方案列表
         } catch (e) { st.textContent = '失败: ' + e.message; st.className = 'status error'; }
     },
@@ -2213,6 +2299,292 @@ const Tools = {
         } catch (e) {
             alert('获取详情失败: ' + e.message);
         }
+    },
+
+    // ==================== SOP 维护 ====================
+    _sopEntries: [],
+
+    initSop() {
+        // SOP 数据在 tab 激活时懒加载（_activateTab → loadSops），此处仅占位
+    },
+
+    async loadSops() {
+        const keyword = document.getElementById('sop-keyword')?.value || '';
+        const status = document.getElementById('sop-status-filter')?.value || '';
+        const params = [];
+        if (keyword) params.push('keyword=' + encodeURIComponent(keyword));
+        if (status) params.push('status=' + encodeURIComponent(status));
+        const url = '/api/tools/sop/entries' + (params.length ? '?' + params.join('&') : '');
+        try {
+            const resp = await AUTH.authFetch(url);
+            if (!resp.ok) return _alertErr(resp, '加载SOP列表失败');
+            const data = await resp.json();
+            this._sopEntries = data.items || [];
+            this._renderSopList();
+        } catch (e) {
+            alert('加载SOP列表失败: ' + e.message);
+        }
+    },
+
+    _renderSopList() {
+        const tbody = document.querySelector('#sop-table tbody');
+        const items = this._sopEntries || [];
+        if (!items.length) {
+            tbody.innerHTML = '<tr><td colspan="8" class="empty-state">暂无SOP条目</td></tr>';
+            return;
+        }
+        const canCreate = AUTH.hasPerm('tools.sop.create');
+        const canReview = AUTH.hasPerm('tools.sop.review');
+        const canManage = AUTH.hasPerm('tools.sop.manage');
+        tbody.innerHTML = items.map(e => {
+            const btns = [`<button class="btn btn-sm" onclick="Tools.showSopDetail(${e.id})">详情</button>`];
+            if (canCreate) btns.push(`<button class="btn btn-sm" style="margin-left:4px;" onclick="Tools.showSopUpload(${e.id})">上传文件</button>`);
+            if (canReview && e.status === 'ai_passed') btns.push(`<button class="btn btn-sm" style="margin-left:4px;background:#ffc107;" onclick="Tools.showSopReview(${e.id})">审核</button>`);
+            if (canManage) btns.push(`<button class="btn btn-sm btn-danger" style="margin-left:4px;" onclick="Tools.deleteSop(${e.id})">删除</button>`);
+            return `<tr>
+                <td>${e.id}</td>
+                <td>${_escape(e.customer_name)}</td>
+                <td>${_escape(e.description || '-')}</td>
+                <td>${this._sopStatusHtml(e.status)}</td>
+                <td>${e.round_no || 0}</td>
+                <td>${_escape(e.ai_comment || '-')}</td>
+                <td>${e.updated_at ? new Date(e.updated_at).toLocaleString() : '-'}</td>
+                <td class="actions">${btns.join('')}</td>
+            </tr>`;
+        }).join('');
+    },
+
+    _sopStatusHtml(status) {
+        const map = {
+            draft: ['草稿', '#9e9e9e'],
+            ai_analyzing: ['AI分析中', '#2196f3'],
+            ai_failed: ['有问题', '#f44336'],
+            ai_passed: ['待人工审核', '#ff9800'],
+            completed: ['已完成', '#4caf50'],
+            rejected: ['已打回', '#e91e63'],
+            failed: ['分析失败', '#f44336'],
+        };
+        const [label, color] = map[status] || [status, '#9e9e9e'];
+        return `<span style="color:${color};font-weight:600;">${label}</span>`;
+    },
+
+    showCreateSop() {
+        this.openModal('新建SOP', `
+            <div style="display:flex;flex-direction:column;gap:10px;">
+                <div><label style="font-weight:500;">客户名称 <span style="color:#f44336;">*</span></label>
+                    <input type="text" id="m-sop-customer" placeholder="客户名称" style="width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:6px;margin-top:4px;"></div>
+                <div><label style="font-weight:500;">SOP 描述</label>
+                    <textarea id="m-sop-desc" placeholder="SOP 大体描述" rows="4" style="width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:6px;margin-top:4px;"></textarea></div>
+            </div>`, async () => {
+            const name = document.getElementById('m-sop-customer').value.trim();
+            if (!name) return alert('请填写客户名称');
+            const resp = await AUTH.authFetch('/api/tools/sop/entries', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ customer_name: name, description: document.getElementById('m-sop-desc').value }),
+            });
+            if (!resp.ok) return _alertErr(resp, '新建失败');
+            this.closeModal();
+            this.loadSops();
+        });
+    },
+
+    showSopUpload(entryId) {
+        const entry = (this._sopEntries || []).find(e => e.id === entryId) || {};
+        this.openModal(`上传文件 - ${entry.customer_name || entryId}`, `
+            <div style="display:flex;flex-direction:column;gap:10px;">
+                <div><label style="font-weight:500;">源文件（可多选）<span style="color:#f44336;">*</span></label>
+                    <input type="file" id="m-sop-source" accept=".xlsx,.xls,.xlsm" multiple style="margin-top:4px;"></div>
+                <div><label style="font-weight:500;">结果文件 <span style="color:#f44336;">*</span></label>
+                    <input type="file" id="m-sop-result" accept=".xlsx,.xls,.xlsm" style="margin-top:4px;"></div>
+                <div><label style="font-weight:500;">规则文件（可选）</label>
+                    <input type="file" id="m-sop-rule" accept=".xlsx,.xls,.xlsm,.docx,.doc,.pdf,.txt,.md" style="margin-top:4px;"></div>
+                <div style="font-size:12px;color:#888;">上传后将自动开始 AI 后台分析，请稍候。</div>
+            </div>`, () => {
+            this._sopUpload(entryId);
+        });
+    },
+
+    async _sopUpload(entryId) {
+        const fd = new FormData();
+        const srcFiles = document.getElementById('m-sop-source').files;
+        const res = document.getElementById('m-sop-result').files[0];
+        const rul = document.getElementById('m-sop-rule').files[0];
+        if (!srcFiles || !srcFiles.length) return alert('请选择至少一个源文件');
+        if (!res) return alert('请选择结果文件');
+        for (const f of srcFiles) fd.append('source_files', f);
+        fd.append('result_file', res);
+        if (rul) fd.append('rule_file', rul);
+        const resp = await AUTH.authFetch(`/api/tools/sop/entries/${entryId}/upload`, { method: 'POST', body: fd });
+        if (!resp.ok) return _alertErr(resp, '上传失败');
+        const data = await resp.json();
+        this.closeModal();
+        this._pollSopRound(data.round_id, entryId);
+    },
+
+    async _pollSopRound(roundId, entryId) {
+        let tries = 0;
+        const maxTries = 72;   // 每 2.5s 一次，最长约 3 分钟
+        document.getElementById('loading-overlay').style.display = 'flex';
+        document.getElementById('loading-text').textContent = 'AI 正在后台分析文件，请稍候...';
+        const timer = setInterval(async () => {
+            tries++;
+            try {
+                const resp = await AUTH.authFetch(`/api/tools/sop/rounds/${roundId}`);
+                if (!resp.ok) throw new Error('查询分析状态失败');
+                const r = await resp.json();
+                const done = ['ai_passed', 'ai_failed', 'failed', 'completed', 'rejected'].includes(r.status);
+                if (done || tries >= maxTries) {
+                    clearInterval(timer);
+                    document.getElementById('loading-overlay').style.display = 'none';
+                    this.loadSops();
+                    if (r.status === 'ai_passed') {
+                        alert('AI 分析完成：符合大规则，等待人工审核。');
+                    } else if (r.status === 'ai_failed') {
+                        const a = r.ai_analysis || {};
+                        alert(`AI 判定不符合大规则。\n\n${a.summary || ''}\n\n问题：\n${(a.issues || []).join('\n') || '（见详情）'}\n\n建议：\n${(a.suggestions || []).join('\n') || ''}`);
+                    } else if (r.status === 'failed') {
+                        alert('AI 分析失败：' + (r.error_message || '未知错误'));
+                    } else if (tries >= maxTries) {
+                        alert('分析超时，请手动刷新列表查看结果。');
+                    }
+                }
+            } catch (e) {
+                clearInterval(timer);
+                document.getElementById('loading-overlay').style.display = 'none';
+                this.loadSops();
+                alert('查询分析状态失败: ' + e.message);
+            }
+        }, 2500);
+    },
+
+    async showSopDetail(entryId) {
+        try {
+            const resp = await AUTH.authFetch(`/api/tools/sop/entries/${entryId}`);
+            if (!resp.ok) return _alertErr(resp, '获取详情失败');
+            const entry = await resp.json();
+            const canCreate = AUTH.hasPerm('tools.sop.create');
+            const canReview = AUTH.hasPerm('tools.sop.review');
+            const rounds = (entry.rounds || []).slice().reverse();   // 最新一轮在前
+            const roundsHtml = rounds.map(r => {
+                const srcNames = (r.source_file_names && r.source_file_names.length) ? r.source_file_names : [r.source_file_name];
+                const files = [];
+                srcNames.forEach((n, i) => {
+                    const label = srcNames.length > 1 ? `源文件${i + 1}` : '源文件';
+                    files.push(`<button class="btn btn-sm" ${i ? 'style="margin-left:4px;"' : ''} onclick="Tools.downloadSopFile(${r.id},'source','${String(n).replace(/'/g, "\\'")}',${i})">${label}</button>`);
+                });
+                files.push(`<button class="btn btn-sm" style="margin-left:4px;" onclick="Tools.downloadSopFile(${r.id},'result','${r.result_file_name.replace(/'/g, "\\'")}')">结果文件</button>`);
+                if (r.rule_file_name) files.push(`<button class="btn btn-sm" style="margin-left:4px;" onclick="Tools.downloadSopFile(${r.id},'rule','${r.rule_file_name.replace(/'/g, "\\'")}')">规则文件</button>`);
+                const a = r.ai_analysis || {};
+                let aiBlock;
+                if (r.status === 'ai_analyzing') {
+                    aiBlock = '<div style="margin-top:6px;color:#2196f3;">AI 分析中...</div>';
+                } else {
+                    const verdictHtml = a.passed === undefined
+                        ? (r.ai_comment || '-')
+                        : `<span style="color:${a.passed ? '#4caf50' : '#f44336'};font-weight:600;">${a.passed ? '符合' : '不符合'}</span>　评分：${a.score ?? '-'}`;
+                    aiBlock = `<div style="margin-top:6px;">
+                        <div>AI评价：${verdictHtml}</div>
+                        ${r.ai_comment ? `<div style="margin-top:4px;">${_escape(r.ai_comment)}</div>` : ''}
+                        ${(a.issues && a.issues.length) ? `<div style="margin-top:4px;color:#f44336;">问题：${_escape(a.issues.join('；'))}</div>` : ''}
+                        ${(a.suggestions && a.suggestions.length) ? `<div style="margin-top:4px;color:#ff9800;">建议：${_escape(a.suggestions.join('；'))}</div>` : ''}
+                    </div>`;
+                }
+                const reviewBlock = r.review_status
+                    ? `<div style="margin-top:6px;">最终评价：<span style="color:${r.review_status === 'completed' ? '#4caf50' : '#e91e63'};font-weight:600;">${r.review_status === 'completed' ? '已完成' : '打回重写'}</span>　${_escape(r.review_comment || '')}　（审核人：${_escape(r.reviewer_name || '-')}　${r.reviewed_at ? new Date(r.reviewed_at).toLocaleString() : ''}）</div>`
+                    : '';
+                const errBlock = r.error_message ? `<div style="margin-top:6px;color:#f44336;">错误：${_escape(r.error_message)}</div>` : '';
+                let reviewBtns = '';
+                if (canReview && entry.status === 'ai_passed' && r.id === entry.latest_round_id) {
+                    reviewBtns = `<button class="btn btn-sm" style="background:#4caf50;color:#fff;margin-left:4px;" onclick="Tools.reviewSop(${entry.id}, ${r.id}, 'completed')">审核通过</button>
+                        <button class="btn btn-sm btn-danger" style="margin-left:4px;" onclick="Tools.showSopRejectModal(${entry.id}, ${r.id}, ${r.round_no})">打回重写</button>`;
+                }
+                return `<div style="border:1px solid #e0e0e0;border-radius:8px;padding:12px;margin-bottom:12px;${r.id === entry.latest_round_id ? 'border-left:4px solid #2196f3;' : 'opacity:.85;'}">
+                    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                        <span style="font-weight:600;">第 ${r.round_no} 轮</span>
+                        ${this._sopStatusHtml(r.status)}
+                        ${files.join('')}
+                        ${reviewBtns}
+                    </div>
+                    ${aiBlock}
+                    ${reviewBlock}
+                    ${errBlock}
+                </div>`;
+            }).join('');
+            const body = `
+                <div style="margin-bottom:12px;">
+                    <div><strong>客户名称：</strong>${_escape(entry.customer_name)}</div>
+                    <div style="margin-top:4px;"><strong>SOP 描述：</strong>${_escape(entry.description || '-')}</div>
+                    <div style="margin-top:4px;"><strong>当前状态：</strong>${this._sopStatusHtml(entry.status)}</div>
+                    <div style="margin-top:4px;"><strong>创建人：</strong>${_escape(entry.created_by_name || '-')}　<strong>创建时间：</strong>${entry.created_at ? new Date(entry.created_at).toLocaleString() : '-'}</div>
+                </div>
+                <hr style="border:none;border-top:1px solid #eee;margin:12px 0;">
+                ${roundsHtml || '<div class="empty-state">暂无上传记录</div>'}
+                ${canCreate ? `<div style="margin-top:12px;"><button class="btn btn-primary" onclick="Tools.showSopUpload(${entry.id})">+ 重新上传（开启新一轮）</button></div>` : ''}`;
+            this.openModal('SOP 详情', body, null, { wide: true });
+        } catch (e) {
+            alert('获取详情失败: ' + e.message);
+        }
+    },
+
+    showSopReview(entryId) {
+        this.showSopDetail(entryId);
+    },
+
+    async reviewSop(entryId, roundId, verdict) {
+        if (verdict === 'rejected') { this.showSopRejectModal(entryId, roundId); return; }
+        if (!confirm('确认标记该 SOP 为已完成？')) return;
+        await this._submitSopReview(entryId, roundId, verdict, '');
+    },
+
+    // 打回重写：专门弹窗填写打回原因/完善意见（不再用浏览器 prompt）
+    showSopRejectModal(entryId, roundId, roundNo) {
+        const entry = (this._sopEntries || []).find(e => e.id === entryId) || {};
+        this.openModal(`打回重写 - ${entry.customer_name || entryId}`, `
+            <div style="font-size:13px;color:#555;margin-bottom:10px;">
+                第 ${roundNo || '-'} 轮未通过人工审核。请填写打回原因/完善意见，将反馈给上传人重新完善后再上传。
+            </div>
+            <textarea id="sop-reject-comment" rows="5" placeholder="请输入打回原因/完善意见（必填）"
+                style="width:100%;box-sizing:border-box;min-height:110px;"></textarea>
+            <div style="margin-top:12px;display:flex;justify-content:flex-end;gap:8px;">
+                <button class="btn" onclick="Tools.closeModal()">取消</button>
+                <button class="btn btn-danger" onclick="Tools.submitSopReject(${entryId}, ${roundId})">确认打回</button>
+            </div>
+        `, null);
+        const ta = document.getElementById('sop-reject-comment');
+        if (ta) setTimeout(() => ta.focus(), 50);
+    },
+
+    async submitSopReject(entryId, roundId) {
+        const ta = document.getElementById('sop-reject-comment');
+        const comment = (ta ? ta.value : '').trim();
+        if (!comment) { alert('请填写打回原因/完善意见'); if (ta) ta.focus(); return; }
+        await this._submitSopReview(entryId, roundId, 'rejected', comment);
+    },
+
+    async _submitSopReview(entryId, roundId, verdict, comment) {
+        const resp = await AUTH.authFetch(`/api/tools/sop/entries/${entryId}/review`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ round_id: roundId, verdict, comment }),
+        });
+        if (!resp.ok) return _alertErr(resp, verdict === 'rejected' ? '打回失败' : '审核失败');
+        this.closeModal();
+        this.loadSops();
+    },
+
+    async deleteSop(entryId) {
+        const entry = (this._sopEntries || []).find(e => e.id === entryId);
+        if (!confirm(`确认删除 SOP「${entry ? entry.customer_name : entryId}」？该操作不可恢复。`)) return;
+        const resp = await AUTH.authFetch(`/api/tools/sop/entries/${entryId}`, { method: 'DELETE' });
+        if (!resp.ok) return _alertErr(resp, '删除失败');
+        this.loadSops();
+    },
+
+    downloadSopFile(roundId, kind, fileName, idx = 0) {
+        let url = `/api/tools/sop/rounds/${roundId}/download?kind=${kind}`;
+        if (idx) url += `&idx=${idx}`;
+        this._fetchAndDownload(url, fileName);
     },
 };
 

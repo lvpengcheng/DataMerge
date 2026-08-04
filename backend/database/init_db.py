@@ -92,6 +92,7 @@ from backend.database.models import (
     TrainingSession, TrainingIteration, TrainingMessage, Script,
     ComputeTask, ComputeTaskInput, RuleSession,
     MergeFieldMapping, MergeTemplate, ScriptMigration,
+    SopEntry, SopRound, SopRuleFile,
 )
 from passlib.context import CryptContext
 
@@ -144,6 +145,9 @@ def _migrate_add_columns():
         # ---------- integrate_templates（多表整合对比方案化）----------
         ("integrate_templates", "org_id", "INTEGER"),
         ("integrate_templates", "created_by", "INTEGER"),
+        # ---------- sop_rounds（SOP 多源文件）----------
+        ("sop_rounds", "source_file_paths", "JSON"),
+        ("sop_rounds", "source_file_names", "JSON"),
     ]
 
     with engine.connect() as conn:

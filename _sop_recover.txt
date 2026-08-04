@@ -1,0 +1,28 @@
+===ROUND RULE: rule_20260803_152353_0_rules.md===
+bytes: 2320cafdbeddb4a6c0edb9e6d4f20d0a0d0a232320cafdbeddd4b4cec4bcfe0d0a312e20736f75726365312e786c7378202d20d4b1b9a4bbf9b1bed0c5cfa20d0a322e20736f75726365322e786c7378202d20b9a4d7cacafdbedd0d0a0d0a232320bcc6cbe3b9e6d4f20d0a312e20bbf9b1beb9a4d7ca203d20b8dacebbb9a4d7ca202b20bca8d0a7b9a4d7ca0d0a322e20d3a6b7a2b9a4d7ca203d20bbf9b1beb9a4d7ca202b20bdf2ccf9202d20bfdbbfee0d0a332e20cab5b7a2b9a4d7ca203d20d3a6b7a2b9
+as utf8: # ���ݴ�������
+
+## ����Դ�ļ�
+1. source1.xlsx - Ա��������Ϣ
+2. source2.xlsx - ��������
+
+## �������
+1. �������� = ��λ���� + ��Ч����
+2. Ӧ������ = �������� + ���� - �ۿ�
+3. ʵ������ = Ӧ������ - ��˰ - �籣
+
+## �����ʽ
+1. ����Ա��ID������������
+2. �����������ϸ
+3. �����ϼ���
+
+===RULE FILE: rule_20260803_150130_cust_rule.md===
+bytes: e5aea2e688b7e8a784e58899efbc9ae98791e9a29de4bf9de79599e4b8a4e4bd8de5b08fe695b0
+as utf8: 客户规则：金额保留两位小数
+===RULE FILE: rule_20260803_150130_smoke_rule.md===
+bytes: e585a8e5b180e5a4a7e8a784e58899efbc9ae7bb93e69e9ce5bf85e9a1bbe590abe5b7a5e58fb7e58897
+as utf8: 全局大规则：结果必须含工号列
+===RULE FILE: rule_20260803_151320_全局.md===
+bytes: 312ee79baee6a087e69687e4bbb6e5bf85e9a1bbe698afe6b885e699b0e58fafe8afbbe79a840d0a322ee8a784e58899e69687e4bbb6e4b8ade5bf85e9a1bbe6b885e699b0e79a84e68f8fe8bfb0e587bae79baee6a087e69687e4bbb6e79a84e6af8fe58897e79a84e69da5e6ba90
+as utf8: 1.目标文件必须是清晰可读的
+2.规则文件中必须清晰的描述出目标文件的每列的来源

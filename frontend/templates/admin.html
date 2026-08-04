@@ -31,6 +31,7 @@
             <button class="tab-btn" data-tab="ref-data" data-perm="admin.ref_data">基础数据</button>
             <button class="tab-btn" data-tab="scripts" data-perm="admin.scripts">脚本管理</button>
             <button class="tab-btn" data-tab="test-migration" data-perm="admin.test_migration">测试迁移</button>
+            <button class="tab-btn" data-tab="sop-rules" data-perm="tools.sop.manage">SOP规则</button>
         </div>
 
         <!-- 用户管理 Tab -->
@@ -210,6 +211,29 @@
                 <tbody></tbody>
             </table>
         </div>
+
+        <!-- SOP规则 Tab -->
+        <div class="tab-content" id="tab-sop-rules">
+            <div class="toolbar" style="flex-wrap:wrap;gap:12px;align-items:center;">
+                <button class="btn btn-primary" onclick="Admin.showCreateSopRule()">+ 上传规则文件</button>
+                <span style="font-size:12px;color:#888;">全局大规则：AI 分析所有 SOP 的兜底依据；按客户规则：仅该客户优先使用。</span>
+            </div>
+            <table class="data-table" id="sop-rules-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>作用域</th>
+                        <th>客户名称</th>
+                        <th>规则名称</th>
+                        <th>文件名</th>
+                        <th>状态</th>
+                        <th>更新时间</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
     </div>
 
     <!-- 全局加载遮罩 -->
@@ -234,6 +258,6 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260722a"></script>
-    <script src="/static/js/admin.js?v=20260803a"></script>
+    <script src="/static/js/admin.js?v=20260804a"></script>
 </body>
 </html>

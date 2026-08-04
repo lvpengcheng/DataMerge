@@ -408,3 +408,103 @@ class ScriptMigration(Base):
     migrated_at = Column(DateTime, default=datetime.utcnow)
 
 
+# ==================== SOP 维护 ====================
+
+class SopEntry(Base):
+    """SOP 维护：一条 SOP 条目（客户 + 描述），状态随最新一轮流转。"""
+    __tablename__ = "sop_entries"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(100), nullable=False, index=True, default="__tools_sop__")
+    customer_name = Column(String(200), nullable=False, index=True)   # 客户名称
+    description = Column(Text, default="")                            # SOP 大体描述
+    # 状态机: draft / ai_analyzing / ai_failed / ai_passed / completed / rejected
+    status = Column(String(20), default="draft")
+    latest_round_id = Column(Integer, nullable=True)                  # 最新一轮 sop_rounds.id（冗余加速列表）
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    creator = relationship("User", foreign_keys=[created_by])
+    rounds = relationship(
+        "SopRound", back_populates="sop", order_by="SopRound.round_no",
+        cascade="all, delete-orphan",
+    )
+
+
+class SopRound(Base):
+    """SOP 每轮记录：一次上传（源/结果/规则文件）+ 一次 AI 分析 + 一次人工审核。
+
+    多轮循环历史全部落在这里（round_no 从 1 递增）。
+    """
+    __tablename__ = "sop_rounds"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sop_id = Column(Integer, ForeignKey("sop_entries.id"), nullable=False, index=True)
+    round_no = Column(Integer, nullable=False)
+    # 本轮状态: ai_analyzing / ai_passed / ai_failed / completed / rejected / failed
+    status = Column(String(20), default="ai_analyzing")
+
+    source_file_path = Column(String(500), nullable=False)
+    source_file_name = Column(String(200), nullable=False)
+    source_file_paths = Column(JSON, nullable=True)                  # 多源文件：路径列表（新上传时记录全部）
+    source_file_names = Column(JSON, nullable=True)                  # 多源文件：原始文件名列表
+    result_file_path = Column(String(500), nullable=False)
+    result_file_name = Column(String(200), nullable=False)
+    rule_file_path = Column(String(500), nullable=True)              # 本轮用户上传的规则文件（可选）
+    rule_file_name = Column(String(200), nullable=True)
+    rule_used_id = Column(Integer, nullable=True)                    # 本次使用的后台规则 id（无外键，规则可删）
+
+    ai_provider = Column(String(50), nullable=True)                  # deepseek / claude / openai ...
+    prompt_text = Column(Text, nullable=True)                        # 发给 AI 的 prompt（排查用）
+    ai_response = Column(Text, nullable=True)                        # AI 原始返回
+    ai_analysis = Column(JSON, nullable=True)                        # {passed,score,summary,issues,suggestions,details}
+    ai_comment = Column(Text, nullable=True)                         # AI 评价文本（= summary 冗余）
+    error_message = Column(Text, nullable=True)                      # AI 技术性失败信息
+
+    review_status = Column(String(20), nullable=True)                # completed / rejected
+    review_comment = Column(Text, nullable=True)                     # 人工评价文本
+    reviewed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+
+    started_at = Column(DateTime, default=datetime.utcnow)
+    finished_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    sop = relationship("SopEntry", back_populates="rounds")
+    reviewer = relationship("User", foreign_keys=[reviewed_by])
+
+    __table_args__ = (
+        UniqueConstraint("sop_id", "round_no", name="uq_sop_round_no"),
+    )
+
+
+class SopRuleFile(Base):
+    """SOP 规则文件：全局大规则（scope=global）或按客户专属规则（scope=customer）。
+
+    scope=customer 时 customer_name 必填；global 时 customer_name 为 NULL。
+    同 scope（+customer）每次只允许一条 is_active=True，由 API 层维护。
+    """
+    __tablename__ = "sop_rule_files"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(100), nullable=False, index=True, default="__tools_sop__")
+    scope = Column(String(20), nullable=False, default="global")     # global / customer
+    customer_name = Column(String(200), nullable=True, index=True)   # scope=customer 时必填
+    name = Column(String(200), default="")                           # 规则名称/说明
+    description = Column(Text, default="")
+    file_path = Column(String(500), nullable=False)
+    file_name = Column(String(200), nullable=False)
+    is_active = Column(Boolean, default=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    creator = relationship("User", foreign_keys=[created_by])
+
+    __table_args__ = (
+        UniqueConstraint("scope", "customer_name", name="uq_sop_rule_scope_customer"),
+    )
+
+

@@ -3619,6 +3619,8 @@ class IntelligentExcelParser:
         first_value = None
         first_value_col = None
         second_value = None
+        last_value_col = None
+        values_list: list = []
         has_required_marker = False  # 是否包含必填标记
         # Aspose 视图下，被横向合并的单元格会"展开"成多个相同值。
         # 用 distinct 值集合去重，避免 non_empty_cells 因合并被虚高、误退出 title 检测。
@@ -3630,6 +3632,8 @@ class IntelligentExcelParser:
                 non_empty_cells += 1
                 str_val = str(value).strip()
                 distinct_values.add(str_val)
+                last_value_col = col
+                values_list.append(str_val)
 
                 # 检查是否包含必填标记（※、*等），如果有多个这样的单元格，很可能是表头
                 for marker in self.REQUIRED_FIELD_MARKERS:
@@ -3721,6 +3725,21 @@ class IntelligentExcelParser:
                 if not (first_value_str.endswith(':') or first_value_str.endswith('：')):
                     if not any(m in first_value_str for m in self.REQUIRED_FIELD_MARKERS):
                         return True
+
+        # 情况1e: 少量分散的横幅/说明文本（3-6个非空、首末跨大跨度、多数命中标题/日期特征）
+        # 典型：报表名横幅 + 调薪日期 + 发放说明 散在 A1/E1/AU1（无物理合并），既非单值横幅也
+        # 非 <=2 非空，原逻辑漏判而被当表头。真实表头列通常连续且列数更多，不满足跨度/特征条件。
+        if 3 <= non_empty_cells <= 6 and first_value_col and last_value_col \
+                and (last_value_col - first_value_col) >= 3:
+            _banner_hits = 0
+            for _s in values_list:
+                if any(k.lower() in _s.lower() for k in self.TITLE_KEYWORDS) or re.search(
+                        r'(?<!\d)(?:19|20|21)\d{2}[.\-/年](?:0?[1-9]|1[0-2])(?![.\d])'
+                        r'|\d{1,2}\.\d{1,2}\s*[-~至]\s*\d{1,2}\.\d{1,2}',
+                        _s):
+                    _banner_hits += 1
+            if _banner_hits >= 2:
+                return True
 
         # 情况2: 第一个单元格包含说明区域关键字（但不是只有必填标记开头）
         # 排除 "※ 员工编号" 这种表头格式

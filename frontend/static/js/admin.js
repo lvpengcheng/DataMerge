@@ -53,6 +53,7 @@ const Admin = {
                 else if (tab === 'ref-data') this.loadRefCategories().then(() => this.loadRefData());
                 else if (tab === 'scripts') this.loadScripts();
                 else if (tab === 'test-migration') this.initMigration();
+                else if (tab === 'sop-rules') this.loadSopRules();
             });
         });
     },
@@ -298,6 +299,10 @@ const Admin = {
                 { key: 'tools.training_history', label: '└ 训练历史' },
                 { key: 'tools.compute_history', label: '└ 计算历史' },
                 { key: 'tools.data_compare', label: '└ 数据对比（管理员）' },
+                { key: 'tools.sop', label: '└ SOP维护' },
+                { key: 'tools.sop.create', label: '　　└ 新建SOP / 上传文件' },
+                { key: 'tools.sop.review', label: '　　└ 人工审核' },
+                { key: 'tools.sop.manage', label: '　　└ 规则文件管理 / 删除SOP' },
             ]
         },
         {
@@ -1114,6 +1119,129 @@ const Admin = {
             this.loadMigrationScripts();  // 刷新已迁移状态
         } catch (e) {
             this._setMigStatus('迁移失败: ' + e.message);
+        }
+    },
+
+    // ==================== SOP 规则文件管理 ====================
+    _sopRules: [],
+
+    async loadSopRules() {
+        try {
+            const resp = await AUTH.authFetch('/api/tools/sop/rules');
+            if (!resp.ok) return _alertErr(resp, '加载规则列表失败');
+            const data = await resp.json();
+            this._sopRules = data.items || [];
+            this._renderSopRules();
+        } catch (e) {
+            alert('加载规则列表失败: ' + e.message);
+        }
+    },
+
+    _renderSopRules() {
+        const tbody = document.querySelector('#sop-rules-table tbody');
+        const items = this._sopRules || [];
+        if (!items.length) {
+            tbody.innerHTML = '<tr><td colspan="8" class="empty-state">暂无规则文件</td></tr>';
+            return;
+        }
+        tbody.innerHTML = items.map(r => `<tr>
+            <td>${r.id}</td>
+            <td>${r.scope === 'global' ? '<span class="tag">全局</span>' : '<span class="tag" style="background:#e3f2fd;">按客户</span>'}</td>
+            <td>${r.customer_name ? this._escapeHtml(r.customer_name) : '-'}</td>
+            <td>${this._escapeHtml(r.name || '-')}</td>
+            <td>${this._escapeHtml(r.file_name)}</td>
+            <td><span class="${r.is_active ? 'status-active' : 'status-inactive'}">${r.is_active ? '启用' : '停用'}</span></td>
+            <td>${r.updated_at ? new Date(r.updated_at).toLocaleString() : '-'}</td>
+            <td class="actions">
+                <button class="btn btn-sm" onclick="Admin.downloadSopRule(${r.id}, '${r.file_name.replace(/'/g, "\\'")}')">下载</button>
+                <button class="btn btn-sm" style="margin-left:4px;" onclick="Admin.toggleSopRule(${r.id})">${r.is_active ? '停用' : '启用'}</button>
+                <button class="btn btn-sm btn-danger" style="margin-left:4px;" onclick="Admin.deleteSopRule(${r.id})">删除</button>
+            </td>
+        </tr>`).join('');
+    },
+
+    _escapeHtml(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    },
+
+    showCreateSopRule() {
+        this.openModal('上传规则文件', `
+            <div style="display:flex;flex-direction:column;gap:10px;">
+                <div><label style="font-weight:500;">作用域 <span style="color:#f44336;">*</span></label>
+                    <select id="m-soprule-scope" style="width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:6px;margin-top:4px;" onchange="Admin._onSopRuleScopeChange()">
+                        <option value="global">全局大规则</option>
+                        <option value="customer">按客户专属规则</option>
+                    </select></div>
+                <div id="m-soprule-cust-wrap" style="display:none;"><label style="font-weight:500;">客户名称 <span style="color:#f44336;">*</span></label>
+                    <input type="text" id="m-soprule-customer" placeholder="客户名称（需与 SOP 条目中的客户名称一致）" style="width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:6px;margin-top:4px;"></div>
+                <div><label style="font-weight:500;">规则文件 <span style="color:#f44336;">*</span></label>
+                    <input type="file" id="m-soprule-file" accept=".txt,.md,.docx,.doc,.pdf,.xlsx,.xls" style="margin-top:4px;"></div>
+                <div><label style="font-weight:500;">规则名称</label>
+                    <input type="text" id="m-soprule-name" placeholder="规则名称/说明" style="width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:6px;margin-top:4px;"></div>
+                <div><label style="font-weight:500;">描述</label>
+                    <textarea id="m-soprule-desc" rows="2" placeholder="描述（可选）" style="width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:6px;margin-top:4px;"></textarea></div>
+            </div>`, () => {
+            this._uploadSopRule();
+        });
+    },
+
+    _onSopRuleScopeChange() {
+        const scope = document.getElementById('m-soprule-scope').value;
+        document.getElementById('m-soprule-cust-wrap').style.display = scope === 'customer' ? '' : 'none';
+    },
+
+    async _uploadSopRule() {
+        const scope = document.getElementById('m-soprule-scope').value;
+        const cust = document.getElementById('m-soprule-customer').value.trim();
+        const file = document.getElementById('m-soprule-file').files[0];
+        if (!file) return alert('请选择规则文件');
+        if (scope === 'customer' && !cust) return alert('按客户规则必须填写客户名称');
+        const fd = new FormData();
+        fd.append('file', file);
+        fd.append('scope', scope);
+        fd.append('customer_name', cust);
+        fd.append('name', document.getElementById('m-soprule-name').value);
+        fd.append('description', document.getElementById('m-soprule-desc').value);
+        const resp = await AUTH.authFetch('/api/tools/sop/rules', { method: 'POST', body: fd });
+        if (!resp.ok) return _alertErr(resp, '上传失败');
+        this.closeModal();
+        this.loadSopRules();
+    },
+
+    async toggleSopRule(id) {
+        const resp = await AUTH.authFetch(`/api/tools/sop/rules/${id}/toggle`, { method: 'POST' });
+        if (!resp.ok) return _alertErr(resp, '切换失败');
+        this.loadSopRules();
+    },
+
+    async deleteSopRule(id) {
+        if (!confirm('确认删除该规则文件？删除后不再参与 AI 分析。')) return;
+        const resp = await AUTH.authFetch(`/api/tools/sop/rules/${id}`, { method: 'DELETE' });
+        if (!resp.ok) return _alertErr(resp, '删除失败');
+        this.loadSopRules();
+    },
+
+    downloadSopRule(id, fileName) {
+        this._downloadViaAuth(`/api/tools/sop/rules/${id}/download`, fileName);
+    },
+
+    async _downloadViaAuth(url, fileName) {
+        try {
+            const sep = url.includes('?') ? '&' : '?';
+            const bustedUrl = `${url}${sep}_=${Date.now()}`;
+            const resp = await AUTH.authFetch(bustedUrl, { cache: 'no-store' });
+            if (!resp.ok) return alert('下载失败: ' + resp.statusText);
+            const blob = await resp.blob();
+            const blobUrl = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = blobUrl;
+            a.download = fileName;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(blobUrl);
+        } catch (e) {
+            alert('下载失败: ' + e.message);
         }
     },
 };

@@ -2,6 +2,7 @@
 
 import io
 import os
+import re
 import sys
 import json
 import uuid
@@ -12,13 +13,18 @@ import logging
 import hashlib
 from pathlib import Path
 from typing import List, Optional
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 import pandas as pd
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, Query
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from ..auth.dependencies import get_current_user
+from ..auth.dependencies import get_current_user, require_permission
+from ..database.connection import SessionLocal
+from ..database.models import SopEntry, SopRound, SopRuleFile
+from ..ai_engine.document_parser import DocumentParser
 
 router = APIRouter(prefix="/api/tools", tags=["智能小工具"])
 
@@ -912,6 +918,56 @@ class IntegrateExecuteRequest(BaseModel):
     date_key_mode: str = "yearmonthday"  # 日期关联键归一 off|yearmonthday|yearmonth|month|day（默认按年月日）
 
 
+def _validate_integrate_columns(parsed, key_map, overwrite_pairs, compare_pairs, main_file):
+    """执行前预检：方案引用的列在对应上传文件里是否真实存在。
+
+    缺列历史上是静默失败的（键列缺失→空索引→0 命中；源列缺失→取值返回 None→跳过），
+    用户只会看到"0 行"或结果不对。这里把每个引用列逐一校验，报错精确到 文件+sheet+列。
+    Returns: 错误消息列表（空则通过）。
+    """
+    from ..utils.integrate_engine import _expr_columns
+
+    errs = []
+
+    def _sheet(f):
+        return (parsed.get(f) or {}).get("sheet") or ""
+
+    def _cols(f):
+        _df = (parsed.get(f) or {}).get("df")
+        return list(_df.columns) if _df is not None else []
+
+    # 1) 关联键列：主表与各对照表都必须存在
+    for f, kcol in (key_map or {}).items():
+        if not kcol or f not in parsed:
+            continue
+        if kcol not in _cols(f):
+            errs.append(f"文件【{f}】的 sheet【{_sheet(f)}】的关联键列 '{kcol}' 不存在")
+
+    # 2) 覆盖/对比对的 A 列（主表）与源列（对照表，支持公式里的列名）
+    main_cols, main_sheet = _cols(main_file), _sheet(main_file)
+    for pair in list(overwrite_pairs or []) + list(compare_pairs or []):
+        ac, f = pair.get("a_col"), pair.get("source_file")
+        expr = pair.get("source_expr") or pair.get("source_col")
+        if ac and ac not in main_cols:
+            errs.append(f"文件【{main_file}】的 sheet【{main_sheet}】的列 '{ac}' 不存在（覆盖/对比目标列）")
+        if not (f and f != main_file and f in parsed and expr):
+            continue
+        fcols = _cols(f)
+        expr = str(expr)
+        refs = _expr_columns(expr, fcols)
+        if expr in fcols:
+            refs.append(expr)
+        # 把已知列抠掉后，剩下的非数字/运算符 token 即"引用但不存在"的列名
+        subst = expr
+        for c in refs:
+            subst = subst.replace(c, " ")
+        unresolved = [t for t in re.split(r"[+\*/()\s]+", subst)
+                      if t and not re.fullmatch(r"[0-9eE.+\-*/()]*", t)]
+        if unresolved:
+            errs.append(f"文件【{f}】的 sheet【{_sheet(f)}】的列 '{'、'.join(unresolved)}' 不存在（覆盖/对比源列）")
+    return errs
+
+
 @router.post("/integrate/execute")
 async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(get_current_user)):
     """按覆盖/对比配置回填主表并输出：原地覆盖主表激活页覆盖列（只写值、保全其余 sheet/公式），
@@ -931,11 +987,18 @@ async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(g
     try:
         # 解析：主表要区域坐标，对照表只要 df
         main_info = _parse_file_full(str(main_path))
-        parsed = {req.main_file: {"df": main_info["df"]}}
+        parsed = {req.main_file: {"df": main_info["df"], "sheet": main_info["sheet"]}}
         for fp_path in sorted(sdir.iterdir()):
             if fp_path.suffix.lower() not in EXCEL_EXTS or fp_path.name == req.main_file:
                 continue
-            parsed[fp_path.name] = {"df": _parse_file_to_df(str(fp_path))["df"]}
+            _info = _parse_file_to_df(str(fp_path))
+            parsed[fp_path.name] = {"df": _info["df"], "sheet": _info["sheet"]}
+
+        # 执行前预检：方案引用的列必须真实存在，报错精确到 文件+sheet+列（缺列历史上是静默的）
+        errs = _validate_integrate_columns(
+            parsed, req.key_map, req.overwrite_pairs, req.compare_pairs, req.main_file)
+        if errs:
+            raise HTTPException(status_code=400, detail="；".join(errs))
 
         n_sources = len([f for f in parsed if f != req.main_file])
         if n_sources < 1:
@@ -1054,10 +1117,49 @@ def _can_edit_scheme(row, current_user) -> bool:
     return False
 
 
+_PHANTOM_COL = re.compile(r"^Column_[A-Z]+$")
+
+
+def _real_header_set(cols):
+    """归一化的真实列头集合：过滤 excel_parser 生成的空表头幻影列(Column_X)。
+
+    幻影列是"有格式但表头为空"的列占位（excel_parser.py 3069 行），同一张表在不同月份
+    因末尾多/少一个空白样式列会导致指纹不一致，方案应用被误判为"表头结构不一致"。
+    匹配角色时把幻影列忽略，仅按真实列头集合比对。
+    """
+    from ..utils.merge_engine import _norm_header
+    return {_norm_header(c) for c in (cols or []) if not _PHANTOM_COL.match(str(c))}
+
+
+def _file_matches_role(f, expected_fp, expected_cols) -> bool:
+    """该文件是否可作为方案角色的候选：精确指纹，或忽略幻影列后真实列头集合一致。"""
+    if f.get("fingerprint") == expected_fp:
+        return True
+    exp_set = _real_header_set(expected_cols)
+    if exp_set:
+        return _real_header_set(f.get("columns", [])) == exp_set
+    return False
+
+
+def _pick_file_for_role(used: set, expected_fp, expected_cols, files_meta):
+    """为方案角色挑上传文件：优先精确指纹；否则按忽略幻影列后的列集合一致兜底。
+
+    Returns: 命中文件 dict（未命中 None），不修改 used。
+    """
+    for f in files_meta:
+        if f["name"] not in used and _file_matches_role(f, expected_fp, expected_cols):
+            return f
+    return None
+
+
 def _match_integrate_schemes(current_user, files_meta: List[dict]) -> List[dict]:
     """按列头指纹把【当前用户可见】方案匹配到本次上传的文件，解析出角色(主表/各对照表)。
 
-    Returns: [{id, name, main_file, fp_to_file{fp:file}, config}]  仅返回能完整匹配的方案。
+    Returns: [{id, name, main_file, fp_to_file{fp:file}, ambiguous, config}]
+    - 仅返回能完整匹配的方案（每个角色至少一个候选文件）。
+    - ambiguous: [{"label","fp","candidates":[文件名...],"saved_file"}] —— 存在同结构表竞争
+      同一角色（候选集合与其它角色相交）时的歧义角色，由前端弹匹配框让操作人员手动确认
+      对应关系；无歧义为空列表。
     """
     from ..database.connection import SessionLocal
 
@@ -1071,32 +1173,66 @@ def _match_integrate_schemes(current_user, files_meta: List[dict]) -> List[dict]
             source_fps = cfg.get("source_fps", [])
             if not main_fp:
                 continue
-            # 指纹 → 上传文件名（同指纹多文件时取首个未占用的）
+            cols_by_fp = cfg.get("cols_by_fp", {})
+            roles = [("主表", main_fp)] + [(f"对照表{i + 1}", fp) for i, fp in enumerate(source_fps)]
+
+            # 1) 每个角色的全部候选文件（不排除占用），先保证方案完整
+            role_cands = []
+            incomplete = False
+            for label, fp in roles:
+                cands = [f["name"] for f in files_meta
+                         if _file_matches_role(f, fp, cols_by_fp.get(fp) or [])]
+                if not cands:
+                    incomplete = True
+                    break
+                role_cands.append((label, fp, cands))
+            if incomplete:
+                continue
+
+            # 2) 默认分配：顺序取首个未占用（保持原有行为）。
+            #    role_files 直接按角色顺序收集（同指纹角色 fp_to_file 会互相覆盖，不能反查）
             used = set()
             fp_to_file = {}
-
-            def _pick(fp):
-                for f in files_meta:
-                    if f["fingerprint"] == fp and f["name"] not in used:
-                        used.add(f["name"])
-                        return f["name"]
-                return None
-
-            mf = _pick(main_fp)
-            if not mf:
-                continue
-            fp_to_file[main_fp] = mf
+            role_files = []
             ok = True
-            for sfp in source_fps:
-                sf = _pick(sfp)
-                if not sf:
+            for label, fp, cands in role_cands:
+                hit = next((c for c in cands if c not in used), None)
+                if not hit:
                     ok = False
                     break
-                fp_to_file[sfp] = sf
+                used.add(hit)
+                fp_to_file[fp] = hit
+                role_files.append(hit)
             if not ok:
                 continue
-            out.append({"id": row.id, "name": row.name, "main_file": mf,
-                        "fp_to_file": fp_to_file, "config": cfg})
+
+            # 3) 歧义检测：同结构表竞争（候选集合相交）或单角色多候选（>1 个同结构文件可选）→
+            #    无法自动确定对应关系，交由前端弹匹配框人工确认。
+            #    角色用【角色索引】标识（同结构角色指纹相同，fp 不能作唯一键）。
+            files_by_fp = cfg.get("files_by_fp") or {}
+            roles_cfg = cfg.get("roles") or []
+            ambiguous = []
+            for i, (label, fp, cands) in enumerate(role_cands):
+                set_i = set(cands)
+                involved = len(cands) > 1 or any(
+                    set_i & set(rc[2]) for j, rc in enumerate(role_cands) if j != i)
+                if involved:
+                    saved = (roles_cfg[i].get("file", "") if roles_cfg and i < len(roles_cfg)
+                             else files_by_fp.get(fp, ""))
+                    ambiguous.append({
+                        "label": label,
+                        "fp": fp,
+                        "role_index": i,
+                        "candidates": sorted(cands),
+                        "saved_file": saved,
+                    })
+
+            out.append({"id": row.id, "name": row.name,
+                        "main_file": fp_to_file.get(main_fp, ""),
+                        "fp_to_file": fp_to_file,
+                        "role_files": role_files,
+                        "ambiguous": ambiguous,
+                        "config": cfg})
     finally:
         db.close()
     return out
@@ -1146,13 +1282,22 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
             src_files.append(f)
     source_fps = [fp_by_file[f] for f in src_files]
 
+    # 角色有序数组（0=主表, 1..=对照表）：同结构对照表指纹相同，fp 无法作唯一键，
+    # 必须用角色索引区分"第几个对照表"，供套用时按角色顺序取文件。
+    roles = [{"fp": main_fp, "file": req.main_file}]
+    for f in src_files:
+        roles.append({"fp": fp_by_file[f], "file": f})
+    role_of_file = {r["file"]: i for i, r in enumerate(roles)}
+
     def _to_fp_pairs(pairs):
         out = []
         for p in pairs or []:
             f = p.get("source_file")
             if f in fp_by_file:
                 _expr = p.get("source_expr") or p.get("source_col")
-                out.append({"a_col": p.get("a_col"), "source_fp": fp_by_file[f],
+                out.append({"a_col": p.get("a_col"),
+                            "source_fp": fp_by_file[f],
+                            "source_role": role_of_file.get(f),
                             "source_expr": _expr, "source_col": _expr})
         return out
 
@@ -1161,11 +1306,19 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
     for f in src_files:
         cols_by_fp[fp_by_file[f]] = cols_by_file.get(f, [])
 
+    # 各角色保存时的文件名（供套用出现同结构表歧义时提示"保存时：本月.xlsx"参考）
+    files_by_fp = {main_fp: req.main_file}
+    for f in src_files:
+        files_by_fp[fp_by_file[f]] = f
+
     config = {
         "main_fp": main_fp,
         "source_fps": source_fps,
+        "roles": roles,
         "cols_by_fp": cols_by_fp,
+        "files_by_fp": files_by_fp,
         "key_map_by_fp": {fp_by_file[f]: k for f, k in (req.key_map or {}).items() if f in fp_by_file},
+        "key_map_by_role": {role_of_file[f]: k for f, k in (req.key_map or {}).items() if f in role_of_file},
         "overwrite_pairs": _to_fp_pairs(req.overwrite_pairs),
         "compare_pairs": _to_fp_pairs(req.compare_pairs),
         "name_col": req.name_col, "id_col": req.id_col,
@@ -1316,38 +1469,639 @@ async def integrate_scheme_apply_validate(req: IntegrateApplyValidateRequest, cu
     if len(uploaded) != len(expected):
         reasons.append(f"方案需要 {len(expected)} 张表，实际上传 {len(uploaded)} 张")
 
-    # 2) 表头结构校验：逐个期望角色找同指纹上传文件（消耗式），找不到则对最接近文件做列级 diff
+    # 2) 表头结构校验：逐个期望角色按"精确指纹→忽略幻影列后列集合一致"找上传文件（消耗式），
+    #    找不到则对最接近文件做列级 diff（同样忽略幻影列，避免空表头样式列干扰）。
     used = set()
     for label, fp in expected:
-        hit = next((f for f in uploaded if f.get("fingerprint") == fp and f["name"] not in used), None)
+        exp_cols = cols_by_fp.get(fp) or []
+        hit = _pick_file_for_role(used, fp, exp_cols, uploaded)
         if hit:
             used.add(hit["name"])
             continue
-        exp_cols = cols_by_fp.get(fp) or []
         # 在未占用文件里按列名重合度找最接近的
         best, best_score = None, -1.0
-        exp_norm = {_norm_header(c) for c in exp_cols}
+        exp_norm = _real_header_set(exp_cols)
         for f in uploaded:
             if f["name"] in used:
                 continue
-            up_norm = {_norm_header(c) for c in f.get("columns", [])}
+            up_norm = _real_header_set(f.get("columns", []))
             inter = len(exp_norm & up_norm)
             union = len(exp_norm | up_norm) or 1
             score = inter / union
             if score > best_score:
                 best_score, best = score, f
-        if best is not None and exp_cols:
-            up_norm = {_norm_header(c) for c in best.get("columns", [])}
-            missing = [c for c in exp_cols if _norm_header(c) not in up_norm]
-            extra = [c for c in best.get("columns", []) if _norm_header(c) not in exp_norm]
+        if best is not None and exp_norm:
+            up_norm = _real_header_set(best.get("columns", []))
+            missing = [c for c in exp_cols if not _PHANTOM_COL.match(str(c)) and _norm_header(c) not in up_norm]
+            extra = [c for c in best.get("columns", []) if not _PHANTOM_COL.match(str(c)) and _norm_header(c) not in exp_norm]
             detail = []
             if extra:
-                detail.append("多了 " + "、".join(map(str, extra)))
+                detail.append("多列 " + "、".join(map(str, extra)))
             if missing:
-                detail.append("缺了 " + "、".join(map(str, missing)))
-            tail = ("；最接近的是【" + best["name"] + "】：" + "；".join(detail)) if detail else ""
+                detail.append("缺列 " + "、".join(map(str, missing)))
+            sheet = best.get("sheet") or "?"
+            tail = (f"；最接近的是文件【{best['name']}】的 sheet【{sheet}】：" + "；".join(detail)) if detail else ""
             reasons.append(f"缺少表头结构为【{label}】的表" + tail)
         else:
             reasons.append(f"缺少表头结构为【{label}】的表")
 
     return {"ok": len(reasons) == 0, "reasons": reasons, "scheme_id": req.scheme_id, "scheme_name": row.name}
+
+
+# ==================== SOP 维护 ====================
+
+SOP_ROOT = PROJECT_ROOT / "tenants" / "__tools_sop__"
+_sop_executor = ThreadPoolExecutor(max_workers=2)   # AI 后台分析线程池
+
+
+class SopAiVerdict(BaseModel):
+    """AI 结构化判定结果"""
+    passed: bool
+    score: int = 0
+    summary: str = ""
+    issues: List[str] = []
+    suggestions: List[str] = []
+    details: dict = {}
+
+
+class SopCreateRequest(BaseModel):
+    customer_name: str
+    description: str = ""
+
+
+class SopReviewRequest(BaseModel):
+    round_id: int
+    verdict: str          # completed / rejected
+    comment: str = ""
+
+
+def _sop_round_dir(entry_id: int, round_no: int) -> Path:
+    return SOP_ROOT / "entries" / str(entry_id) / f"round_{round_no}"
+
+
+def _sop_latest_round(entry: SopEntry, db) -> Optional[SopRound]:
+    if entry.latest_round_id:
+        return db.query(SopRound).filter_by(id=entry.latest_round_id).first()
+    return (
+        db.query(SopRound).filter(SopRound.sop_id == entry.id)
+        .order_by(SopRound.round_no.desc()).first()
+    )
+
+
+def _sop_round_to_out(r: SopRound) -> dict:
+    return {
+        "id": r.id,
+        "round_no": r.round_no,
+        "status": r.status,
+        "source_file_name": r.source_file_name,
+        "source_file_names": r.source_file_names or ([r.source_file_name] if r.source_file_name else []),
+        "result_file_name": r.result_file_name,
+        "rule_file_name": r.rule_file_name,
+        "ai_analysis": r.ai_analysis,
+        "ai_comment": r.ai_comment,
+        "ai_provider": r.ai_provider,
+        "error_message": r.error_message,
+        "review_status": r.review_status,
+        "review_comment": r.review_comment,
+        "reviewer_name": r.reviewer.display_name if r.reviewer else "",
+        "reviewed_at": r.reviewed_at.isoformat() if r.reviewed_at else None,
+        "started_at": r.started_at.isoformat() if r.started_at else None,
+        "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+    }
+
+
+def _sop_entry_to_out(entry: SopEntry, db) -> dict:
+    latest = _sop_latest_round(entry, db)
+    return {
+        "id": entry.id,
+        "customer_name": entry.customer_name,
+        "description": entry.description,
+        "status": entry.status,
+        "created_by_name": entry.creator.display_name if entry.creator else "",
+        "created_at": entry.created_at.isoformat() if entry.created_at else None,
+        "updated_at": entry.updated_at.isoformat() if entry.updated_at else None,
+        "round_no": latest.round_no if latest else 0,
+        "ai_comment": (latest.ai_comment or "") if latest else "",
+        "latest_round_id": entry.latest_round_id,
+    }
+
+
+# ---------- SOP 条目 ----------
+
+@router.get("/sop/entries")
+async def sop_entries_list(
+    keyword: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    current_user=Depends(require_permission("tools.sop")),
+):
+    """SOP 条目列表：客户名称模糊搜索 + 状态过滤。"""
+    db = SessionLocal()
+    try:
+        q = db.query(SopEntry)
+        if keyword:
+            q = q.filter(SopEntry.customer_name.like(f"%{keyword}%"))
+        if status:
+            q = q.filter(SopEntry.status == status)
+        entries = q.order_by(SopEntry.updated_at.desc()).all()
+        return {"items": [_sop_entry_to_out(e, db) for e in entries]}
+    finally:
+        db.close()
+
+
+@router.post("/sop/entries")
+async def sop_entries_create(req: SopCreateRequest, current_user=Depends(require_permission("tools.sop.create"))):
+    """新建 SOP 条目（客户名称 + 描述），状态 draft。"""
+    name = (req.customer_name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="客户名称不能为空")
+    db = SessionLocal()
+    try:
+        entry = SopEntry(
+            customer_name=name, description=req.description or "",
+            status="draft", created_by=current_user.id,
+        )
+        db.add(entry)
+        db.commit()
+        db.refresh(entry)
+        return _sop_entry_to_out(entry, db)
+    finally:
+        db.close()
+
+
+@router.get("/sop/entries/{entry_id}")
+async def sop_entries_detail(entry_id: int, current_user=Depends(require_permission("tools.sop"))):
+    """SOP 详情：含全部轮次历史。"""
+    db = SessionLocal()
+    try:
+        entry = db.query(SopEntry).filter_by(id=entry_id).first()
+        if not entry:
+            raise HTTPException(status_code=404, detail="SOP条目不存在")
+        out = _sop_entry_to_out(entry, db)
+        out["rounds"] = [_sop_round_to_out(r) for r in sorted(entry.rounds, key=lambda x: x.round_no)]
+        return out
+    finally:
+        db.close()
+
+
+@router.delete("/sop/entries/{entry_id}")
+async def sop_entries_delete(entry_id: int, current_user=Depends(require_permission("tools.sop.manage"))):
+    """删除 SOP 条目 + 轮次记录 + 物理文件。"""
+    db = SessionLocal()
+    try:
+        entry = db.query(SopEntry).filter_by(id=entry_id).first()
+        if not entry:
+            raise HTTPException(status_code=404, detail="SOP条目不存在")
+        entry_dir = SOP_ROOT / "entries" / str(entry_id)
+        db.delete(entry)   # 关系 cascade 级联删除 rounds
+        db.commit()
+        if entry_dir.exists():
+            shutil.rmtree(entry_dir, ignore_errors=True)
+        return {"ok": True}
+    finally:
+        db.close()
+
+
+@router.post("/sop/entries/{entry_id}/upload")
+async def sop_entries_upload(
+    entry_id: int,
+    source_files: List[UploadFile] = File(...),
+    result_file: UploadFile = File(...),
+    rule_file: UploadFile = File(None),
+    current_user=Depends(require_permission("tools.sop.create")),
+):
+    """上传源(可多个)/结果/规则文件 → 建新轮次 → 后台启动 AI 分析。"""
+    import asyncio
+
+    db = SessionLocal()
+    try:
+        entry = db.query(SopEntry).filter_by(id=entry_id).first()
+        if not entry:
+            raise HTTPException(status_code=404, detail="SOP条目不存在")
+        if entry.status == "ai_analyzing":
+            raise HTTPException(status_code=400, detail="正在AI分析中，请稍候再操作")
+
+        max_no = db.query(SopRound).filter(SopRound.sop_id == entry_id).count()
+        round_no = max_no + 1
+        rdir = _sop_round_dir(entry_id, round_no)
+        rdir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        def _save(uf: UploadFile, prefix: str, idx: int = 0):
+            orig = Path(uf.filename or "").name or "file"
+            dest = rdir / f"{prefix}_{ts}_{idx}_{orig}"
+            dest.write_bytes(uf.file.read())
+            return str(dest), orig
+
+        if not source_files:
+            raise HTTPException(status_code=400, detail="请至少上传一个源文件")
+        src_items = [_save(f, "source", i) for i, f in enumerate(source_files)]
+        src_paths = [p for p, _ in src_items]
+        src_names = [n for _, n in src_items]
+        res_path, res_name = _save(result_file, "result")
+        rule_path = rule_name = None
+        if rule_file and rule_file.filename:
+            rule_path, rule_name = _save(rule_file, "rule")
+
+        round = SopRound(
+            sop_id=entry_id, round_no=round_no, status="ai_analyzing",
+            source_file_path=src_paths[0], source_file_name=src_names[0],
+            source_file_paths=src_paths, source_file_names=src_names,
+            result_file_path=res_path, result_file_name=res_name,
+            rule_file_path=rule_path, rule_file_name=rule_name,
+        )
+        db.add(round)
+        db.flush()
+        entry.status = "ai_analyzing"
+        entry.latest_round_id = round.id
+        db.commit()
+        db.refresh(round)
+
+        # 后台 AI 分析（纯 AI 调用，无子进程，规避 Windows SelectorEventLoop 坑）
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(_sop_executor, _run_sop_ai_analysis, round.id, entry_id)
+
+        return {
+            "round_id": round.id, "entry_id": entry_id,
+            "round_no": round.round_no, "status": entry.status,
+        }
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.exception("[sop] 上传失败")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@router.get("/sop/rounds/{round_id}")
+async def sop_round_poll(round_id: int, current_user=Depends(require_permission("tools.sop"))):
+    """轮询本轮分析状态（前端 2~3s 调用直到终态）。"""
+    db = SessionLocal()
+    try:
+        r = db.query(SopRound).filter_by(id=round_id).first()
+        if not r:
+            raise HTTPException(status_code=404, detail="轮次不存在")
+        return _sop_round_to_out(r)
+    finally:
+        db.close()
+
+
+@router.get("/sop/rounds/{round_id}/download")
+async def sop_round_download(
+    round_id: int,
+    kind: str = Query("source"),
+    idx: int = Query(0),
+    current_user=Depends(require_permission("tools.sop")),
+):
+    """下载某轮某类文件：kind = source / result / rule，source 可多个用 idx 指定。"""
+    from urllib.parse import quote
+    db = SessionLocal()
+    try:
+        r = db.query(SopRound).filter_by(id=round_id).first()
+        if not r:
+            raise HTTPException(status_code=404, detail="轮次不存在")
+        if kind == "source":
+            paths = r.source_file_paths or ([r.source_file_path] if r.source_file_path else [])
+            names = r.source_file_names or ([r.source_file_name] if r.source_file_name else [])
+            if idx >= len(paths):
+                raise HTTPException(status_code=404, detail="源文件不存在")
+            path = paths[idx]
+            name = names[idx] if idx < len(names) else os.path.basename(paths[idx])
+        else:
+            path = {"result": r.result_file_path, "rule": r.rule_file_path}.get(kind)
+            name = {"result": r.result_file_name, "rule": r.rule_file_name}.get(kind)
+            if kind == "rule" and not path:
+                raise HTTPException(status_code=404, detail="本轮未上传规则文件")
+        if not path or not os.path.exists(path):
+            raise HTTPException(status_code=404, detail="文件不存在")
+        return FileResponse(
+            path, filename=name,
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}"},
+        )
+    finally:
+        db.close()
+
+
+@router.post("/sop/entries/{entry_id}/review")
+async def sop_entries_review(entry_id: int, req: SopReviewRequest, current_user=Depends(require_permission("tools.sop.review"))):
+    """人工审核：标记已完成(completed) 或 打回重写完善(rejected)。"""
+    if req.verdict not in ("completed", "rejected"):
+        raise HTTPException(status_code=400, detail="verdict 必须是 completed 或 rejected")
+    db = SessionLocal()
+    try:
+        entry = db.query(SopEntry).filter_by(id=entry_id).first()
+        if not entry:
+            raise HTTPException(status_code=404, detail="SOP条目不存在")
+        if entry.status != "ai_passed":
+            raise HTTPException(status_code=400, detail="当前状态不允许人工审核（仅待人工审核状态可操作）")
+        r = db.query(SopRound).filter_by(id=req.round_id).first()
+        if not r or r.sop_id != entry_id:
+            raise HTTPException(status_code=404, detail="轮次不存在")
+        if entry.latest_round_id != r.id:
+            raise HTTPException(status_code=400, detail="只能审核最新一轮")
+        r.review_status = req.verdict
+        r.review_comment = req.comment or ""
+        r.reviewed_by = current_user.id
+        r.reviewed_at = datetime.utcnow()
+        r.status = req.verdict
+        entry.status = req.verdict
+        db.commit()
+        return _sop_round_to_out(r)
+    finally:
+        db.close()
+
+
+# ---------- SOP 规则文件（系统管理页维护）----------
+
+@router.get("/sop/rules")
+async def sop_rules_list(current_user=Depends(require_permission("tools.sop.manage"))):
+    """规则文件列表：全局优先，其次按客户。"""
+    db = SessionLocal()
+    try:
+        rows = db.query(SopRuleFile).all()
+        items = [{
+            "id": r.id, "scope": r.scope, "customer_name": r.customer_name,
+            "name": r.name, "description": r.description, "file_name": r.file_name,
+            "is_active": r.is_active,
+            "created_by_name": r.creator.display_name if r.creator else "",
+            "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+        } for r in rows]
+        items.sort(key=lambda x: (x["scope"] != "global", x["id"]))
+        return {"items": items}
+    finally:
+        db.close()
+
+
+@router.post("/sop/rules")
+async def sop_rules_create(
+    file: UploadFile = File(...),
+    scope: str = Form("global"),
+    customer_name: Optional[str] = Form(None),
+    name: str = Form(""),
+    description: str = Form(""),
+    current_user=Depends(require_permission("tools.sop.manage")),
+):
+    """上传规则文件：scope=global 全局大规则 / scope=customer 按客户专属规则。
+
+    同 scope（+customer）已有启用规则 → 先停用，保证每次只有一条生效。
+    """
+    scope = (scope or "global").strip()
+    if scope not in ("global", "customer"):
+        raise HTTPException(status_code=400, detail="scope 必须是 global 或 customer")
+    cust = (customer_name or "").strip()
+    if scope == "customer" and not cust:
+        raise HTTPException(status_code=400, detail="按客户规则必须填写客户名称")
+    if scope == "global":
+        cust = None
+
+    db = SessionLocal()
+    try:
+        # 同 scope（+customer）已有 active 规则 → 停用
+        q = db.query(SopRuleFile).filter(SopRuleFile.scope == scope, SopRuleFile.is_active == True)
+        if cust:
+            q = q.filter(SopRuleFile.customer_name == cust)
+        else:
+            q = q.filter(SopRuleFile.customer_name.is_(None))
+        for old in q.all():
+            old.is_active = False
+
+        rules_dir = SOP_ROOT / "rules"
+        rules_dir.mkdir(parents=True, exist_ok=True)
+        orig = Path(file.filename or "").name or "rule"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest = rules_dir / f"rule_{ts}_{orig}"
+        dest.write_bytes(file.file.read())
+
+        row = SopRuleFile(
+            scope=scope, customer_name=cust, name=name or "", description=description,
+            file_path=str(dest), file_name=orig, is_active=True, created_by=current_user.id,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return {"id": row.id, "scope": row.scope, "customer_name": row.customer_name, "is_active": row.is_active}
+    finally:
+        db.close()
+
+
+@router.post("/sop/rules/{rule_id}/toggle")
+async def sop_rules_toggle(rule_id: int, current_user=Depends(require_permission("tools.sop.manage"))):
+    """启用/停用切换：启用时停用同 scope（+customer）其它生效规则。"""
+    db = SessionLocal()
+    try:
+        r = db.query(SopRuleFile).filter_by(id=rule_id).first()
+        if not r:
+            raise HTTPException(status_code=404, detail="规则文件不存在")
+        if not r.is_active:
+            q = db.query(SopRuleFile).filter(
+                SopRuleFile.scope == r.scope, SopRuleFile.is_active == True, SopRuleFile.id != r.id,
+            )
+            if r.customer_name:
+                q = q.filter(SopRuleFile.customer_name == r.customer_name)
+            else:
+                q = q.filter(SopRuleFile.customer_name.is_(None))
+            for old in q.all():
+                old.is_active = False
+        r.is_active = not r.is_active
+        db.commit()
+        return {"id": r.id, "is_active": r.is_active}
+    finally:
+        db.close()
+
+
+@router.delete("/sop/rules/{rule_id}")
+async def sop_rules_delete(rule_id: int, current_user=Depends(require_permission("tools.sop.manage"))):
+    """删除规则文件 + 物理文件。"""
+    db = SessionLocal()
+    try:
+        r = db.query(SopRuleFile).filter_by(id=rule_id).first()
+        if not r:
+            raise HTTPException(status_code=404, detail="规则文件不存在")
+        path = r.file_path
+        db.delete(r)
+        db.commit()
+        try:
+            if path and os.path.exists(path):
+                os.unlink(path)
+        except Exception:
+            logger.warning("[sop] 删除规则文件失败: %s", path)
+        return {"ok": True}
+    finally:
+        db.close()
+
+
+@router.get("/sop/rules/{rule_id}/download")
+async def sop_rules_download(rule_id: int, current_user=Depends(require_permission("tools.sop.manage"))):
+    """下载规则文件。"""
+    from urllib.parse import quote
+    db = SessionLocal()
+    try:
+        r = db.query(SopRuleFile).filter_by(id=rule_id).first()
+        if not r:
+            raise HTTPException(status_code=404, detail="规则文件不存在")
+        if not os.path.exists(r.file_path):
+            raise HTTPException(status_code=404, detail="文件不存在")
+        return FileResponse(
+            r.file_path, filename=r.file_name,
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(r.file_name)}"},
+        )
+    finally:
+        db.close()
+
+
+# ---------- SOP AI 分析 ----------
+
+SOP_SYSTEM_PROMPT = """你是企业 SOP 合规审核专家。请严格依据给定的【大规则】，逐项核对用户提交的【源文件】、【结果文件】与【本轮规则文件】是否满足规则要求。
+要求：
+1. 只输出一个 JSON 对象，不要任何解释或 Markdown 代码块标记。
+2. JSON 结构：
+{
+  "passed": true 或 false,
+  "score": 0~100,
+  "summary": "总体评价（中文，简洁）",
+  "issues": ["不符合项1", "..."],
+  "suggestions": ["完善建议1"],
+  "details": {}
+}"""
+
+
+def _sop_read_file(path: str, max_chars: int = 6000) -> str:
+    """读取文件内容供 AI 分析：Excel → 表头(含列字母映射) + 前 10 行数据；其它格式 → 文档解析。失败返回错误片段，不中断。"""
+    if not path or not os.path.exists(path):
+        return "（文件缺失）"
+    ext = Path(path).suffix.lower()
+    try:
+        if ext in (".xlsx", ".xls", ".xlsm"):
+            # 延迟导入，避免模块顶层加载 Aspose/.NET 产生副作用
+            if str(PROJECT_ROOT) not in sys.path:
+                sys.path.insert(0, str(PROJECT_ROOT))
+            from excel_parser import IntelligentExcelParser
+            sheets = IntelligentExcelParser().parse_excel_file(
+                path, read_formulas=False, calculate_formulas=True,
+                active_sheet_only=False, best_region_only=False,
+            )
+            parts = []
+            for sd in sheets:
+                parts.append(f"== Sheet {sd.sheet_name} ==")
+                for region in (sd.regions or []):
+                    # head_data 结构为 {表头名: 列字母}，反转为 {列字母: 表头名} 用于数据行渲染
+                    letter_to_name = {str(v).upper(): k for k, v in (region.head_data or {}).items()}
+                    if region.head_data:
+                        parts.append("表头: " + " | ".join(f"{name}({col})" for name, col in region.head_data.items()))
+                    for i, row in enumerate((region.data or [])[:10]):
+                        cells = " | ".join(f"{letter_to_name.get(str(k).upper(), k)}: {v}" for k, v in row.items())
+                        parts.append(f"第{i + 1}行: {cells}")
+            text = "\n".join(parts)
+        else:
+            text = DocumentParser().parse_document(path)
+        if not text:
+            return "（空内容）"
+        if len(text) > max_chars:
+            text = text[:max_chars] + "\n...[内容过长已截断]"
+        return text
+    except Exception as e:
+        return f"[文件解析失败: {e}]"
+
+
+def _build_sop_prompt(entry: SopEntry, admin_rule_text: str, source_text: str, result_text: str, rule_text: Optional[str]) -> str:
+    lines = [
+        f"【客户名称】{entry.customer_name}",
+        f"【SOP 描述】{entry.description or '（无）'}",
+        "",
+        "========== 大规则 ==========",
+        admin_rule_text or "（无）",
+        "",
+        "========== 源文件 ==========",
+        source_text or "（无）",
+        "",
+        "========== 结果文件 ==========",
+        result_text or "（无）",
+    ]
+    if rule_text:
+        lines += ["", "========== 本轮规则文件 ==========", rule_text]
+    return "\n".join(lines)
+
+
+def _run_sop_ai_analysis(round_id: int, entry_id: int):
+    """后台 AI 分析：选规则 → 读文件 → 构建 prompt → 调 AI → 解析判定 → 更新状态。"""
+    from ..ai_engine.ai_provider import AIProviderFactory
+    db = SessionLocal()
+    try:
+        r = db.query(SopRound).filter_by(id=round_id).first()
+        entry = db.query(SopEntry).filter_by(id=entry_id).first()
+        if not r or not entry:
+            logger.warning("[sop] AI分析: 记录不存在 round=%s entry=%s", round_id, entry_id)
+            return
+
+        # 1) 选规则：客户专属优先，无则全局
+        rule = (
+            db.query(SopRuleFile)
+            .filter(SopRuleFile.scope == "customer",
+                    SopRuleFile.customer_name == entry.customer_name,
+                    SopRuleFile.is_active == True)
+            .first()
+        )
+        if not rule:
+            rule = db.query(SopRuleFile).filter(SopRuleFile.scope == "global", SopRuleFile.is_active == True).first()
+        r.rule_used_id = rule.id if rule else None
+
+        # 2) 读文件
+        src_paths = r.source_file_paths or ([r.source_file_path] if r.source_file_path else [])
+        src_parts = []
+        for i, p in enumerate(src_paths):
+            src_parts.append(f"--- 源文件 {i + 1}: {os.path.basename(p)} ---\n{_sop_read_file(p)}")
+        source_text = "\n\n".join(src_parts) if src_parts else "（无源文件）"
+        result_text = _sop_read_file(r.result_file_path)
+        rule_text = _sop_read_file(r.rule_file_path) if r.rule_file_path else None
+        admin_rule_text = _sop_read_file(rule.file_path) if rule else "（无后台规则）"
+
+        # 3) 构建 prompt 并落库（排查用）
+        r.prompt_text = _build_sop_prompt(entry, admin_rule_text, source_text, result_text, rule_text)
+        db.commit()
+
+        # 4) 调 AI
+        provider = AIProviderFactory.create_with_fallback()
+        resp = provider.chat([
+            {"role": "system", "content": SOP_SYSTEM_PROMPT},
+            {"role": "user", "content": r.prompt_text},
+        ]) or ""
+        r.ai_response = resp
+
+        # 5) 解析 JSON + 校验
+        m = re.search(r"\{.*\}", resp, re.DOTALL)
+        if not m:
+            raise ValueError("AI 返回中未找到 JSON")
+        verdict = SopAiVerdict.model_validate(json.loads(m.group(0)))
+        r.ai_analysis = verdict.model_dump()
+        r.ai_comment = verdict.summary
+        r.ai_provider = getattr(provider, "model", None) or "unknown"
+        r.finished_at = datetime.utcnow()
+
+        # 6) 更新状态
+        if verdict.passed:
+            r.status = "ai_passed"
+            entry.status = "ai_passed"
+        else:
+            r.status = "ai_failed"
+            entry.status = "ai_failed"
+        entry.latest_round_id = r.id
+        db.commit()
+        logger.info("[sop] AI分析完成 round=%s passed=%s", round_id, verdict.passed)
+    except Exception as e:
+        db.rollback()
+        logger.exception("[sop] AI分析失败 round=%s", round_id)
+        r = db.query(SopRound).filter_by(id=round_id).first()
+        if r:
+            r.status = "failed"
+            r.error_message = str(e)
+            r.finished_at = datetime.utcnow()
+        entry = db.query(SopEntry).filter_by(id=entry_id).first()
+        if entry:
+            entry.status = "ai_failed"   # 技术失败也回退到"有问题"，允许重传
+            if r:
+                entry.latest_round_id = r.id
+        db.commit()
+    finally:
+        db.close()
