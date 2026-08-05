@@ -126,7 +126,9 @@ async function selectSession(sessionId) {
             document.getElementById('download-btn').style.display = '';
         }
 
-        document.getElementById('chat-title').textContent = data.title || '';
+        const chatTitleEl = document.getElementById('chat-title');
+        chatTitleEl.textContent = data.title || '';
+        chatTitleEl.title = data.title || '';   // 主题过长被省略号截断时，悬停可看完整内容
         _highlightActiveSession();
     } catch (e) {
         console.error('加载会话失败:', e);

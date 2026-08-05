@@ -97,7 +97,7 @@ header {
 /* ========== Main Content ========== */
 .main-content {
     display: grid;
-    grid-template-columns: 260px 1fr;
+    grid-template-columns: 260px minmax(0, 1fr);
     gap: 20px;
     flex: 1;
     min-height: 0;
@@ -112,6 +112,7 @@ header {
     display: flex;
     flex-direction: column;
     min-height: 0;
+    min-width: 0;
 }
 
 .sidebar-header {
@@ -225,6 +226,7 @@ header {
     display: flex;
     flex-direction: column;
     min-height: 0;
+    min-width: 0;
     position: relative;
 }
 
@@ -234,17 +236,26 @@ header {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 12px;
     flex-shrink: 0;
+    min-width: 0;
 }
 
+/* 主题超长时省略号截断，避免把下载/清空按钮挤出可视区 */
 .chat-header h2 {
     color: #1976d2;
     font-size: 18px;
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .chat-actions {
     display: flex;
     gap: 8px;
+    flex-shrink: 0;
 }
 
 /* ========== Buttons ========== */
@@ -345,6 +356,7 @@ header {
     display: flex;
     flex-direction: column;
     max-width: 90%;
+    min-width: 0;
 }
 
 .message.user {
@@ -373,6 +385,7 @@ header {
     word-break: break-word;
     overflow-wrap: break-word;
     max-width: 100%;
+    min-width: 0;
     overflow: hidden;
 }
 

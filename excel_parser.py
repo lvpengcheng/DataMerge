@@ -1867,7 +1867,9 @@ class IntelligentExcelParser:
                 # 计算转换得分
                 if first_row_features.text_ratio > 0.6:  # 第一行是文本为主
                     avg_number_ratio = sum(f.number_ratio for f in rest_rows_features) / len(rest_rows_features)
-                    if avg_number_ratio > 0.3:  # 后续行数值为主
+                    # 后续行须为真实数据行：至少 2 个非空（排除"只有序号列、其余空"的空数据行，
+                    # 否则考勤表缺勤行会被当成数据起点，把前面真实文本数据行误并进表头）
+                    if avg_number_ratio > 0.3 and all(f.non_empty_count >= 2 for f in rest_rows_features):  # 后续行数值为主
                         transition_score = (first_row_features.text_ratio + avg_number_ratio) / 2
 
                         # 检查后续行的一致性
@@ -1916,14 +1918,29 @@ class IntelligentExcelParser:
         if len(row_features_list) < 2:
             return None
 
+        # 策略0：序号列从 1 开始且连续递增的行是强数据信号（明细/考勤表常见），
+        # 要求该行至少 2 个非空（排除"只有序号列"的空数据行）。
+        # 典型：考勤表表头夹着"日期数字行+星期行"（数字占比高），各种"文本→数字"转换
+        # 启发式会被表头数字行/空数据行骗到，而"序号=1 起"的行直接锁定数据起点。
+        for row, features in row_features_list:
+            if features.non_empty_count >= 2 and features.has_sequence_number \
+                    and features.sequence_value == 1:
+                nxt = next((f for r, f in row_features_list if r == row + 1), None)
+                if nxt is not None and nxt.has_sequence_number and nxt.sequence_value == 2:
+                    return row
+
         # 策略1：找到数值比例突然增加的行（表头->数据的转换点）
         for i in range(1, len(row_features_list)):
             prev_row, prev_features = row_features_list[i - 1]
             curr_row, curr_features = row_features_list[i]
 
             # 检查是否是表头到数据的转换
-            # 条件：前一行文本为主，当前行有较多数值
-            if prev_features.text_ratio > 0.7 and curr_features.number_ratio > 0.2:
+            # 条件：前一行文本为主，当前行有较多数值，且当前行至少 2 个非空单元格。
+            #   non_empty>=2 排除"只有序号列、其余空"的伪数据行（考勤表里某人缺勤时整行
+            #   只剩顺序号数字），否则它会被当成第一条数据行，把前面真实的文本数据行
+            #   （姓名+考勤符号）反向误并进表头。
+            if prev_features.text_ratio > 0.7 and curr_features.number_ratio > 0.2 \
+                    and curr_features.non_empty_count >= 2:
                 # 额外验证：检查后续几行是否结构一致
                 if i + 1 < len(row_features_list):
                     next_row, next_features = row_features_list[i + 1]
