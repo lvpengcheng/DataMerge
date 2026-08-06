@@ -16,3 +16,7 @@ deploy.config.*.json
 
 # 本地配置（含API密钥，勿提交）
 /.env
+
+# Python编译缓存
+__pycache__/
+*.pyc
