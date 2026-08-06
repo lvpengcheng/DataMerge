@@ -117,16 +117,18 @@ class BaseAIProvider(ABC):
         """生成完成文本（单轮对话）"""
         pass
 
-    def chat_stream(self, messages: List[Dict[str, str]], chunk_callback: callable = None, **kwargs) -> str:
+    def chat_stream(self, messages: List[Dict[str, str]], chunk_callback: callable = None,
+                    thinking_callback: callable = None, **kwargs) -> str:
         """流式对话接口 - 逐块输出并返回完整内容
 
         Args:
             messages: OpenAI 格式消息列表 [{"role":"system/user/assistant","content":"..."}]
             chunk_callback: 每个文本块的回调函数
+            thinking_callback: 推理模型思考过程回调（Base 默认实现不支持，仅兼容签名）
         Returns:
             完整的回复文本
         """
-        # 默认回退到非流式 chat
+        # 默认回退到非流式 chat（thinking_callback 仅兼容签名，非流式实现无思考过程可回调）
         result = self.chat(messages, **kwargs)
         if chunk_callback:
             chunk_callback(result)
@@ -1000,8 +1002,13 @@ class OpenAIProvider(BaseAIProvider):
             logger.error(f"_openai_chat 调用失败: {e}, response type: {type(response) if 'response' in locals() else 'N/A'}")
             raise
 
-    def _openai_chat_stream(self, messages, temperature=0.1, max_tokens=None, **kwargs):
-        """流式调用 OpenAI SDK，yield (content_chunk, finish_reason)"""
+    def _openai_chat_stream(self, messages, temperature=0.1, max_tokens=None,
+                            thinking_callback=None, **kwargs):
+        """流式调用 OpenAI SDK，yield (content_chunk, finish_reason)
+
+        thinking_callback: DeepSeek 推理模型思考阶段（content 未出）只发 reasoning_content，
+        通过该回调逐块透传思考过程，供前端流式展示；不污染 content 流。
+        """
         filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ("stream",)}
         stream = self._client.chat.completions.create(
             model=self.model,
@@ -1021,6 +1028,14 @@ class OpenAIProvider(BaseAIProvider):
                     finish_reason = fr
                 if content:
                     yield content, finish_reason
+                elif thinking_callback:
+                    # DeepSeek 推理模型：content 未出现前，reasoning_content 是思考过程 token
+                    try:
+                        reasoning = delta.reasoning_content
+                    except Exception:
+                        reasoning = None
+                    if reasoning:
+                        thinking_callback(reasoning)
         # 最后 yield 一个空内容带 finish_reason，确保调用方能拿到
         yield "", finish_reason
 
@@ -1149,10 +1164,16 @@ if __name__ == "__main__":
         content, _ = self._openai_chat(messages, **kwargs)
         return content
 
-    def chat_stream(self, messages: List[Dict[str, str]], chunk_callback: callable = None, **kwargs) -> str:
-        """流式对话接口"""
+    def chat_stream(self, messages: List[Dict[str, str]], chunk_callback: callable = None,
+                    thinking_callback: callable = None, **kwargs) -> str:
+        """流式对话接口。
+
+        thinking_callback: 推理模型思考过程逐块回调（DeepSeek reasoning_content），
+        与正式内容(chunk_callback)分开，避免污染最终结果。
+        """
         full_content = ""
-        for text_chunk, _fr in self._openai_chat_stream(messages, **kwargs):
+        for text_chunk, _fr in self._openai_chat_stream(
+                messages, thinking_callback=thinking_callback, **kwargs):
             if text_chunk:
                 full_content += text_chunk
                 if chunk_callback:
@@ -1572,8 +1593,13 @@ if __name__ == "__main__":
         )
         return content
 
-    def chat_stream(self, messages: List[Dict[str, str]], chunk_callback: callable = None, **kwargs) -> str:
-        """流式对话接口"""
+    def chat_stream(self, messages: List[Dict[str, str]], chunk_callback: callable = None,
+                    thinking_callback: callable = None, **kwargs) -> str:
+        """流式对话接口。
+
+        thinking_callback: 仅兼容统一调用签名（Claude 的思考在 content blocks 内，
+        无独立 reasoning_content 流，暂不透传；必须显式接住，否则会误传给 API 报错）。
+        """
         anthropic_messages = []
         system_message = ""
         for msg in messages:
@@ -1582,7 +1608,8 @@ if __name__ == "__main__":
             else:
                 anthropic_messages.append({"role": msg["role"], "content": msg["content"]})
 
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ("model", "messages", "max_tokens", "system")}
+        filtered_kwargs = {k: v for k, v in kwargs.items()
+                           if k not in ("model", "messages", "max_tokens", "system", "thinking_callback")}
         full_content = ""
         for text_chunk, _sr in self._claude_chat_stream(
             system_message or "", anthropic_messages,

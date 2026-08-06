@@ -296,8 +296,18 @@ function _addMessage(role, content, isStreaming) {
     return contentDiv;
 }
 
-function _updateStreamingMessage(contentDiv, text) {
-    contentDiv.innerHTML = _renderMarkdown(text);
+function _escape(s) {
+    return String(s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+}
+
+// 流式渲染：思考过程（灰色区，不转 markdown 避免样式污染）+ 正式内容
+function _updateStreamingMessage(contentDiv, text, thinkingText) {
+    if (thinkingText) {
+        contentDiv.innerHTML =
+            `<div class="thinking-block">${_escape(thinkingText)}</div>` + _renderMarkdown(text || '');
+    } else {
+        contentDiv.innerHTML = _renderMarkdown(text);
+    }
     const container = document.getElementById('chat-messages');
     container.scrollTop = container.scrollHeight;
 }
@@ -402,6 +412,7 @@ function _sendChatMessage(text) {
 async function _fetchSSE(url, options) {
     let streamingDiv = null;
     let fullContent = '';
+    let thinkingText = '';   // DeepSeek 推理模型思考过程（灰色区显示，不进入最终内容）
 
     try {
         if (!options.headers) options.headers = {};
@@ -415,7 +426,9 @@ async function _fetchSSE(url, options) {
         }
 
         _removeLastAssistantMessage();
-        streamingDiv = _addMessage('assistant', '', true);
+        // 首块到达前显示占位提示（DeepSeek 等模型整理规则时首 token 可能需数秒~数十秒，
+        // 避免用户误以为请求卡死）；首块到达后内容自然替换占位。
+        streamingDiv = _addMessage('assistant', 'AI 正在思考…', true);
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
@@ -434,12 +447,23 @@ async function _fetchSSE(url, options) {
                 if (!jsonStr) continue;
                 try {
                     const data = JSON.parse(jsonStr);
-                    if (data.type === 'chunk') {
+                    if (data.type === 'thinking') {
+                        // DeepSeek 推理模型思考过程：灰色区流式显示（不进入最终内容）
+                        thinkingText += data.content;
+                        _updateStreamingMessage(streamingDiv, fullContent, thinkingText);
+                    } else if (data.type === 'chunk') {
                         fullContent += data.content;
-                        _updateStreamingMessage(streamingDiv, fullContent);
+                        _updateStreamingMessage(streamingDiv, fullContent, thinkingText);
+                    } else if (data.type === 'ping') {
+                        // 首块等待期心跳（DeepSeek 推理模型思考阶段可能 1 分钟+ 无 content）：
+                        // 首块未到且无思考内容时更新占位为"已等待 N 秒"
+                        if (!fullContent && !thinkingText) {
+                            _updateStreamingMessage(streamingDiv,
+                                `AI 正在思考…（已等待 ${data.elapsed || ''} 秒）`);
+                        }
                     } else if (data.type === 'complete') {
                         fullContent = data.content;
-                        _updateStreamingMessage(streamingDiv, fullContent);
+                        _updateStreamingMessage(streamingDiv, fullContent, thinkingText);
                         _finishStreamingMessage(streamingDiv);
                         if (data.session_id) {
                             _currentSessionId = data.session_id;

@@ -203,8 +203,12 @@ class RuleOrganizer:
         file_passwords: Optional[Dict[str, str]] = None,
         user_message: Optional[str] = None,
         chunk_callback: Any = None,
+        thinking_callback: Any = None,
     ) -> str:
-        """流式整理规则：逐块回调 + 返回完整结果"""
+        """流式整理规则：逐块回调 + 返回完整结果。
+
+        thinking_callback: 推理模型思考过程逐块回调（与正式内容分开，不污染结果）。
+        """
         source_info = self._extract_source_structures(source_files, file_passwords)
         target_info = self._extract_target_structure(target_file, file_passwords)
         design_info = self._extract_design_docs(design_doc_files or [])
@@ -213,7 +217,8 @@ class RuleOrganizer:
         total_len = sum(len(m["content"]) for m in messages)
         logger.info(f"[规则整理-流式] 开始调用 AI, 消息总长度: {total_len}")
 
-        result = self.ai_provider.chat_stream(messages, chunk_callback=chunk_callback)
+        result = self.ai_provider.chat_stream(
+            messages, chunk_callback=chunk_callback, thinking_callback=thinking_callback)
 
         # 追加源数据格式段落，使 rules.md 更完整
         source_section = format_source_data_section(source_info)
@@ -228,10 +233,12 @@ class RuleOrganizer:
         self,
         messages: List[Dict[str, str]],
         chunk_callback: Any = None,
+        thinking_callback: Any = None,
     ) -> str:
         """多轮追问：接受完整对话历史，返回 AI 新回复"""
         logger.info(f"[规则整理-追问] 消息轮数: {len(messages)}")
-        result = self.ai_provider.chat_stream(messages, chunk_callback=chunk_callback)
+        result = self.ai_provider.chat_stream(
+            messages, chunk_callback=chunk_callback, thinking_callback=thinking_callback)
         logger.info(f"[规则整理-追问] AI 返回, 结果长度: {len(result)}")
         return result
 

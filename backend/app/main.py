@@ -7,6 +7,7 @@ import aspose_init  # noqa: F401
 
 import os
 import json
+import time
 import logging
 import asyncio
 import shutil
@@ -309,6 +310,16 @@ async def organize_rules_stream_endpoint(
             except Exception:
                 pass
 
+        def thinking_cb(text):
+            # DeepSeek 推理模型思考过程：独立事件，前端灰色区显示，不污染正式内容
+            try:
+                loop.call_soon_threadsafe(
+                    logs_queue.put_nowait,
+                    json.dumps({"type": "thinking", "content": text}, ensure_ascii=False),
+                )
+            except Exception:
+                pass
+
         try:
             provider = AIProviderFactory.create_provider(ai_provider)
             organizer = RuleOrganizer(provider)
@@ -319,6 +330,7 @@ async def organize_rules_stream_endpoint(
                 file_passwords=passwords_dict,
                 user_message=user_message,
                 chunk_callback=chunk_cb,
+                thinking_callback=thinking_cb,
             )
 
             # ---- 持久化会话 ----
@@ -386,9 +398,19 @@ async def organize_rules_stream_endpoint(
     organize_task = loop.run_in_executor(executor, _run_organize)
 
     async def stream_output():
+        _start = time.time()
         try:
             while True:
-                msg = await logs_queue.get()
+                try:
+                    msg = await asyncio.wait_for(logs_queue.get(), timeout=10)
+                except asyncio.TimeoutError:
+                    # 首块等待期心跳：DeepSeek 推理模型思考阶段只发 reasoning_content 不发
+                    # content（可能持续 1 分钟+），前端长时间无消息会误以为卡死。心跳让
+                    # 前端显示"AI 正在思考…（已等待 N 秒）"，感知请求仍在进行。
+                    yield "data: " + json.dumps(
+                        {"type": "ping", "elapsed": int(time.time() - _start)},
+                        ensure_ascii=False) + "\n\n"
+                    continue
                 if msg is None:
                     break
                 yield f"data: {msg}\n\n"
@@ -437,10 +459,21 @@ async def rules_chat_endpoint(
             except Exception:
                 pass
 
+        def thinking_cb(text):
+            # DeepSeek 推理模型思考过程：独立事件，前端灰色区显示，不污染正式内容
+            try:
+                loop.call_soon_threadsafe(
+                    logs_queue.put_nowait,
+                    json.dumps({"type": "thinking", "content": text}, ensure_ascii=False),
+                )
+            except Exception:
+                pass
+
         try:
             provider = AIProviderFactory.create_provider(ai_provider_name)
             organizer = RuleOrganizer(provider)
-            full_content = organizer.chat_followup(messages, chunk_callback=chunk_cb)
+            full_content = organizer.chat_followup(
+                messages, chunk_callback=chunk_cb, thinking_callback=thinking_cb)
 
             # 追问后，如果AI重新生成了完整规则文档但缺少源数据格式段落，
             # 从历史消息中恢复该段落（首次生成时已追加在第一个assistant回复中）
@@ -514,9 +547,17 @@ async def rules_chat_endpoint(
     chat_task = loop.run_in_executor(executor, _run_chat)
 
     async def stream_output():
+        _start = time.time()
         try:
             while True:
-                msg = await logs_queue.get()
+                try:
+                    msg = await asyncio.wait_for(logs_queue.get(), timeout=10)
+                except asyncio.TimeoutError:
+                    # 首块等待期心跳（同 organize 端点，见上）
+                    yield "data: " + json.dumps(
+                        {"type": "ping", "elapsed": int(time.time() - _start)},
+                        ensure_ascii=False) + "\n\n"
+                    continue
                 if msg is None:
                     break
                 yield f"data: {msg}\n\n"

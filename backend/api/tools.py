@@ -1280,6 +1280,12 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
         f = p.get("source_file")
         if f and f != req.main_file and f in fp_by_file and f not in src_files:
             src_files.append(f)
+    # 配了关联键的非主表上传文件也纳入方案角色：否则"上传 N 个文件、另存为新方案"仍只有
+    # 参与映射的 M 个角色，套用时上传 N 个文件会报"方案需要 M 张表，实际上传 N 张"。
+    # （key_map 覆盖所有上传文件，含主表；主表已单独处理，这里只补对照表）
+    for f, k in (req.key_map or {}).items():
+        if f and f != req.main_file and f in fp_by_file and k and f not in src_files:
+            src_files.append(f)
     source_fps = [fp_by_file[f] for f in src_files]
 
     # 角色有序数组（0=主表, 1..=对照表）：同结构对照表指纹相同，fp 无法作唯一键，
