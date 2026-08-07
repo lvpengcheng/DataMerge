@@ -17,6 +17,8 @@ let _integrateSchemeList = [];   // 方案列表页数据（GET /schemes）
 let _intMode = 'create';         // create | apply | edit
 let _intEditingSchemeId = null;  // edit 模式：正在修改的方案 id
 let _intApplyTarget = null;      // apply 模式：目标方案 {id,name}
+let _intSchemePage = 1;          // 方案列表分页：当前页
+let _intSchemeFilterKw = '';     // 方案列表筛选：关键词
 const _ALLOWED_EXT = new Set(['xlsx', 'xls', 'xlsm']);
 
 async function _alertErr(resp, fallback) {
@@ -254,22 +256,61 @@ const Tools = {
         }
     },
 
+    // 方案列表：筛选（按名称）+ 分页（每页 10 条）
+    _intOnFilter(v) {
+        _intSchemeFilterKw = (v || '').trim();
+        _intSchemePage = 1;
+        this._intRenderSchemeList();
+    },
+
+    _intGoPage(p) {
+        _intSchemePage = p;
+        this._intRenderSchemeList();
+    },
+
+    _intRenderPagination(total) {
+        const box = document.getElementById('int-scheme-pagination');
+        if (!box) return;
+        const pageSize = 10;
+        const totalPages = Math.max(1, Math.ceil(total / pageSize));
+        if (totalPages <= 1) { box.innerHTML = ''; return; }
+        let html = '';
+        for (let p = 1; p <= totalPages; p++) {
+            html += `<button class="btn btn-sm ${p === _intSchemePage ? 'btn-primary' : ''}" onclick="Tools._intGoPage(${p})">${p}</button>`;
+        }
+        html += `<span style="margin-left:8px;font-size:12px;color:#888;">共 ${total} 个方案</span>`;
+        box.innerHTML = html;
+    },
+
     _intRenderSchemeList() {
         const tbody = document.querySelector('#integrate-scheme-table tbody');
         if (!tbody) return;
-        if (!_integrateSchemeList.length) {
-            tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#999;">暂无方案，点击「新增方案」创建</td></tr>';
+        const kw = _intSchemeFilterKw.toLowerCase();
+        const filtered = kw
+            ? _integrateSchemeList.filter(s => (s.name || '').toLowerCase().includes(kw))
+            : _integrateSchemeList;
+        const pageSize = 10;
+        const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+        if (_intSchemePage > totalPages) _intSchemePage = totalPages;
+        const pageItems = filtered.slice((_intSchemePage - 1) * pageSize, _intSchemePage * pageSize);
+
+        if (!filtered.length) {
+            tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#999;">' +
+                (kw ? '没有匹配的方案' : '暂无方案，点击「新增方案」创建') + '</td></tr>';
+            this._intRenderPagination(0);
             return;
         }
         const canApply = AUTH.hasPerm('tools.data_integrate.apply');
         const canEditPerm = AUTH.hasPerm('tools.data_integrate.edit');
         const canDelPerm = AUTH.hasPerm('tools.data_integrate.delete');
-        tbody.innerHTML = _integrateSchemeList.map((s, i) => {
-            const t = (s.created_at || '').replace('T', ' ').slice(0, 19);
+        tbody.innerHTML = pageItems.map(s => {
+            // 最后修改时间：有 updated_at 用之，否则回退创建时间
+            const t = ((s.updated_at || s.created_at) || '').replace('T', ' ').slice(0, 19);
             const btns = [];
-            if (canApply) btns.push(`<button class="btn btn-sm btn-primary int-row-apply" data-i="${i}">应用</button>`);
-            if (canEditPerm && s.can_edit) btns.push(`<button class="btn btn-sm int-row-edit" data-i="${i}">修改</button>`);
-            if (canDelPerm && s.can_edit) btns.push(`<button class="btn btn-sm int-row-del" data-i="${i}">删除</button>`);
+            if (canApply) btns.push(`<button class="btn btn-sm btn-primary int-row-apply" data-id="${s.id}">应用</button>`);
+            // 同组织可见即可修改配置（非创建人只能另存为，保存区会禁用「保存修改」）
+            if (canEditPerm && s.can_modify) btns.push(`<button class="btn btn-sm int-row-edit" data-id="${s.id}">修改</button>`);
+            if (canDelPerm && s.can_edit) btns.push(`<button class="btn btn-sm int-row-del" data-id="${s.id}">删除</button>`);
             return `<tr>
                 <td>${_escape(s.name)}</td>
                 <td style="text-align:center;">${s.file_count || ''}</td>
@@ -278,12 +319,14 @@ const Tools = {
                 <td style="white-space:nowrap;">${btns.join(' ') || '<span style="color:#bbb;">无权限</span>'}</td>
             </tr>`;
         }).join('');
+        const findById = (id) => _integrateSchemeList.find(x => x.id === id) || null;
         tbody.querySelectorAll('.int-row-apply').forEach(b =>
-            b.addEventListener('click', () => this._intStartApply(_integrateSchemeList[parseInt(b.dataset.i, 10)])));
+            b.addEventListener('click', () => this._intStartApply(findById(parseInt(b.dataset.id, 10)))));
         tbody.querySelectorAll('.int-row-edit').forEach(b =>
-            b.addEventListener('click', () => this._intStartEdit(_integrateSchemeList[parseInt(b.dataset.i, 10)])));
+            b.addEventListener('click', () => this._intStartEdit(findById(parseInt(b.dataset.id, 10)))));
         tbody.querySelectorAll('.int-row-del').forEach(b =>
-            b.addEventListener('click', () => this._intDeleteSchemeRow(_integrateSchemeList[parseInt(b.dataset.i, 10)])));
+            b.addEventListener('click', () => this._intDeleteSchemeRow(findById(parseInt(b.dataset.id, 10)))));
+        this._intRenderPagination(filtered.length);
     },
 
     _intResetWork() {
@@ -629,10 +672,17 @@ const Tools = {
         } else if (_intMode === 'edit') {
             const cur = _integrateSchemeList.find(s => s.id === _intEditingSchemeId);
             if (nameInp && cur) nameInp.value = cur.name;
-            if (saveBtn) saveBtn.textContent = '保存修改';
+            const canOverwrite = !!(cur && cur.can_edit);   // 仅创建人/管理员可保存修改覆盖原方案
+            if (saveBtn) {
+                saveBtn.textContent = '保存修改';
+                saveBtn.disabled = !canOverwrite;
+                saveBtn.title = canOverwrite ? '' : '仅创建人/管理员可保存修改到原方案，其他人请使用「另存为」';
+            }
             if (saveAsBtn) saveAsBtn.style.display = 'inline-block';   // 另存为：原方案不动，按修改后的配置新建一个方案
             const lbl = document.getElementById('int-save-label');
-            if (lbl) lbl.textContent = '保存修改到方案：';
+            if (lbl) lbl.textContent = canOverwrite
+                ? '保存修改到方案：'
+                : '保存修改到方案（非创建人仅可另存为）：';
         }
         if (saveBtn) saveBtn.addEventListener('click', () => this._intSaveScheme(false));
         if (saveAsBtn) saveAsBtn.addEventListener('click', () => this._intSaveScheme(true));
@@ -701,9 +751,14 @@ const Tools = {
     async _intSaveScheme(asNew) {
         const name = (document.getElementById('int-scheme-name').value || '').trim();
         if (!name) { alert('请填写方案名称'); return; }
-        if (asNew && _intMode === 'edit' && _intEditingSchemeId) {
-            const cur = _integrateSchemeList.find(s => s.id === _intEditingSchemeId);
-            if (cur && name === cur.name) { alert('另存为需使用新的方案名称，请修改后再保存'); return; }
+        if (asNew) {
+            if (_intMode === 'edit' && _intEditingSchemeId) {
+                const cur = _integrateSchemeList.find(s => s.id === _intEditingSchemeId);
+                if (cur && name === cur.name) { alert('另存为需使用新的方案名称，请修改后再保存'); return; }
+            }
+            // 重名预检：与其它方案同名（后端也有同名校验兜底）
+            const dup = _integrateSchemeList.find(s => s.name === name && s.id !== _intEditingSchemeId);
+            if (dup) { alert(`已存在同名方案「${name}」，请换个名称`); return; }
         }
         const key_map = {};
         document.querySelectorAll('.int-key').forEach(s => { key_map[s.dataset.file] = s.value; });

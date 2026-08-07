@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>智能小工具 - 智算</title>
-    <link rel="stylesheet" href="/static/css/admin.css?v=20260414t">
+    <link rel="stylesheet" href="/static/css/admin.css?v=20260807a">
     <link rel="stylesheet" href="/static/css/tools.css?v=20260616a">
 </head>
 <body>
@@ -179,9 +179,11 @@
 
                 <!-- 视图A：方案列表 -->
                 <div id="integrate-scheme-list-view">
-                    <div class="desc">同组织/子组织创建的整合对比方案。可新增方案，或对已有方案应用（按方案配置回填计算）、修改、删除。</div>
-                    <div class="actions" style="margin:12px 0;">
+                    <div class="desc">同组织/子组织创建的整合对比方案。可新增方案，或对已有方案应用（按方案配置回填计算）、修改、删除。非创建人修改时只能「另存为」。</div>
+                    <div class="actions" style="margin:12px 0;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
                         <button class="btn btn-primary" id="btn-int-new-scheme" data-perm="tools.data_integrate.create">+ 新增方案</button>
+                        <input type="text" id="int-scheme-filter" placeholder="按方案名称筛选..." style="padding:5px 10px;border:1px solid #ddd;border-radius:4px;min-width:200px;"
+                            oninput="Tools._intOnFilter(this.value)">
                         <span class="status" id="int-list-status"></span>
                     </div>
                     <table class="data-table" id="integrate-scheme-table">
@@ -190,12 +192,13 @@
                                 <th>方案名称</th>
                                 <th>参与表数</th>
                                 <th>创建人</th>
-                                <th>创建时间</th>
+                                <th>最后修改时间</th>
                                 <th>操作</th>
                             </tr>
                         </thead>
                         <tbody></tbody>
                     </table>
+                    <div id="int-scheme-pagination" style="margin-top:10px;display:flex;align-items:center;gap:4px;flex-wrap:wrap;"></div>
                 </div>
 
                 <!-- 视图B：上传 + 向导（新增/应用/修改共用） -->
@@ -406,6 +409,6 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260722a"></script>
-    <script src="/static/js/tools.js?v=20260805f"></script>
+    <script src="/static/js/tools.js?v=20260807b"></script>
 </body>
 </html>

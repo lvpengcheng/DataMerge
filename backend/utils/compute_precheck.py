@@ -18,7 +18,7 @@ import shutil
 import logging
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,8 @@ class PrecheckResult:
     rename_candidates: List[Dict[str, Any]] = field(default_factory=list)
     missing_columns: List[Dict[str, Any]] = field(default_factory=list)
     ai_suggestions: List[Dict[str, Any]] = field(default_factory=list)
+    # 上传文件的实际列路径全集（file > sheet > col），供前端手动选择下拉全量列出
+    actual_paths: List[str] = field(default_factory=list)
     history_warnings: List[str] = field(default_factory=list)
     # 目标模板表（②模板目标侧）：歧义时的候选，交前端人工选择；确认后的映射透传给计算
     target_candidates: List[Dict[str, Any]] = field(default_factory=list)
@@ -179,10 +181,10 @@ def precheck_compute(
                     missing = _extract_missing_columns(source_structure, input_files, err)
                     result.missing_columns = missing
                     logger.warning(f"[Precheck] 表头匹配失败: {err}")
-                    # 步骤 4：调 AI 给建议
+                    # 步骤 4：调 AI 给建议（同时返回上传文件实际列全集，前端手动选择用）
                     if ai_provider_name:
                         try:
-                            result.ai_suggestions = _ai_suggest_column_mapping(
+                            result.ai_suggestions, result.actual_paths = _ai_suggest_column_mapping(
                                 missing, source_structure, input_files, ai_provider_name
                             )
                         except Exception as ai_err:
@@ -304,7 +306,11 @@ def _extract_missing_columns(
     files = source_structure.get("files", {}) if isinstance(source_structure, dict) else {}
 
     for file_name, file_data in files.items():
-        if not isinstance(file_data, dict) or "error" in file_data:
+        if not isinstance(file_data, dict):
+            continue
+        # 训练文件带 error 但仍有 sheets 结构时也尽力提取列（避免训练侧解析失败的文件
+        # 在手动选择里整体消失、期望列全漏）
+        if "error" in file_data and not file_data.get("sheets"):
             continue
         for sheet_name, sheet_info in (file_data.get("sheets") or {}).items():
             headers = sheet_info.get("headers") if isinstance(sheet_info, dict) else None
@@ -378,8 +384,14 @@ def _ai_suggest_column_mapping(
     source_structure: dict,
     input_files: List[str],
     ai_provider_name: str,
-) -> List[Dict[str, Any]]:
-    """调用 AI 在「训练期望列」与「上传文件实际列」之间给出映射建议"""
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """调用 AI 在「训练期望列」与「上传文件实际列」之间给出映射建议。
+
+    Returns: (suggestions, actual_paths)
+        - suggestions: AI 建议的映射列表（可能为空/只覆盖部分期望列）
+        - actual_paths: 上传文件实际列路径全集，前端手动选择下拉全量列出
+          （AI 未建议的期望列用户也要能手动指定，不能只给 AI 提到过的路径）
+    """
     expected_paths = []
     for file_name, file_data in (source_structure.get("files") or {}).items():
         if not isinstance(file_data, dict) or "error" in file_data:
@@ -392,7 +404,7 @@ def _ai_suggest_column_mapping(
 
     actual_paths = _collect_uploaded_columns(input_files)
     if not expected_paths or not actual_paths:
-        return []
+        return [], actual_paths
 
     prompt = _build_column_match_prompt(expected_paths, actual_paths)
 
@@ -406,29 +418,45 @@ def _ai_suggest_column_mapping(
         raw = provider.chat(messages, temperature=0.1, max_tokens=2000)
     except Exception as e:
         logger.warning(f"[Precheck/AI] 调用失败: {e}")
-        return []
+        return [], actual_paths
 
-    return _parse_ai_response(raw)
+    return _parse_ai_response(raw), actual_paths
 
 
 def _collect_uploaded_columns(input_files: List[str]) -> List[str]:
-    """解析上传文件，列出 {file > sheet > col} 路径列表"""
+    """解析上传文件，列出 {file > sheet > col} 路径列表。
+
+    解析失败的文件用 openpyxl 兜底提取列，保证所有上传文件都进手动选择下拉
+    （上传文件多时，个别文件解析失败若被跳过，用户就选不到该文件）。
+    """
+    from .fast_header_matcher import fallback_headers_openpyxl
     paths = []
     try:
         from excel_parser import IntelligentExcelParser
         parser = IntelligentExcelParser()
         for fp in input_files:
+            fname = os.path.basename(fp)
+            got = False
             try:
                 results = parser.parse_excel_file(fp, max_data_rows=1, read_formulas=False)
-                fname = os.path.basename(fp)
                 for sheet_data in results:
                     sheet_name = sheet_data.sheet_name
                     for region in (sheet_data.regions or []):
                         head = region.head_data or {}
                         for col in head.keys():
                             paths.append(f"{fname} > {sheet_name} > {col}")
+                got = True
             except Exception as e:
                 logger.warning(f"[Precheck/AI] 解析上传文件 {fp} 失败: {e}")
+            if not got:
+                # openpyxl 兜底，保证文件不消失
+                try:
+                    fh = fallback_headers_openpyxl(fp)
+                    for sheet_name, cols in fh.items():
+                        for col in cols:
+                            paths.append(f"{fname} > {sheet_name} > {col}")
+                except Exception:
+                    pass
     except Exception as e:
         logger.warning(f"[Precheck/AI] 加载 parser 失败: {e}")
     return paths

@@ -167,6 +167,20 @@ header {
     border-color: #aaa;
 }
 
+/* 不可用按钮：置灰 + 禁止光标（非创建人保存修改、未满足条件等场景） */
+.btn:disabled,
+.btn.disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    background: #f5f5f5;
+    color: #999;
+}
+
+.btn:disabled:hover,
+.btn.disabled:hover {
+    border-color: #ddd;
+}
+
 .btn-primary {
     background: #1976d2;
     color: white;

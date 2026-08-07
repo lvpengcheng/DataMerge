@@ -385,7 +385,9 @@ class IntegrateTemplate(Base):
     config = Column(JSON, nullable=False)
     org_id = Column(Integer, index=True, nullable=True)          # 创建人组织，用于组织树可见性过滤
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)  # 创建人，用于展示+改删鉴权
-    creator = relationship("User")
+    creator = relationship("User", foreign_keys=[created_by])
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)  # 最后修改人（另存为/保存修改时更新）
+    updater = relationship("User", foreign_keys=[updated_by])
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

@@ -30,7 +30,8 @@ RENAME_AUTO_SCORE = 0.85       # 综合分门槛（列头+文件名加权）
 RENAME_AUTO_LEAD = 0.15        # 综合分领先第二名的差距
 RENAME_JACCARD_AUTO = 0.85     # 列头主导判定：jaccard 单独门槛（不依赖文件名）
 RENAME_JACCARD_LEAD = 0.20     # 列头主导判定：jaccard 领先第二名的差距
-RENAME_CANDIDATE_FLOOR = 0.30  # 候选展示最低分（低于此分根本不算候选）
+RENAME_CANDIDATE_FLOOR = 0.10  # 候选展示最低分（低于此分不按常规评分显示；
+                               # 若某上传文件对所有期望都低于此分，仍兜底列出全部期望供手动选择）
 RENAME_HEADER_WEIGHT = 0.7
 RENAME_NAME_WEIGHT = 0.3
 
@@ -422,16 +423,25 @@ def auto_rename_uploaded_by_combined_score(
             except Exception as e:
                 logger.warning(f"[Rename] 改名失败 '{u_name}' → '{auto_target}': {e}")
 
-    # 第二遍：剩下的算候选
+    # 第二遍：剩下的算候选。未匹配的上传文件必须始终能手动选择——
+    # 1) 候选全量（不再截断 top-5）：上传/期望文件多时，被截断的期望候选用户就选不到；
+    # 2) 即使与所有期望文件的分数都低于 RENAME_CANDIDATE_FLOOR（列头/文件名都不像，
+    #    正是"名称、列头都不一致"的场景），也要兜底列出全部剩余期望作候选，
+    #    否则该文件不会出现在前端选择列表里，用户想手动指定也选不到。
     ambiguous: List[Dict[str, object]] = []
     remaining_headers: Dict[str, set] = {}
-    for u_name, ranked in top_by_uploaded.items():
-        if u_name in consumed_uploaded:
-            continue
+    all_remaining_expected = [e for e in expected_names if e not in consumed_expected]
+
+    # 全量配对（按 uploaded 分组，分数降序）——不依赖 top_by_uploaded 的 top-5 截断
+    pairs_by_uploaded: Dict[str, List[Tuple[float, str, float, float]]] = {}
+    for score, u, e, j, n in scored_pairs:
+        if u not in consumed_uploaded and e not in consumed_expected:
+            pairs_by_uploaded.setdefault(u, []).append((score, e, j, n))
+
+    for u_name, ranked in pairs_by_uploaded.items():
+        ranked.sort(key=lambda x: -x[0])
         candidates = []
         for score, e, j, n in ranked:
-            if e in consumed_expected:
-                continue
             if score < RENAME_CANDIDATE_FLOOR:
                 continue
             candidates.append({
@@ -440,10 +450,23 @@ def auto_rename_uploaded_by_combined_score(
                 "header_jaccard": round(j, 3),
                 "name_similarity": round(n, 3),
             })
+        if not candidates:
+            # 兜底：全部剩余期望列为候选（低分也列出，按分数排序），
+            # 保证该上传文件始终出现在手动选择列表里
+            for e_name in all_remaining_expected:
+                m = next((s for s in scored_pairs if s[1] == u_name and s[2] == e_name), None)
+                if m:
+                    candidates.append({
+                        "expected": e_name,
+                        "score": round(m[0], 3),
+                        "header_jaccard": round(m[3], 3),
+                        "name_similarity": round(m[4], 3),
+                    })
+            candidates.sort(key=lambda c: -c["score"])
         if candidates:
             ambiguous.append({
                 "uploaded": u_name,
-                "candidates": candidates[:5],
+                "candidates": candidates,   # 全量候选，前端下拉可滚动选择
             })
             remaining_headers[u_name] = uploaded_headers.get(u_name, set())
 
@@ -471,10 +494,12 @@ def ai_disambiguate_rename_candidates(
 
     expected_files = (source_structure or {}).get("files") or {}
 
-    # 收集出现在候选里的 expected 名（避免把不相关的 expected 全塞给 AI）
+    # 收集出现在候选里的 expected 名（避免把不相关的 expected 全塞给 AI）。
+    # 候选现为全量（上传/期望文件多时可能几十个），AI 裁决只看 top-8 高分候选，
+    # 不影响前端下拉的全量展示。
     relevant_expected: set = set()
     for item in ambiguous:
-        for c in (item.get("candidates") or []):
+        for c in (item.get("candidates") or [])[:8]:
             if c.get("expected"):
                 relevant_expected.add(c["expected"])
 
@@ -487,7 +512,7 @@ def ai_disambiguate_rename_candidates(
     for item in ambiguous:
         u_name = item.get("uploaded")
         headers = sorted(uploaded_headers_map.get(u_name, set()))
-        candidate_files = [c["expected"] for c in (item.get("candidates") or []) if c.get("expected")]
+        candidate_files = [c["expected"] for c in (item.get("candidates") or [])[:8] if c.get("expected")]
         uploaded_payload.append({
             "file": u_name,
             "headers": headers[:50],

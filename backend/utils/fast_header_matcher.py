@@ -17,6 +17,30 @@ from .data_helpers import assign_sheet_keys
 logger = logging.getLogger(__name__)
 
 
+def fallback_headers_openpyxl(file_path: str) -> Dict[str, List[str]]:
+    """Aspose 解析失败时用 openpyxl 提取各 sheet 第一行作为表头（兜底）。
+
+    目的：上传文件非常多时，个别文件 Aspose 解析失败（损坏/特殊格式/加密残留等）
+    若被静默丢弃，该文件会从匹配与手动选择列表里消失——用户想手动对应也选不到。
+    兜底至少把文件的列名带进候选，保证文件不"漏选"。返回 {sheet名: [列名...]}。
+    """
+    out: Dict[str, List[str]] = {}
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(file_path, read_only=True, data_only=True)
+        try:
+            for ws in wb.worksheets:
+                row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
+                cols = [str(c).strip() for c in row if c is not None and str(c).strip()]
+                if cols:
+                    out[ws.title] = cols
+        finally:
+            wb.close()
+    except Exception as e:
+        logger.warning(f"[匹配] openpyxl 兜底解析也失败 {file_path}: {e}")
+    return out
+
+
 class FastHeaderMatcher:
     """快速表头匹配器 - 性能优化版（headers_only + 并行 + 按需全量解析）"""
 
@@ -215,6 +239,19 @@ class FastHeaderMatcher:
                     except Exception as e:
                         failed_path = futures[future]
                         logger.warning(f"[匹配] 并行解析文件失败: {os.path.basename(failed_path)} - {e}")
+                        # openpyxl 兜底：失败文件也要进匹配/选择列表，否则手动选择时漏掉该文件
+                        try:
+                            fh = fallback_headers_openpyxl(failed_path)
+                            if fh:
+                                for sheet_name, cols in fh.items():
+                                    header_info_list.append({
+                                        "file_name": os.path.basename(failed_path),
+                                        "file_path": failed_path,
+                                        "sheet_name": sheet_name,
+                                        "headers": {c: c for c in cols},
+                                    })
+                        except Exception:
+                            pass
 
         # 整理结果
         for file_path, file_name, sheet_list in results:

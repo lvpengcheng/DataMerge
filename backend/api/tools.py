@@ -1342,25 +1342,26 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
     db = SessionLocal()
     try:
         if req.scheme_id is not None:
-            # 修改已有方案：需 edit 权限 + 仅创建人/管理员
+            # 修改已有方案：需 edit 权限 + 仅创建人/管理员（同组织其他人只能"另存为"新建）
             row = db.query(IntegrateTemplate).filter_by(id=req.scheme_id).first()
             if not row:
                 raise HTTPException(status_code=404, detail="方案不存在")
             if not has_permission(current_user, "tools.data_integrate.edit"):
                 raise HTTPException(status_code=403, detail="缺少权限: 修改方案")
             if not _can_edit_scheme(row, current_user):
-                raise HTTPException(status_code=403, detail="只有创建人或管理员可以修改该方案")
+                raise HTTPException(status_code=403, detail="只有创建人或管理员可以保存修改到该方案，其他人请使用「另存为」")
             row.name = name
             row.config = config
+            row.updated_by = uid
         else:
-            # 新建：需 create 权限 + 组织内方案名唯一
+            # 新建/另存为：需 create 权限 + 组织内方案名唯一（重名提醒）
             if not has_permission(current_user, "tools.data_integrate.create"):
                 raise HTTPException(status_code=403, detail="缺少权限: 新增方案")
             dup = db.query(IntegrateTemplate).filter_by(tenant_id=tenant_id, name=name).first()
             if dup:
-                raise HTTPException(status_code=400, detail="同组织内已存在同名方案，请换个名称")
+                raise HTTPException(status_code=400, detail=f"同组织内已存在同名方案「{name}」，请换个名称")
             row = IntegrateTemplate(tenant_id=tenant_id, name=name, config=config,
-                                    org_id=org_id, created_by=uid)
+                                    org_id=org_id, created_by=uid, updated_by=uid)
             db.add(row)
         db.commit()
         db.refresh(row)
@@ -1393,13 +1394,22 @@ async def integrate_schemes_list(current_user=Depends(get_current_user)):
                 creator_name = r.creator.display_name if r.creator else ""
             except Exception:
                 creator_name = ""
+            updater_name = ""
+            try:
+                updater_name = r.updater.display_name if r.updater else ""
+            except Exception:
+                updater_name = ""
             out.append({
                 "id": r.id, "name": r.name, "config": cfg,
                 "file_count": n_files,
                 "creator_name": creator_name,
+                "updated_by_name": updater_name,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
                 "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+                # can_edit: 能否保存修改覆盖原方案/删除（仅创建人+管理员）
                 "can_edit": _can_edit_scheme(r, current_user),
+                # can_modify: 能否进入修改配置（同组织可见即可；非创建人只能另存为）
+                "can_modify": True,
             })
         return out
     finally:
@@ -1468,17 +1478,30 @@ async def integrate_scheme_apply_validate(req: IntegrateApplyValidateRequest, cu
     main_fp = cfg.get("main_fp")
     source_fps = cfg.get("source_fps", [])
     cols_by_fp = cfg.get("cols_by_fp", {})
+    files_by_fp = cfg.get("files_by_fp") or {}
+    roles_cfg = cfg.get("roles") or []
     expected = [("主表", main_fp)] + [(f"对照表{i + 1}", fp) for i, fp in enumerate(source_fps)]
 
+    def _saved_file(i: int, fp: str) -> str:
+        """该角色的保存时文件名（roles 按索引取，兼容旧方案回退 files_by_fp）"""
+        if roles_cfg and i < len(roles_cfg):
+            return str(roles_cfg[i].get("file") or "")
+        return str(files_by_fp.get(fp) or "")
+
+    def _label_txt(i: int, label: str, fp: str) -> str:
+        sf = _saved_file(i, fp)
+        return f"{label}（方案中表名：{sf}）" if sf else label
+
     reasons: List[str] = []
-    # 1) 文件数校验
+    # 1) 文件数校验（列出方案需要的具体表名，方便用户对照）
     if len(uploaded) != len(expected):
-        reasons.append(f"方案需要 {len(expected)} 张表，实际上传 {len(uploaded)} 张")
+        names = "；".join(_label_txt(i, label, fp) for i, (label, fp) in enumerate(expected))
+        reasons.append(f"方案需要 {len(expected)} 张表，实际上传 {len(uploaded)} 张。方案表清单：{names}")
 
     # 2) 表头结构校验：逐个期望角色按"精确指纹→忽略幻影列后列集合一致"找上传文件（消耗式），
     #    找不到则对最接近文件做列级 diff（同样忽略幻影列，避免空表头样式列干扰）。
     used = set()
-    for label, fp in expected:
+    for i, (label, fp) in enumerate(expected):
         exp_cols = cols_by_fp.get(fp) or []
         hit = _pick_file_for_role(used, fp, exp_cols, uploaded)
         if hit:
@@ -1507,9 +1530,9 @@ async def integrate_scheme_apply_validate(req: IntegrateApplyValidateRequest, cu
                 detail.append("缺列 " + "、".join(map(str, missing)))
             sheet = best.get("sheet") or "?"
             tail = (f"；最接近的是文件【{best['name']}】的 sheet【{sheet}】：" + "；".join(detail)) if detail else ""
-            reasons.append(f"缺少表头结构为【{label}】的表" + tail)
+            reasons.append(f"缺少表头结构为【{_label_txt(i, label, fp)}】的表" + tail)
         else:
-            reasons.append(f"缺少表头结构为【{label}】的表")
+            reasons.append(f"缺少表头结构为【{_label_txt(i, label, fp)}】的表")
 
     return {"ok": len(reasons) == 0, "reasons": reasons, "scheme_id": req.scheme_id, "scheme_name": row.name}
 

@@ -86,27 +86,35 @@ function _showPrecheckDialog(data) {
                 expectedPaths.push(`${item.file} > ${item.sheet} > ${col}`);
             });
         });
-        // 提取所有候选 actual_path（出现过的 suggested_path 集合 + 让用户输入）
-        const actualPathsSet = new Set();
-        aiSuggestions.forEach(s => {
-            if (s.suggested_path) actualPathsSet.add(s.suggested_path);
-        });
-        const actualPaths = Array.from(actualPathsSet);
+        // 提取所有候选 actual_path：优先用后端返回的上传文件实际列全集
+        // （AI 可能只建议了部分列，漏掉的列用户也要能手动选择）；
+        // 兜底用 AI 建议里出现过的 suggested_path 集合
+        const serverActualPaths = data.actual_paths || [];
+        const actualPaths = serverActualPaths.length > 0
+            ? serverActualPaths
+            : Array.from(new Set(aiSuggestions.map(s => s.suggested_path).filter(Boolean)));
 
-        // AI 建议表格
-        const aiTableHtml = aiSuggestions.length === 0
+        // AI 建议表格：AI 建议 + 未被 AI 建议的期望列（AI 只返回高置信建议，漏掉的列
+        // 也要列出供手动选择，否则用户想手动指定也选不到）
+        const sugExpected = new Set(aiSuggestions.map(s => s.expected_path).filter(Boolean));
+        const extraRows = expectedPaths
+            .filter(p => !sugExpected.has(p))
+            .map(p => ({ expected_path: p, confidence: null, reason: '无 AI 建议（可手动选择）' }));
+        const allExpectedRows = [...aiSuggestions, ...extraRows];
+        const aiTableHtml = allExpectedRows.length === 0
             ? '<div style="color:#999;font-size:13px;padding:8px;">无 AI 建议</div>'
             : `<table style="width:100%;border-collapse:collapse;font-size:12px;">
                 <thead><tr style="background:#f5f5f5;">
                     <th style="padding:6px;border:1px solid #e0e0e0;text-align:left;">训练期望列</th>
-                    <th style="padding:6px;border:1px solid #e0e0e0;text-align:left;">AI 建议对应</th>
+                    <th style="padding:6px;border:1px solid #e0e0e0;text-align:left;">对应上传列</th>
                     <th style="padding:6px;border:1px solid #e0e0e0;text-align:center;width:70px;">置信度</th>
                     <th style="padding:6px;border:1px solid #e0e0e0;text-align:left;">原因</th>
                 </tr></thead>
                 <tbody>
-                ${aiSuggestions.map((s, i) => {
-                    const conf = (s.confidence ?? 0).toFixed(2);
-                    const confColor = s.confidence >= 0.8 ? '#388e3c' : (s.confidence >= 0.5 ? '#f57c00' : '#d32f2f');
+                ${allExpectedRows.map((s, i) => {
+                    const hasConf = s.confidence != null;
+                    const conf = hasConf ? Number(s.confidence).toFixed(2) : '-';
+                    const confColor = hasConf ? (s.confidence >= 0.8 ? '#388e3c' : (s.confidence >= 0.5 ? '#f57c00' : '#d32f2f')) : '#999';
                     const options = ['<option value="">（不映射）</option>']
                         .concat(actualPaths.map(p => `<option value="${_escapeHtml(p)}"${p === s.suggested_path ? ' selected' : ''}>${_escapeHtml(p)}</option>`))
                         .join('');
@@ -293,6 +301,30 @@ function _showPrecheckDialog(data) {
             </div>`;
         document.body.appendChild(overlay);
 
+        // ===== 重复匹配检测：一个上传列被多个训练期望列选中 → 红色框实时标记 =====
+        const aiSelects = () => overlay.querySelectorAll('select[data-ai-idx]');
+        function _markAiDup() {
+            const cnt = new Map();
+            aiSelects().forEach(sel => {
+                sel.style.border = '';
+                sel.style.background = '';
+                const v = sel.value;
+                if (v) cnt.set(v, (cnt.get(v) || 0) + 1);
+            });
+            let hasDup = false;
+            aiSelects().forEach(sel => {
+                if (sel.value && cnt.get(sel.value) > 1) {
+                    sel.style.border = '2px solid #f44336';
+                    sel.style.background = '#fff5f5';
+                    hasDup = true;
+                }
+            });
+            return hasDup;
+        }
+        overlay.addEventListener('change', (e) => {
+            if (e.target && e.target.matches && e.target.matches('select[data-ai-idx]')) _markAiDup();
+        });
+
         document.getElementById('_pre_cancel').onclick = () => {
             document.body.removeChild(overlay);
             resolve(null);
@@ -301,8 +333,54 @@ function _showPrecheckDialog(data) {
         const confirmBtn = document.getElementById('_pre_confirm');
         if (confirmBtn && !confirmBtn.disabled) {
             confirmBtn.onclick = () => {
+                // 重复检查 1：同一上传列被多个训练期望列选中（红色标记，理论上应一一匹配）
+                if (_markAiDup()) {
+                    alert('存在重复匹配：同一个上传列被多个训练期望列选中（已用红色框标记），请修正后再确认');
+                    return;
+                }
+                // 重复检查 2：同一上传文件被多个训练文件匹配（理论上应一一对应）
+                const fileDups = [];
+                {
+                    const fileMap = new Map();
+                    aiSelects().forEach(sel => {
+                        const v = sel.value;
+                        if (!v) return;
+                        const idx = parseInt(sel.dataset.aiIdx, 10);
+                        const exp = (allExpectedRows[idx] && allExpectedRows[idx].expected_path) || '';
+                        const file = v.split('>')[0].trim();
+                        const expFile = exp.split('>')[0].trim();
+                        if (!file || !expFile) return;
+                        if (!fileMap.has(file)) fileMap.set(file, new Set());
+                        fileMap.get(file).add(expFile);
+                    });
+                    fileMap.forEach((expFiles, file) => {
+                        if (expFiles.size > 1) fileDups.push(`${file} → ${Array.from(expFiles).join('、')}`);
+                    });
+                }
+                if (fileDups.length > 0) {
+                    alert('以下上传文件被多个训练文件匹配，理论上应一一对应，请修正后再确认：\n' + fileDups.join('\n'));
+                    return;
+                }
+                // 重复检查 3：改名候选里同一训练期望被多个上传文件选中
+                const renameDups = [];
+                {
+                    const expMap = new Map();
+                    overlay.querySelectorAll('select[data-rename-uploaded]').forEach(sel => {
+                        const v = sel.value;
+                        if (!v) return;
+                        if (!expMap.has(v)) expMap.set(v, []);
+                        expMap.get(v).push(sel.dataset.renameUploaded || '');
+                    });
+                    expMap.forEach((ups, exp) => {
+                        if (ups.length > 1) renameDups.push(`${exp} ← ${ups.join('、')}`);
+                    });
+                }
+                if (renameDups.length > 0) {
+                    alert('以下训练期望文件被多个上传文件选中，理论上应一一对应，请修正后再确认：\n' + renameDups.join('\n'));
+                    return;
+                }
                 // 收集用户调整后的 AI 映射 → 转换为 file_mapping 结构
-                const fileMapping = _buildFileMappingFromAiSelections(overlay, aiSuggestions, data.file_mapping);
+                const fileMapping = _buildFileMappingFromAiSelections(overlay, allExpectedRows, data.file_mapping);
                 // 收集用户对改名候选的选择
                 const confirmedRenames = _collectConfirmedRenames(overlay);
                 // 收集用户对目标模板表的选择（②）

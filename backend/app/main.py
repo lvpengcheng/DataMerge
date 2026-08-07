@@ -5455,6 +5455,7 @@ async def compute_submit(
                     "rename_candidates": pc_result.rename_candidates,
                     "missing_columns": pc_result.missing_columns,
                     "ai_suggestions": pc_result.ai_suggestions,
+                    "actual_paths": pc_result.actual_paths,
                     "history_warnings": pc_result.history_warnings,
                     "target_candidates": pc_result.target_candidates,
                 },
