@@ -2479,7 +2479,7 @@ const Tools = {
         const force = document.getElementById('sa-force-rematch').checked;
         const srcFiles = document.getElementById('sa-source-files').files;
         const tplFile = document.getElementById('sa-template-file').files[0];
-        if (!tenantId) return alert('请选择租户');
+        // 租户可留空（空租户走通用全局规则，后端落到 __assemble__ 工具租户）
         if (!srcFiles.length) return alert('请选择源文件');
         if (!tplFile) return alert('请选择模板文件');
 
