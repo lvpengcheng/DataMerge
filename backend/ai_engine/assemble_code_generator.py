@@ -9,6 +9,7 @@
 """
 
 import os
+import re
 import logging
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -164,6 +165,39 @@ class AssembleCodeGenerator(TemplateCodeGenerator):
                 out["files"][fname] = {"error": str(e)}
         return out
 
+    # ==================== 提取兜底：AI 直接输出顶层代码时包成 fill_template ====================
+
+    def _extract_fill_function(self, ai_response: str) -> str:
+        """父类找不到 def fill_template 时，若响应含代码块则整体包成 fill_template 函数。
+
+        真实场景：AI 不按 prompt 输出函数定义，直接写顶层执行代码（引用 wb/_SOURCE_MAP 等
+        全局），父类提取失败。这里把代码块内容缩进后包进函数体，参数与骨架调用签名一致。
+        """
+        text = (ai_response or "").strip()
+        if not text:
+            return ""
+
+        res = super()._extract_fill_function(text)
+        if res:
+            return res
+
+        # 兜底：取第一个代码块（无代码块时取整段），包成 fill_template
+        blocks = re.findall(r"```(?:[a-zA-Z0-9_+-]*)\s*(.*?)\s*```", text, re.DOTALL)
+        body = (blocks[0] if blocks else text).strip()
+        if not body:
+            return ""
+        # 去掉 AI 可能输出的非代码前后缀（如"以下是代码："），取从 import/from/def/变量赋值起的内容
+        lines = body.splitlines()
+        start = 0
+        for i, ln in enumerate(lines):
+            if ln.strip() and not ln.strip().startswith(("#", "//", "以下", "这是", "代码")):
+                start = i
+                break
+        body = "\n".join(lines[start:]).strip()
+        indented = "\n".join(("    " + ln) if ln.strip() else ln for ln in body.splitlines())
+        return (f"def fill_template(wb, source_data, salary_year, salary_month, "
+                f"monthly_standard_hours):\n{indented}")
+
     # ==================== Prompt：追加脱敏样例 + 知识库映射 + 扩展说明 ====================
 
     def _build_prompt(
@@ -178,6 +212,14 @@ class AssembleCodeGenerator(TemplateCodeGenerator):
                                        use_history, reserved_names=reserved_names)
 
         parts = ["\n\n# ==================== 智能组表附加信息 ===================="]
+
+        # 0) 输出格式硬性要求（AI 经常直接输出顶层代码导致提取失败）
+        parts.append(
+            "【输出格式硬性要求】你的输出必须是一个完整的 Python 函数定义，第一行必须是：\n"
+            "def fill_template(wb, source_data, salary_year, salary_month, monthly_standard_hours):\n"
+            "函数体内实现全部填充逻辑（可内部定义变量/import，但不要出现函数定义之外的顶层执行语句，"
+            "不要输出 ```python 围栏，不要输出解释性文字）。"
+        )
 
         # 1) 数据行数处理指引（模板模式同款：AI 在 openpyxl 内直接写入/扩展行）
         if self._src_data_rows > 0:

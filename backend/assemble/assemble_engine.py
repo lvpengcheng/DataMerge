@@ -493,30 +493,38 @@ def run_assemble_task(task_id: int, push, params: Dict):
             else:
                 push({"type": "log", "message": "强制重匹配：知识库映射不使用，全部交 AI"})
 
-            # AI 生成
+            # AI 生成（失败自动重试 1 次，带错误反馈）
             push({"type": "status", "status": "generating", "message": "AI 生成填充代码..."})
-            try:
-                from ..ai_engine.assemble_code_generator import AssembleCodeGenerator
-                gen = AssembleCodeGenerator(file_passwords=file_passwords)
-                if ai_provider:
-                    # 与智训一致：设 AI_PROVIDER 环境变量 → create_provider 读 .env 对应配置
-                    # （api_key/base_url/model/max_tokens 等，不写死）
-                    from ..ai_engine.ai_provider import AIProviderFactory
-                    _orig = os.environ.get("AI_PROVIDER")
-                    os.environ["AI_PROVIDER"] = ai_provider
-                    try:
-                        gen.ai_provider = AIProviderFactory.create_provider(ai_provider)
-                    finally:
-                        if _orig is not None:
-                            os.environ["AI_PROVIDER"] = _orig
-                        else:
-                            os.environ.pop("AI_PROVIDER", None)
-                code, _ = _ai_generate_code(
-                    gen, source_struct, source_dir, rule_text, template_path,
-                    template_struct, auto_mappings, max_source_rows, push)
-            except Exception as e:
-                logger.exception("[assemble] AI 生成失败")
-                raise RuntimeError(f"AI 生成代码失败: {e}")
+            gen = None
+            code = None
+            for _attempt in range(2):
+                try:
+                    from ..ai_engine.assemble_code_generator import AssembleCodeGenerator
+                    gen = AssembleCodeGenerator(file_passwords=file_passwords)
+                    if ai_provider:
+                        # 与智训一致：设 AI_PROVIDER 环境变量 → create_provider 读 .env 对应配置
+                        # （api_key/base_url/model/max_tokens 等，不写死）
+                        from ..ai_engine.ai_provider import AIProviderFactory
+                        _orig = os.environ.get("AI_PROVIDER")
+                        os.environ["AI_PROVIDER"] = ai_provider
+                        try:
+                            gen.ai_provider = AIProviderFactory.create_provider(ai_provider)
+                        finally:
+                            if _orig is not None:
+                                os.environ["AI_PROVIDER"] = _orig
+                            else:
+                                os.environ.pop("AI_PROVIDER", None)
+                    code, _ = _ai_generate_code(
+                        gen, source_struct, source_dir, rule_text, template_path,
+                        template_struct, auto_mappings, max_source_rows, push)
+                    break
+                except Exception as e:
+                    logger.exception("[assemble] AI 生成失败（第 %d 次）", _attempt + 1)
+                    if _attempt == 0:
+                        push({"type": "log", "message":
+                              f"⚠️ AI 生成失败（{e}），自动重试 1 次..."})
+                    else:
+                        raise RuntimeError(f"AI 生成代码失败: {e}")
 
             # 存档 + 知识库回写（AI 新映射由生成器 prompt 覆盖了 auto_mappings；
             # 实际新映射 = auto_mappings 之外 AI 处理的字段 → 简单起见回写 auto_mappings 全量）
