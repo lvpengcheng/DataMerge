@@ -327,6 +327,76 @@ class RuleSession(Base):
     user = relationship("User", foreign_keys=[user_id])
 
 
+# ==================== 智能组表 ====================
+
+class AssembleRule(Base):
+    """智能组表：规则文件元信息。scope=global 存 global_assets/assemble_rules/，
+    scope=tenant 存 tenants/{tenant_id}/assemble_rules/，文件命名 {id}_{原始文件名}。
+    """
+    __tablename__ = "assemble_rules"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(200), nullable=False)
+    scope = Column(String(20), nullable=False, default="global")        # global / tenant
+    tenant_id = Column(String(50), nullable=True, index=True)           # scope=tenant 时有效
+    file_names = Column(JSON, nullable=True)                            # ["rules.md", ...]
+    description = Column(Text, nullable=True)
+    uploader_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    uploader = relationship("User", foreign_keys=[uploader_id])
+
+
+class AssembleTask(Base):
+    """智能组表：任务历史。signature=sha256(规则内容哈希+源签名+模板签名)，
+    命中代码存档可跳过 AI 直接执行。used_mapping_ids 记录命中的知识库条目，
+    结果反馈标错时精确停用。"""
+    __tablename__ = "assemble_tasks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    rule_id = Column(Integer, ForeignKey("assemble_rules.id"), nullable=True)
+    signature = Column(String(64), nullable=True, index=True)           # 总签名
+    source_signature = Column(String(64), nullable=True)
+    template_signature = Column(String(64), nullable=True, index=True)
+    code_path = Column(String(300), nullable=True)                      # 执行代码路径（存档或新生成）
+    used_mapping_ids = Column(JSON, nullable=True)                      # 命中的知识库条目 id 列表
+    status = Column(String(20), default="pending")                      # pending/analyzing/generating/executing/completed/error
+    ai_provider = Column(String(50), nullable=True)
+    matched_from_cache = Column(Boolean, default=False)                 # 是否命中代码存档
+    output_files = Column(JSON, nullable=True)                          # 结果文件名列表
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", foreign_keys=[user_id])
+    rule = relationship("AssembleRule", foreign_keys=[rule_id])
+
+
+class AssembleFieldMapping(Base):
+    """智能组表：字段级匹配知识库。条目=(源列名→模板列名)+模板结构签名锚点。
+    status=review_needed 时查询不再自动采用，交 AI 重新匹配。"""
+    __tablename__ = "assemble_field_mappings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    source_column = Column(String(100), nullable=False)
+    target_column = Column(String(100), nullable=False)
+    template_signature = Column(String(64), nullable=False, index=True)  # 该映射生效的模板结构签名
+    hit_count = Column(Integer, default=1)                               # 命中/确认次数
+    source_task_id = Column(Integer, ForeignKey("assemble_tasks.id"), nullable=True)
+    status = Column(String(20), default="active")                        # active / review_needed
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "template_signature", "source_column",
+                         name="uq_assemble_map"),
+    )
+
+
 class MergeFieldMapping(Base):
     """多表合并：字段匹配结果缓存。
 

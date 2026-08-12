@@ -32,6 +32,7 @@
             <button class="tab-btn" data-tab="scripts" data-perm="admin.scripts">脚本管理</button>
             <button class="tab-btn" data-tab="test-migration" data-perm="admin.test_migration">测试迁移</button>
             <button class="tab-btn" data-tab="sop-rules" data-perm="tools.sop.manage">SOP规则</button>
+            <button class="tab-btn" data-tab="assemble-rules" data-perm="tools.assemble.manage">智能组表规则</button>
         </div>
 
         <!-- 用户管理 Tab -->
@@ -234,6 +235,58 @@
                 <tbody></tbody>
             </table>
         </div>
+
+        <!-- 智能组表规则 Tab -->
+        <div class="tab-content" id="tab-assemble-rules">
+            <div class="toolbar" style="flex-wrap:wrap;gap:12px;align-items:center;">
+                <button class="btn btn-primary" onclick="Admin.showCreateAssembleRule()">+ 上传规则文件</button>
+                <span style="font-size:12px;color:#888;">全局大规则：所有租户可用；按租户规则：仅该租户优先使用。</span>
+            </div>
+            <table class="data-table" id="assemble-rules-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>类型</th>
+                        <th>适用租户</th>
+                        <th>规则名称</th>
+                        <th>文件数</th>
+                        <th>上传人</th>
+                        <th>更新时间</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+
+            <h4 style="margin-top:24px;border-top:1px solid #eee;padding-top:14px;">匹配知识库
+                <span style="font-size:12px;color:#888;font-weight:normal;">(字段级映射沉淀：AI 分析出的源列→模板列自动入库，下次同结构直接命中；结果反馈"有误"后自动标待复核停用)</span>
+            </h4>
+            <div class="toolbar" style="flex-wrap:wrap;gap:12px;align-items:center;">
+                <input type="text" id="mapping-keyword" placeholder="源列/目标列搜索" style="padding:6px 12px;border:1px solid #ddd;border-radius:6px;">
+                <button class="btn" onclick="Admin.loadMappings()">查询</button>
+                <select id="mapping-status" style="padding:6px 12px;border:1px solid #ddd;border-radius:6px;" onchange="Admin.loadMappings()">
+                    <option value="">全部状态</option>
+                    <option value="active">正常</option>
+                    <option value="review_needed">待复核</option>
+                </select>
+            </div>
+            <table class="data-table" id="mappings-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>租户</th>
+                        <th>源列</th>
+                        <th>目标列</th>
+                        <th>模板指纹</th>
+                        <th>命中次数</th>
+                        <th>状态</th>
+                        <th>更新时间</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
     </div>
 
     <!-- 全局加载遮罩 -->
@@ -258,6 +311,6 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260722a"></script>
-    <script src="/static/js/admin.js?v=20260804a"></script>
+    <script src="/static/js/admin.js?v=20260812a"></script>
 </body>
 </html>

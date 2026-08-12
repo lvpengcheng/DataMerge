@@ -93,6 +93,7 @@ from backend.database.models import (
     ComputeTask, ComputeTaskInput, RuleSession,
     MergeFieldMapping, MergeTemplate, ScriptMigration,
     SopEntry, SopRound, SopRuleFile,
+    AssembleRule, AssembleTask, AssembleFieldMapping,
 )
 from passlib.context import CryptContext
 

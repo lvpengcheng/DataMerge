@@ -54,6 +54,7 @@ const Admin = {
                 else if (tab === 'scripts') this.loadScripts();
                 else if (tab === 'test-migration') this.initMigration();
                 else if (tab === 'sop-rules') this.loadSopRules();
+                else if (tab === 'assemble-rules') this.loadAssembleRules();
             });
         });
     },
@@ -1223,6 +1224,166 @@ const Admin = {
 
     downloadSopRule(id, fileName) {
         this._downloadViaAuth(`/api/tools/sop/rules/${id}/download`, fileName);
+    },
+
+    // ==================== 智能组表规则管理 ====================
+    _assembleRules: [],
+    _mappings: [],
+
+    async loadAssembleRules() {
+        try {
+            const resp = await AUTH.authFetch('/api/assemble/rules?scope=all');
+            if (!resp.ok) return _alertErr(resp, '加载组表规则失败');
+            const data = await resp.json();
+            this._assembleRules = data.items || [];
+            this._renderAssembleRules();
+        } catch (e) {
+            alert('加载组表规则失败: ' + e.message);
+        }
+    },
+
+    _renderAssembleRules() {
+        const tbody = document.querySelector('#assemble-rules-table tbody');
+        const items = this._assembleRules || [];
+        if (!items.length) {
+            tbody.innerHTML = '<tr><td colspan="8" class="empty-state">暂无组表规则文件</td></tr>';
+            return;
+        }
+        tbody.innerHTML = items.map(r => `<tr>
+            <td>${r.id}</td>
+            <td>${r.scope === 'global' ? '<span class="tag">全局</span>' : '<span class="tag" style="background:#e3f2fd;">按租户</span>'}</td>
+            <td>${r.scope === 'tenant' ? this._escapeHtml(r.tenant_id || '-') : '-'}</td>
+            <td>${this._escapeHtml(r.name || '-')}</td>
+            <td>${(r.file_names || []).length}</td>
+            <td>${this._escapeHtml(r.uploader_name || '-')}</td>
+            <td>${r.updated_at ? new Date(r.updated_at).toLocaleString() : '-'}</td>
+            <td class="actions">
+                ${(r.file_names || []).map(fn => `<button class="btn btn-sm" onclick="Admin.downloadAssembleRule(${r.id}, '${fn.replace(/'/g, "\\'")}')">下载</button>`).join('')}
+                <button class="btn btn-sm btn-danger" style="margin-left:4px;" onclick="Admin.deleteAssembleRule(${r.id})">删除</button>
+            </td>
+        </tr>`).join('');
+    },
+
+    async showCreateAssembleRule() {
+        // 先取租户列表
+        let tenantOpts = '';
+        try {
+            const resp = await AUTH.authFetch('/api/admin/tenant-auth/tenants');
+            const tenants = resp.ok ? await resp.json() : [];
+            tenantOpts = tenants.map(t => `<option value="${t}">${t}</option>`).join('');
+        } catch (e) { /* 忽略 */ }
+
+        this.openModal('上传组表规则文件', `
+            <div style="display:flex;flex-direction:column;gap:10px;">
+                <div><label style="font-weight:500;">作用域 <span style="color:#f44336;">*</span></label>
+                    <select id="m-arule-scope" style="width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:6px;margin-top:4px;" onchange="Admin._onAssembleRuleScopeChange()">
+                        <option value="global">全局大规则</option>
+                        <option value="tenant">按租户规则</option>
+                    </select></div>
+                <div id="m-arule-tenant-wrap" style="display:none;"><label style="font-weight:500;">适用租户 <span style="color:#f44336;">*</span></label>
+                    <select id="m-arule-tenant" style="width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:6px;margin-top:4px;">${tenantOpts}</select></div>
+                <div><label style="font-weight:500;">规则文件 <span style="color:#f44336;">*</span></label>
+                    <input type="file" id="m-arule-files" multiple accept=".txt,.md,.docx,.doc,.pdf,.xlsx,.xls" style="margin-top:4px;">
+                    <div style="font-size:12px;color:#888;">可多选：文字说明规则 + 结构化示例（源列→目标列）</div></div>
+                <div><label style="font-weight:500;">规则名称</label>
+                    <input type="text" id="m-arule-name" placeholder="规则名称/说明" style="width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:6px;margin-top:4px;"></div>
+                <div><label style="font-weight:500;">描述</label>
+                    <textarea id="m-arule-desc" rows="2" placeholder="描述（可选）" style="width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:6px;margin-top:4px;"></textarea></div>
+            </div>`, () => {
+            this._uploadAssembleRule();
+        });
+    },
+
+    _onAssembleRuleScopeChange() {
+        const scope = document.getElementById('m-arule-scope').value;
+        document.getElementById('m-arule-tenant-wrap').style.display = scope === 'tenant' ? '' : 'none';
+    },
+
+    async _uploadAssembleRule() {
+        const scope = document.getElementById('m-arule-scope').value;
+        const tenantId = document.getElementById('m-arule-tenant').value;
+        const files = document.getElementById('m-arule-files').files;
+        if (!files.length) return alert('请选择规则文件');
+        if (scope === 'tenant' && !tenantId) return alert('按租户规则必须选择租户');
+        const fd = new FormData();
+        for (const f of files) fd.append('files', f);
+        fd.append('scope', scope);
+        fd.append('tenant_id', tenantId);
+        fd.append('name', document.getElementById('m-arule-name').value);
+        fd.append('description', document.getElementById('m-arule-desc').value);
+        const resp = await AUTH.authFetch('/api/assemble/rules', { method: 'POST', body: fd });
+        if (!resp.ok) return _alertErr(resp, '上传失败');
+        this.closeModal();
+        this.loadAssembleRules();
+    },
+
+    async deleteAssembleRule(id) {
+        if (!confirm('确认删除该组表规则？删除后不再参与组表分析。')) return;
+        const resp = await AUTH.authFetch(`/api/assemble/rules/${id}`, { method: 'DELETE' });
+        if (!resp.ok) return _alertErr(resp, '删除失败');
+        this.loadAssembleRules();
+    },
+
+    downloadAssembleRule(id, fileName) {
+        this._downloadViaAuth(`/api/assemble/rules/${id}/download?file_name=${encodeURIComponent(fileName)}`, fileName);
+    },
+
+    // ==================== 匹配知识库管理 ====================
+    async loadMappings() {
+        try {
+            const kw = document.getElementById('mapping-keyword').value.trim();
+            const st = document.getElementById('mapping-status').value;
+            const qs = new URLSearchParams();
+            if (kw) qs.set('keyword', kw);
+            if (st) qs.set('status', st);
+            const resp = await AUTH.authFetch('/api/assemble/mappings?' + qs.toString());
+            if (!resp.ok) return _alertErr(resp, '加载知识库失败');
+            const data = await resp.json();
+            this._mappings = data.items || [];
+            this._renderMappings();
+        } catch (e) {
+            alert('加载知识库失败: ' + e.message);
+        }
+    },
+
+    _renderMappings() {
+        const tbody = document.querySelector('#mappings-table tbody');
+        const items = this._mappings || [];
+        if (!items.length) {
+            tbody.innerHTML = '<tr><td colspan="9" class="empty-state">暂无匹配知识库条目</td></tr>';
+            return;
+        }
+        tbody.innerHTML = items.map(m => `<tr>
+            <td>${m.id}</td>
+            <td>${this._escapeHtml(m.tenant_id)}</td>
+            <td>${this._escapeHtml(m.source_column)}</td>
+            <td>${this._escapeHtml(m.target_column)}</td>
+            <td style="font-size:11px;color:#888;">${m.template_signature}</td>
+            <td>${m.hit_count}</td>
+            <td>${m.status === 'active'
+                ? '<span class="status-active">正常</span>'
+                : '<span class="status-inactive" style="color:#f44336;">待复核</span>'}</td>
+            <td>${m.updated_at ? new Date(m.updated_at).toLocaleString() : '-'}</td>
+            <td class="actions">
+                <button class="btn btn-sm" onclick="Admin.setMappingStatus(${m.id}, ${m.status === 'active' ? "'review_needed'" : "'active'"})">${m.status === 'active' ? '停用' : '恢复'}</button>
+                <button class="btn btn-sm btn-danger" style="margin-left:4px;" onclick="Admin.deleteMapping(${m.id})">删除</button>
+            </td>
+        </tr>`).join('');
+    },
+
+    async setMappingStatus(id, status) {
+        const fd = new FormData();
+        fd.append('status', status);
+        const resp = await AUTH.authFetch(`/api/assemble/mappings/${id}`, { method: 'PUT', body: fd });
+        if (!resp.ok) return _alertErr(resp, '操作失败');
+        this.loadMappings();
+    },
+
+    async deleteMapping(id) {
+        if (!confirm('确认删除该映射条目？删除后该字段将重新走 AI 匹配。')) return;
+        const resp = await AUTH.authFetch(`/api/assemble/mappings/${id}`, { method: 'DELETE' });
+        if (!resp.ok) return _alertErr(resp, '删除失败');
+        this.loadMappings();
     },
 
     async _downloadViaAuth(url, fileName) {

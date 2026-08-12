@@ -39,6 +39,8 @@ from ..api.rules import router as rules_api_router
 from ..api.dashboard import router as dashboard_api_router
 from ..api.training_chat import router as training_chat_router
 from ..api.tools import router as tools_router
+from ..api.assemble_rules import router as assemble_rules_router
+from ..api.assemble import router as assemble_router
 from ..database.connection import engine, get_db, SessionLocal
 from ..database import models as db_models
 from ..auth.dependencies import get_current_user, get_accessible_tenants, get_operable_tenants
@@ -90,6 +92,8 @@ app.include_router(rules_api_router)
 app.include_router(dashboard_api_router)
 app.include_router(training_chat_router)
 app.include_router(tools_router)
+app.include_router(assemble_rules_router)
+app.include_router(assemble_router)
 
 
 # ==================== 文件加密检测 API ====================

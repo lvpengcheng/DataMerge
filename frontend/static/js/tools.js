@@ -50,6 +50,7 @@ const Tools = {
         this.initDataMerge();
         this.initDataIntegrate();
         this.initSop();
+        this.initSmartAssemble();
     },
 
     initTabs() {
@@ -82,6 +83,7 @@ const Tools = {
         else if (tab === 'data-compare') this.loadCompareHistory();
         else if (tab === 'data-integrate') this.loadIntegrateSchemes();
         else if (tab === 'sop') this.loadSops();
+        else if (tab === 'smart-assemble') this.initSmartAssemble();
     },
 
     // ==================== 弹窗工具 ====================
@@ -2354,6 +2356,282 @@ const Tools = {
         } catch (e) {
             alert('获取详情失败: ' + e.message);
         }
+    },
+
+    // ==================== 智能组表 ====================
+    _saTenants: [],
+    _saRules: [],
+    _saEventSource: null,
+    _saTaskId: null,
+    _saLastEventId: 0,
+
+    initSmartAssemble() {
+        const srcInput = document.getElementById('sa-source-files');
+        if (srcInput) srcInput.addEventListener('change', () => {
+            document.getElementById('sa-source-file-list').textContent =
+                Array.from(srcInput.files).map(f => f.name).join(', ');
+        });
+        const tplInput = document.getElementById('sa-template-file');
+        if (tplInput) tplInput.addEventListener('change', () => {
+            document.getElementById('sa-template-file-list').textContent =
+                Array.from(tplInput.files).map(f => f.name).join(', ');
+        });
+        const tenantSel = document.getElementById('sa-tenant-select');
+        if (tenantSel) tenantSel.addEventListener('change', () => this._saLoadRules());
+
+        this._saLoadTenants();
+        // 恢复进行中任务（1小时内）
+        try {
+            const saved = sessionStorage.getItem('sa_active_task');
+            if (saved) {
+                const s = JSON.parse(saved);
+                if (s.taskId && Date.now() - (s.ts || 0) < 3600 * 1000) {
+                    this._saResume(s.taskId, s.lastEventId || 0);
+                } else {
+                    sessionStorage.removeItem('sa_active_task');
+                }
+            }
+        } catch (e) {}
+    },
+
+    async _saLoadTenants() {
+        try {
+            const resp = await AUTH.authFetch('/api/training-history');
+            if (!resp.ok) return;
+            const data = await resp.json();
+            const historyData = data.history || {};
+            this._saTenants = Object.keys(historyData);
+            const sel = document.getElementById('sa-tenant-select');
+            sel.innerHTML = this._saTenants.length
+                ? this._saTenants.map(t => `<option value="${t}">${t}</option>`).join('')
+                : '<option value="">（无可用租户）</option>';
+            sel.value = this._saTenants[0] || '';
+            this._saLoadRules();
+        } catch (e) {}
+    },
+
+    async _saLoadRules() {
+        const tenantId = document.getElementById('sa-tenant-select').value;
+        if (!tenantId) return;
+        try {
+            const resp = await AUTH.authFetch('/api/assemble/rules?scope=available&tenant_id=' + encodeURIComponent(tenantId));
+            if (!resp.ok) return;
+            const data = await resp.json();
+            this._saRules = data.items || [];
+            const sel = document.getElementById('sa-rule-select');
+            sel.innerHTML = '<option value="">（不选规则，AI 仅按结构分析）</option>' +
+                this._saRules.map(r => `<option value="${r.id}">${r.name}（${r.scope === 'global' ? '全局' : r.tenant_id}）</option>`).join('');
+        } catch (e) {}
+    },
+
+    _saAddLog(text, cls) {
+        const el = document.getElementById('sa-log');
+        if (!el) return;
+        const div = document.createElement('div');
+        div.textContent = text;
+        if (cls === 'thinking') {
+            div.style.color = '#8a94a6';
+            div.style.marginLeft = '12px';
+        } else if (cls === 'err') {
+            div.style.color = '#f87171';
+        } else if (cls === 'ok') {
+            div.style.color = '#4ade80';
+        } else if (cls === 'map') {
+            div.style.color = '#fbbf24';
+        }
+        el.appendChild(div);
+        el.scrollTop = el.scrollHeight;
+    },
+
+    _saSetStatus(text, pct) {
+        document.getElementById('sa-status').textContent = text;
+        if (pct != null) {
+            document.getElementById('sa-progress').style.width = pct + '%';
+            document.getElementById('sa-progress-text').textContent = pct + '%';
+        }
+    },
+
+    async saStart() {
+        const tenantId = document.getElementById('sa-tenant-select').value;
+        const ruleId = document.getElementById('sa-rule-select').value;
+        const force = document.getElementById('sa-force-rematch').checked;
+        const srcFiles = document.getElementById('sa-source-files').files;
+        const tplFile = document.getElementById('sa-template-file').files[0];
+        if (!tenantId) return alert('请选择租户');
+        if (!srcFiles.length) return alert('请选择源文件');
+        if (!tplFile) return alert('请选择模板文件');
+
+        const btn = document.getElementById('sa-start-btn');
+        btn.disabled = true;
+        btn.textContent = '组表中...';
+        document.getElementById('sa-log').innerHTML = '';
+        document.getElementById('sa-result-card').style.display = 'none';
+        this._saSetStatus('提交任务...', 5);
+
+        const fd = new FormData();
+        fd.append('tenant_id', tenantId);
+        fd.append('rule_id', ruleId || '0');
+        fd.append('force_rematch', force ? 'true' : 'false');
+        for (const f of srcFiles) fd.append('source_files', f);
+        fd.append('template_file', tplFile);
+
+        try {
+            const resp = await AUTH.authFetch('/api/assemble/submit', { method: 'POST', body: fd });
+            if (!resp.ok) return _alertErr(resp, '提交失败');
+            const data = await resp.json();
+            this._saTaskId = data.task_id;
+            this._saLastEventId = 0;
+            sessionStorage.setItem('sa_active_task', JSON.stringify({ taskId: data.task_id, lastEventId: 0, ts: Date.now() }));
+            this._saConnectStream(data.task_id, 0);
+        } catch (e) {
+            btn.disabled = false;
+            btn.textContent = '开始组表';
+            alert('提交失败: ' + e.message);
+        }
+    },
+
+    _saResume(taskId, lastEventId) {
+        this._saTaskId = taskId;
+        this._saLastEventId = lastEventId || 0;
+        const btn = document.getElementById('sa-start-btn');
+        btn.disabled = true;
+        btn.textContent = '组表中...';
+        document.getElementById('sa-log').innerHTML = '';
+        this._saAddLog('（检测到进行中的组表任务 #' + taskId + '，恢复进度...）');
+        this._saConnectStream(taskId, lastEventId || 0);
+    },
+
+    _saConnectStream(taskId, fromId) {
+        if (this._saEventSource) {
+            this._saEventSource.close();
+            this._saEventSource = null;
+        }
+        const es = new EventSource('/api/assemble/tasks/' + taskId + '/stream?last_event_id=' + fromId);
+        this._saEventSource = es;
+        es.onmessage = (e) => {
+            try {
+                const event = JSON.parse(e.data);
+                if (e.lastEventId) {
+                    this._saLastEventId = parseInt(e.lastEventId);
+                    sessionStorage.setItem('sa_active_task', JSON.stringify({
+                        taskId: taskId, lastEventId: this._saLastEventId, ts: Date.now() }));
+                }
+                this._saHandleEvent(event);
+                if (event.type === 'complete' || event.type === 'error') {
+                    es.close();
+                    this._saEventSource = null;
+                    sessionStorage.removeItem('sa_active_task');
+                }
+            } catch (err) {
+                console.error('解析组表SSE事件失败:', err);
+            }
+        };
+        es.onerror = () => {
+            es.close();
+            this._saEventSource = null;
+            this._saAddLog('⚠️ 连接中断，尝试重连...');
+            setTimeout(() => this._saReconnect(taskId), 2000);
+        };
+    },
+
+    async _saReconnect(taskId) {
+        try {
+            const resp = await AUTH.authFetch('/api/assemble/tasks/' + taskId + '/status');
+            if (!resp.ok) return setTimeout(() => this._saReconnect(taskId), 5000);
+            const st = await resp.json();
+            if (st.status === 'completed') {
+                this._saShowResult(st);
+                return;
+            }
+            if (st.status === 'error') {
+                this._saAddLog('❌ ' + (st.error || '组表失败'), 'err');
+                this._saResetBtn();
+                return;
+            }
+            this._saConnectStream(taskId, this._saLastEventId);
+        } catch (e) {
+            setTimeout(() => this._saReconnect(taskId), 5000);
+        }
+    },
+
+    _saHandleEvent(event) {
+        switch (event.type) {
+            case 'status': {
+                const pct = event.status === 'pending' ? 5
+                    : event.status === 'analyzing' ? 15
+                    : event.status === 'generating' ? 40
+                    : event.status === 'executing' ? 70
+                    : event.status === 'complete' ? 100 : 5;
+                this._saSetStatus(event.message || event.status, pct);
+                break;
+            }
+            case 'log':
+                this._saAddLog(event.message || '', event.message && event.message.includes('✅') ? 'ok' : '');
+                break;
+            case 'mapping':
+                this._saAddLog(event.message || '', 'map');
+                break;
+            case 'thinking':
+                this._saAddLog(event.content || '', 'thinking');
+                break;
+            case 'complete':
+                this._saSetStatus('组表完成', 100);
+                this._saAddLog('✅ ' + (event.message || '组表完成'), 'ok');
+                this._saShowResult({ status: 'completed', output_files: event.output_files || [], matched_from_cache: event.matched_from_cache });
+                break;
+            case 'error':
+                this._saSetStatus('组表失败', 0);
+                this._saAddLog('❌ ' + (event.message || '组表失败'), 'err');
+                this._saResetBtn();
+                break;
+        }
+    },
+
+    _saShowResult(st) {
+        const card = document.getElementById('sa-result-card');
+        card.style.display = '';
+        const dl = document.getElementById('sa-result-downloads');
+        dl.innerHTML = (st.output_files || []).map(f =>
+            `<a class="btn btn-sm btn-primary" href="#" onclick="Tools._saDownload(${this._saTaskId}, '${f.replace(/'/g, "\\'")}');return false;">下载 ${f}</a>`
+        ).join('') || '<span style="color:#888;">无结果文件</span>';
+        document.getElementById('sa-feedback-bar').style.display = st.status === 'completed' ? '' : 'none';
+        document.getElementById('sa-feedback-msg').textContent = '';
+        this._saResetBtn();
+    },
+
+    _saDownload(taskId, fileName) {
+        const sep = fileName.includes('?') ? '&' : '?';
+        const url = '/api/assemble/download/' + taskId + '/' + encodeURIComponent(fileName) + sep + '_=' + Date.now();
+        const a = document.createElement('a');
+        a.href = url;
+        a.setAttribute('download', fileName);
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+    },
+
+    async saFeedback(correct) {
+        if (!this._saTaskId) return;
+        const fd = new FormData();
+        fd.append('correct', correct ? 'true' : 'false');
+        try {
+            const resp = await AUTH.authFetch('/api/assemble/tasks/' + this._saTaskId + '/feedback', { method: 'POST', body: fd });
+            if (!resp.ok) return _alertErr(resp, '反馈提交失败');
+            const data = await resp.json();
+            document.getElementById('sa-feedback-msg').textContent = data.message || '';
+            document.getElementById('sa-feedback-bar').style.opacity = '0.6';
+            if (!correct) {
+                this._saAddLog('❌ 已反馈：命中映射标待复核，建议勾选"强制重新匹配"重新组表', 'err');
+            }
+        } catch (e) {
+            alert('反馈失败: ' + e.message);
+        }
+    },
+
+    _saResetBtn() {
+        const btn = document.getElementById('sa-start-btn');
+        btn.disabled = false;
+        btn.textContent = '开始组表';
     },
 
     // ==================== SOP 维护 ====================
