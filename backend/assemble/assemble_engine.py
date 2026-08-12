@@ -357,6 +357,75 @@ def _execute_in_sandbox(code: str, source_dir: Path, output_dir: Path,
 
 # ==================== 结果后处理 ====================
 
+def _fix_out_of_range_dates(file_path: Path, push) -> int:
+    """修复"日期格式列被填大数字"导致的打开报错。
+
+    模板某些列是日期格式（如第 2 行公式列），AI 填充/公式计算后得到超范围数字
+    （如 31029340 当作日期序列号），Excel 打开报"序列号超出日期范围"。
+    扫描日期格式列中超出日期范围（1~2958465）的数值 → 改 General。
+    列级判断（采样前 20 行格式）避免全表 95 万格遍历。
+    """
+    import aspose_init
+    from Aspose.Cells import Workbook
+    from openpyxl.styles.numbers import is_date_format, builtin_format_code
+
+    def _is_date_style(style) -> bool:
+        try:
+            code = style.Custom or builtin_format_code(int(style.Number or 0))
+        except Exception:
+            code = None
+        try:
+            return bool(code) and is_date_format(str(code))
+        except Exception:
+            return False
+
+    wb = Workbook(str(file_path))
+    total_fixed = 0
+    try:
+        for ws in wb.Worksheets:
+            cells = ws.Cells
+            max_r = cells.MaxDataRow
+            max_c = cells.MaxDataColumn
+            for c in range(max_c + 1):
+                # 列级判断：采样前 20 行，有日期格式（含混合格式列）才扫描该列
+                is_date_col = False
+                for r in range(min(max_r + 1, 20)):
+                    try:
+                        if _is_date_style(cells[r, c].GetStyle()):
+                            is_date_col = True
+                            break
+                    except Exception:
+                        pass
+                if not is_date_col:
+                    continue
+                for r in range(max_r + 1):
+                    try:
+                        cell = cells[r, c]
+                        v = cell.Value
+                        if v is None:
+                            continue
+                        try:
+                            nv = float(v)
+                        except (TypeError, ValueError):
+                            continue
+                        # 日期序列号合法范围 1~2958465，超范围是"被套日期格式的大数字"
+                        if nv > 2958465 or nv < 1:
+                            st = cell.GetStyle()
+                            st.Number = 0        # 内置 General
+                            cell.SetStyle(st)
+                            total_fixed += 1
+                    except Exception:
+                        pass
+    finally:
+        try:
+            wb.Save(str(file_path))
+        except Exception as e:
+            logger.warning("[assemble] 日期修复保存失败: %s", e)
+    if total_fixed:
+        push({"type": "log", "message":
+              f"✅ 已修复 {total_fixed} 个日期格式超范围单元格（防止 Excel 打开报错）"})
+    return total_fixed
+
 def _finalize_results(output_dir: Path, tenant_id: str, task_id: int,
                       rule_name: str, push) -> List[str]:
     """从脚本输出挑出结果，生成 原版 + 纯值版，落盘到 tenants/{tenant}/assemble_results/{task_id}/"""
@@ -381,11 +450,21 @@ def _finalize_results(output_dir: Path, tenant_id: str, task_id: int,
     shutil.copy2(main_out, orig_path)
     saved.append(orig_name)
 
+    # 修复日期格式超范围数字（模板公式列 + 大数字导致 Excel 打开报错）
+    try:
+        _fix_out_of_range_dates(orig_path, push)
+    except Exception as e:
+        logger.warning("[assemble] 日期格式修复失败: %s", e)
+
     # 纯值版：公式扁平化为值
     try:
         values_name = f"{safe_name}_{ts}_纯值.xlsx"
         values_path = result_dir / values_name
         flatten_formulas_to_values(str(orig_path), str(values_path))
+        try:
+            _fix_out_of_range_dates(values_path, push)
+        except Exception as e:
+            logger.warning("[assemble] 纯值版日期格式修复失败: %s", e)
         saved.append(values_name)
         push({"type": "log", "message": f"✅ 已生成纯值版: {values_name}"})
     except Exception as e:

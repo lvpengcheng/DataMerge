@@ -57,7 +57,7 @@ class AssembleCodeGenerator(TemplateCodeGenerator):
         self._pre_mapped = pre_mapped or {}
         self._tpl_data_rows = int(tpl_data_rows or 0)
         self._src_data_rows = int(src_data_rows or 0)
-        return super().generate_code(
+        code, ai_response = super().generate_code(
             input_folder, rules_content, template_path, manual_headers,
             stream_callback, thinking_callback,
             multi_sheet_source=True,   # 智能组表源始终读全部可见 sheet
@@ -65,6 +65,16 @@ class AssembleCodeGenerator(TemplateCodeGenerator):
             target_sheets=target_sheets,
             expected_structure=expected_structure,
         )
+        # 静态检查：fill_template 必须包含"值赋值"（主键列填充）。
+        # 只写公式的代码会导致主键列为空、全部公式落空（真实事故）。
+        assignments = re.findall(r'\.value\s*=\s*([^\n]+)', code)
+        value_assigns = [a for a in assignments if not a.strip().startswith(
+            ('f"=', "f'=", '"=', "'=", 'pattern'))]
+        if not value_assigns:
+            raise RuntimeError(
+                "AI 生成的代码只有公式、没有主键列的值赋值（主键列必须从源_表填入实际值），"
+                "无法填充主键，请重新生成")
+        return code, ai_response
 
     # ==================== 模板解析：只读激活 sheet ====================
 
@@ -219,6 +229,16 @@ class AssembleCodeGenerator(TemplateCodeGenerator):
             "def fill_template(wb, source_data, salary_year, salary_month, monthly_standard_hours):\n"
             "函数体内实现全部填充逻辑（可内部定义变量/import，但不要出现函数定义之外的顶层执行语句，"
             "不要输出 ```python 围栏，不要输出解释性文字）。"
+        )
+
+        # 0.5) 主键列填充硬性要求（防止只写公式不填主键 → 全部落空）
+        parts.append(
+            "【主键列填充硬性要求】模板的身份主键列（列名含「外服工号/工号/员工编号/编号/Payroll ID」"
+            "或「证件号码/身份证/证件号」的列）必须从源_ sheet **填入实际值**（逐行把源表对应主键列的值"
+            "直接赋给模板主键列单元格，如 ws.cell(row=r, column=...).value = 源值），"
+            "**绝不允许对主键列写公式**（尤其不能写引用自身行的 VLOOKUP/INDEX，会导致循环引用）。\n"
+            "非主键列可以写跨 sheet 公式（VLOOKUP/INDEX/MATCH 引用主键列）。"
+            "函数体内必须包含至少一条『值赋值』语句（.value = 非公式），只有公式没有值赋值的输出是无效的。"
         )
 
         # 1) 数据行数处理指引（模板模式同款：AI 在 openpyxl 内直接写入/扩展行）
