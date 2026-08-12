@@ -23,7 +23,11 @@ const _ALLOWED_EXT = new Set(['xlsx', 'xls', 'xlsm']);
 
 async function _alertErr(resp, fallback) {
     let msg = fallback;
-    try { const j = await resp.json(); msg = j.detail || j.message || fallback; } catch (_) {
+    try {
+        const j = await resp.json();
+        // detail 可能是对象/数组（FastAPI 422 校验错误），序列化后展示，避免弹出 [object Object]
+        msg = typeof j.detail === 'object' ? JSON.stringify(j.detail) : (j.detail || j.message || fallback);
+    } catch (_) {
         try { msg = await resp.text(); } catch (__) {}
     }
     alert(msg);

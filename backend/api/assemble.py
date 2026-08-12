@@ -42,7 +42,7 @@ def _buffer_key(task_id: int) -> str:
 
 @router.post("/submit")
 async def assemble_submit(
-    tenant_id: str = Form(...),
+    tenant_id: str = Form(""),        # 可空（空租户走通用全局规则）⚠️ multipart 空字符串会被 FastAPI 判缺失，必须给默认值
     rule_id: int = Form(0),
     force_rematch: str = Form("false"),
     ai_provider: str = Form(""),
