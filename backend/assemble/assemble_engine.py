@@ -427,9 +427,9 @@ def _fix_out_of_range_dates(file_path: Path, push) -> int:
     return total_fixed
 
 def _finalize_results(output_dir: Path, tenant_id: str, task_id: int,
-                      rule_name: str, push) -> List[str]:
+                      rule_name: str, push, template_path: Optional[Path] = None) -> List[str]:
     """从脚本输出挑出结果，生成 原版 + 纯值版，落盘到 tenants/{tenant}/assemble_results/{task_id}/"""
-    from backend.utils.aspose_helper import flatten_formulas_to_values
+    from backend.utils.output_postprocess import make_values_only_copy
 
     outputs = sorted(p for p in output_dir.iterdir()
                      if p.is_file() and p.suffix.lower() in EXCEL_EXTS)
@@ -456,20 +456,25 @@ def _finalize_results(output_dir: Path, tenant_id: str, task_id: int,
     except Exception as e:
         logger.warning("[assemble] 日期格式修复失败: %s", e)
 
-    # 纯值版：公式扁平化为值
+    # 纯值版：复用智算 make_values_only_copy —— 只删 源_ sheet（模板其他 sheet 保留），
+    # 公式选择性拍平（AI 新填公式→值，模板原有公式保留），防止删除源_ 后 #REF!
     try:
         values_name = f"{safe_name}_{ts}_纯值.xlsx"
         values_path = result_dir / values_name
-        flatten_formulas_to_values(str(orig_path), str(values_path))
+        tpl_for_values = str(template_path) if (template_path and template_path.exists()) else None
+        ok = make_values_only_copy(str(orig_path), str(values_path), "源_",
+                                   None, tpl_for_values, None)
+        if not ok:
+            raise RuntimeError("make_values_only_copy 返回 None")
         try:
             _fix_out_of_range_dates(values_path, push)
         except Exception as e:
             logger.warning("[assemble] 纯值版日期格式修复失败: %s", e)
         saved.append(values_name)
-        push({"type": "log", "message": f"✅ 已生成纯值版: {values_name}"})
+        push({"type": "log", "message": f"✅ 已生成纯值版（仅目标 sheet）: {values_name}"})
     except Exception as e:
         logger.warning("[assemble] 纯值版生成失败: %s", e)
-        push({"type": "log", "message": f"⚠️ 纯值版生成失败: {e}"})
+        push({"type": "log", "message": f"⚠️ 纯值版生成失败（仅提供原版）: {e}"})
 
     # 清理多余输出
     for p in outputs[1:]:
@@ -637,7 +642,8 @@ def run_assemble_task(task_id: int, push, params: Dict):
         # 7. 结果后处理 + 落盘
         push({"type": "status", "status": "executing", "message": "生成结果文件（原版+纯值版）..."})
         saved = _finalize_results(output_dir, tenant_id, task_id,
-                                  rule.name if rule else "", push)
+                                  rule.name if rule else "", push,
+                                  template_path=template_path)
 
         # 8. 归档
         task.status = "completed"
