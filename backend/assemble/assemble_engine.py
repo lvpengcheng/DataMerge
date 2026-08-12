@@ -499,8 +499,18 @@ def run_assemble_task(task_id: int, push, params: Dict):
                 from ..ai_engine.assemble_code_generator import AssembleCodeGenerator
                 gen = AssembleCodeGenerator(file_passwords=file_passwords)
                 if ai_provider:
+                    # 与智训一致：设 AI_PROVIDER 环境变量 → create_provider 读 .env 对应配置
+                    # （api_key/base_url/model/max_tokens 等，不写死）
                     from ..ai_engine.ai_provider import AIProviderFactory
-                    gen.ai_provider = AIProviderFactory.create(provider=ai_provider)
+                    _orig = os.environ.get("AI_PROVIDER")
+                    os.environ["AI_PROVIDER"] = ai_provider
+                    try:
+                        gen.ai_provider = AIProviderFactory.create_provider(ai_provider)
+                    finally:
+                        if _orig is not None:
+                            os.environ["AI_PROVIDER"] = _orig
+                        else:
+                            os.environ.pop("AI_PROVIDER", None)
                 code, _ = _ai_generate_code(
                     gen, source_struct, source_dir, rule_text, template_path,
                     template_struct, auto_mappings, max_source_rows, push)

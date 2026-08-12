@@ -57,6 +57,19 @@ async def assemble_submit(
     from ..database.models import AssembleTask as _AT
     from backend.compute.task_log_buffer import TaskLogBuffer
 
+    # 校验 AI provider 未被系统禁用（模型管理配置）
+    from ..database.models import SystemConfig
+    _db_cfg = SessionLocal()
+    try:
+        _cfg_row = _db_cfg.query(SystemConfig).filter_by(key="ai_providers_enabled").first()
+    finally:
+        _db_cfg.close()
+    if ai_provider:
+        if _cfg_row and _cfg_row.value and ai_provider not in (_cfg_row.value.get("enabled") or []):
+            raise HTTPException(status_code=400, detail=f"AI 模型 {ai_provider} 已被系统禁用")
+        if ai_provider not in {"openai", "claude", "deepseek", "ollama", "local"}:
+            raise HTTPException(status_code=400, detail=f"不支持的 AI 模型: {ai_provider}")
+
     tenant_id = (tenant_id or "").strip()
     if not tenant_id:
         # 空租户（默认）：走工具租户 __assemble__（类似 __tools_sop__），不校验授权

@@ -2383,6 +2383,7 @@ const Tools = {
         const tenantSel = document.getElementById('sa-tenant-select');
         if (tenantSel) tenantSel.addEventListener('change', () => this._saLoadRules());
 
+        this._saLoadAiProviders();
         this._saLoadTenants();
         // 恢复进行中任务（1小时内）
         try {
@@ -2396,6 +2397,24 @@ const Tools = {
                 }
             }
         } catch (e) {}
+    },
+
+    // AI 模型下拉框：按系统设置（模型管理）的启用状态过滤，禁用的不显示
+    async _saLoadAiProviders() {
+        const sel = document.getElementById('sa-ai-provider');
+        if (!sel) return;
+        try {
+            const resp = await AUTH.authFetch('/api/admin/ai-providers');
+            if (!resp.ok) return;
+            const data = await resp.json();
+            const items = (data.items || []).filter(p => p.enabled);
+            sel.innerHTML = items.length
+                ? items.map(p => `<option value="${p.key}">${p.label}${p.key === 'claude' ? ' (推荐)' : ''}</option>`).join('')
+                : '<option value="">（无可用模型）</option>';
+            sel.value = items.length ? items[0].key : '';
+        } catch (e) {
+            console.warn('加载AI模型列表失败:', e);
+        }
     },
 
     async _saLoadTenants() {
@@ -2480,6 +2499,7 @@ const Tools = {
     async saStart() {
         const tenantId = document.getElementById('sa-tenant-select').value;
         const ruleId = document.getElementById('sa-rule-select').value;
+        const aiProvider = document.getElementById('sa-ai-provider').value;
         const force = document.getElementById('sa-force-rematch').checked;
         const srcFiles = document.getElementById('sa-source-files').files;
         const tplFile = document.getElementById('sa-template-file').files[0];
@@ -2501,6 +2521,7 @@ const Tools = {
         const fd = new FormData();
         fd.append('tenant_id', tenantId);
         fd.append('rule_id', ruleId || '0');
+        fd.append('ai_provider', aiProvider || '');
         fd.append('force_rematch', force ? 'true' : 'false');
         for (const f of srcFiles) fd.append('source_files', f);
         fd.append('template_file', tplFile);
