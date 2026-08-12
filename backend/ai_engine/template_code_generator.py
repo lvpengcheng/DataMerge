@@ -47,6 +47,7 @@ class TemplateCodeGenerator:
         template_path: str,
         manual_headers: Dict = None,
         stream_callback: callable = None,
+        thinking_callback: callable = None,
         multi_sheet_source: bool = False,
         use_history: bool = False,
         target_sheets: Optional[List[str]] = None,
@@ -60,6 +61,7 @@ class TemplateCodeGenerator:
             template_path: 模板文件持久化路径（写入生成的脚本中）
             manual_headers: 源数据手动表头配置
             stream_callback: 流式日志回调
+            thinking_callback: 推理模型思考过程逐块回调
             multi_sheet_source: 源是否多 sheet
             use_history: 是否启用历史数据
             target_sheets: 用户在前端勾选的目标 sheet 名列表；为空则用全部 sheet
@@ -107,7 +109,7 @@ class TemplateCodeGenerator:
 
         # 4. 调用 AI 生成 fill_template 函数
         log("步骤4: 调用 AI 生成 fill_template 函数...")
-        ai_response = self._call_ai(prompt, stream_callback)
+        ai_response = self._call_ai(prompt, stream_callback, thinking_callback)
 
         # 5. 提取 fill_template 函数代码
         fill_function = self._extract_fill_function(ai_response)
@@ -493,11 +495,14 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
 
     # ==================== AI 调用 ====================
 
-    def _call_ai(self, prompt: str, stream_callback=None) -> str:
+    def _call_ai(self, prompt: str, stream_callback=None, thinking_callback=None) -> str:
         messages = [
             {"role": "system", "content": "你是 Python + openpyxl + Excel 公式专家，擅长 HR 薪酬场景的模板填充。严格按用户给定的输出格式回答。"},
             {"role": "user", "content": prompt},
         ]
+        # 输出预算用 provider 配置：deepseek 推理模型的 max_tokens 是【含思考的总预算】，
+        # 写死 8000 会被思考阶段吃掉大半、代码截断（Claude 思考不占输出预算所以没暴露）
+        _effective_max_tokens = getattr(self.ai_provider, "max_tokens", None) or 8000
         try:
             # 流式：让前端实时看到 AI 生成过程
             if stream_callback and hasattr(self.ai_provider, "chat_stream"):
@@ -510,11 +515,12 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
                 resp = self.ai_provider.chat_stream(
                     messages,
                     chunk_callback=_on_chunk,
+                    thinking_callback=thinking_callback,
                     temperature=0.1,
-                    max_tokens=8000,
+                    max_tokens=_effective_max_tokens,
                 )
             else:
-                resp = self.ai_provider.chat(messages, temperature=0.1, max_tokens=8000)
+                resp = self.ai_provider.chat(messages, temperature=0.1, max_tokens=_effective_max_tokens)
         except Exception as e:
             logger.error(f"AI 调用失败: {e}", exc_info=True)
             raise
@@ -1588,6 +1594,7 @@ if __name__ == "__main__":
         rules_content: str,
         source_structure: str = "",
         stream_callback: callable = None,
+        thinking_callback: callable = None,
         iteration_num: int = 1,
     ) -> str:
         """生成模板模式的修正代码 — 仅改写 fill_template 函数，骨架原样保留
@@ -1685,7 +1692,7 @@ if __name__ == "__main__":
                 pass
 
         # 4. 调用 AI（流式）
-        ai_response = self._call_ai(prompt, stream_callback)
+        ai_response = self._call_ai(prompt, stream_callback, thinking_callback)
         if self.training_logger and hasattr(self.training_logger, "log_full_ai_response"):
             try:
                 self.training_logger.log_full_ai_response(ai_response, "correct")
@@ -1738,6 +1745,7 @@ if __name__ == "__main__":
         rules_content: str = "",
         source_structure: str = "",
         stream_callback: callable = None,
+        thinking_callback: callable = None,
         iteration_num: int = 1,
         history_context: str = "",
         reason_sink: Optional[list] = None,
@@ -1785,6 +1793,7 @@ if __name__ == "__main__":
             code_label="当前完整脚本（模板模式，可改填充逻辑 fill_template 与源数据读取 _append_source_sheets 等任意部分）",
             extra_context=extra,
             stream_callback=stream_callback,
+            thinking_callback=thinking_callback,
             indent_fixer=self._indent_fixer,
             training_logger=self.training_logger,
             reason_sink=reason_sink,

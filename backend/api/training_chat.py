@@ -1629,6 +1629,10 @@ def main(source_dir, output_dir, **kwargs):
             def stream_cb(msg):
                 _emit({"type": "log", "message": msg})
 
+            # DeepSeek 推理模型思考过程：灰色区流式展示（不进入正式内容）
+            def thinking_cb(text):
+                _emit({"type": "thinking", "content": text})
+
             _emit({"type": "status", "message": "正在调用 AI 生成代码..."})
 
             _mode = (config.get("mode") or "formula").lower()
@@ -1705,6 +1709,7 @@ def main(source_dir, output_dir, **kwargs):
                     template_path=_tpl_path,
                     manual_headers=config.get("manual_headers"),
                     stream_callback=stream_cb,
+                    thinking_callback=thinking_cb,
                     multi_sheet_source=config.get("multi_sheet_source", False),
                     use_history=config.get("use_history", False),
                     target_sheets=_cfg_target_sheets,
@@ -1718,6 +1723,7 @@ def main(source_dir, output_dir, **kwargs):
                     expected_structure=expected_struct,  # 软参考，AutoCodeGenerator 不强制对齐
                     manual_headers=config.get("manual_headers"),
                     stream_callback=stream_cb,
+                    thinking_callback=thinking_cb,
                     multi_sheet_source=config.get("multi_sheet_source", False),
                     use_history=config.get("use_history", False),
                     target_sheets=_cfg_target_sheets,
@@ -1730,6 +1736,7 @@ def main(source_dir, output_dir, **kwargs):
                     expected_structure=expected_struct,
                     manual_headers=config.get("manual_headers"),
                     stream_callback=stream_cb,
+                    thinking_callback=thinking_cb,
                     multi_sheet_source=config.get("multi_sheet_source", False),
                     use_history=config.get("use_history", False),
                 )
@@ -2027,10 +2034,15 @@ async def send_message(
                 full_response += chunk
                 _emit({"type": "chat_chunk", "content": chunk})
 
+            # DeepSeek 推理模型思考过程：灰色区流式展示（不进入正式内容）
+            def thinking_cb(text):
+                _emit({"type": "thinking", "content": text})
+
             try:
                 result = provider.chat_stream(
                     [{"role": "system", "content": system_prompt}] + chat_messages,
                     chunk_callback=chunk_cb,
+                    thinking_callback=thinking_cb,
                 )
                 if not full_response:
                     full_response = result or ""
@@ -2148,6 +2160,10 @@ async def send_message(
             def stream_cb(msg):
                 _emit({"type": "log", "message": msg})
 
+            # DeepSeek 推理模型思考过程：灰色区流式展示（不进入正式内容）
+            def thinking_cb(text):
+                _emit({"type": "thinking", "content": text})
+
             from ..ai_engine.ai_provider import AIProviderFactory as _AIPF
             generator = None
             if _cur_mode == "template":
@@ -2185,6 +2201,7 @@ async def send_message(
                         rules_content=rules,
                         source_structure=source_structure_desc,
                         stream_callback=stream_cb,
+                        thinking_callback=thinking_cb,
                         iteration_num=(session.total_iterations or 0) + 1,
                         history_context=_history_context,  # 对话背景（仅理解指代）
                         reason_sink=_edit_reasons,
@@ -2199,6 +2216,7 @@ async def send_message(
                         message,   # 当前指示为唯一修改依据
                         extra_context=_history_context + _rules_extra,  # 对话背景（仅理解指代）+ 规则
                         stream_callback=stream_cb,
+                        thinking_callback=thinking_cb,
                         reason_sink=_edit_reasons,
                     )
             except Exception as pe_err:
@@ -2222,6 +2240,7 @@ async def send_message(
                         source_structure=source_structure_desc,
                         expected_structure=config.get("expected_structure", {}),
                         stream_callback=stream_cb,
+                        thinking_callback=thinking_cb,
                         user_feedback=message,
                         history_context=_history_context,  # 对话背景（仅理解指代）
                     )
@@ -2601,6 +2620,10 @@ async def send_message(
             def stream_cb(msg):
                 _emit({"type": "log", "message": msg})
 
+            # DeepSeek 推理模型思考过程：灰色区流式展示（不进入正式内容）
+            def thinking_cb(text):
+                _emit({"type": "thinking", "content": text})
+
             _emit({"type": "status", "message": "正在调用 AI 重新生成代码..."})
 
             _is_template_mode = (mode or "").lower() == "template"
@@ -2651,6 +2674,7 @@ async def send_message(
                     template_path=_tpl_path,
                     manual_headers=config.get("manual_headers"),
                     stream_callback=stream_cb,
+                    thinking_callback=thinking_cb,
                     multi_sheet_source=config.get("multi_sheet_source", False),
                     use_history=config.get("use_history", False),
                     expected_structure=expected_struct,
@@ -2663,6 +2687,7 @@ async def send_message(
                     expected_structure=expected_struct,
                     manual_headers=config.get("manual_headers"),
                     stream_callback=stream_cb,
+                    thinking_callback=thinking_cb,
                     multi_sheet_source=config.get("multi_sheet_source", False),
                     use_history=config.get("use_history", False),
                 )
@@ -2674,6 +2699,7 @@ async def send_message(
                     expected_structure=expected_struct,
                     manual_headers=config.get("manual_headers"),
                     stream_callback=stream_cb,
+                    thinking_callback=thinking_cb,
                     multi_sheet_source=config.get("multi_sheet_source", False),
                     use_history=config.get("use_history", False),
                 )

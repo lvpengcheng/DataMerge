@@ -1182,3 +1182,19 @@ header {
     color: #1976d2;
     background: #e3f2fd;
 }
+
+/* DeepSeek 推理模型思考过程：灰色区（不污染正式内容） */
+.thinking-block {
+    color: #8a8a8a;
+    font-size: 12px;
+    line-height: 1.5;
+    border-left: 3px solid #d0d0d0;
+    background: #fafafa;
+    padding: 4px 10px;
+    margin-bottom: 8px;
+    border-radius: 4px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 220px;
+    overflow-y: auto;
+}

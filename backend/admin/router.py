@@ -1301,6 +1301,20 @@ async def generate_report(
         except Exception as _carry_e:
             logger.error(f"[整表搬运] 失败（不阻断报表下载）: {_carry_e}", exc_info=True)
 
+    # 9.6 日期值归一：模板日期格式列（如 yyyy/mm/dd）被填成日期文本时格式不渲染
+    #     （SmartMarker 数据经 _coerce_df_for_report 全部文本化，"2026-08-01" 以字符串
+    #     落格，Excel 显示原样、编辑回车后才解析成日期）。此处把"日期格式 + 日期文本"
+    #     的单元格转成真日期，模板格式下载即生效。仅单文件 xlsx；zip 打包模式跳过；
+    #     加密报表打不开则跳过（均不阻断下载）。
+    try:
+        if not output_path.lower().endswith(".zip"):
+            from ..utils.output_postprocess import normalize_date_formatted_values
+            _dn = normalize_date_formatted_values(output_path)
+            if _dn:
+                logger.info(f"[报表] 日期值归一 {_dn} 格: {output_path}")
+    except Exception as _dne:
+        logger.warning(f"[报表] 日期值归一跳过（不阻断）: {_dne}")
+
     # 10. 留痕 — 保存为 DataAsset
     #     磁盘文件名带时间戳前缀（防同模版同任务重复生成时互相覆盖），
     #     但用户可见的下载名/展示名去掉该前缀，保持干净（如 aaaaaa-202605.xlsx）。

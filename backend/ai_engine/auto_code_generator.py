@@ -49,6 +49,7 @@ class AutoCodeGenerator:
         expected_structure: Optional[Dict[str, Any]] = None,
         manual_headers: Dict = None,
         stream_callback: callable = None,
+        thinking_callback: callable = None,
         multi_sheet_source: bool = False,
         use_history: bool = False,
         target_sheets: Optional[List[str]] = None,
@@ -61,6 +62,7 @@ class AutoCodeGenerator:
             expected_structure: 目标文件结构（可选，软参考）
             manual_headers: 源数据手动表头
             stream_callback: 流式日志回调
+            thinking_callback: 推理模型思考过程逐块回调
             multi_sheet_source: 源是否多 sheet
             use_history: 是否启用历史数据
             target_sheets: 用户勾选的目标 sheet 名列表；过滤 expected_structure 软参考
@@ -98,7 +100,7 @@ class AutoCodeGenerator:
 
         # 3. 调用 AI
         log("步骤3: 调用 AI 生成构建函数...")
-        ai_response = self._call_ai(prompt, stream_callback)
+        ai_response = self._call_ai(prompt, stream_callback, thinking_callback)
 
         # 4. 提取函数代码
         build_function = self._extract_build_function(ai_response)
@@ -229,11 +231,14 @@ def build_result_workbook(source_data, salary_year, salary_month, monthly_hours)
 
     # ==================== AI 调用 ====================
 
-    def _call_ai(self, prompt: str, stream_callback=None) -> str:
+    def _call_ai(self, prompt: str, stream_callback=None, thinking_callback=None) -> str:
         messages = [
             {"role": "system", "content": "你是 Python + pandas + openpyxl 专家，擅长 HR/薪酬数据处理。严格按用户给定的输出格式回答。"},
             {"role": "user", "content": prompt},
         ]
+        # 输出预算用 provider 配置：deepseek 推理模型的 max_tokens 是【含思考的总预算】，
+        # 写死 8000 会被思考阶段吃掉大半、代码截断（Claude 思考不占输出预算所以没暴露）
+        _effective_max_tokens = getattr(self.ai_provider, "max_tokens", None) or 8000
         try:
             if stream_callback and hasattr(self.ai_provider, "chat_stream"):
                 from datetime import datetime as _dt
@@ -245,11 +250,12 @@ def build_result_workbook(source_data, salary_year, salary_month, monthly_hours)
                 resp = self.ai_provider.chat_stream(
                     messages,
                     chunk_callback=_on_chunk,
+                    thinking_callback=thinking_callback,
                     temperature=0.1,
-                    max_tokens=8000,
+                    max_tokens=_effective_max_tokens,
                 )
             else:
-                resp = self.ai_provider.chat(messages, temperature=0.1, max_tokens=8000)
+                resp = self.ai_provider.chat(messages, temperature=0.1, max_tokens=_effective_max_tokens)
         except Exception as e:
             logger.error(f"AI 调用失败: {e}", exc_info=True)
             raise

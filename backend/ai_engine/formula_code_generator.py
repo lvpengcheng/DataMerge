@@ -82,6 +82,7 @@ class FormulaCodeGenerator:
         expected_structure: Dict[str, Any],
         manual_headers: Dict = None,
         stream_callback: callable = None,
+        thinking_callback: callable = None,
         multi_sheet_source: bool = False,
         analysis=None,
         skip_load: bool = False,
@@ -99,6 +100,7 @@ class FormulaCodeGenerator:
             expected_structure: 预期输出结构
             manual_headers: 手动表头配置
             stream_callback: 流式回调函数
+            thinking_callback: 推理模型思考过程逐块回调（如 DeepSeek reasoning_content）
             multi_sheet_source: 是否多sheet源
             analysis: TableAnalysisResult 预分析结果
             skip_load: 跳过源数据加载（已由外部加载）
@@ -176,6 +178,7 @@ class FormulaCodeGenerator:
                 total_columns=total_columns,
                 manual_headers=manual_headers,
                 stream_callback=stream_callback,
+                thinking_callback=thinking_callback,
                 log=log
             )
         else:
@@ -202,6 +205,7 @@ class FormulaCodeGenerator:
                 expected_col_names=all_expected_col_names,
                 total_columns=total_columns,
                 stream_callback=stream_callback,
+                thinking_callback=thinking_callback,
                 log=log,
                 max_rounds=max_rounds
             )
@@ -236,6 +240,7 @@ class FormulaCodeGenerator:
                 rules_content=rules_content,
                 source_structure=source_structure,
                 stream_callback=stream_callback,
+                thinking_callback=thinking_callback,
                 log=log
             )
 
@@ -284,6 +289,7 @@ class FormulaCodeGenerator:
         expected_col_names: List[str],
         total_columns: int,
         stream_callback: callable = None,
+        thinking_callback: callable = None,
         log: callable = None,
         max_rounds: int = 15
     ) -> Tuple[Optional[str], str]:
@@ -297,6 +303,7 @@ class FormulaCodeGenerator:
             expected_col_names: 预期的所有列名列表
             total_columns: 预期总列数
             stream_callback: 流式回调
+            thinking_callback: 推理模型思考过程逐块回调
             log: 日志函数
             max_rounds: 最大续写轮数
 
@@ -360,7 +367,8 @@ class FormulaCodeGenerator:
                                     sys.stdout.flush()
                     else:
                         for content_chunk, fr in self.ai_provider._openai_chat_stream(
-                            messages, max_tokens=effective_max_tokens
+                            messages, max_tokens=effective_max_tokens,
+                            thinking_callback=thinking_callback
                         ):
                             if content_chunk:
                                 current_response += content_chunk
@@ -655,6 +663,7 @@ class FormulaCodeGenerator:
         rules_content: str,
         columns_per_batch: int = 35,
         stream_callback: callable = None,
+        thinking_callback: callable = None,
         log: callable = None
     ) -> Tuple[Optional[str], str]:
         """分批生成fill_result_sheets函数代码 — 独立函数模式
@@ -745,7 +754,8 @@ class FormulaCodeGenerator:
                     sys.stdout.write(chunk)
                     sys.stdout.flush()
 
-                extracted = self.ai_provider.generate_code_with_stream(prompt, chunk_callback=chunk_handler)
+                extracted = self.ai_provider.generate_code_with_stream(
+                    prompt, chunk_callback=chunk_handler, thinking_callback=thinking_callback)
                 ai_response = raw_response if raw_response else extracted
             else:
                 ai_response = self.ai_provider.generate_code(prompt)
@@ -917,6 +927,7 @@ class FormulaCodeGenerator:
         rules_content: str,
         source_structure: str,
         stream_callback: callable = None,
+        thinking_callback: callable = None,
         log: callable = None,
         max_completions: int = 10
     ) -> str:
@@ -1029,7 +1040,8 @@ class FormulaCodeGenerator:
                     sys.stdout.write(chunk)
                     sys.stdout.flush()
 
-                extracted = self.ai_provider.generate_code_with_stream(completion_prompt, chunk_callback=chunk_handler)
+                extracted = self.ai_provider.generate_code_with_stream(
+                    completion_prompt, chunk_callback=chunk_handler, thinking_callback=thinking_callback)
                 completion_response = raw_resp if raw_resp else extracted
             else:
                 completion_response = self.ai_provider.generate_code(completion_prompt)
@@ -2887,6 +2899,7 @@ def main():
         rules_content: str,
         source_structure: str,
         stream_callback: callable = None,
+        thinking_callback: callable = None,
         iteration_num: int = 1
     ) -> str:
         """生成修正后的代码
@@ -2899,6 +2912,7 @@ def main():
             rules_content: 规则内容
             source_structure: 源数据结构描述
             stream_callback: 流式回调
+            thinking_callback: 推理模型思考过程逐块回调
             iteration_num: 当前修正轮次（>=2 时启用"换思路"指令防止死循环）
 
         Returns:
@@ -3004,7 +3018,8 @@ def main():
                 timestamp = datetime.now().strftime("%H:%M:%S")
                 stream_callback(f"[{timestamp}] [CODE] {chunk}")
 
-            extracted = self.ai_provider.generate_code_with_stream(prompt, chunk_callback=chunk_handler)
+            extracted = self.ai_provider.generate_code_with_stream(
+                prompt, chunk_callback=chunk_handler, thinking_callback=thinking_callback)
             ai_response = raw_response if raw_response else extracted
         else:
             ai_response = self.ai_provider.generate_code(prompt)
@@ -3067,6 +3082,7 @@ def main():
         source_structure: str,
         expected_structure: dict,
         stream_callback: callable = None,
+        thinking_callback: callable = None,
         user_feedback: str = None,
         iteration_num: int = 1,
         history_context: str = "",
@@ -3159,7 +3175,8 @@ def main():
                 timestamp = datetime.now().strftime("%H:%M:%S")
                 stream_callback(f"[{timestamp}] [CODE] {chunk}")
 
-            extracted = self.ai_provider.generate_code_with_stream(prompt, chunk_callback=chunk_handler)
+            extracted = self.ai_provider.generate_code_with_stream(
+                prompt, chunk_callback=chunk_handler, thinking_callback=thinking_callback)
             ai_response = raw_response if raw_response else extracted
         else:
             ai_response = self.ai_provider.generate_code(prompt)
@@ -3408,6 +3425,7 @@ def main():
         total_columns: int,
         manual_headers: Dict = None,
         stream_callback: callable = None,
+        thinking_callback: callable = None,
         log: callable = None
     ) -> Tuple[Optional[str], str]:
         """生成+验证模式：生成代码后让AI自审修正
@@ -3454,7 +3472,7 @@ def main():
 
         # 第一轮生成
         response = self._call_ai_chat(
-            system_prompt, messages, is_claude, stream_callback, log
+            system_prompt, messages, is_claude, stream_callback, thinking_callback, log
         )
         full_response += f"\n\n--- 生成代码 ---\n{response}"
         messages.append({"role": "assistant", "content": response})
@@ -3567,7 +3585,7 @@ def main():
                     messages.append({"role": "user", "content": continuation_msg})
 
                 response = self._call_ai_chat(
-                    system_prompt, messages, is_claude, stream_callback, log
+                    system_prompt, messages, is_claude, stream_callback, thinking_callback, log
                 )
                 full_response += response
                 messages.append({"role": "assistant", "content": response})
@@ -3594,6 +3612,7 @@ def main():
                 expected_col_names=expected_col_names,
                 total_columns=total_columns,
                 stream_callback=stream_callback,
+                thinking_callback=thinking_callback,
                 log=log
             )
             if verified_code:
@@ -3621,6 +3640,7 @@ def main():
         expected_col_names: List[str] = None,
         total_columns: int = 0,
         stream_callback: callable = None,
+        thinking_callback: callable = None,
         log: callable = None
     ) -> Optional[str]:
         """验证步: 让AI对照分析结果验证代码并修正
@@ -3652,7 +3672,7 @@ def main():
 
         # 调用AI验证
         response = self._call_ai_chat(
-            system_prompt, verify_messages, is_claude, stream_callback, log
+            system_prompt, verify_messages, is_claude, stream_callback, thinking_callback, log
         )
 
         log(f"验证响应长度: {len(response)} 字符")
@@ -3689,6 +3709,7 @@ def main():
         messages: List[Dict],
         is_claude: bool,
         stream_callback: callable = None,
+        thinking_callback: callable = None,
         log: callable = None
     ) -> str:
         """统一的AI对话调用方法"""
@@ -3718,7 +3739,8 @@ def main():
                         _forward_chunk(text_chunk)
             else:
                 for content_chunk, fr in self.ai_provider._openai_chat_stream(
-                    messages, max_tokens=effective_max_tokens
+                    messages, max_tokens=effective_max_tokens,
+                    thinking_callback=thinking_callback
                 ):
                     if content_chunk:
                         response += content_chunk

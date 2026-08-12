@@ -197,6 +197,114 @@ def restore_formats_from_template(output_path, template_path) -> int:
     return restored
 
 
+def normalize_date_formatted_values(output_path) -> int:
+    """把"日期格式 + 日期文本值"的单元格转成真日期，让模板日期格式立即生效。
+
+    背景：模板列设了自定义日期格式（如 yyyy/mm/dd），但脚本把源里的日期文本
+    （"2026-08-01"）原样写进单元格。Excel 对字符串**不**应用数字格式 → 下载显示
+    "2026-08-01"；用户点进单元格回车后 Excel 才把文本重解析成日期 → 显示
+    "2026/08/01"。本函数在格式已恢复（脚本内 _restore_number_formats 或
+    restore_formats_from_template）之后跑：逐格检查，**单元格格式是日期格式**且
+    **值是可解析的日期字符串**时，用 Aspose 把值换成真日期（底层日期值，格式不动）。
+
+    零误伤策略：只动"格式命中日期格式 + 值命中日期文本形态（含 年/月/日 或
+    YYYY[-/.]M[-/.]D 等）+ pandas 能解析"三重条件的格；占位符（N/A、—）与普通
+    文本日期列里的文字一律原样保留。已是真日期/数字的格不触发（幂等）。
+
+    返回转换的单元格数。
+    """
+    if not output_path or not os.path.exists(output_path):
+        return 0
+    if not str(output_path).lower().endswith((".xlsx", ".xlsm")):
+        return 0
+    try:
+        from openpyxl.styles.numbers import is_date_format, builtin_format_code
+    except Exception:
+        return 0
+    try:
+        from Aspose.Cells import Workbook
+        import aspose_init
+        aspose_init.ensure_license()
+    except Exception as e:
+        logger.warning(f"[日期值归一] Aspose 不可用，跳过: {e}")
+        return 0
+
+    # 日期文本形态预判（防止误伤普通文本；pandas 解析再兜一层）
+    _date_text_re = re.compile(
+        r"^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:\s|$)"      # 2026-08-01 / 2026/8/1 / 2026-08-01 09:30
+        r"|^\d{1,2}[-/.]\d{1,2}[-/.]\d{4}(?:\s|$)"     # 08-01-2026（美式）
+        r"|^\d{8}$"                                     # 20260801
+        r"|^\d{4}年\d{1,2}月\d{1,2}日"                    # 2026年8月1日
+    )
+
+    def _is_date_style(style):
+        """按格式码判定日期格式：Custom 非空用 Custom，否则查内置格式码（如 mm-dd-yy=14）。"""
+        try:
+            code = style.Custom or builtin_format_code(int(style.Number or 0))
+        except Exception:
+            code = None
+        try:
+            return bool(code) and is_date_format(str(code))
+        except Exception:
+            return False
+
+    changed = 0
+    wb = None
+    try:
+        wb = _open_workbook(output_path)
+    except Exception as e:
+        logger.warning(f"[日期值归一] 打开失败，跳过: {output_path} - {e}")
+        return 0
+    try:
+        touched = False
+        for si in range(wb.Worksheets.Count):
+            ws = wb.Worksheets[si]
+            cells = ws.Cells
+            it = cells.GetEnumerator()
+            while it.MoveNext():
+                cell = it.Current
+                try:
+                    v = cell.Value
+                    if not isinstance(v, str):   # 只处理文本值（.NET String → Python str）
+                        continue
+                    s = v.strip()
+                    if not s or not _date_text_re.match(s):
+                        continue
+                    if not _is_date_style(cell.GetStyle()):
+                        continue
+                    import pandas as pd
+                    _m_cn = re.match(r"^(\d{4})年(\d{1,2})月(\d{1,2})日", s)
+                    if _m_cn:
+                        # 中文年月日：pandas 默认解析不了，正则提取直接构造
+                        _t = datetime(int(_m_cn.group(1)), int(_m_cn.group(2)),
+                                      int(_m_cn.group(3)))
+                    else:
+                        ts = pd.to_datetime(s, errors="coerce")
+                        if pd.isna(ts):
+                            continue
+                        _t = ts.to_pydatetime()
+                    from System import DateTime
+                    cell.PutValue(DateTime(_t.year, _t.month, _t.day,
+                                           _t.hour, _t.minute, _t.second))
+                    changed += 1
+                    touched = True
+                except Exception:
+                    continue
+        if touched:
+            wb.Save(str(output_path))
+            logger.info(f"[日期值归一] 已把 {changed} 个日期格式格从文本转成真日期"
+                        f"（模板格式立即生效，Aspose 保值）: {output_path}")
+    except Exception as e:
+        logger.warning(f"[日期值归一] 处理异常，按原文件: {output_path} - {e}")
+        return 0
+    finally:
+        try:
+            wb.Dispose()
+        except Exception:
+            pass
+    return changed
+
+
 def restore_summary_format_enabled() -> bool:
     """读取 .env 开关：是否启用"汇总行格式随行跟随"的后处理兜底（默认 true）。
     显式设为 false/0/no/off 可关闭（老脚本若已重训走 Aspose 引擎则无需兜底）。"""

@@ -1187,12 +1187,14 @@ if __name__ == "__main__":
         ]
         return self.chat(messages, **kwargs)
 
-    def stream_generate_code(self, prompt: str, chunk_callback: callable = None, **kwargs):
+    def stream_generate_code(self, prompt: str, chunk_callback: callable = None,
+                             thinking_callback: callable = None, **kwargs):
         """流式生成代码（支持自动续写）
 
         Args:
             prompt: 提示词
             chunk_callback: 每个chunk的回调函数，接收chunk字符串
+            thinking_callback: 推理模型思考过程逐块回调（如 DeepSeek reasoning_content）
             **kwargs: 其他参数
 
         Yields:
@@ -1235,7 +1237,9 @@ if __name__ == "__main__":
 
                 logger.info(f"OpenAIProvider: 流式第 {iteration+1} 次调用API，模型: {self.model}")
 
-                for content_chunk, fr in self._openai_chat_stream(messages, max_tokens=self.max_tokens, **kwargs):
+                for content_chunk, fr in self._openai_chat_stream(
+                        messages, max_tokens=self.max_tokens,
+                        thinking_callback=thinking_callback, **kwargs):
                     if content_chunk:
                         current_response += content_chunk
                         full_raw_response += content_chunk
@@ -1307,19 +1311,22 @@ if __name__ == "__main__":
             logger.error(f"OpenAI 流式API调用失败: {e}", exc_info=True)
             raise
 
-    def generate_code_with_stream(self, prompt: str, chunk_callback: callable = None, **kwargs) -> str:
+    def generate_code_with_stream(self, prompt: str, chunk_callback: callable = None,
+                                  thinking_callback: callable = None, **kwargs) -> str:
         """流式生成代码并返回完整结果
 
         Args:
             prompt: 提示词
             chunk_callback: 每个chunk的回调函数
+            thinking_callback: 推理模型思考过程逐块回调（如 DeepSeek reasoning_content）
             **kwargs: 其他参数
 
         Returns:
             生成的完整代码
         """
         # 消费完整个流式生成器（内部已做续写和统一提取）
-        for _chunk in self.stream_generate_code(prompt, chunk_callback, **kwargs):
+        for _chunk in self.stream_generate_code(prompt, chunk_callback,
+                                                thinking_callback, **kwargs):
             pass
 
         return self.last_extracted_code or ""
@@ -1628,12 +1635,15 @@ if __name__ == "__main__":
         ]
         return self.chat(messages, **kwargs)
 
-    def stream_generate_code(self, prompt: str, chunk_callback: callable = None, **kwargs):
+    def stream_generate_code(self, prompt: str, chunk_callback: callable = None,
+                             thinking_callback: callable = None, **kwargs):
         """流式生成代码（流式接收避免超时，max_tokens截断或代码不完整时对话续写，最后统一提取）
 
         Args:
             prompt: 提示词
             chunk_callback: 每个chunk的回调函数
+            thinking_callback: 仅兼容统一签名（Claude 思考在 content blocks 内，无
+                独立 reasoning_content 流，暂不透传；显式接住避免误传给 API）
             **kwargs: 其他参数
 
         Yields:
@@ -1741,19 +1751,22 @@ if __name__ == "__main__":
             logger.error(f"Claude 流式API调用失败: {e}", exc_info=True)
             raise
 
-    def generate_code_with_stream(self, prompt: str, chunk_callback: callable = None, **kwargs) -> str:
+    def generate_code_with_stream(self, prompt: str, chunk_callback: callable = None,
+                                  thinking_callback: callable = None, **kwargs) -> str:
         """流式生成代码并返回完整结果
 
         Args:
             prompt: 提示词
             chunk_callback: 每个chunk的回调函数
+            thinking_callback: 仅兼容统一签名（Claude 无独立 reasoning 流，忽略）
             **kwargs: 其他参数
 
         Returns:
             生成的完整代码
         """
         # 消费完整个流式生成器（内部已做对话续传和统一提取）
-        for _chunk in self.stream_generate_code(prompt, chunk_callback, **kwargs):
+        for _chunk in self.stream_generate_code(prompt, chunk_callback,
+                                                thinking_callback, **kwargs):
             pass
 
         # stream_generate_code 结束后已提取并修复代码，直接返回

@@ -106,12 +106,20 @@ def build_prompt(code_segment: str, user_feedback: str, code_label: str = "当�
 {extra_context}"""
 
 
-def _call_provider(ai_provider, prompt: str, stream_callback: Callable = None) -> str:
-    """统一走 provider 的 chat / chat_stream（所有 provider 都实现 BaseAIProvider 接口）。"""
+def _call_provider(ai_provider, prompt: str, stream_callback: Callable = None,
+                   thinking_callback: Callable = None) -> str:
+    """统一走 provider 的 chat / chat_stream（所有 provider 都实现 BaseAIProvider 接口）。
+
+    thinking_callback: 推理模型思考过程逐块回调（如 DeepSeek reasoning_content），
+    与正式内容(stream_callback)分开，不污染代码流。
+    """
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": prompt},
     ]
+    # 输出预算用 provider 配置：deepseek 推理模型的 max_tokens 是【含思考的总预算】，
+    # 写死 8000 会被思考阶段吃掉大半、代码截断（Claude 思考不占输出预算所以没暴露）
+    _effective_max_tokens = getattr(ai_provider, "max_tokens", None) or 8000
     if stream_callback and hasattr(ai_provider, "chat_stream"):
         from datetime import datetime as _dt
 
@@ -120,8 +128,9 @@ def _call_provider(ai_provider, prompt: str, stream_callback: Callable = None) -
                 stream_callback(f"[{_dt.now().strftime('%H:%M:%S')}] [CODE] {chunk}")
 
         return ai_provider.chat_stream(messages, chunk_callback=_on_chunk,
-                                       temperature=0.1, max_tokens=8000) or ""
-    return ai_provider.chat(messages, temperature=0.1, max_tokens=8000) or ""
+                                       thinking_callback=thinking_callback,
+                                       temperature=0.1, max_tokens=_effective_max_tokens) or ""
+    return ai_provider.chat(messages, temperature=0.1, max_tokens=_effective_max_tokens) or ""
 
 
 def _validate_syntax(code: str) -> Optional[str]:
@@ -143,6 +152,7 @@ def run_precise_edit(
     code_label: str = "当前代码",
     extra_context: str = "",
     stream_callback: Callable = None,
+    thinking_callback: Callable = None,
     indent_fixer=None,
     training_logger=None,
     reason_sink: Optional[list] = None,
@@ -157,6 +167,8 @@ def run_precise_edit(
         splice_fn: (full_code, patched_segment) -> 新 full_code；None = 片段即整份
         code_label: prompt 里对代码块的称呼（如 "当前 fill_template 函数"）
         extra_context: 追加到 prompt 末尾的上下文（_COL_MAP / 规则等，可选）
+        stream_callback: 代码内容流回调（[CODE] 前缀由 _call_provider 封装）
+        thinking_callback: 推理模型思考过程逐块回调（如 DeepSeek reasoning_content）
         reason_sink: 可选 list；失败返回 None 时向其追加一句人类可读的失败原因，
                      供调用方拼进给用户的提示（不影响返回值）。
 
@@ -184,7 +196,7 @@ def run_precise_edit(
         except Exception:
             pass
 
-    ai_response = _call_provider(ai_provider, prompt, stream_callback)
+    ai_response = _call_provider(ai_provider, prompt, stream_callback, thinking_callback)
     if training_logger and hasattr(training_logger, "log_full_ai_response"):
         try:
             training_logger.log_full_ai_response(ai_response, "precise_edit")

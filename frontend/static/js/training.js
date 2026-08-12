@@ -13,6 +13,7 @@ let _currentCode = null;
 let _filePasswordsMap = {};
 let _chatStreamEl = null;   // AI 对话流式输出的 DOM 元素
 let _chatStreamBuf = '';    // AI 对话流式输出的文本缓冲
+let _chatThinkingBuf = '';  // DeepSeek 推理模型思考过程缓冲（灰色区显示，不进入正式内容）
 let _pendingScriptName = null;  // 新建训练时由用户命名的脚本名（仅新建会话首次提交时使用）
 
 // ===== 对话历史分页（B 方案：初始最近 5 轮，上划加载更早）=====
@@ -698,8 +699,14 @@ function _addSystemMessage(content, msgType, metadata, target) {
     return contentDiv;
 }
 
-function _updateStreamingMessage(contentDiv, text) {
-    contentDiv.innerHTML = _renderMarkdown(text);
+function _updateStreamingMessage(contentDiv, text, thinkingText) {
+    // 思考过程（灰色区，不转 markdown 避免样式污染）+ 正式内容
+    if (thinkingText) {
+        contentDiv.innerHTML =
+            `<div class="thinking-block">${_escapeHtml(thinkingText)}</div>` + _renderMarkdown(text || '');
+    } else {
+        contentDiv.innerHTML = _renderMarkdown(text);
+    }
     const container = document.getElementById('chat-messages');
     container.scrollTop = container.scrollHeight;
 }
@@ -1218,19 +1225,36 @@ function _handleSSEEvent(event) {
             if (!_chatStreamEl) {
                 _chatStreamEl = _addMessage('assistant', '', true);
                 _chatStreamBuf = '';
+                _chatThinkingBuf = '';
             }
             _chatStreamBuf += event.content;
-            _updateStreamingMessage(_chatStreamEl, _chatStreamBuf);
+            _updateStreamingMessage(_chatStreamEl, _chatStreamBuf, _chatThinkingBuf);
+            break;
+
+        case 'thinking':
+            // DeepSeek 推理模型思考过程：灰色区流式显示（不进入正式内容）
+            if (!_chatStreamEl) {
+                _chatStreamEl = _addMessage('assistant', '', true);
+                _chatStreamBuf = '';
+                _chatThinkingBuf = '';
+            }
+            _chatThinkingBuf += event.content;
+            _updateStreamingMessage(_chatStreamEl, _chatStreamBuf, _chatThinkingBuf);
             break;
 
         case 'chat_done':
             // AI 对话完成
             if (_chatStreamEl) {
                 _finishStreamingMessage(_chatStreamEl);
-                // 用最终完整内容重新渲染（确保 markdown 完整）
-                _chatStreamEl.innerHTML = _renderMarkdown(_chatStreamBuf || event.content);
+                // 用最终完整内容重新渲染（确保 markdown 完整；思考过程保留在灰色区）
+                _chatStreamEl.innerHTML =
+                    (_chatThinkingBuf
+                        ? `<div class="thinking-block">${_escapeHtml(_chatThinkingBuf)}</div>`
+                        : '') +
+                    _renderMarkdown(_chatStreamBuf || event.content);
                 _chatStreamEl = null;
                 _chatStreamBuf = '';
+                _chatThinkingBuf = '';
             } else {
                 _addMessage('assistant', event.content);
             }
@@ -1811,6 +1835,7 @@ function _setUIStreaming(streaming) {
         // 对话流式状态也要重置
         _chatStreamEl = null;
         _chatStreamBuf = '';
+        _chatThinkingBuf = '';
         // 流式结束后，重新应用租户权限灰化
         _applyTenantPermission();
         // 已进入会话时，显示"重新生成"按钮
