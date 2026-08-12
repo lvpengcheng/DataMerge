@@ -73,9 +73,11 @@ async def assemble_rules_list(
         if scope == "available":
             t = (tenant_id or "").strip()
             if not t:
-                return {"items": []}
-            q = q.filter((AssembleRule.scope == "global") | (
-                (AssembleRule.scope == "tenant") & (AssembleRule.tenant_id == t)))
+                # 空租户：只看全局规则
+                q = q.filter(AssembleRule.scope == "global")
+            else:
+                q = q.filter((AssembleRule.scope == "global") | (
+                    (AssembleRule.scope == "tenant") & (AssembleRule.tenant_id == t)))
         items = [_rule_to_dict(r) for r in q.order_by(AssembleRule.updated_at.desc()).all()]
         return {"items": items}
     finally:

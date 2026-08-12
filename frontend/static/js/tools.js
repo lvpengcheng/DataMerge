@@ -2402,17 +2402,16 @@ const Tools = {
             const historyData = data.history || {};
             this._saTenants = Object.keys(historyData);
             const sel = document.getElementById('sa-tenant-select');
-            sel.innerHTML = this._saTenants.length
-                ? this._saTenants.map(t => `<option value="${t}">${t}</option>`).join('')
-                : '<option value="">（无可用租户）</option>';
-            sel.value = this._saTenants[0] || '';
+            // 默认「空租户」（值为空，主要用全局规则）
+            sel.innerHTML = '<option value="">（空租户）</option>' +
+                this._saTenants.map(t => `<option value="${t}">${t}</option>`).join('');
+            sel.value = '';
             this._saLoadRules();
         } catch (e) {}
     },
 
     async _saLoadRules() {
         const tenantId = document.getElementById('sa-tenant-select').value;
-        if (!tenantId) return;
         try {
             const resp = await AUTH.authFetch('/api/assemble/rules?scope=available&tenant_id=' + encodeURIComponent(tenantId));
             if (!resp.ok) return;
@@ -2421,6 +2420,9 @@ const Tools = {
             const sel = document.getElementById('sa-rule-select');
             sel.innerHTML = '<option value="">（不选规则，AI 仅按结构分析）</option>' +
                 this._saRules.map(r => `<option value="${r.id}">${r.name}（${r.scope === 'global' ? '全局' : r.tenant_id}）</option>`).join('');
+            // 默认选中第一条全局规则（存在时）
+            const globalRule = this._saRules.find(r => r.scope === 'global');
+            if (globalRule) sel.value = String(globalRule.id);
         } catch (e) {}
     },
 
@@ -2444,6 +2446,33 @@ const Tools = {
         }
     },
 
+    // AI 生成的代码流累积到折叠代码区（对齐智训的代码区，不刷日志区）
+    _saCodeBuf: '',
+    _saThinkingBuf: '',
+
+    _saAppendCode(chunk) {
+        this._saCodeBuf += chunk;
+        const el = document.getElementById('sa-code-content');
+        if (el) {
+            el.textContent = this._saCodeBuf;
+            el.scrollTop = el.scrollHeight;
+        }
+        const cnt = document.getElementById('sa-code-count');
+        if (cnt) cnt.textContent = `（${this._saCodeBuf.length} 字符）`;
+    },
+
+    _saAppendThinking(chunk) {
+        this._saThinkingBuf += chunk;
+        const logEl = document.getElementById('sa-log');
+        const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+        let last = logEl && logEl.lastElementChild;
+        if (last && last.classList.contains('thinking')) {
+            last.innerHTML = `<span class="log-timestamp">[${time}]</span>${this._saThinkingBuf}`;
+        } else {
+            this._saLog('thinking', this._saThinkingBuf);
+        }
+    },
+
     async saStart() {
         const tenantId = document.getElementById('sa-tenant-select').value;
         const ruleId = document.getElementById('sa-rule-select').value;
@@ -2458,6 +2487,10 @@ const Tools = {
         btn.disabled = true;
         btn.textContent = '组表中...';
         document.getElementById('sa-log').innerHTML = '';
+        document.getElementById('sa-code-content').textContent = '';
+        document.getElementById('sa-code-count').textContent = '';
+        this._saCodeBuf = '';
+        this._saThinkingBuf = '';
         document.getElementById('sa-result-card').style.display = 'none';
         this._saSetStatus('提交任务...', 5);
 
@@ -2559,20 +2592,25 @@ const Tools = {
                 break;
             }
             case 'log':
-                // 对齐智训：AI 生成时的 [CODE] 代码流不刷日志区（智训走代码区展示，组表无代码区故过滤）
-                if (event.message && !event.message.includes('[CODE]')) {
-                    let level = 'info';
-                    if (event.message.includes('✅')) level = 'success';
-                    else if (event.message.includes('⚠️')) level = 'warning';
-                    else if (event.message.includes('❌') || event.message.includes('失败')) level = 'error';
-                    this._saLog(level, event.message);
+                if (!event.message) break;
+                // AI 生成时的 [CODE] 代码流 → 累积到折叠代码区（对齐智训的代码区展示）
+                const codeMatch = event.message.match(/\[CODE\]\s*([\s\S]*)/);
+                if (codeMatch) {
+                    this._saAppendCode(codeMatch[1]);
+                    break;
                 }
+                let level = 'info';
+                if (event.message.includes('✅')) level = 'success';
+                else if (event.message.includes('⚠️')) level = 'warning';
+                else if (event.message.includes('❌') || event.message.includes('失败')) level = 'error';
+                this._saLog(level, event.message);
                 break;
             case 'mapping':
                 this._saLog('mapping', event.message || '');
                 break;
             case 'thinking':
-                this._saLog('thinking', event.content || '');
+                // 思考流合并成一块显示（不逐 chunk 刷屏）
+                this._saAppendThinking(event.content || '');
                 break;
             case 'complete':
                 this._saSetStatus('组表完成', 100);

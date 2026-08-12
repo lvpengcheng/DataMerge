@@ -59,16 +59,18 @@ async def assemble_submit(
 
     tenant_id = (tenant_id or "").strip()
     if not tenant_id:
-        raise HTTPException(status_code=400, detail="必须选择租户")
-    # 校验租户可访问性
-    from ..auth.dependencies import get_accessible_tenants
-    _db_check = SessionLocal()
-    try:
-        accessible = get_accessible_tenants(current_user=current_user, db=_db_check)
-    finally:
-        _db_check.close()
-    if tenant_id not in accessible:
-        raise HTTPException(status_code=403, detail="无权访问该租户")
+        # 空租户（默认）：走工具租户 __assemble__（类似 __tools_sop__），不校验授权
+        tenant_id = "__assemble__"
+    else:
+        # 校验租户可访问性
+        from ..auth.dependencies import get_accessible_tenants
+        _db_check = SessionLocal()
+        try:
+            accessible = get_accessible_tenants(current_user=current_user, db=_db_check)
+        finally:
+            _db_check.close()
+        if tenant_id not in accessible:
+            raise HTTPException(status_code=403, detail="无权访问该租户")
 
     if not source_files or not template_file:
         raise HTTPException(status_code=400, detail="必须上传源文件和模板文件")
