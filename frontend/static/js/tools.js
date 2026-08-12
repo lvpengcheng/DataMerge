@@ -2424,30 +2424,23 @@ const Tools = {
         } catch (e) {}
     },
 
-    _saAddLog(text, cls) {
-        const el = document.getElementById('sa-log');
-        if (!el) return;
-        const div = document.createElement('div');
-        div.textContent = text;
-        if (cls === 'thinking') {
-            div.style.color = '#8a94a6';
-            div.style.marginLeft = '12px';
-        } else if (cls === 'err') {
-            div.style.color = '#f87171';
-        } else if (cls === 'ok') {
-            div.style.color = '#4ade80';
-        } else if (cls === 'map') {
-            div.style.color = '#fbbf24';
-        }
-        el.appendChild(div);
-        el.scrollTop = el.scrollHeight;
+    // 对齐智算 addLog：时间戳 + 着色条目
+    _saLog(level, message) {
+        const logContent = document.getElementById('sa-log');
+        if (!logContent) return;
+        const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+        const entry = document.createElement('div');
+        entry.className = 'log-entry ' + (level || 'info');
+        entry.innerHTML = `<span class="log-timestamp">[${time}]</span>${message}`;
+        logContent.appendChild(entry);
+        logContent.scrollTop = logContent.scrollHeight;
     },
 
     _saSetStatus(text, pct) {
         document.getElementById('sa-status').textContent = text;
         if (pct != null) {
             document.getElementById('sa-progress').style.width = pct + '%';
-            document.getElementById('sa-progress-text').textContent = pct + '%';
+            document.getElementById('sa-progress-text').textContent = Math.round(pct) + '%';
         }
     },
 
@@ -2497,7 +2490,7 @@ const Tools = {
         btn.disabled = true;
         btn.textContent = '组表中...';
         document.getElementById('sa-log').innerHTML = '';
-        this._saAddLog('（检测到进行中的组表任务 #' + taskId + '，恢复进度...）');
+        this._saLog('info', '（检测到进行中的组表任务 #' + taskId + '，恢复进度...）');
         this._saConnectStream(taskId, lastEventId || 0);
     },
 
@@ -2529,7 +2522,7 @@ const Tools = {
         es.onerror = () => {
             es.close();
             this._saEventSource = null;
-            this._saAddLog('⚠️ 连接中断，尝试重连...');
+            this._saLog('warning', '⚠️ 连接中断，尝试重连...');
             setTimeout(() => this._saReconnect(taskId), 2000);
         };
     },
@@ -2544,7 +2537,7 @@ const Tools = {
                 return;
             }
             if (st.status === 'error') {
-                this._saAddLog('❌ ' + (st.error || '组表失败'), 'err');
+                this._saLog('error', '❌ ' + (st.error || '组表失败'));
                 this._saResetBtn();
                 return;
             }
@@ -2566,34 +2559,56 @@ const Tools = {
                 break;
             }
             case 'log':
-                this._saAddLog(event.message || '', event.message && event.message.includes('✅') ? 'ok' : '');
+                // 对齐智训：AI 生成时的 [CODE] 代码流不刷日志区（智训走代码区展示，组表无代码区故过滤）
+                if (event.message && !event.message.includes('[CODE]')) {
+                    let level = 'info';
+                    if (event.message.includes('✅')) level = 'success';
+                    else if (event.message.includes('⚠️')) level = 'warning';
+                    else if (event.message.includes('❌') || event.message.includes('失败')) level = 'error';
+                    this._saLog(level, event.message);
+                }
                 break;
             case 'mapping':
-                this._saAddLog(event.message || '', 'map');
+                this._saLog('mapping', event.message || '');
                 break;
             case 'thinking':
-                this._saAddLog(event.content || '', 'thinking');
+                this._saLog('thinking', event.content || '');
                 break;
             case 'complete':
                 this._saSetStatus('组表完成', 100);
-                this._saAddLog('✅ ' + (event.message || '组表完成'), 'ok');
+                this._saLog('success', '✅ ' + (event.message || '组表完成'));
                 this._saShowResult({ status: 'completed', output_files: event.output_files || [], matched_from_cache: event.matched_from_cache });
                 break;
             case 'error':
                 this._saSetStatus('组表失败', 0);
-                this._saAddLog('❌ ' + (event.message || '组表失败'), 'err');
+                this._saLog('error', '❌ ' + (event.message || '组表失败'));
                 this._saResetBtn();
                 break;
         }
     },
 
     _saShowResult(st) {
-        const card = document.getElementById('sa-result-card');
-        card.style.display = '';
-        const dl = document.getElementById('sa-result-downloads');
-        dl.innerHTML = (st.output_files || []).map(f =>
-            `<a class="btn btn-sm btn-primary" href="#" onclick="Tools._saDownload(${this._saTaskId}, '${f.replace(/'/g, "\\'")}');return false;">下载 ${f}</a>`
-        ).join('') || '<span style="color:#888;">无结果文件</span>';
+        const resultCard = document.getElementById('sa-result-card');
+        const resultDownloads = document.getElementById('sa-result-downloads');
+        const files = st.output_files || [];
+
+        resultCard.className = 'result-card result-success';
+        resultCard.innerHTML = `
+            <div class="result-row">
+                <div class="result-item">
+                    <div class="label">组表状态</div>
+                    <div class="value" style="color: #28a745; font-size: 20px;">成功${st.matched_from_cache ? '（命中存档）' : ''}</div>
+                </div>
+                <div class="result-item">
+                    <div class="label">输出文件</div>
+                    <div class="value">${files.length ? files.map(f => `${f.includes('_纯值') ? '纯值版' : '原版'}：${f}`).join('<br>') : 'N/A'}</div>
+                </div>
+            </div>
+        `;
+        resultDownloads.innerHTML = files.length
+            ? files.map(f => `<button class="btn btn-download" onclick="Tools._saDownload(${this._saTaskId}, '${f.replace(/'/g, "\\'")}')">下载${f.includes('_纯值') ? '纯值版' : '原版'}</button>`).join('')
+            : '';
+
         document.getElementById('sa-feedback-bar').style.display = st.status === 'completed' ? '' : 'none';
         document.getElementById('sa-feedback-msg').textContent = '';
         this._saResetBtn();
@@ -2621,7 +2636,7 @@ const Tools = {
             document.getElementById('sa-feedback-msg').textContent = data.message || '';
             document.getElementById('sa-feedback-bar').style.opacity = '0.6';
             if (!correct) {
-                this._saAddLog('❌ 已反馈：命中映射标待复核，建议勾选"强制重新匹配"重新组表', 'err');
+                this._saLog('error', '❌ 已反馈：命中映射标待复核，建议勾选"强制重新匹配"重新组表');
             }
         } catch (e) {
             alert('反馈失败: ' + e.message);

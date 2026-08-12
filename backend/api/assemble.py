@@ -325,9 +325,12 @@ async def assemble_task_result(task_id: int,
 
 
 @router.get("/download/{task_id}/{file_name}")
-async def assemble_download(task_id: int, file_name: str,
-                            current_user=Depends(require_permission("tools.assemble", "tools.assemble.manage"))):
-    """下载结果文件（原版/纯值版）。"""
+async def assemble_download(task_id: int, file_name: str):
+    """下载结果文件（原版/纯值版）。
+
+    ⚠️ 无鉴权（与智算 /api/download-compute-result 一致）：前端用 <a> 标签直接跳转下载，
+    EventSource/普通链接无法携带 Authorization header，加鉴权会导致下载 401。
+    """
     name = Path(file_name).name   # 防目录穿越
     p = _TENANTS_DIR / "placeholder"  # 先占位，下面按任务查租户
     db = SessionLocal()

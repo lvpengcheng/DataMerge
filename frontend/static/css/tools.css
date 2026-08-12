@@ -123,3 +123,194 @@
     color: #999;
     padding: 0 4px;
 }
+
+/* ==================== 智能组表（对齐智算 compute.css 布局） ==================== */
+#tab-smart-assemble .sa-main-content {
+    display: grid;
+    grid-template-columns: minmax(280px, 28%) 1fr;
+    gap: 20px;
+    align-items: stretch;
+    width: 100%;
+}
+#tab-smart-assemble section {
+    background: white;
+    padding: 24px 30px;
+    border-radius: 12px;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+#tab-smart-assemble section h2 {
+    color: #333;
+    font-size: 18px;
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid #f0f0f0;
+}
+#tab-smart-assemble section h3 {
+    color: #555;
+    font-size: 14px;
+    margin-bottom: 6px;
+    margin-top: 0;
+}
+#tab-smart-assemble .form-group {
+    margin-bottom: 20px;
+}
+#tab-smart-assemble .form-group label {
+    display: block;
+    color: #555;
+    font-size: 14px;
+    margin-bottom: 8px;
+    font-weight: 500;
+}
+#tab-smart-assemble .form-group select,
+#tab-smart-assemble .form-group input[type="text"],
+#tab-smart-assemble .form-group input[type="number"] {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    font-size: 14px;
+    transition: border-color 0.3s;
+}
+#tab-smart-assemble .form-group input[type="file"] {
+    width: 100%;
+    padding: 8px;
+    border: 2px dashed #ddd;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 14px;
+}
+#tab-smart-assemble .file-list {
+    margin-top: 8px;
+    font-size: 12px;
+    color: #666;
+}
+#tab-smart-assemble .file-list div {
+    padding: 4px 8px;
+    background: #f5f5f5;
+    border-radius: 4px;
+    margin-top: 4px;
+}
+#tab-smart-assemble .sa-config-section {
+    overflow-y: auto;
+    max-height: 100%;
+}
+#tab-smart-assemble .sa-right-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    min-height: 0;
+    min-width: 0;
+}
+#tab-smart-assemble .sa-progress-section {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+#tab-smart-assemble .status-card {
+    background: linear-gradient(135deg, #42a5f5 0%, #1976d2 100%);
+    padding: 10px 16px;
+    border-radius: 10px;
+    color: white;
+    margin-bottom: 8px;
+}
+#tab-smart-assemble .status-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+}
+#tab-smart-assemble .status-label {
+    font-size: 13px;
+    opacity: 0.9;
+}
+#tab-smart-assemble .status-value {
+    font-size: 15px;
+    font-weight: 600;
+}
+#tab-smart-assemble .progress-bar-container {
+    position: relative;
+    background: rgba(255, 255, 255, 0.2);
+    height: 22px;
+    border-radius: 11px;
+    overflow: hidden;
+}
+#tab-smart-assemble .progress-bar {
+    height: 100%;
+    background: white;
+    border-radius: 11px;
+    transition: width 0.5s ease;
+    width: 0%;
+}
+#tab-smart-assemble .progress-text {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-weight: 600;
+    font-size: 12px;
+    color: #333;
+}
+#tab-smart-assemble .log-container {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+#tab-smart-assemble .log-content {
+    background: #1e1e1e;
+    color: #d4d4d4;
+    padding: 10px 12px;
+    border-radius: 8px;
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 12px;
+    min-height: 58px;
+    max-height: 50vh;
+    overflow-y: auto;
+    overflow-x: hidden;
+    line-height: 1.6;
+    word-break: break-all;
+}
+#tab-smart-assemble .log-entry {
+    margin-bottom: 8px;
+    padding: 4px 0;
+}
+#tab-smart-assemble .log-entry.info {
+    color: #4fc3f7;
+}
+#tab-smart-assemble .log-entry.success {
+    color: #66bb6a;
+}
+#tab-smart-assemble .log-entry.error {
+    color: #ef5350;
+}
+#tab-smart-assemble .log-entry.warning {
+    color: #ffb74d;
+}
+#tab-smart-assemble .log-entry.mapping {
+    color: #ffb74d;
+}
+#tab-smart-assemble .log-entry.thinking {
+    color: #8a94a6;
+    margin-left: 12px;
+}
+#tab-smart-assemble .log-timestamp {
+    color: #888;
+    margin-right: 8px;
+}
+#tab-smart-assemble .sa-result-section {
+    flex-shrink: 0;
+}
+#tab-smart-assemble .result-card {
+    background: #f8f9fa;
+    padding: 10px 16px;
+    border-radius: 8px;
+    margin-bottom: 10px;
+}
+#tab-smart-assemble .result-success {
+    border-left: 4px solid #28a745;
+}
+#tab-smart-assemble .result-downloads {
+    margin-bottom: 10px;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>智能小工具 - 智算</title>
     <link rel="stylesheet" href="/static/css/admin.css?v=20260807a">
-    <link rel="stylesheet" href="/static/css/tools.css?v=20260616a">
+    <link rel="stylesheet" href="/static/css/tools.css?v=20260812a">
 </head>
 <body>
     <div class="container">
@@ -389,67 +389,85 @@
 
         <!-- 智能组表 Tab -->
         <div class="tab-content" id="tab-smart-assemble">
-            <div style="display:grid;grid-template-columns:minmax(280px,30%) 1fr;gap:16px;">
-                <!-- 左侧配置区 -->
-                <div style="padding:16px;background:#fff;border:1px solid #e5e9f0;border-radius:8px;display:flex;flex-direction:column;gap:14px;">
-                    <h2 style="margin:0;font-size:16px;">智能组表</h2>
-                    <div style="font-size:12px;color:#888;">上传源文件 + 模板文件，AI 分析字段匹配并填充到模板数据行。
-                        结构一致的自动复用存档代码（跳过 AI）。样例数据已脱敏，安全。</div>
-                    <div class="form-group" style="margin:0;">
-                        <label style="font-weight:600;display:block;margin-bottom:4px;">租户</label>
-                        <select id="sa-tenant-select" style="width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:6px;">
+            <div class="sa-main-content">
+                <!-- 左侧配置（对齐智算 config-section） -->
+                <section class="sa-config-section">
+                    <h2>组表配置</h2>
+
+                    <div class="form-group">
+                        <label for="sa-tenant-select">租户ID:</label>
+                        <select id="sa-tenant-select">
                             <option value="">加载中...</option>
                         </select>
                     </div>
-                    <div class="form-group" style="margin:0;">
-                        <label style="font-weight:600;display:block;margin-bottom:4px;">组表规则（可选）</label>
-                        <select id="sa-rule-select" style="width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:6px;">
+
+                    <div class="form-group">
+                        <label for="sa-rule-select">组表规则 (可选):</label>
+                        <select id="sa-rule-select">
                             <option value="">（不选规则，AI 仅按结构分析）</option>
                         </select>
                     </div>
-                    <div class="form-group" style="margin:0;">
-                        <label style="font-weight:600;display:block;margin-bottom:4px;">源文件（可多选）</label>
-                        <input type="file" id="sa-source-files" multiple accept=".xlsx,.xls" style="width:100%;">
-                        <div class="file-list" id="sa-source-file-list" style="font-size:12px;color:#666;margin-top:4px;"></div>
-                    </div>
-                    <div class="form-group" style="margin:0;">
-                        <label style="font-weight:600;display:block;margin-bottom:4px;">模板文件</label>
-                        <input type="file" id="sa-template-file" accept=".xlsx,.xls" style="width:100%;">
-                        <div class="file-list" id="sa-template-file-list" style="font-size:12px;color:#666;margin-top:4px;"></div>
-                    </div>
-                    <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;">
-                        <input type="checkbox" id="sa-force-rematch">
-                        强制重新匹配（跳过代码存档和知识库，全量 AI 分析）
-                    </label>
-                    <button class="btn btn-primary" id="sa-start-btn" onclick="Tools.saStart()" style="width:100%;">开始组表</button>
-                    <div style="font-size:12px;color:#888;">只读取模板的激活 sheet；源文件读全部可见 sheet。</div>
-                </div>
 
-                <!-- 右侧过程区 -->
-                <div style="display:flex;flex-direction:column;gap:14px;">
-                    <div style="padding:14px;background:#fff;border:1px solid #e5e9f0;border-radius:8px;">
-                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                            <span id="sa-status" style="font-weight:600;">就绪</span>
-                            <span id="sa-progress-text" style="font-size:12px;color:#888;">0%</span>
-                        </div>
-                        <div style="height:8px;background:#e8edf5;border-radius:4px;overflow:hidden;">
-                            <div id="sa-progress" style="height:100%;width:0%;background:#3b82f6;transition:width .4s;"></div>
-                        </div>
-                        <div id="sa-log" style="height:340px;overflow:auto;background:#1e2430;color:#c8d3e0;
-                            font-family:Consolas,monospace;font-size:12px;padding:10px;border-radius:6px;margin-top:10px;white-space:pre-wrap;">
-                            <span style="color:#6b7280;">等待开始...</span>
-                        </div>
+                    <div class="form-group">
+                        <label for="sa-source-files">源文件:</label>
+                        <input type="file" id="sa-source-files" multiple accept=".xlsx,.xls">
+                        <div class="file-list" id="sa-source-file-list"></div>
                     </div>
-                    <div id="sa-result-card" style="display:none;padding:14px;background:#fff;border:1px solid #e5e9f0;border-radius:8px;">
-                        <div style="font-weight:600;margin-bottom:8px;">组表结果</div>
-                        <div id="sa-result-downloads" style="display:flex;gap:8px;flex-wrap:wrap;"></div>
-                        <div id="sa-feedback-bar" style="margin-top:12px;padding:10px 12px;background:#f0f7ff;border-radius:6px;font-size:13px;display:none;">
+
+                    <div class="form-group">
+                        <label for="sa-template-file">模板文件:</label>
+                        <input type="file" id="sa-template-file" accept=".xlsx,.xls">
+                        <div class="file-list" id="sa-template-file-list"></div>
+                    </div>
+
+                    <div class="form-group">
+                        <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+                            <input type="checkbox" id="sa-force-rematch" style="width:auto;">
+                            强制重新匹配（跳过代码存档和知识库，全量 AI 分析）
+                        </label>
+                        <div style="font-size:12px;color:#888;margin-top:4px;">模板只读激活 sheet；源文件读全部可见 sheet。</div>
+                    </div>
+
+                    <button class="btn btn-primary" id="sa-start-btn" onclick="Tools.saStart()">开始组表</button>
+                </section>
+
+                <!-- 右侧过程（对齐智算 right-panel） -->
+                <div class="sa-right-panel">
+                    <section class="sa-progress-section">
+                        <h2>组表进度</h2>
+
+                        <div class="status-card">
+                            <div class="status-header">
+                                <span class="status-label">当前状态:</span>
+                                <span class="status-value" id="sa-status">等待开始</span>
+                            </div>
+                            <div class="progress-bar-container">
+                                <div class="progress-bar" id="sa-progress"></div>
+                                <span class="progress-text" id="sa-progress-text">0%</span>
+                            </div>
+                        </div>
+
+                        <div class="log-container">
+                            <h3>执行日志</h3>
+                            <div class="log-content" id="sa-log">
+                                <div class="log-entry info"><span class="log-timestamp">[--:--:--]</span>等待开始组表...</div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="sa-result-section">
+                        <h2>组表结果</h2>
+                        <div class="result-card" id="sa-result-card">
+                            <p style="color: #999; text-align: center; padding: 20px;">等待组表完成...</p>
+                        </div>
+                        <div class="result-downloads" id="sa-result-downloads"></div>
+                        <div id="sa-feedback-bar" style="display:none;margin-top:12px;padding:10px 12px;background:#f0f7ff;border-radius:6px;font-size:13px;">
                             结果是否正确？
-                            <button class="btn btn-sm" onclick="Tools.saFeedback(true)" style="margin-left:6px;">✅ 正确</button>
-                            <button class="btn btn-sm" onclick="Tools.saFeedback(false)" style="margin-left:4px;">❌ 有误</button>
+                            <button class="btn btn-small" onclick="Tools.saFeedback(true)">✅ 正确</button>
+                            <button class="btn btn-small" onclick="Tools.saFeedback(false)">❌ 有误</button>
                             <span id="sa-feedback-msg" style="margin-left:8px;color:#888;font-size:12px;"></span>
                         </div>
-                    </div>
+                    </section>
                 </div>
             </div>
         </div>
@@ -477,6 +495,6 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260722a"></script>
-    <script src="/static/js/tools.js?v=20260812a"></script>
+    <script src="/static/js/tools.js?v=20260812d"></script>
 </body>
 </html>
