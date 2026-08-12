@@ -33,6 +33,7 @@
             <button class="tab-btn" data-tab="test-migration" data-perm="admin.test_migration">测试迁移</button>
             <button class="tab-btn" data-tab="sop-rules" data-perm="tools.sop.manage">SOP规则</button>
             <button class="tab-btn" data-tab="assemble-rules" data-perm="tools.assemble.manage">智能组表规则</button>
+            <button class="tab-btn" data-tab="system-config" data-perm="admin.config">系统配置</button>
         </div>
 
         <!-- 用户管理 Tab -->
@@ -287,6 +288,21 @@
                 <tbody></tbody>
             </table>
         </div>
+
+        <!-- 系统配置 Tab -->
+        <div class="tab-content" id="tab-system-config">
+            <h4 style="margin:0 0 6px;">模型管理</h4>
+            <div style="font-size:12px;color:#888;margin-bottom:14px;">
+                勾选启用的 AI 模型：规则整理和智训页面的"AI 模型"下拉框只显示勾选的模型，未勾选的不显示。
+            </div>
+            <div id="ai-providers-config" style="display:flex;flex-direction:column;gap:10px;max-width:420px;">
+                <span style="color:#888;font-size:13px;">加载中...</span>
+            </div>
+            <div style="margin-top:14px;">
+                <button class="btn btn-primary" onclick="Admin.saveAiProviders()">保存配置</button>
+                <span id="ai-providers-msg" style="margin-left:10px;color:#4caf50;font-size:13px;"></span>
+            </div>
+        </div>
     </div>
 
     <!-- 全局加载遮罩 -->
@@ -311,6 +327,6 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260722a"></script>
-    <script src="/static/js/admin.js?v=20260812a"></script>
+    <script src="/static/js/admin.js?v=20260812b"></script>
 </body>
 </html>

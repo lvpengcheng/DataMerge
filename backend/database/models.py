@@ -397,6 +397,20 @@ class AssembleFieldMapping(Base):
     )
 
 
+class SystemConfig(Base):
+    """系统配置（key-value，JSON 值）。
+
+    目前用途：ai_providers_enabled = {"enabled": ["deepseek", "claude"]}
+    规则整理/智训的 AI 模型下拉框按此过滤显示。
+    """
+    __tablename__ = "system_configs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    key = Column(String(100), nullable=False, unique=True, index=True)
+    value = Column(JSON, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class MergeFieldMapping(Base):
     """多表合并：字段匹配结果缓存。
 

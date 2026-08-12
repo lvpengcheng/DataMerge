@@ -47,7 +47,24 @@ document.addEventListener('DOMContentLoaded', function () {
     });
 
     loadSessions();
+    loadAiProviderOptions();
 });
+
+// ==================== AI 模型下拉框（按后台启用状态过滤） ====================
+async function loadAiProviderOptions() {
+    const sel = document.getElementById('ai-provider');
+    if (!sel) return;
+    try {
+        const resp = await AUTH.authFetch('/api/admin/ai-providers');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const items = (data.items || []).filter(p => p.enabled);
+        if (!items.length) return;   // 未配置时保持默认
+        sel.innerHTML = items.map(p => `<option value="${p.key}">${p.label}${p.key === 'claude' ? ' (推荐)' : ''}</option>`).join('');
+    } catch (e) {
+        console.warn('加载AI模型列表失败:', e);
+    }
+}
 
 // ==================== 会话管理 ====================
 async function loadSessions() {

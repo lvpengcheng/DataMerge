@@ -1936,3 +1936,60 @@ def migration_import(req: _MigrateReq, db: Session = Depends(get_db), _admin: Us
     db.commit()
     return {"imported": imported, "conflicts": conflicts, "skipped": skipped}
 
+# ==================== AI 模型管理（系统配置） ====================
+
+# 支持的 AI provider 及显示名（与 ai_provider.AIProviderFactory.PROVIDERS 对齐）
+AI_PROVIDER_OPTIONS = [
+    {"key": "deepseek", "label": "DeepSeek"},
+    {"key": "claude", "label": "Claude"},
+    {"key": "openai", "label": "OpenAI GPT"},
+    {"key": "ollama", "label": "Ollama（本地）"},
+    {"key": "local", "label": "Local（本地）"},
+]
+
+CONFIG_KEY_AI_PROVIDERS = "ai_providers_enabled"
+
+
+def _get_ai_providers_config(db) -> dict:
+    """读取启用配置：未配置时返回全部启用（升级兼容）。"""
+    from ..database.models import SystemConfig
+    row = db.query(SystemConfig).filter_by(key=CONFIG_KEY_AI_PROVIDERS).first()
+    if not row or not row.value:
+        return {"enabled": [o["key"] for o in AI_PROVIDER_OPTIONS]}
+    enabled = [k for k in (row.value.get("enabled") or []) if k in [o["key"] for o in AI_PROVIDER_OPTIONS]]
+    return {"enabled": enabled}
+
+
+@router.get("/ai-providers")
+async def list_ai_providers(current_user=Depends(get_current_user),
+                            db: Session = Depends(get_db)):
+    """AI 模型列表 + 启用状态（规则整理/智训下拉框据此过滤显示）。"""
+    cfg = _get_ai_providers_config(db)
+    enabled_set = set(cfg["enabled"])
+    return {
+        "items": [
+            {"key": o["key"], "label": o["label"], "enabled": o["key"] in enabled_set}
+            for o in AI_PROVIDER_OPTIONS
+        ],
+        "enabled": list(enabled_set),
+    }
+
+
+@router.put("/ai-providers")
+async def update_ai_providers(
+    enabled: List[str],
+    _admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """保存启用的 AI 模型列表（仅管理员）。"""
+    from ..database.models import SystemConfig
+    valid = {o["key"] for o in AI_PROVIDER_OPTIONS}
+    enabled = [k for k in enabled if k in valid]
+    row = db.query(SystemConfig).filter_by(key=CONFIG_KEY_AI_PROVIDERS).first()
+    if not row:
+        row = SystemConfig(key=CONFIG_KEY_AI_PROVIDERS, value={"enabled": enabled})
+        db.add(row)
+    else:
+        row.value = {"enabled": enabled}
+    db.commit()
+    return {"ok": True, "enabled": enabled}

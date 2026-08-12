@@ -94,6 +94,7 @@ from backend.database.models import (
     MergeFieldMapping, MergeTemplate, ScriptMigration,
     SopEntry, SopRound, SopRuleFile,
     AssembleRule, AssembleTask, AssembleFieldMapping,
+    SystemConfig,
 )
 from passlib.context import CryptContext
 

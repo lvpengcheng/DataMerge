@@ -55,6 +55,7 @@ const Admin = {
                 else if (tab === 'test-migration') this.initMigration();
                 else if (tab === 'sop-rules') this.loadSopRules();
                 else if (tab === 'assemble-rules') this.loadAssembleRules();
+                else if (tab === 'system-config') this.loadAiProviders();
             });
         });
     },
@@ -1384,6 +1385,68 @@ const Admin = {
         const resp = await AUTH.authFetch(`/api/assemble/mappings/${id}`, { method: 'DELETE' });
         if (!resp.ok) return _alertErr(resp, '删除失败');
         this.loadMappings();
+    },
+
+    // ==================== 系统配置：模型管理 ====================
+    _aiProviders: [],
+
+    async loadAiProviders() {
+        try {
+            const resp = await AUTH.authFetch('/api/admin/ai-providers');
+            if (!resp.ok) return _alertErr(resp, '加载模型配置失败');
+            const data = await resp.json();
+            this._aiProviders = data.items || [];
+            const box = document.getElementById('ai-providers-config');
+            box.innerHTML = this._aiProviders.map(p => `
+                <label style="display:flex;align-items:center;gap:10px;padding:10px 12px;
+                    border:1px solid #e3e7ed;border-radius:6px;cursor:pointer;background:${p.enabled ? '#f0f7ff' : '#fff'};">
+                    <input type="checkbox" data-key="${p.key}" ${p.enabled ? 'checked' : ''}
+                        style="width:16px;height:16px;" onchange="Admin._onAiProviderToggle(this)">
+                    <span style="font-weight:500;">${this._escapeHtml(p.label)}</span>
+                    <span style="font-size:12px;color:#888;margin-left:4px;">(${p.key})</span>
+                    <span style="margin-left:auto;font-size:12px;${p.enabled ? 'color:#4caf50;' : 'color:#999;'}" class="ai-provider-state">
+                        ${p.enabled ? '已启用' : '已停用'}
+                    </span>
+                </label>`).join('');
+            document.getElementById('ai-providers-msg').textContent = '';
+        } catch (e) {
+            alert('加载模型配置失败: ' + e.message);
+        }
+    },
+
+    _onAiProviderToggle(checkbox) {
+        const label = checkbox.closest('label');
+        const state = label.querySelector('.ai-provider-state');
+        if (checkbox.checked) {
+            label.style.background = '#f0f7ff';
+            state.textContent = '已启用';
+            state.style.color = '#4caf50';
+        } else {
+            label.style.background = '#fff';
+            state.textContent = '已停用';
+            state.style.color = '#999';
+        }
+    },
+
+    async saveAiProviders() {
+        const enabled = Array.from(document.querySelectorAll('#ai-providers-config input:checked'))
+            .map(i => i.dataset.key);
+        if (!enabled.length) {
+            if (!confirm('一个模型都不启用会导致规则整理/智训无法使用 AI，确认继续？')) return;
+        }
+        try {
+            const resp = await AUTH.authFetch('/api/admin/ai-providers', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(enabled),
+            });
+            if (!resp.ok) return _alertErr(resp, '保存失败');
+            const msg = document.getElementById('ai-providers-msg');
+            msg.textContent = '✅ 已保存，启用: ' + (enabled.join('、') || '（无）');
+            this.loadAiProviders();
+        } catch (e) {
+            alert('保存失败: ' + e.message);
+        }
     },
 
     async _downloadViaAuth(url, fileName) {
