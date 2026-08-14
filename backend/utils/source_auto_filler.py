@@ -525,13 +525,16 @@ def ai_disambiguate_rename_candidates(
     prompt = _build_rename_disambiguation_prompt(uploaded_payload, expected_payload)
 
     try:
-        from backend.ai_engine.ai_provider import AIProviderFactory
+        from backend.ai_engine.ai_provider import AIProviderFactory, chat_with_timeout
         provider = AIProviderFactory.create_provider(ai_provider_name)
         messages = [
             {"role": "system", "content": "你是一个 Excel 数据语义识别专家，擅长在不同命名习惯下识别文件之间的对应关系。"},
             {"role": "user", "content": prompt},
         ]
-        raw = provider.chat(messages, temperature=0.1, max_tokens=1500)
+        # 带总超时：AI 卡住时原样返回程序评分结果（提交请求同步等待，超网关读超时会被判 504）
+        raw = chat_with_timeout(provider, messages, max_tokens=1500)
+        if raw is None:
+            return ambiguous
     except Exception as e:
         logger.warning(f"[Rename/AI] 调用失败: {e}")
         return ambiguous

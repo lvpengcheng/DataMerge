@@ -7,6 +7,7 @@ import json
 import re
 import logging
 from abc import ABC, abstractmethod
+from concurrent import futures
 from typing import Dict, List, Any, Optional
 import requests as http_requests
 from backend.utils.indentation_fixer import IndentationFixer
@@ -1936,6 +1937,36 @@ if __name__ == "__main__":
             {"role": "user", "content": prompt}
         ]
         return self.chat(messages, **kwargs)
+
+
+# 超时执行器：给"建议/裁决"类 AI 调用加总超时（线程池复用，超时后调用返回 None，
+# 底层请求线程继续跑不阻塞主流程；防 submit 同步等 AI 卡住被网关判 504/502）
+_ai_call_executor = futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="ai-call-guard")
+
+
+def chat_with_timeout(provider: BaseAIProvider, messages: List[Dict[str, Any]],
+                      timeout: Optional[int] = None, **kwargs) -> Any:
+    """带总超时的 AI 调用：超时/异常返回 None（调用方降级，不阻断主流程）。
+
+    timeout 默认读 .env PRECHECK_AI_TIMEOUT（默认 60s）。用于智算 precheck 的
+    列头映射建议/改名裁决等"非关键 AI"环节——AI 卡住时跳过建议，规则校验照常，
+    避免提交请求挂起超过网关读超时（nginx 默认 60s → 504）。
+    """
+    try:
+        _timeout = int(timeout) if timeout is not None else int(
+            os.getenv("PRECHECK_AI_TIMEOUT", "60"))
+    except (TypeError, ValueError):
+        _timeout = 60
+    fut = _ai_call_executor.submit(provider.chat, messages, **kwargs)
+    try:
+        return fut.result(timeout=_timeout)
+    except futures.TimeoutError:
+        logging.getLogger(__name__).warning(
+            f"[AI超时] {type(provider).__name__} 调用超过 {_timeout}s，跳过本次 AI 环节")
+        return None
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"[AI超时] 调用失败: {e}")
+        return None
 
 
 class AIProviderFactory:

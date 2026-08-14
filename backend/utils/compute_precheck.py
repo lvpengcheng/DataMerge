@@ -409,13 +409,16 @@ def _ai_suggest_column_mapping(
     prompt = _build_column_match_prompt(expected_paths, actual_paths)
 
     try:
-        from backend.ai_engine.ai_provider import AIProviderFactory
+        from backend.ai_engine.ai_provider import AIProviderFactory, chat_with_timeout
         provider = AIProviderFactory.create_provider(ai_provider_name)
         messages = [
             {"role": "system", "content": "你是一个 Excel 表头匹配专家，擅长在不同命名习惯之间找到语义等价的列对应关系。"},
             {"role": "user", "content": prompt},
         ]
-        raw = provider.chat(messages, temperature=0.1, max_tokens=2000)
+        # 带总超时：AI 卡住时跳过建议（提交请求同步等待，超网关读超时会被判 504）
+        raw = chat_with_timeout(provider, messages, max_tokens=2000)
+        if raw is None:
+            return [], actual_paths
     except Exception as e:
         logger.warning(f"[Precheck/AI] 调用失败: {e}")
         return [], actual_paths
