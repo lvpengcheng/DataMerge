@@ -603,20 +603,60 @@ def _execute_in_sandbox(code: str, source_dir: Path, output_dir: Path,
 
 # ==================== 结果后处理 ====================
 
+def _strip_single_arg_iferror(formula: str) -> str:
+    """把公式中所有"单参 IFERROR(X)"替换为 X。
+
+    IFERROR 必须 2 参数 (value, value_if_error)；单参 IFERROR(X) 是非法公式，
+    openpyxl 不校验照存，但 Aspose/Excel 解析失败 → 公式单元格丢失（真实事故：
+    任务46 全部公式变 IsNull，原版/纯值版全空）。
+    循环处理嵌套：IFERROR(A,IFERROR(B)) → IFERROR(A,B)。
+    """
+    prev = None
+    f = formula
+    while prev != f:
+        prev = f
+        out = []
+        i = 0
+        n = len(f)
+        while i < n:
+            if f.startswith('IFERROR(', i):
+                depth = 1
+                j = i + 8          # len('IFERROR(')
+                k = j
+                top_comma = False
+                while k < n and depth > 0:
+                    ch = f[k]
+                    if ch == '(':
+                        depth += 1
+                    elif ch == ')':
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    elif ch == ',' and depth == 1:
+                        top_comma = True
+                    k += 1
+                if not top_comma and depth == 0:
+                    out.append(f[j:k])   # 单参 → 去壳
+                    i = k + 1
+                    continue
+            out.append(f[i])
+            i += 1
+        f = ''.join(out)
+    return f
+
+
 def _fix_formula_syntax(file_path: Path, push) -> int:
     """修复 AI 公式拼接的常见语法错误，防止 Excel 打开提示修复并丢弃公式。
 
-    已知错误模式（真实事故）：AI 把 IFERROR 写成 3 个参数
-        =IFERROR(VLOOKUP(...),IFERROR(VLOOKUP(...),""),"")
-    IFERROR 只接受 2 参数 (value, value_if_error) → Excel 打开报"公式错误"提示修复，
-    修复时会丢弃非法公式 → 用户看到"原版没有公式"。
-
-    修复：公式以 =IFERROR( 开头且最外层多了一个尾参 ,"") 时，删除该尾参。
+    已知错误模式（真实事故）：
+      1) 单参 IFERROR: =IFERROR(VLOOKUP(...)) —— 缺 value_if_error → Aspose 解析失败
+         公式单元格变 IsNull（原版/纯值版全空）
+      2) 3 参 IFERROR: =IFERROR(A,IFERROR(B,""),"") —— 参数过多 → Excel 修复丢公式
+    修复：单参去壳（用户要求裸公式），3 参删除尾参。
     """
     import openpyxl
 
-    # 模式：=IFERROR(...) ,"" ) 结尾 → 贪婪匹配最后一个 ,"" 前的括号组
-    _pat = re.compile(r'^(=IFERROR\(.*),""\)$')
+    _pat3 = re.compile(r'^(=IFERROR\(.*),""\)$')   # 3 参 → 删尾参
     wb = openpyxl.load_workbook(str(file_path))
     fixed = 0
     for ws in wb.worksheets:
@@ -625,15 +665,41 @@ def _fix_formula_syntax(file_path: Path, push) -> int:
                 v = cell.value
                 if not isinstance(v, str) or not v.startswith("="):
                     continue
-                m = _pat.match(v)
+                nv = v
+                m = _pat3.match(nv)
                 if m:
-                    cell.value = m.group(1) + ")"
+                    nv = m.group(1) + ")"
+                nv = _strip_single_arg_iferror(nv)
+                if nv != v:
+                    cell.value = nv
                     fixed += 1
     if fixed:
         wb.save(str(file_path))
         push({"type": "log", "message":
-              f"✅ 已修复 {fixed} 个 IFERROR 参数错误公式（防止 Excel 打开修复丢公式）"})
+              f"✅ 已修复 {fixed} 个公式语法错误（单参/3参 IFERROR）"})
     return fixed
+
+
+def _calculate_formulas(file_path: Path, push) -> None:
+    """Aspose 计算公式并保存缓存值。
+
+    openpyxl 保存的公式没有计算缓存值，Excel 打开时若不自动重算就显示空白
+    （"数据没填上"）。计算后保存 → 公式保留 + 缓存值写入，Excel 打开直接显示结果；
+    查不到的错误值（#N/A 等）按用户要求保留可见。
+    """
+    import aspose_init
+    from Aspose.Cells import Workbook
+
+    wb = Workbook(str(file_path))
+    try:
+        wb.CalculateFormula()
+        wb.Save(str(file_path))
+        push({"type": "log", "message": "✅ 公式已计算并保存缓存值（Excel 打开直接显示结果）"})
+    finally:
+        try:
+            wb.Dispose()
+        except Exception:
+            pass
 
 
 def _fix_out_of_range_dates(file_path: Path, push) -> int:
@@ -738,6 +804,11 @@ def _finalize_results(output_dir: Path, tenant_id: str, task_id: int,
         _fix_formula_syntax(orig_path, push)
     except Exception as e:
         logger.warning("[assemble] 公式语法修复失败: %s", e)
+    # 公式计算缓存值：openpyxl 保存的公式无缓存值，Excel 打开不重算会显示空白
+    try:
+        _calculate_formulas(orig_path, push)
+    except Exception as e:
+        logger.warning("[assemble] 公式计算失败: %s", e)
 
     # 【已移除】日期格式超范围修复（曾全表遍历修百万级单元格"防 Excel 打开报错"）：
     # 实测修复后打开仍报错（根因不在序列号，见任务日志），且后处理掩盖了真实问题。
