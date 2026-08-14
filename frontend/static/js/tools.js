@@ -2788,16 +2788,16 @@ const Tools = {
         }
     },
 
-    // 错误反馈弹窗：逐列复核映射（目标列 → 源列下拉可改）+ 源样例不脱敏
+    // 错误反馈弹窗：逐列复核映射（目标列 → 源列下拉可改）
     _saShowReviewModal(data) {
         const fm = data.field_mapping || {};
-        const samples = data.samples || [];
         // 汇总所有源列名（下拉选项）
         const srcCols = [];
         const seen = {};
-        samples.forEach(s => (s.columns || []).forEach(c => {
-            if (!seen[c]) { seen[c] = 1; srcCols.push(c); }
-        }));
+        Object.values(fm).forEach(info => {
+            const src = info && info.source_column;
+            if (src && !seen[src]) { seen[src] = 1; srcCols.push(src); }
+        });
 
         const rows = Object.keys(fm).map(tgt => {
             const info = fm[tgt] || {};
@@ -2814,30 +2814,14 @@ const Tools = {
             </tr>`;
         }).join('');
 
-        const sampleHtml = samples.map(s => {
-            const cols = s.columns || [];
-            const cell = v => (v === null || v === undefined) ? '' : _escape(v);
-            const rowHtml = (s.rows || []).map(r => {
-                const tds = cols.map(c => `<td>${cell(r[c])}</td>`).join('');
-                return `<tr>${tds}</tr>`;
-            }).join('');
-            return `<div class="sa-review-sample">
-                <div class="sa-review-sample-title">${_escape(s.file)} / ${_escape(s.sheet)}</div>
-                <table class="sa-review-sample-table"><thead><tr>${cols.map(c => `<th>${_escape(c)}</th>`).join('')}</tr></thead>
-                <tbody>${rowHtml || '<tr><td colspan="' + cols.length + '" style="color:#999;">（无数据行）</td></tr>'}</tbody></table>
-            </div>`;
-        }).join('');
-
         const body = `
             <p style="font-size:13px;color:#555;margin:0 0 10px;">请核对每列「目标表头 → 源表头」映射，直接在下拉里改。改完可点「重新组表」用修正映射重跑验证；确认无误后点「确认」记录本次匹配。</p>
-            <div style="max-height:38vh;overflow:auto;margin-bottom:12px;">
+            <div style="max-height:50vh;overflow:auto;margin-bottom:12px;">
                 <table class="sa-review-table">
                     <thead><tr><th>目标表头</th><th>目标列号</th><th>源表头（可改）</th><th>源列号</th></tr></thead>
-                    <tbody>${rows}</tbody>
+                    <tbody>${rows || '<tr><td colspan="4" style="color:#999;text-align:center;padding:16px;">（本次任务没有可复核的匹配关系）</td></tr>'}</tbody>
                 </table>
             </div>
-            <div style="font-weight:600;margin:8px 0 4px;font-size:13px;">源文件样例（未脱敏，前 3 行）</div>
-            <div style="max-height:24vh;overflow:auto;">${sampleHtml || '<div style="color:#999;">无源样例</div>'}</div>
             <div style="margin-top:14px;text-align:right;">
                 <button type="button" class="btn" onclick="Tools._saRematch()">重新组表</button>
                 <button type="button" class="btn btn-primary" onclick="Tools._saConfirmCorrected()">确认</button>
