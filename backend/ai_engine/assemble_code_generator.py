@@ -262,6 +262,10 @@ class AssembleCodeGenerator(TemplateCodeGenerator):
             "（VLOOKUP/INDEX/MATCH 引用主键列与 源_ sheet，如 "
             "=IFERROR(VLOOKUP(B2,'源_xxx'!B:C,2,FALSE),\"\")），**不要写死数值**"
             "——原版必须保留公式、可追溯，纯值版才会在后续转成值。\n"
+            "【公式语法硬性要求】IFERROR 只能有 2 个参数 (值, 出错时返回值)；"
+            "嵌套时写 =IFERROR(A,IFERROR(B,\"\"))，**绝不允许出现 3 个参数**"
+            "（如 =IFERROR(A,B,\"\") 是语法错误，Excel 会打开报错并丢弃公式）。"
+            "每个公式必须括号匹配、逗号分隔参数个数正确。\n"
             "函数体内必须包含至少一条『值赋值』语句（主键列 .value = 非公式）；"
             "只有公式没有值赋值、或只有值没有公式的输出都是无效的。"
         )

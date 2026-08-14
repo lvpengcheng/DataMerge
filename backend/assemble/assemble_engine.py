@@ -603,6 +603,39 @@ def _execute_in_sandbox(code: str, source_dir: Path, output_dir: Path,
 
 # ==================== 结果后处理 ====================
 
+def _fix_formula_syntax(file_path: Path, push) -> int:
+    """修复 AI 公式拼接的常见语法错误，防止 Excel 打开提示修复并丢弃公式。
+
+    已知错误模式（真实事故）：AI 把 IFERROR 写成 3 个参数
+        =IFERROR(VLOOKUP(...),IFERROR(VLOOKUP(...),""),"")
+    IFERROR 只接受 2 参数 (value, value_if_error) → Excel 打开报"公式错误"提示修复，
+    修复时会丢弃非法公式 → 用户看到"原版没有公式"。
+
+    修复：公式以 =IFERROR( 开头且最外层多了一个尾参 ,"") 时，删除该尾参。
+    """
+    import openpyxl
+
+    # 模式：=IFERROR(...) ,"" ) 结尾 → 贪婪匹配最后一个 ,"" 前的括号组
+    _pat = re.compile(r'^(=IFERROR\(.*),""\)$')
+    wb = openpyxl.load_workbook(str(file_path))
+    fixed = 0
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                v = cell.value
+                if not isinstance(v, str) or not v.startswith("="):
+                    continue
+                m = _pat.match(v)
+                if m:
+                    cell.value = m.group(1) + ")"
+                    fixed += 1
+    if fixed:
+        wb.save(str(file_path))
+        push({"type": "log", "message":
+              f"✅ 已修复 {fixed} 个 IFERROR 参数错误公式（防止 Excel 打开修复丢公式）"})
+    return fixed
+
+
 def _fix_out_of_range_dates(file_path: Path, push) -> int:
     """修复"日期格式列被填大数字"导致的打开报错。
 
@@ -699,6 +732,12 @@ def _finalize_results(output_dir: Path, tenant_id: str, task_id: int,
     orig_path = result_dir / orig_name
     shutil.copy2(main_out, orig_path)
     saved.append(orig_name)
+
+    # 公式语法修复：AI 拼接 IFERROR 3 参数等 → Excel 打开提示修复并丢公式（真实事故）
+    try:
+        _fix_formula_syntax(orig_path, push)
+    except Exception as e:
+        logger.warning("[assemble] 公式语法修复失败: %s", e)
 
     # 【已移除】日期格式超范围修复（曾全表遍历修百万级单元格"防 Excel 打开报错"）：
     # 实测修复后打开仍报错（根因不在序列号，见任务日志），且后处理掩盖了真实问题。
