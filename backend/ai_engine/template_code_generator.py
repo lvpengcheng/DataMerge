@@ -764,12 +764,9 @@ _SK_TO_SHEET = {sk_to_sheet_literal}
 CLEANING_SPEC = None
 # 结构化字段映射（智能组表专用）：默认 None。AI 若输出了 FIELD_MAPPING = {{...}}
 # （在 def fill_template 上方、同一个代码块内），此处被覆盖，main() 导出 JSON 供引擎落库。
+# ⚠️ 人工复核修正映射（_field_mapping_override）在 main() 里 fill_template 调用前覆盖
+#    （模块顶层覆盖会被 AI 的 FIELD_MAPPING 赋值语句顶掉，见 main()）。
 FIELD_MAPPING = None
-# 运行时人工复核修正映射（智能组表 rematch 注入 _field_mapping_override）：覆盖 FIELD_MAPPING，
-# fill_template 若按 FIELD_MAPPING 驱动则修正立即生效，无需重新 AI 生成。
-_field_ov = globals().get("_field_mapping_override")
-if _field_ov:
-    FIELD_MAPPING = _field_ov
 # 阶段0 执行后的行布局：{{sheet_name: {{"key_to_row": {{主键:0based行}}, "data_start":.., "data_end":.., "removed":.., "added":..}}}}
 _ROW_LAYOUT = None
 # ==================================================================
@@ -1463,6 +1460,13 @@ def main():
 
     snapshot_before = _snapshot_workbook(wb)
     _fmt_snapshot = _snapshot_number_formats(wb)
+
+    # 人工复核修正映射覆盖：必须在 fill_template 调用前（此时模块级 AI 输出的 FIELD_MAPPING
+    # 已赋值，此处再覆盖才生效；模块顶层覆盖会被 AI 赋值语句顶掉）。
+    _fm_ov = globals().get("_field_mapping_override")
+    if _fm_ov:
+        FIELD_MAPPING = _fm_ov
+        print("使用人工修正映射执行（{{len(FIELD_MAPPING)}} 列），不重新 AI 生成")
 
     print("步骤：调用 AI 生成的 fill_template 写入规则要求的列...")
     fill_template(wb, source_data, salary_year, salary_month, monthly_standard_hours)
