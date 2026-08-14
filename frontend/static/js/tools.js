@@ -1148,12 +1148,19 @@ const Tools = {
         const st = document.getElementById('int-exec-status');
         const btn = document.getElementById('int-execute');
         btn.disabled = true; st.textContent = '生成中...'; st.className = 'status';
+        // 与套用方案入口的状态元素统一（#integrate-status），避免"正在生成结果"永不更新
+        this._setIntegrateStatus('正在生成结果...', 'ok');
         try {
             const resp = await AUTH.authFetch('/api/tools/integrate/execute', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload),
             });
-            if (!resp.ok) { await _alertErr(resp, '生成失败'); st.textContent = '生成失败'; st.className = 'status error'; return; }
+            if (!resp.ok) {
+                await _alertErr(resp, '生成失败');
+                st.textContent = '生成失败'; st.className = 'status error';
+                this._setIntegrateStatus('生成失败', 'error');
+                return;
+            }
             const blob = await resp.blob();
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
@@ -1162,7 +1169,11 @@ const Tools = {
             URL.revokeObjectURL(url);
             const info = `命中${resp.headers.get('X-Integrate-Matched') || 0}行 覆盖${resp.headers.get('X-Integrate-Cells') || 0}格 差异${resp.headers.get('X-Integrate-Diffs') || 0}行`;
             st.textContent = '已生成下载（' + info + '）'; st.className = 'status ok';
-        } catch (e) { st.textContent = '失败: ' + e.message; st.className = 'status error'; }
+            this._setIntegrateStatus('已生成下载（' + info + '）', 'ok');
+        } catch (e) {
+            st.textContent = '失败: ' + e.message; st.className = 'status error';
+            this._setIntegrateStatus('生成失败: ' + e.message, 'error');
+        }
         finally { btn.disabled = false; }
     },
 

@@ -194,8 +194,9 @@ def normalize_key(val, enabled: bool = True, date_mode: str = "off") -> str:
                 if mo:
                     return f"{mo:02d}"
                 return ""
-    s = str(val).strip()
-    if s == "" or s.lower() == "nan":
+    # 主键归一：去首尾空格 + 忽略大小写（"ABC" 与 "abc"、" 张三 " 与 "张三" 视为同一主键）
+    s = str(val).strip().lower()
+    if s == "" or s == "nan":
         return ""
     if not enabled:
         return s
