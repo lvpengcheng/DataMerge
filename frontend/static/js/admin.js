@@ -1290,7 +1290,8 @@ const Admin = {
             <td>${this._escapeHtml(r.uploader_name || '-')}</td>
             <td>${r.updated_at ? new Date(r.updated_at).toLocaleString() : '-'}</td>
             <td class="actions">
-                ${(r.file_names || []).map(fn => `<button class="btn btn-sm" onclick="Admin.downloadAssembleRule(${r.id}, '${fn.replace(/'/g, "\\'")}')">下载</button>`).join('')}
+                <button class="btn btn-sm" onclick="Admin.reuploadAssembleRule(${r.id}, '${this._escapeHtml(r.name || '')}')">重新上传</button>
+                ${(r.file_names || []).map(fn => `<button class="btn btn-sm" style="margin-left:4px;" onclick="Admin.downloadAssembleRule(${r.id}, '${fn.replace(/'/g, "\\'")}')">下载</button>`).join('')}
                 <button class="btn btn-sm btn-danger" style="margin-left:4px;" onclick="Admin.deleteAssembleRule(${r.id})">删除</button>
             </td>
         </tr>`).join('');
@@ -1353,6 +1354,30 @@ const Admin = {
         if (!confirm('确认删除该组表规则？删除后不再参与组表分析。')) return;
         const resp = await AUTH.authFetch(`/api/assemble/rules/${id}`, { method: 'DELETE' });
         if (!resp.ok) return _alertErr(resp, '删除失败');
+        this.loadAssembleRules();
+    },
+
+    // 重新上传：新文件替换原规则文件（保留规则 id/名称/作用域）
+    reuploadAssembleRule(id, name) {
+        this.openModal('重新上传规则文件', `
+            <div style="display:flex;flex-direction:column;gap:10px;">
+                <div style="font-size:13px;color:#555;">规则「${this._escapeHtml(name)}」的现有文件将被新文件替换（规则 id/名称/作用域保持不变）。</div>
+                <div><label style="font-weight:500;">新规则文件 <span style="color:#f44336;">*</span></label>
+                    <input type="file" id="m-arule-reupload-files" multiple accept=".txt,.md,.docx,.doc,.pdf,.xlsx,.xls" style="margin-top:4px;">
+                    <div style="font-size:12px;color:#888;">可多选：文字说明规则 + 结构化示例（源列→目标列）</div></div>
+            </div>`, () => {
+            this._uploadAssembleRuleReplace(id);
+        });
+    },
+
+    async _uploadAssembleRuleReplace(id) {
+        const files = document.getElementById('m-arule-reupload-files').files;
+        if (!files.length) return alert('请选择新的规则文件');
+        const fd = new FormData();
+        for (const f of files) fd.append('files', f);
+        const resp = await AUTH.authFetch(`/api/assemble/rules/${id}/upload`, { method: 'POST', body: fd });
+        if (!resp.ok) return _alertErr(resp, '重新上传失败');
+        this.closeModal();
         this.loadAssembleRules();
     },
 

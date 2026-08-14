@@ -140,6 +140,51 @@ async def assemble_rules_create(
         db.close()
 
 
+@router.post("/rules/{rule_id}/upload")
+async def assemble_rules_reupload(
+    rule_id: int,
+    files: List[UploadFile] = File(...),
+    current_user=Depends(require_permission("tools.assemble.manage")),
+):
+    """重新上传：新文件替换原规则文件（保留规则 id/名称/作用域，删旧文件换新文件）。"""
+    if not files or all(f.filename is None for f in files):
+        raise HTTPException(status_code=400, detail="至少选择一个规则文件")
+    db = SessionLocal()
+    try:
+        r = db.query(AssembleRule).filter_by(id=rule_id).first()
+        if not r:
+            raise HTTPException(status_code=404, detail="规则文件不存在")
+        d = _rule_dir(r.scope, r.tenant_id)
+
+        # 删旧文件
+        for n in r.file_names or []:
+            try:
+                p = d / f"{r.id}_{n}"
+                if p.exists():
+                    os.unlink(p)
+            except Exception:
+                logger.warning("[assemble] 删除旧规则文件失败: %s", n)
+
+        # 存新文件
+        saved = []
+        for f in files:
+            orig = Path(f.filename or "").name or "rule"
+            if Path(orig).suffix.lower() not in ALLOWED_EXTS:
+                continue
+            dest = d / f"{r.id}_{orig}"
+            with open(dest, "wb") as out:
+                out.write(f.file.read())
+            saved.append(orig)
+        if not saved:
+            raise HTTPException(status_code=400, detail="没有可用的规则文件（支持 md/txt/pdf/docx/xlsx）")
+
+        r.file_names = saved
+        db.commit()
+        return _rule_to_dict(r)
+    finally:
+        db.close()
+
+
 @router.get("/rules/{rule_id}/download")
 async def assemble_rules_download(
     rule_id: int,
