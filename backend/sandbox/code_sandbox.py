@@ -124,13 +124,18 @@ class CodeSandbox:
             'compile', 'file', 'input', 'raw_input', 'execfile'
         }
 
-    def execute_script(self, script_content: str, execution_env: Dict[str, Any]) -> Dict[str, Any]:
+    def execute_script(self, script_content: str, execution_env: Dict[str, Any],
+                       progress_cb=None) -> Dict[str, Any]:
         """在【独立子进程】中执行脚本。
 
         历史上脚本在 daemon 线程里跑 + join(timeout) 假超时：超时后线程无法强杀仍在
         继续执行（内存照涨），max_memory_mb 从未实现 → 脚本死循环/吃内存时主进程内存
         无限膨胀 → VM 假死（swap 风暴，宿主 C 盘 IO 100%）。现改为子进程执行：
         超时/超内存直接强杀进程，主进程内存永远安全。
+
+        progress_cb: 进度回调。⚠️ 不能放进 execution_env —— env 会 pickle 进子进程，
+            局部闭包/实例方法不可 pickle（报 Can't pickle local object）。须走
+            run_in_subprocess 的 progress_cb 参数（子进程侧注入 @@PROG@@ stdout 包装）。
         """
         result = {
             "success": False,
@@ -158,6 +163,7 @@ class CodeSandbox:
                 (script_content, execution_env),
                 timeout=self.timeout,
                 max_memory_mb=self.max_memory_mb,
+                progress_cb=progress_cb,
             )
         except Exception as e:
             result["error"] = f"沙箱子进程启动失败: {e}"
@@ -174,7 +180,8 @@ class CodeSandbox:
             result["error"] = r.error or "沙箱执行失败"
         return result
 
-    def _run_script_core(self, script_content, execution_env, output_buffer, error_buffer):
+    def _run_script_core(self, script_content, execution_env, output_buffer, error_buffer,
+                         progress_cb=None):
         """脚本执行核心（在独立子进程内运行，由模块级 _execute_script_in_proc 调度）。
 
         编译并执行 AI 脚本 + 模板覆盖注入 + 加密密码 monkey-patch + 预加载源数据替换
@@ -183,7 +190,7 @@ class CodeSandbox:
         import contextlib
         import traceback
 
-        safe_env = self._create_safe_environment(execution_env)
+        safe_env = self._create_safe_environment(execution_env, progress_cb=progress_cb)
         result = {
             "success": False,
             "output": "",
@@ -535,8 +542,12 @@ class CodeSandbox:
 
         return False
 
-    def _create_safe_environment(self, execution_env: Dict[str, Any]) -> Dict[str, Any]:
-        """创建安全的执行环境"""
+    def _create_safe_environment(self, execution_env: Dict[str, Any], progress_cb=None) -> Dict[str, Any]:
+        """创建安全的执行环境
+
+        progress_cb: 子进程内的进度回调（subprocess_worker 注入的 @@PROG@@ stdout 包装）。
+            用于注入 AI 脚本可调用的 report_progress。
+        """
         safe_env = {
             '__builtins__': self._get_safe_builtins(),
             '__name__': '__sandbox__',  # 不使用__main__避免执行if __name__ == "__main__"块
@@ -660,6 +671,19 @@ class CodeSandbox:
             elif hasattr(value, '__class__'):
                 # 允许对象传递，但会进行安全检查
                 safe_env[key] = value
+
+        # B1: 进度回调 → 注入 AI 脚本可调用的 report_progress。
+        # 回调经 run_in_subprocess 的 progress_cb 参数进子进程（subprocess_worker 已替换为
+        # @@PROG@@ stdout 包装），不能放进 execution_env——env 会 pickle，局部闭包/实例方法
+        # 不可 pickle（报 Can't pickle local object）。
+        if callable(progress_cb):
+            def _report_progress(msg: str):
+                """AI 脚本内调用，推送进度到前端（沙箱埋点）。"""
+                try:
+                    progress_cb(f"[沙箱] {msg}")
+                except Exception:
+                    pass
+            safe_env['report_progress'] = _report_progress
 
         # 添加自定义的open函数，限制文件访问
         def safe_open(filepath, mode='r', *args, **kwargs):
@@ -1086,7 +1110,7 @@ class CodeSandbox:
                 pass
             return EmptyModule()
 
-def _execute_script_in_proc(script_content, execution_env):
+def _execute_script_in_proc(script_content, execution_env, progress_cb=None):
     """沙箱脚本执行体（模块级，在【独立子进程】内由 subprocess_runner 调度执行）。
 
     子进程侧重建 CodeSandbox（模块/环境在子进程内重新导入）并执行脚本核心逻辑。
@@ -1103,4 +1127,5 @@ def _execute_script_in_proc(script_content, execution_env):
     output_buffer.write(f"执行环境: {execution_env}\n")
     output_buffer.write(f"脚本长度: {len(script_content)} 字符\n")
 
-    return sandbox._run_script_core(script_content, execution_env, output_buffer, error_buffer)
+    return sandbox._run_script_core(script_content, execution_env, output_buffer, error_buffer,
+                                    progress_cb=progress_cb)

@@ -212,7 +212,7 @@ async def assemble_mappings_list(
                 (AssembleFieldMapping.source_column.like(f"%{kw}%"))
                 | (AssembleFieldMapping.target_column.like(f"%{kw}%"))
             )
-        if status in ("active", "review_needed"):
+        if status in ("active", "review_needed", "pending"):
             q = q.filter(AssembleFieldMapping.status == status)
         rows = q.order_by(AssembleFieldMapping.updated_at.desc()).limit(1000).all()
         items = [{
@@ -221,6 +221,8 @@ async def assemble_mappings_list(
             "source_column": m.source_column,
             "target_column": m.target_column,
             "template_signature": m.template_signature,
+            "match_type": m.match_type,
+            "confirm_count": m.confirm_count,
             "hit_count": m.hit_count,
             "status": m.status,
             "created_at": m.created_at.isoformat() if m.created_at else None,
@@ -255,16 +257,22 @@ async def assemble_mappings_update(
     status: str = Form(""),
     current_user=Depends(require_permission("tools.assemble.manage")),
 ):
-    """停用/恢复知识库条目：status=active / review_needed。"""
-    if status not in ("active", "review_needed"):
-        raise HTTPException(status_code=400, detail="status 必须是 active 或 review_needed")
+    """停用/恢复/候选知识库条目：status=active / review_needed / pending。"""
+    if status not in ("active", "review_needed", "pending"):
+        raise HTTPException(status_code=400, detail="status 必须是 active / review_needed / pending")
+    from ..assemble.assemble_engine import CONFIRM_THRESHOLD
     db = SessionLocal()
     try:
         m = db.query(AssembleFieldMapping).filter_by(id=mapping_id).first()
         if not m:
             raise HTTPException(status_code=404, detail="映射条目不存在")
         m.status = status
+        if status == "active":
+            # 手动置 active 时补齐确认次数，确保能被查询自动采用
+            if (m.confirm_count or 0) < CONFIRM_THRESHOLD:
+                m.confirm_count = CONFIRM_THRESHOLD
+            m.match_type = "anchored"
         db.commit()
-        return {"id": m.id, "status": m.status}
+        return {"id": m.id, "status": m.status, "confirm_count": m.confirm_count}
     finally:
         db.close()

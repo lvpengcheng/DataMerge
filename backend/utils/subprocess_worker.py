@@ -27,15 +27,24 @@ _PROGRESS_MARK = "__SUBPROC_PROGRESS__"   # 与 subprocess_runner 中一致
 
 
 def _progress_wrapper(msg):
-    """把进度消息打到 stdout，父进程按 @@PROG@@ 前缀转发给调用方。"""
+    """把进度消息打到 stdout，父进程按 @@PROG@@ 前缀转发给调用方。
+
+    必须写 sys.__stdout__（真实管道）而非 sys.stdout：目标函数执行时可能被
+    contextlib.redirect_stdout 重定向（沙箱把 sys.stdout 换成 StringIO），
+    写 sys.stdout 会把 @@PROG@@ 标记吞进输出缓冲，父进程永远收不到进度。
+    """
     if not isinstance(msg, str):
         try:
             msg = str(msg)
         except Exception:
             msg = repr(msg)
     msg = msg.replace("\n", " ")[:2000]
-    sys.stdout.write(f"@@PROG@@{msg}\n")
-    sys.stdout.flush()
+    _out = getattr(sys, "__stdout__", None) or sys.stdout
+    try:
+        _out.write(f"@@PROG@@{msg}\n")
+        _out.flush()
+    except Exception:
+        pass
 
 
 def main():
@@ -73,9 +82,10 @@ def main():
         module = importlib.import_module(module_path)
         func = getattr(module, func_name)
 
-        # 进度回调：kwargs 里的标记替换为真正的 stdout 包装（pickle 不能传函数）
-        if kwargs.get(_PROGRESS_MARK):
-            kwargs[_PROGRESS_MARK] = None
+        # 进度回调：kwargs 里的标记替换为真正的 stdout 包装（pickle 不能传函数）。
+        # 注意用 pop 彻底移除标记键，否则会作为多余 kwarg 传给目标函数报
+        # "unexpected keyword argument"。
+        if kwargs.pop(_PROGRESS_MARK, None):
             kwargs["progress_cb"] = _progress_wrapper
 
         result = func(*args, **kwargs)

@@ -151,6 +151,13 @@ def _migrate_add_columns():
         # ---------- sop_rounds（SOP 多源文件）----------
         ("sop_rounds", "source_file_paths", "JSON"),
         ("sop_rounds", "source_file_names", "JSON"),
+        # ---------- assemble_field_mappings（智能组表置信度闭环）----------
+        ("assemble_field_mappings", "match_type", "VARCHAR(20) DEFAULT 'semantic'"),
+        ("assemble_field_mappings", "confirm_count", "INTEGER DEFAULT 0"),
+        # ---------- assemble_tasks（结构化映射 + 反馈幂等）----------
+        ("assemble_tasks", "field_mapping", "JSON"),
+        ("assemble_tasks", "feedback_status", "VARCHAR(20)"),
+        ("assemble_tasks", "corrected_mapping", "JSON"),
     ]
 
     with engine.connect() as conn:
@@ -161,6 +168,16 @@ def _migrate_add_columns():
             if column not in existing:
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"))
                 print(f"      迁移: {table}.{column} 已添加")
+
+        # 置信度闭环回填：历史 active 条目视为"已充分确认"，confirm_count 置 2 保持 active，
+        # 避免上线后旧知识库因 confirm_count=0 被整体降级为 pending 而失效。
+        if "assemble_field_mappings" in insp.get_table_names():
+            try:
+                conn.execute(text(
+                    "UPDATE assemble_field_mappings SET confirm_count = 2 "
+                    "WHERE status = 'active' AND (confirm_count IS NULL OR confirm_count = 0)"))
+            except Exception as e:
+                print(f"      回填 assemble_field_mappings.confirm_count 跳过: {e}")
         conn.commit()
 
 

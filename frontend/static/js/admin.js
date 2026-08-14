@@ -1382,25 +1382,37 @@ const Admin = {
         const tbody = document.querySelector('#mappings-table tbody');
         const items = this._mappings || [];
         if (!items.length) {
-            tbody.innerHTML = '<tr><td colspan="9" class="empty-state">暂无匹配知识库条目</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="10" class="empty-state">暂无匹配知识库条目</td></tr>';
             return;
         }
-        tbody.innerHTML = items.map(m => `<tr>
-            <td>${m.id}</td>
-            <td>${this._escapeHtml(m.tenant_id)}</td>
-            <td>${this._escapeHtml(m.source_column)}</td>
-            <td>${this._escapeHtml(m.target_column)}</td>
-            <td style="font-size:11px;color:#888;">${m.template_signature}</td>
-            <td>${m.hit_count}</td>
-            <td>${m.status === 'active'
+        tbody.innerHTML = items.map(m => {
+            const typeLabel = m.match_type === 'exact' ? '同名列'
+                : m.match_type === 'anchored' ? '已确认'
+                : '语义候选';
+            const statusHtml = m.status === 'active'
                 ? '<span class="status-active">正常</span>'
-                : '<span class="status-inactive" style="color:#f44336;">待复核</span>'}</td>
-            <td>${m.updated_at ? new Date(m.updated_at).toLocaleString() : '-'}</td>
-            <td class="actions">
-                <button class="btn btn-sm" onclick="Admin.setMappingStatus(${m.id}, ${m.status === 'active' ? "'review_needed'" : "'active'"})">${m.status === 'active' ? '停用' : '恢复'}</button>
-                <button class="btn btn-sm btn-danger" style="margin-left:4px;" onclick="Admin.deleteMapping(${m.id})">删除</button>
-            </td>
-        </tr>`).join('');
+                : m.status === 'pending'
+                    ? '<span style="color:#ff9800;">候选</span>'
+                    : '<span class="status-inactive" style="color:#f44336;">待复核</span>';
+            const toggle = m.status === 'active'
+                ? { to: "'review_needed'", label: '停用' }
+                : { to: "'active'", label: '启用' };
+            return `<tr>
+                <td>${m.id}</td>
+                <td>${this._escapeHtml(m.tenant_id)}</td>
+                <td>${this._escapeHtml(m.source_column)}</td>
+                <td>${this._escapeHtml(m.target_column)}</td>
+                <td style="font-size:11px;color:#888;">${m.template_signature}</td>
+                <td>${typeLabel}</td>
+                <td>${m.confirm_count != null ? m.confirm_count : 0}</td>
+                <td>${statusHtml}</td>
+                <td>${m.updated_at ? new Date(m.updated_at).toLocaleString() : '-'}</td>
+                <td class="actions">
+                    <button class="btn btn-sm" onclick="Admin.setMappingStatus(${m.id}, ${toggle.to})">${toggle.label}</button>
+                    <button class="btn btn-sm btn-danger" style="margin-left:4px;" onclick="Admin.deleteMapping(${m.id})">删除</button>
+                </td>
+            </tr>`;
+        }).join('');
     },
 
     async setMappingStatus(id, status) {

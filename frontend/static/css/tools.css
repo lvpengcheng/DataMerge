@@ -314,3 +314,47 @@
     gap: 8px;
     flex-wrap: wrap;
 }
+/* 智能组表：错误反馈弹窗（逐列复核映射 + 源样例不脱敏） */
+.sa-review-table, .sa-review-sample-table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 13px;
+}
+.sa-review-table th, .sa-review-table td,
+.sa-review-sample-table th, .sa-review-sample-table td {
+    border: 1px solid #e0e0e0;
+    padding: 6px 8px;
+    text-align: left;
+    vertical-align: top;
+}
+.sa-review-table th, .sa-review-sample-table th {
+    background: #f0f4f8;
+    font-weight: 600;
+    position: sticky;
+    top: 0;
+}
+.sa-review-table select {
+    min-width: 140px;
+    max-width: 220px;
+}
+.sa-review-conf {
+    font-size: 12px;
+    color: #888;
+    margin-top: 4px;
+}
+.sa-review-sample {
+    margin-bottom: 10px;
+    border: 1px solid #eee;
+    border-radius: 6px;
+    overflow: hidden;
+}
+.sa-review-sample-title {
+    background: #fafafa;
+    padding: 6px 10px;
+    font-weight: 600;
+    font-size: 13px;
+    border-bottom: 1px solid #eee;
+}
+.sa-review-sample-table {
+    border: none;
+}

@@ -367,6 +367,9 @@ class AssembleTask(Base):
     ai_provider = Column(String(50), nullable=True)
     matched_from_cache = Column(Boolean, default=False)                 # 是否命中代码存档
     output_files = Column(JSON, nullable=True)                          # 结果文件名列表
+    field_mapping = Column(JSON, nullable=True)                         # 本次任务 AI 输出的完整结构化映射（供错误弹窗逐列复核）
+    feedback_status = Column(String(20), nullable=True)                 # None / confirmed / corrected（反馈幂等）
+    corrected_mapping = Column(JSON, nullable=True)                     # 人工修正后的映射 {目标列: 源列}
     error = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
@@ -377,7 +380,12 @@ class AssembleTask(Base):
 
 class AssembleFieldMapping(Base):
     """智能组表：字段级匹配知识库。条目=(源列名→模板列名)+模板结构签名锚点。
-    status=review_needed 时查询不再自动采用，交 AI 重新匹配。"""
+
+    状态机（置信度闭环）：
+      match_type: exact(同名列，白名单直过) / semantic(AI 语义匹配候选) / anchored(已确认语义)
+      confirm_count: 人工确认正确次数。仅语义匹配列累计，达到阈值(2)才转 active
+      status: pending(候选，交 AI) / active(自动采用) / review_needed(被否定，停用)
+    """
     __tablename__ = "assemble_field_mappings"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -385,9 +393,11 @@ class AssembleFieldMapping(Base):
     source_column = Column(String(100), nullable=False)
     target_column = Column(String(100), nullable=False)
     template_signature = Column(String(64), nullable=False, index=True)  # 该映射生效的模板结构签名
-    hit_count = Column(Integer, default=1)                               # 命中/确认次数
+    match_type = Column(String(20), default="semantic")                  # exact / semantic / anchored
+    confirm_count = Column(Integer, default=0)                           # 人工确认正确次数（阈值 2 → active）
+    hit_count = Column(Integer, default=1)                               # 历史命中次数（仅展示，不再驱动状态）
     source_task_id = Column(Integer, ForeignKey("assemble_tasks.id"), nullable=True)
-    status = Column(String(20), default="active")                        # active / review_needed
+    status = Column(String(20), default="pending")                       # pending / active / review_needed
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

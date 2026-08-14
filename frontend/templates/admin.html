@@ -262,7 +262,7 @@
             </table>
 
             <h4 style="margin-top:24px;border-top:1px solid #eee;padding-top:14px;">匹配知识库
-                <span style="font-size:12px;color:#888;font-weight:normal;">(字段级映射沉淀：AI 分析出的源列→模板列自动入库，下次同结构直接命中；结果反馈"有误"后自动标待复核停用)</span>
+                <span style="font-size:12px;color:#888;font-weight:normal;">(字段级映射沉淀：AI 语义匹配先入「候选」，人工确认累计 2 次转「正常」自动采用；同名列白名单直过；确认错误只停用对应列)</span>
             </h4>
             <div class="toolbar" style="flex-wrap:wrap;gap:12px;align-items:center;">
                 <input type="text" id="mapping-keyword" placeholder="源列/目标列搜索" style="padding:6px 12px;border:1px solid #ddd;border-radius:6px;">
@@ -270,6 +270,7 @@
                 <select id="mapping-status" style="padding:6px 12px;border:1px solid #ddd;border-radius:6px;" onchange="Admin.loadMappings()">
                     <option value="">全部状态</option>
                     <option value="active">正常</option>
+                    <option value="pending">候选</option>
                     <option value="review_needed">待复核</option>
                 </select>
             </div>
@@ -281,7 +282,8 @@
                         <th>源列</th>
                         <th>目标列</th>
                         <th>模板指纹</th>
-                        <th>命中次数</th>
+                        <th>匹配类型</th>
+                        <th>确认次数</th>
                         <th>状态</th>
                         <th>更新时间</th>
                         <th>操作</th>
@@ -329,6 +331,6 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260722a"></script>
-    <script src="/static/js/admin.js?v=20260813a"></script>
+    <script src="/static/js/admin.js?v=20260814a"></script>
 </body>
 </html>
