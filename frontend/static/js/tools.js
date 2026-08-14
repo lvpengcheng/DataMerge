@@ -2799,65 +2799,78 @@ const Tools = {
         }
     },
 
-    // 错误反馈弹窗：逐列复核映射（目标列 → 源表/源列下拉可改）
+    // 错误反馈弹窗：逐列复核映射（目标列 → 每个源表一行，源列下拉可改）
     _saShowReviewModal(data) {
         const fm = data.field_mapping || {};
-        const cm = data.corrected_mapping || {};   // 上次人工修正映射（"源表|源列"），预填
-        // 用上次修正覆盖对应列的当前值
-        Object.keys(cm).forEach(tgt => {
-            if (fm[tgt] && cm[tgt]) {
-                const v = String(cm[tgt]);
-                if (v.indexOf('|') >= 0) {
-                    const parts = v.split('|');
-                    fm[tgt].source_sheet = parts[0];
-                    fm[tgt].source_column = parts[1];
-                } else {
-                    fm[tgt].source_column = v;
-                    fm[tgt].source_sheet = '';
-                }
-            }
+        const cm = data.corrected_mapping || {};   // 上次人工修正映射，预填
+
+        // 归一化 field_mapping 为 {目标列: [entries...]}（兼容 list 一对多 / dict 一对一）
+        const norm = {};
+        Object.keys(fm).forEach(tgt => {
+            const v = fm[tgt];
+            if (Array.isArray(v)) norm[tgt] = v;
+            else if (v && typeof v === 'object') norm[tgt] = [v];
+            else norm[tgt] = [];
         });
-        // 候选选项 = 全部源表的所有列（source_options，修正后也能选回其它表）+ 当前映射值
-        // 值编码 "源表|源列"（多源表同名列可区分）
-        const srcOpts = [];
-        const seen = {};
-        (data.source_options || []).forEach(so => {
-            (so.columns || []).forEach(c => {
-                const key = so.source_sheet + '|' + c;
-                if (!seen[key]) { seen[key] = 1; srcOpts.push({ sheet: so.source_sheet, col: c, key }); }
+        // 用上次修正覆盖（cm 值可能是 "源表|源列" 或 [多个"源表|源列"]）
+        Object.keys(cm).forEach(tgt => {
+            const cv = cm[tgt];
+            const items = Array.isArray(cv) ? cv : [cv];
+            if (!norm[tgt]) norm[tgt] = [];
+            // 按源表匹配覆盖：同源表的条目更新列；新源表追加
+            items.forEach(v => {
+                const s = String(v);
+                const parts = s.indexOf('|') >= 0 ? s.split('|') : ['', s];
+                const sheet = parts[0], col = parts[1];
+                let found = norm[tgt].find(e => (e.source_sheet || '') === sheet);
+                if (found) { found.source_column = col; }
+                else { norm[tgt].push({ source_sheet: sheet, source_column: col }); }
             });
         });
-        Object.values(fm).forEach(info => {
-            const src = info && info.source_column;
-            const sheet = (info && info.source_sheet) || '';
-            if (!src) return;
-            const key = sheet + '|' + src;
-            if (!seen[key]) { seen[key] = 1; srcOpts.push({ sheet, col: src, key }); }
+
+        // 候选选项 = 全部源表的所有列（source_options，修正后也能选回其它表）
+        const srcOptsBySheet = {};
+        (data.source_options || []).forEach(so => {
+            srcOptsBySheet[so.source_sheet] = (so.columns || []).map(c => ({
+                sheet: so.source_sheet, col: c, key: so.source_sheet + '|' + c,
+            }));
         });
 
-        const rows = Object.keys(fm).map(tgt => {
-            const info = fm[tgt] || {};
-            const curSheet = (info && info.source_sheet) || '';
-            const curSrc = (info && info.source_column) || '';
-            const curKey = curSheet ? curSheet + '|' + curSrc : curSrc;
-            const opts = ['<option value="">（无映射）</option>']
-                .concat(srcOpts.map(o => `<option value="${_escape(o.key)}"${o.key === curKey ? ' selected' : ''}>${_escape(o.sheet ? o.sheet + ' / ' + o.col : o.col)}</option>`))
-                .join('');
-            return `<tr data-target="${_escape(tgt)}">
-                <td>${_escape(tgt)}</td>
-                <td>${_escape(info.target_letter || '')}</td>
-                <td><select class="sa-review-src">${opts}</select>
-                    <div class="sa-review-conf">置信度 ${info.confidence != null ? info.confidence : '-'}</div></td>
-                <td>${_escape(info.source_letter || '')}</td>
-            </tr>`;
-        }).join('');
+        // 每个目标列 → 每个源表一行（源表名固定，源列下拉可改）
+        const rows = [];
+        Object.keys(norm).forEach(tgt => {
+            const entries = norm[tgt] || [];
+            const tl = (entries[0] && entries[0].target_letter) || '';
+            entries.forEach((info, i) => {
+                const sheet = (info && info.source_sheet) || '';
+                const curKey = sheet + '|' + ((info && info.source_column) || '');
+                const candidates = srcOptsBySheet[sheet] || [];
+                // 候选：该源表的列 + 当前值（防源表列清单缺失）
+                if (!candidates.some(o => o.key === curKey)) {
+                    candidates.unshift({ sheet, col: info.source_column, key: curKey });
+                }
+                const opts = ['<option value="">（无映射）</option>']
+                    .concat(candidates.map(o => `<option value="${_escape(o.key)}"${o.key === curKey ? ' selected' : ''}>${_escape(o.col)}</option>`))
+                    .join('');
+                const tgtCell = i === 0
+                    ? `<td rowspan="${entries.length}"><strong>${_escape(tgt)}</strong></td><td rowspan="${entries.length}">${_escape(tl)}</td>`
+                    : '';
+                rows.push(`<tr data-target="${_escape(tgt)}" data-sheet="${_escape(sheet)}">
+                    ${tgtCell}
+                    <td style="max-width:220px;word-break:break-all;">${_escape(sheet || '（未指定源表）')}</td>
+                    <td><select class="sa-review-src">${opts}</select>
+                        <div class="sa-review-conf">置信度 ${info.confidence != null ? info.confidence : '-'}</div></td>
+                    <td>${_escape(info.source_letter || '')}</td>
+                </tr>`);
+            });
+        });
 
         const body = `
-            <p style="font-size:13px;color:#555;margin:0 0 10px;">请核对每列「目标表头 → 源表头」映射，直接在下拉里改。改完可点「重新组表」用修正映射重跑验证；确认无误后点「确认」记录本次匹配。</p>
+            <p style="font-size:13px;color:#555;margin:0 0 10px;">请核对每列「目标表头 → 源表/源列」映射：同构整合模式下一个目标列对应多个源表（每个源表一行），职责分工模式下一行。直接在下拉里改源列。改完可点「重新组表」用修正映射重跑验证；确认无误后点「确认」记录本次匹配。</p>
             <div style="max-height:50vh;overflow:auto;margin-bottom:12px;">
                 <table class="sa-review-table">
-                    <thead><tr><th>目标表头</th><th>目标列号</th><th>源表头（可改）</th><th>源列号</th></tr></thead>
-                    <tbody>${rows || '<tr><td colspan="4" style="color:#999;text-align:center;padding:16px;">（本次任务没有可复核的匹配关系）</td></tr>'}</tbody>
+                    <thead><tr><th>目标表头</th><th>目标列号</th><th>源表</th><th>源列（可改）</th><th>源列号</th></tr></thead>
+                    <tbody>${rows || '<tr><td colspan="5" style="color:#999;text-align:center;padding:16px;">（本次任务没有可复核的匹配关系）</td></tr>'}</tbody>
                 </table>
             </div>
             <div style="margin-top:14px;text-align:right;">
@@ -2868,12 +2881,15 @@ const Tools = {
     },
 
     _saCollectCorrectedMapping() {
+        // 收集为 {目标列: ["源表|源列", ...]}（一对多：一个目标列多个源表各一条）
         const cm = {};
         document.querySelectorAll('#modal-body .sa-review-table tbody tr').forEach(tr => {
             const tgt = tr.dataset.target;
             const sel = tr.querySelector('.sa-review-src');
             const src = sel ? sel.value : '';
-            if (tgt && src) cm[tgt] = src;
+            if (!tgt || !src) return;
+            if (!cm[tgt]) cm[tgt] = [];
+            if (!cm[tgt].includes(src)) cm[tgt].push(src);
         });
         return cm;
     },

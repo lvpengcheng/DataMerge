@@ -635,11 +635,17 @@ async def assemble_confirm_corrected(
 
         n = 0
         for tgt, src in cm.items():
-            _src_col = str(src).strip()
-            if "|" in _src_col:          # "源表|源列" → 知识库只存源列名
-                _src_col = _src_col.split("|", 1)[1].strip()
-            if _confirm_mapping(db, task.tenant_id, task.template_signature, _src_col, tgt) is not None:
-                n += 1
+            # 兼容一对多（list）与一对一（字符串）
+            items = src if isinstance(src, list) else [src]
+            for it in items:
+                if not it:
+                    continue
+                _src_col = str(it).strip()
+                if "|" in _src_col:      # "源表|源列" → 知识库只存源列名
+                    _src_col = _src_col.split("|", 1)[1].strip()
+                if _confirm_mapping(db, task.tenant_id, task.template_signature,
+                                    _src_col, tgt) is not None:
+                    n += 1
         task.corrected_mapping = cm
         task.feedback_status = "confirmed"
         db.commit()
@@ -712,27 +718,30 @@ async def assemble_rematch(
     finally:
         db.close()
 
-    # 方向转换：{目标列: 源表|源列} → 两个结构
-    #   field_mapping_override: {目标列: {source_sheet, source_column}}（骨架 FIELD_MAPPING 覆盖）
+    # 方向转换：{目标列: ["源表|源列", ...]（一对多）或 "源表|源列"（旧一对一）} → 两个结构
+    #   field_mapping_override: {目标列: [entries...]}（骨架 FIELD_MAPPING 覆盖，同构整合一对多）
     #   pre_mapped: {源列: 目标列@源表}（供 AI 生成兜底，本次直接执行不需要，保留兼容）
     field_mapping_override = {}
     pre_mapped = {}
     for tgt, src in cm.items():
-        if src and tgt:
-            _v = str(src).strip()
+        if not tgt:
+            continue
+        items = src if isinstance(src, list) else [src]
+        entries = []
+        for it in items:
+            if not it:
+                continue
+            _v = str(it).strip()
             if "|" in _v:
                 _sheet, _col = _v.split("|", 1)
-                field_mapping_override[str(tgt).strip()] = {
-                    "source_sheet": _sheet.strip(),
-                    "source_column": _col.strip(),
-                }
-                pre_mapped[_col.strip()] = f"{str(tgt).strip()}@{_sheet.strip()}"
+                _sheet, _col = _sheet.strip(), _col.strip()
             else:
-                field_mapping_override[str(tgt).strip()] = {
-                    "source_sheet": "",
-                    "source_column": _v,
-                }
-                pre_mapped[_v] = str(tgt).strip()
+                _sheet, _col = "", _v
+            entries.append({"source_sheet": _sheet, "source_column": _col})
+            if _col and tgt:
+                pre_mapped[_col] = f"{str(tgt).strip()}@{_sheet}"
+        if entries:
+            field_mapping_override[str(tgt).strip()] = entries
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="assemble_"))
     try:

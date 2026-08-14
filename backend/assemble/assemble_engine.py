@@ -1077,13 +1077,19 @@ def run_assemble_task(task_id: int, push, params: Dict):
         if fm_override:
             try:
                 _src_letter = _build_src_letter_lookup(source_struct, template_struct)
+                def _patch_entry(_e):
+                    if not isinstance(_e, dict):
+                        return
+                    _sheet = (_e.get("source_sheet") or "").strip()
+                    _col = (_e.get("source_column") or "").strip()
+                    if not _e.get("source_letter"):
+                        _e["source_letter"] = (_src_letter.get(_sheet) or {}).get(_col, "")
                 for _tgt, _info in fm_override.items():
-                    if not isinstance(_info, dict):
-                        continue
-                    _sheet = (_info.get("source_sheet") or "").strip()
-                    _col = (_info.get("source_column") or "").strip()
-                    if not _info.get("source_letter"):
-                        _info["source_letter"] = (_src_letter.get(_sheet) or {}).get(_col, "")
+                    if isinstance(_info, list):
+                        for _e in _info:
+                            _patch_entry(_e)
+                    else:
+                        _patch_entry(_info)
             except Exception as _e:
                 logger.warning("[assemble] 补全 source_letter 失败: %s", _e)
         result = _execute_in_sandbox(code, source_dir, output_dir, clean_template,
@@ -1112,10 +1118,18 @@ def run_assemble_task(task_id: int, push, params: Dict):
                     for _reg in (_sinfo.get("regions") or []):
                         _tpl_cols.extend(_reg.get("columns") or [])
                 _letter = {_c.get("name"): _c.get("column_letter") for _c in _tpl_cols}
+                # 兼容两种格式：新格式 value=list（一对多），旧格式 value=dict（一对一）
+                def _norm_entries(v):
+                    if isinstance(v, list):
+                        return v
+                    if isinstance(v, dict):
+                        return [v]
+                    return []
                 if isinstance(fm, dict):
                     for _tgt, _info in fm.items():
-                        if isinstance(_info, dict):
-                            _info["target_letter"] = _letter.get(_tgt)
+                        for _e in _norm_entries(_info):
+                            if isinstance(_e, dict):
+                                _e["target_letter"] = _letter.get(_tgt)
                 task.field_mapping = fm
             except Exception as _e:
                 logger.warning("[assemble] 解析 field_mapping.json 失败: %s", _e)
@@ -1125,11 +1139,14 @@ def run_assemble_task(task_id: int, push, params: Dict):
             # 已确认的 active 条目由 _save_knowledge_mappings 内部跳过，不被 AI 覆盖。
             ai_semantic: Dict[str, str] = {}
             for _tgt, _info in (task.field_mapping or {}).items():
-                if not isinstance(_info, dict):
-                    continue
-                _src = (_info.get("source_column") or "").strip()
-                if _src and _src != _tgt:
-                    ai_semantic.setdefault(_src, _tgt)   # 一对多时保留首个
+                # 兼容 list（一对多）与 dict（一对一）
+                _entries = _info if isinstance(_info, list) else ([_info] if isinstance(_info, dict) else [])
+                for _e in _entries:
+                    if not isinstance(_e, dict):
+                        continue
+                    _src = (_e.get("source_column") or "").strip()
+                    if _src and _src != _tgt:
+                        ai_semantic.setdefault(_src, _tgt)   # 同源列多目标时保留首个
             _save_knowledge_mappings(db, tenant_id, template_signature,
                                      ai_semantic, task_id)
             push({"type": "log", "message": "✅ 代码执行成功，已存入代码存档并更新知识库"})
