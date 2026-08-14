@@ -3759,6 +3759,27 @@ def _extract_code_from_response(response: str):
 
 # ==================== 计算任务 DB 持久化辅助函数 ====================
 
+def _resolve_enabled_ai_provider(preferred: Optional[str]) -> Optional[str]:
+    """校验 AI provider 是否在系统配置（模型管理）中启用。
+
+    - 无配置记录（未设置过）→ 全部启用，返回 preferred
+    - 有配置且 preferred 在启用列表 → 返回 preferred
+    - preferred 被停用 → 返回 None（调用方跳过 AI 建议，规则校验照常）
+    """
+    from backend.database.models import SystemConfig
+    if not preferred:
+        return None
+    db = SessionLocal()
+    try:
+        row = db.query(SystemConfig).filter_by(key="ai_providers_enabled").first()
+    finally:
+        db.close()
+    if not row or not row.value:
+        return preferred
+    enabled = row.value.get("enabled") or []
+    return preferred if preferred in enabled else None
+
+
 def _load_script_info_for_precheck(tenant_id: str, script_id: str) -> dict:
     """加载脚本元数据（source_structure / manual_headers / use_history），事前校验时使用。
 
@@ -5481,7 +5502,10 @@ async def compute_submit(
                     salary_year=salary_year,
                     salary_month=salary_month,
                     db_session=_db,
-                    ai_provider_name=os.environ.get("AI_PROVIDER", "deepseek"),
+                    # 智算 precheck 的 AI（列头匹配建议/改名裁决）也受系统配置启停约束：
+                    # 停用的 provider 传 None → precheck 跳过 AI 建议（规则校验照常）
+                    ai_provider_name=_resolve_enabled_ai_provider(
+                        os.environ.get("AI_PROVIDER", "deepseek")),
                     confirmed_mapping=_confirmed,
                     confirmed_renames=_confirmed_renames,
                     use_history=_use_history_flag,
