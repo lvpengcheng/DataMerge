@@ -47,28 +47,35 @@ def _progress_wrapper(msg):
         pass
 
 
-def main():
-    # 以 .env 文件为准重新加载配置（override=True 覆盖父进程继承的旧环境变量，
-    # 防止父进程启动后改 .env 不生效导致子进程用旧配置运行）。
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(override=True)
-    except Exception:
-        pass
-    if len(sys.argv) < 2:
-        print("@@ERROR@@subprocess_worker: 缺少参数文件")
-        sys.exit(2)
+def _progress_wrapper_for(task_id: str):
+    """带 task_id 的进度包装（daemon 模式每任务生成一个）。"""
+    def _wrap(msg):
+        if not isinstance(msg, str):
+            try:
+                msg = str(msg)
+            except Exception:
+                msg = repr(msg)
+        msg = msg.replace("\n", " ")[:2000]
+        _out = getattr(sys, "__stdout__", None) or sys.stdout
+        try:
+            _out.write(f"@@PROG@@{task_id}@@{msg}\n")
+            _out.flush()
+        except Exception:
+            pass
+    return _wrap
 
-    params_file = sys.argv[1]
+
+def _run_task(params: dict, task_id: str = "") -> None:
+    """执行单个任务（成功 @@RESULT@@{task_id}@@{path}，失败 @@ERROR@@{task_id}@@{b64}）。
+
+    任务级异常就地输出错误行，不向上抛（daemon 模式任务失败不能拖垮 worker）。
+    """
     try:
-        with open(params_file, "rb") as f:
-            params = pickle.load(f)
         entry = params["entry"]
         args = params.get("args") or ()
         kwargs = params.get("kwargs") or {}
 
-        # Aspose 许可证/运行时：子进程各自初始化（aspose_init.py 是唯一初始化点）。
-        # 被调函数可能解析 xlsx（Aspose.Cells），沙箱脚本也可能 monkey-patch excel_parser。
+        # Aspose 许可证/运行时：daemon 模式已在启动时预加载，这里 ensure_license 幂等兜底。
         try:
             import aspose_init
             aspose_init.ensure_license()
@@ -77,16 +84,14 @@ def main():
 
         module_path, _, func_name = entry.partition(":")
         if not func_name:
-            print(f"@@ERROR@@subprocess_worker: entry 格式错误: {entry!r}（应为 module.path:func_name）")
-            sys.exit(2)
+            sys.stdout.write(f"@@ERROR@@{task_id}@@{base64.b64encode(f'entry 格式错误: {entry!r}'.encode()).decode('ascii')}\n")
+            return
         module = importlib.import_module(module_path)
         func = getattr(module, func_name)
 
-        # 进度回调：kwargs 里的标记替换为真正的 stdout 包装（pickle 不能传函数）。
-        # 注意用 pop 彻底移除标记键，否则会作为多余 kwarg 传给目标函数报
-        # "unexpected keyword argument"。
+        # 进度回调：kwargs 里的标记替换为 stdout 包装（pickle 不能传函数）。
         if kwargs.pop(_PROGRESS_MARK, None):
-            kwargs["progress_cb"] = _progress_wrapper
+            kwargs["progress_cb"] = _progress_wrapper_for(task_id)
 
         result = func(*args, **kwargs)
 
@@ -96,14 +101,89 @@ def main():
             with os.fdopen(fd, "wb") as f:
                 pickle.dump(result, f, protocol=pickle.HIGHEST_PROTOCOL)
         except Exception:
-            # 结果不可 pickle（如含不可序列化对象）→ 报错而不是带病回传
             try:
                 os.remove(result_path)
             except Exception:
                 pass
             raise
-        print(f"@@RESULT@@{result_path}")
+        sys.stdout.write(f"@@RESULT@@{task_id}@@{result_path}\n")
+    except SystemExit:
+        raise
+    except Exception:
+        tb = traceback.format_exc()
+        sys.stdout.write(
+            f"@@ERROR@@{task_id}@@{base64.b64encode(tb.encode('utf-8', 'replace')).decode('ascii')}\n")
+    finally:
         sys.stdout.flush()
+
+
+def daemon_main():
+    """常驻 worker 循环：预加载 Aspose/excel_parser，然后循环读 stdin 任务行。
+
+    任务行 = 任务 pickle 文件路径（父进程写入）。串行处理（单个 worker），
+    任务级异常不退出；父进程负责超时/内存监控与崩溃重启。
+    启动完成后输出 @@READY@@ 供父进程等待就绪。
+    """
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(override=True)
+    except Exception:
+        pass
+    # 预加载 Aspose + excel_parser：这是常驻 worker 省掉 20-30s 初始化开销的关键
+    try:
+        import aspose_init
+        aspose_init.ensure_license()
+    except Exception:
+        pass
+    try:
+        import excel_parser  # noqa: F401
+    except Exception:
+        pass
+
+    print("@@READY@@", flush=True)
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        params_file = line
+        task_id = ""
+        try:
+            with open(params_file, "rb") as f:
+                params = pickle.load(f)
+            task_id = str(params.get("task_id") or "")
+            _run_task(params, task_id=task_id)
+        except Exception as e:
+            sys.stdout.write(
+                f"@@ERROR@@{task_id}@@{base64.b64encode(f'daemon 任务异常: {e}'.encode()).decode('ascii')}\n")
+            sys.stdout.flush()
+        finally:
+            try:
+                os.remove(params_file)
+            except Exception:
+                pass
+
+
+def main():
+    # 以 .env 文件为准重新加载配置（override=True 覆盖父进程继承的旧环境变量，
+    # 防止父进程启动后改 .env 不生效导致子进程用旧配置运行）。
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(override=True)
+    except Exception:
+        pass
+    if len(sys.argv) >= 2 and sys.argv[1] == "--daemon":
+        daemon_main()
+        return
+    if len(sys.argv) < 2:
+        print("@@ERROR@@subprocess_worker: 缺少参数文件")
+        sys.exit(2)
+
+    params_file = sys.argv[1]
+    try:
+        with open(params_file, "rb") as f:
+            params = pickle.load(f)
+        _run_task(params, task_id="")
         sys.exit(0)
     except SystemExit:
         raise

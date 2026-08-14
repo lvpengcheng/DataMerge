@@ -27,6 +27,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -183,27 +184,15 @@ class SubprocessResult:
         return self.timed_out or self.killed_by_memory
 
 
-def run_in_subprocess(
+def _run_single(
     entry: str,
-    args: tuple = (),
-    kwargs: dict = None,
-    timeout: float = 300,
-    max_memory_mb: int = None,
-    progress_cb=None,
+    args: tuple,
+    kwargs: dict,
+    timeout: float,
+    max_memory_mb: int,
+    progress_cb,
 ) -> SubprocessResult:
-    """在独立子进程执行 entry 指向的模块级函数，超时/超内存强杀。
-
-    Args:
-        entry: "module.path:func_name"
-        args/kwargs: 函数参数（必须可 pickle；kwargs 中的 progress_cb 会被移除，
-            以标记替换后由子进程注入真回调）
-        timeout: 超时秒数（0/None = 不限）
-        max_memory_mb: 内存上限 MB，超限强杀；None 用 .env SUBPROCESS_MAX_MEMORY_MB（默认 4096）
-        progress_cb: 进度回调（函数签名须支持 progress_cb= 参数），子进程打 @@PROG@@ 后转发
-
-    Returns:
-        SubprocessResult
-    """
+    """单任务模式：每次调用起全新子进程（WorkerPool 不可用时的回退路径）。"""
     max_memory_mb = default_max_memory_mb() if max_memory_mb is None else max_memory_mb
     kwargs = dict(kwargs or {})
     if progress_cb is not None:
@@ -367,6 +356,274 @@ def run_in_subprocess(
             _kill_tree(proc.pid)
 
     return res
+
+
+# ==================== 常驻 Worker 池（省掉每次启动的 Aspose 初始化开销） ====================
+
+class _WorkerSlot:
+    """一个常驻 worker：Popen + 常驻 reader 线程 + 当前任务上下文。
+
+    任务协议（daemon 模式，stdout 行带 task_id）：
+        @@RESULT@@{task_id}@@{result_path} / @@ERROR@@{task_id}@@{b64}
+        @@PROG@@{task_id}@@{msg}
+    """
+
+    def __init__(self, idx: int):
+        self.idx = idx
+        self.proc = None
+        self.lock = threading.Lock()
+        self.idle = True
+        self.pending: Dict[str, dict] = {}
+        self.dead = True
+        self.start()
+
+    def start(self):
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        self.proc = subprocess.Popen(
+            [sys.executable, "-u", "-m", "backend.utils.subprocess_worker", "--daemon"],
+            cwd=_PROJ_ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, env=env, bufsize=0)
+        self.dead = False
+        self.reader = threading.Thread(target=self._read_loop, daemon=True,
+                                       name=f"pool-reader-{self.idx}")
+        self.reader.start()
+
+    def restart(self):
+        """崩溃/被杀后重启补位（pending 任务已由 kill/EOF 置完成）。"""
+        try:
+            self.start()
+        except Exception as e:
+            logger.error(f"[subproc-pool/{self.idx}] worker 重启失败: {e}")
+            self.dead = True
+
+    def _read_loop(self):
+        try:
+            for raw in self.proc.stdout:
+                line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                if line.startswith("@@READY@@"):
+                    continue
+                if line.startswith(("@@RESULT@@", "@@ERROR@@", "@@PROG@@")):
+                    # 行格式: @@RESULT@@{task_id}@@{payload} —— 先去掉前缀 @@ 再 partition
+                    kind, _, rest = line[2:].partition("@@")
+                    task_id, _, payload = rest.partition("@@")
+                    with self.lock:
+                        ctx = self.pending.get(task_id)
+                    if ctx is None:
+                        continue
+                    if kind == "RESULT":
+                        ctx["result_path"] = payload
+                        ctx["event"].set()
+                    elif kind == "ERROR":
+                        ctx["error_b64"] = payload
+                        ctx["event"].set()
+                    elif kind == "PROG" and ctx.get("progress_cb"):
+                        try:
+                            ctx["progress_cb"](payload)
+                        except Exception:
+                            pass
+                elif line.strip():
+                    logger.debug(f"[subproc-pool/{self.idx}] {line}")
+        except Exception:
+            pass
+        finally:
+            # EOF = worker 退出：pending 任务全部置失败（父进程 wait 返回）
+            with self.lock:
+                self.dead = True
+                for tid, ctx in self.pending.items():
+                    if not ctx["event"].is_set():
+                        ctx["error_b64"] = base64.b64encode("worker 进程意外退出".encode("utf-8"))
+                        ctx["event"].set()
+                self.pending.clear()
+
+    def submit(self, task_id: str, params_file: str, ctx: dict) -> bool:
+        with self.lock:
+            if self.dead or self.proc is None or self.proc.poll() is not None:
+                return False
+            self.pending[task_id] = ctx
+            self.idle = False
+        try:
+            self.proc.stdin.write((params_file + "\n").encode("utf-8"))
+            self.proc.stdin.flush()
+            return True
+        except Exception:
+            return False
+
+    def kill_and_restart(self):
+        """强杀当前 worker 并重启补位（任务超时/内存超限时调用）。"""
+        with self.lock:
+            self.dead = True
+            for tid, ctx in self.pending.items():
+                if not ctx["event"].is_set():
+                    ctx["error_b64"] = base64.b64encode("worker 被强杀（超时/内存超限）".encode("utf-8"))
+                    ctx["event"].set()
+            self.pending.clear()
+        try:
+            _kill_tree(self.proc.pid)
+        except Exception:
+            pass
+        self.restart()
+
+
+class _WorkerPool:
+    """常驻 worker 池：任务按 SUBPROCESS_CONCURRENCY 并发，超时/内存超限强杀重启。"""
+
+    def __init__(self, size: int):
+        self.slots = [_WorkerSlot(i) for i in range(size)]
+        self._sem = threading.Semaphore(size)
+        self._acquire_lock = threading.Lock()
+
+    def _acquire_slot(self) -> "_WorkerSlot":
+        """等一个空闲 slot（死亡的自动重启）。"""
+        while True:
+            for slot in self.slots:
+                with slot.lock:
+                    if slot.dead or slot.proc is None or slot.proc.poll() is not None:
+                        slot.restart()
+                    if slot.idle:
+                        slot.idle = False
+                        return slot
+            time.sleep(0.05)
+
+    def run(self, entry: str, args: tuple, kwargs: dict,
+            timeout: float, max_memory_mb: int, progress_cb) -> SubprocessResult:
+        res = SubprocessResult()
+        t0 = time.time()
+        kwargs = dict(kwargs or {})
+        if progress_cb is not None:
+            kwargs[_PROGRESS_MARK] = True
+        else:
+            kwargs.pop("progress_cb", None)
+
+        if not self._sem.acquire(timeout=queue_timeout()):
+            res.error = (f"系统繁忙：并发计算任务已满（上限 {len(self.slots)}），"
+                         f"排队超过 {queue_timeout()}s，请稍后重试")
+            return res
+
+        slot = None
+        params_file = None
+        task_id = f"t{int(time.time() * 1000)}"
+        try:
+            fd, params_file = tempfile.mkstemp(suffix=".pkl", prefix="subproc_params_")
+            with os.fdopen(fd, "wb") as f:
+                pickle.dump({"entry": entry, "args": args, "kwargs": kwargs,
+                             "task_id": task_id}, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+            slot = self._acquire_slot()
+            ctx = {"event": threading.Event(), "result_path": None,
+                   "error_b64": None, "progress_cb": progress_cb}
+            if not slot.submit(task_id, params_file, ctx):
+                raise RuntimeError(f"worker {slot.idx} 提交失败")
+
+            # 等待 + 超时/内存监控（0.5s 粒度轮询）
+            timed_out = False
+            killed_mem = False
+            deadline = time.time() + (timeout if (timeout and timeout > 0) else 3600 * 24)
+            while not ctx["event"].is_set():
+                if time.time() > deadline:
+                    timed_out = True
+                    slot.kill_and_restart()
+                    break
+                if max_memory_mb and max_memory_mb > 0:
+                    try:
+                        rss = _process_rss_mb(slot.proc.pid)
+                        if rss > max_memory_mb:
+                            killed_mem = True
+                            slot.kill_and_restart()
+                            break
+                    except Exception:
+                        pass
+                ctx["event"].wait(0.5)
+
+            res.duration = time.time() - t0
+
+            if timed_out:
+                res.timed_out = True
+                res.error = f"执行超时（{timeout}s），已强杀"
+                logger.error(f"[subproc-pool/{entry}] {res.error}")
+            elif killed_mem:
+                res.killed_by_memory = True
+                res.error = f"内存超限被杀（上限 {max_memory_mb}MB）"
+            elif ctx["error_b64"]:
+                try:
+                    tb = base64.b64decode(ctx["error_b64"]).decode("utf-8", "replace")
+                except Exception:
+                    tb = ctx["error_b64"]
+                res.error = tb.strip()
+            elif ctx["result_path"] and os.path.exists(ctx["result_path"]):
+                try:
+                    with open(ctx["result_path"], "rb") as f:
+                        res.result = pickle.load(f)
+                    res.success = True
+                except Exception as e:
+                    res.error = f"结果反序列化失败: {e}"
+                finally:
+                    try:
+                        os.remove(ctx["result_path"])
+                    except Exception:
+                        pass
+            else:
+                res.error = "worker 无结果返回"
+        except Exception as e:
+            res.error = f"子进程池执行异常: {e}"
+            logger.error(f"[subproc-pool/{entry}] {res.error}", exc_info=True)
+        finally:
+            self._sem.release()
+            if slot is not None:
+                with slot.lock:
+                    slot.pending.pop(task_id, None)
+                    slot.idle = True
+            try:
+                if params_file and os.path.exists(params_file):
+                    os.remove(params_file)
+            except Exception:
+                pass
+        return res
+
+
+_pool: Optional[_WorkerPool] = None
+_pool_lock = threading.Lock()
+_pool_failed = False
+
+
+def _get_pool() -> Optional[_WorkerPool]:
+    """惰性创建常驻 worker 池；创建失败返回 None（调用方回退单任务模式）。"""
+    global _pool, _pool_failed
+    if _pool is not None or _pool_failed:
+        return _pool
+    with _pool_lock:
+        if _pool is not None or _pool_failed:
+            return _pool
+        try:
+            size = max(1, env_int("SUBPROCESS_CONCURRENCY", 2))
+            _pool = _WorkerPool(size)
+            logger.info(f"[subproc-pool] 常驻 worker 池已启动（{size} 个，预加载 Aspose）")
+            return _pool
+        except Exception as e:
+            _pool_failed = True
+            logger.error(f"[subproc-pool] 启动失败，回退单任务模式: {e}")
+            return None
+
+
+def run_in_subprocess(
+    entry: str,
+    args: tuple = (),
+    kwargs: dict = None,
+    timeout: float = 300,
+    max_memory_mb: int = None,
+    progress_cb=None,
+) -> SubprocessResult:
+    """在独立子进程执行 entry 指向的模块级函数，超时/超内存强杀。
+
+    优先走常驻 worker 池（省掉每次启动的 Aspose 初始化开销，20-30s → <1s）；
+    池不可用时回退单任务模式（每次新进程）。接口与行为语义不变。
+    """
+    max_memory_mb = default_max_memory_mb() if max_memory_mb is None else max_memory_mb
+    pool = _get_pool()
+    if pool is not None:
+        return pool.run(entry, args, kwargs, timeout, max_memory_mb, progress_cb)
+    return _run_single(entry, args, kwargs, timeout, max_memory_mb, progress_cb)
 
 
 async def run_in_subprocess_async(entry: str, args: tuple = (), kwargs: dict = None,
