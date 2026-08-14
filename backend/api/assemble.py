@@ -641,12 +641,23 @@ async def assemble_rematch(
         ai_provider = task.ai_provider
         tpl_path_src = tpl_files[0]
         # 复用原任务代码（匹配关系已定，不重新 AI 生成，直接覆盖 FIELD_MAPPING 执行）
+        # 兜底：任务 code_path 为空时（如 rematch 产生的新任务未落库）按签名存档路径找
         prewritten_code = None
-        if task.code_path and Path(task.code_path).exists():
-            try:
-                prewritten_code = Path(task.code_path).read_text(encoding="utf-8")
-            except Exception:
-                prewritten_code = None
+        _code_candidates = []
+        if task.code_path:
+            _code_candidates.append(task.code_path)
+        if task.signature:
+            _code_candidates.append(str(_TENANTS_DIR / task.tenant_id / "assemble_scripts"
+                                         / f"{task.signature}.py"))
+        for _cp in _code_candidates:
+            if _cp and Path(_cp).exists():
+                try:
+                    prewritten_code = Path(_cp).read_text(encoding="utf-8")
+                    break
+                except Exception:
+                    continue
+        if prewritten_code is None:
+            logger.warning(f"[assemble/rematch] 未找到原任务代码，回退 AI 生成: task={task_id}")
     finally:
         db.close()
 

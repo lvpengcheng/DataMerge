@@ -1084,6 +1084,11 @@ def run_assemble_task(task_id: int, push, params: Dict):
             _save_knowledge_mappings(db, tenant_id, template_signature,
                                      ai_semantic, task_id)
             push({"type": "log", "message": "✅ 代码执行成功，已存入代码存档并更新知识库"})
+        elif params.get("prewritten_code"):
+            # 人工修正映射直接执行成功：落库 code_path，后续再次 rematch 可直接复用
+            task.code_path = _save_cached_code(db, tenant_id, signature, code)
+            push({"type": "log", "message":
+                  "✅ 修正映射执行成功，代码已存入存档（下次复核修正可直接复用）"})
 
         # 7. 结果后处理 + 落盘
         push({"type": "status", "status": "executing", "message": "生成结果文件（原版+纯值版）..."})
