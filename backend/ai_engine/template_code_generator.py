@@ -1463,9 +1463,11 @@ def main():
 
     # 人工复核修正映射覆盖：必须在 fill_template 调用前（此时模块级 AI 输出的 FIELD_MAPPING
     # 已赋值，此处再覆盖才生效；模块顶层覆盖会被 AI 赋值语句顶掉）。
+    # ⚠️ 必须用 globals()["FIELD_MAPPING"] 赋值：直接 FIELD_MAPPING = ... 会把 FIELD_MAPPING
+    #    变成 main 的局部变量，无 override 时后续访问报 UnboundLocalError（真实事故）。
     _fm_ov = globals().get("_field_mapping_override")
     if _fm_ov:
-        FIELD_MAPPING = _fm_ov
+        globals()["FIELD_MAPPING"] = _fm_ov
         print("使用人工修正映射执行（{{len(FIELD_MAPPING)}} 列），不重新 AI 生成")
 
     print("步骤：调用 AI 生成的 fill_template 写入规则要求的列...")
