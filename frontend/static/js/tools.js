@@ -2403,7 +2403,6 @@ const Tools = {
     // ==================== 智能组表 ====================
     _saTenants: [],
     _saRules: [],
-    _saEventSource: null,
     _saTaskId: null,
     _saLastEventId: 0,
 
@@ -2523,7 +2522,12 @@ const Tools = {
     },
 
     _saAppendThinking(chunk) {
+        // 思考流限长展示：AI 思考可能复述 prompt 里的样例数据，过长只显示前段
+        const MAX_THINKING = 2000;
         this._saThinkingBuf += chunk;
+        if (this._saThinkingBuf.length > MAX_THINKING) {
+            this._saThinkingBuf = this._saThinkingBuf.slice(0, MAX_THINKING) + '\n…（思考内容过长已截断）';
+        }
         const logEl = document.getElementById('sa-log');
         const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
         let last = logEl && logEl.lastElementChild;
@@ -2590,37 +2594,74 @@ const Tools = {
         this._saConnectStream(taskId, lastEventId || 0);
     },
 
-    _saConnectStream(taskId, fromId) {
-        if (this._saEventSource) {
-            this._saEventSource.close();
-            this._saEventSource = null;
-        }
-        const es = new EventSource('/api/assemble/tasks/' + taskId + '/stream?last_event_id=' + fromId);
-        this._saEventSource = es;
-        es.onmessage = (e) => {
-            try {
-                const event = JSON.parse(e.data);
-                if (e.lastEventId) {
-                    this._saLastEventId = parseInt(e.lastEventId);
-                    sessionStorage.setItem('sa_active_task', JSON.stringify({
-                        taskId: taskId, lastEventId: this._saLastEventId, ts: Date.now() }));
-                }
-                this._saHandleEvent(event);
-                if (event.type === 'complete' || event.type === 'error') {
-                    es.close();
-                    this._saEventSource = null;
-                    sessionStorage.removeItem('sa_active_task');
-                }
-            } catch (err) {
-                console.error('解析组表SSE事件失败:', err);
+    async _saConnectStream(taskId, fromId) {
+        // 改用 fetch + ReadableStream 解析 SSE（对齐智训 _fetchTrainingSSE）：
+        // EventSource 无法携带 Authorization: Bearer 头，而 stream 端点已加鉴权，
+        // 不改会导致 401 失败；顺带获得统一的网络错误提示。
+        let gotAnyEvent = false;
+        try {
+            const resp = await AUTH.authFetch('/api/assemble/tasks/' + taskId + '/stream?last_event_id=' + (fromId || 0));
+            if (!resp.ok) {
+                let errMsg = 'HTTP ' + resp.status;
+                try { errMsg = (await resp.json()).detail || errMsg; } catch (e) {}
+                throw new Error(errMsg);
             }
-        };
-        es.onerror = () => {
-            es.close();
-            this._saEventSource = null;
-            this._saLog('warning', '⚠️ 连接中断，尝试重连...');
-            setTimeout(() => this._saReconnect(taskId), 2000);
-        };
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let lastEventId = fromId || 0;
+            let closed = false;
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const blocks = buffer.split('\n\n');
+                buffer = blocks.pop() || '';
+                for (const block of blocks) {
+                    let data = null;
+                    for (const line of block.split('\n')) {
+                        if (line.startsWith('id: ')) lastEventId = parseInt(line.slice(4), 10) || lastEventId;
+                        else if (line.startsWith('data: ')) data = line.slice(6).trim();
+                    }
+                    if (!data) continue;
+                    gotAnyEvent = true;
+                    try {
+                        const event = JSON.parse(data);
+                        if (lastEventId) {
+                            this._saLastEventId = lastEventId;
+                            sessionStorage.setItem('sa_active_task', JSON.stringify({
+                                taskId: taskId, lastEventId: lastEventId, ts: Date.now() }));
+                        }
+                        this._saHandleEvent(event);
+                        if (event.type === 'complete' || event.type === 'error') {
+                            closed = true;
+                            sessionStorage.removeItem('sa_active_task');
+                        }
+                    } catch (err) {
+                        console.error('解析组表SSE事件失败:', err);
+                    }
+                }
+            }
+            // 流正常结束但未收到终态（服务端断开/进程退出）→ 查状态兜底
+            if (!closed) this._saReconnect(taskId);
+        } catch (e) {
+            console.error('组表SSE读取失败:', e);
+            const isAuth = e && typeof e.message === 'string' && /401|403|Unauthorized|无权访问/.test(e.message);
+            const isNetErr = (e && e.name === 'TypeError') ||
+                             (e && typeof e.message === 'string' && /Failed to fetch|NetworkError|ERR_/.test(e.message));
+            if (isAuth) {
+                // 登录态失效或无权访问该任务（如切换了账号）→ 清理残留任务，避免反复重连
+                sessionStorage.removeItem('sa_active_task');
+                this._saLog('error', '❌ 鉴权已失效或无权访问该任务，请重新登录后重试');
+                this._saResetBtn();
+            } else if (isNetErr || gotAnyEvent) {
+                this._saLog('warning', '⚠️ 连接中断，尝试重连...');
+                setTimeout(() => this._saReconnect(taskId), 2000);
+            } else {
+                this._saLog('error', '❌ 连接失败: ' + e.message);
+                this._saResetBtn();
+            }
+        }
     },
 
     async _saReconnect(taskId) {
@@ -2734,13 +2775,127 @@ const Tools = {
             const resp = await AUTH.authFetch('/api/assemble/tasks/' + this._saTaskId + '/feedback', { method: 'POST', body: fd });
             if (!resp.ok) return _alertErr(resp, '反馈提交失败');
             const data = await resp.json();
-            document.getElementById('sa-feedback-msg').textContent = data.message || '';
-            document.getElementById('sa-feedback-bar').style.opacity = '0.6';
-            if (!correct) {
-                this._saLog('error', '❌ 已反馈：命中映射标待复核，建议勾选"强制重新匹配"重新组表');
+            if (correct) {
+                document.getElementById('sa-feedback-msg').textContent = data.message || '';
+                document.getElementById('sa-feedback-bar').style.opacity = '0.6';
+                this._saLog('success', '✅ ' + (data.message || '已确认结果正确'));
+            } else {
+                // 错误 → 弹窗逐列复核
+                this._saShowReviewModal(data);
             }
         } catch (e) {
             alert('反馈失败: ' + e.message);
+        }
+    },
+
+    // 错误反馈弹窗：逐列复核映射（目标列 → 源列下拉可改）+ 源样例不脱敏
+    _saShowReviewModal(data) {
+        const fm = data.field_mapping || {};
+        const samples = data.samples || [];
+        // 汇总所有源列名（下拉选项）
+        const srcCols = [];
+        const seen = {};
+        samples.forEach(s => (s.columns || []).forEach(c => {
+            if (!seen[c]) { seen[c] = 1; srcCols.push(c); }
+        }));
+
+        const rows = Object.keys(fm).map(tgt => {
+            const info = fm[tgt] || {};
+            const curSrc = info.source_column || '';
+            const opts = ['<option value="">（无映射）</option>']
+                .concat(srcCols.map(c => `<option value="${_escape(c)}"${c === curSrc ? ' selected' : ''}>${_escape(c)}</option>`))
+                .join('');
+            return `<tr data-target="${_escape(tgt)}">
+                <td>${_escape(tgt)}</td>
+                <td>${_escape(info.target_letter || '')}</td>
+                <td><select class="sa-review-src">${opts}</select>
+                    <div class="sa-review-conf">置信度 ${info.confidence != null ? info.confidence : '-'}</div></td>
+                <td>${_escape(info.source_letter || '')}</td>
+            </tr>`;
+        }).join('');
+
+        const sampleHtml = samples.map(s => {
+            const cols = s.columns || [];
+            const cell = v => (v === null || v === undefined) ? '' : _escape(v);
+            const rowHtml = (s.rows || []).map(r => {
+                const tds = cols.map(c => `<td>${cell(r[c])}</td>`).join('');
+                return `<tr>${tds}</tr>`;
+            }).join('');
+            return `<div class="sa-review-sample">
+                <div class="sa-review-sample-title">${_escape(s.file)} / ${_escape(s.sheet)}</div>
+                <table class="sa-review-sample-table"><thead><tr>${cols.map(c => `<th>${_escape(c)}</th>`).join('')}</tr></thead>
+                <tbody>${rowHtml || '<tr><td colspan="' + cols.length + '" style="color:#999;">（无数据行）</td></tr>'}</tbody></table>
+            </div>`;
+        }).join('');
+
+        const body = `
+            <p style="font-size:13px;color:#555;margin:0 0 10px;">请核对每列「目标表头 → 源表头」映射，直接在下拉里改。改完可点「重新组表」用修正映射重跑验证；确认无误后点「确认」记录本次匹配。</p>
+            <div style="max-height:38vh;overflow:auto;margin-bottom:12px;">
+                <table class="sa-review-table">
+                    <thead><tr><th>目标表头</th><th>目标列号</th><th>源表头（可改）</th><th>源列号</th></tr></thead>
+                    <tbody>${rows}</tbody>
+                </table>
+            </div>
+            <div style="font-weight:600;margin:8px 0 4px;font-size:13px;">源文件样例（未脱敏，前 3 行）</div>
+            <div style="max-height:24vh;overflow:auto;">${sampleHtml || '<div style="color:#999;">无源样例</div>'}</div>
+            <div style="margin-top:14px;text-align:right;">
+                <button type="button" class="btn" onclick="Tools._saRematch()">重新组表</button>
+                <button type="button" class="btn btn-primary" onclick="Tools._saConfirmCorrected()">确认</button>
+            </div>`;
+        this.openModal('复核字段匹配', body, null, { wide: true });
+    },
+
+    _saCollectCorrectedMapping() {
+        const cm = {};
+        document.querySelectorAll('#modal-body .sa-review-table tbody tr').forEach(tr => {
+            const tgt = tr.dataset.target;
+            const sel = tr.querySelector('.sa-review-src');
+            const src = sel ? sel.value : '';
+            if (tgt && src) cm[tgt] = src;
+        });
+        return cm;
+    },
+
+    async _saRematch() {
+        const cm = this._saCollectCorrectedMapping();
+        const fd = new FormData();
+        fd.append('corrected_mapping', JSON.stringify(cm));
+        try {
+            const resp = await AUTH.authFetch('/api/assemble/tasks/' + this._saTaskId + '/rematch', { method: 'POST', body: fd });
+            if (!resp.ok) return _alertErr(resp, '重新组表失败');
+            const data = await resp.json();
+            this.closeModal();
+            this._saTaskId = data.task_id;
+            this._saLastEventId = 0;
+            sessionStorage.setItem('sa_active_task', JSON.stringify({ taskId: data.task_id, lastEventId: 0, ts: Date.now() }));
+            const btn = document.getElementById('sa-start-btn');
+            btn.disabled = true;
+            btn.textContent = '组表中...';
+            document.getElementById('sa-log').innerHTML = '';
+            document.getElementById('sa-result-card').style.display = 'none';
+            document.getElementById('sa-feedback-bar').style.display = 'none';
+            this._saSetStatus('提交重新组表任务...', 5);
+            this._saLog('info', '（使用修正映射重新组表 #' + data.task_id + '...）');
+            this._saConnectStream(data.task_id, 0);
+        } catch (e) {
+            alert('重新组表失败: ' + e.message);
+        }
+    },
+
+    async _saConfirmCorrected() {
+        const cm = this._saCollectCorrectedMapping();
+        const fd = new FormData();
+        fd.append('corrected_mapping', JSON.stringify(cm));
+        try {
+            const resp = await AUTH.authFetch('/api/assemble/tasks/' + this._saTaskId + '/confirm-corrected', { method: 'POST', body: fd });
+            if (!resp.ok) return _alertErr(resp, '确认失败');
+            const data = await resp.json();
+            this.closeModal();
+            document.getElementById('sa-feedback-msg').textContent = data.message || '';
+            document.getElementById('sa-feedback-bar').style.opacity = '0.6';
+            this._saLog('success', '✅ ' + (data.message || '已确认匹配'));
+        } catch (e) {
+            alert('确认失败: ' + e.message);
         }
     },
 

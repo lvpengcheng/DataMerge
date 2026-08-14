@@ -27,7 +27,6 @@ class AssembleCodeGenerator(TemplateCodeGenerator):
         self.file_passwords = file_passwords or {}
         self._pre_mapped: Dict[str, str] = {}      # 知识库已命中映射 {源列: 模板列}
         self._tpl_data_rows: int = 0               # 模板数据区现有数据行数
-        self._src_data_rows: int = 0               # 源数据最大行数
 
     # ==================== 主入口（附加参数） ====================
 
@@ -45,18 +44,15 @@ class AssembleCodeGenerator(TemplateCodeGenerator):
         expected_structure: Optional[Dict] = None,
         pre_mapped: Optional[Dict[str, str]] = None,
         tpl_data_rows: int = 0,
-        src_data_rows: int = 0,
     ) -> Tuple[str, str]:
         """生成智能组表填充代码。
 
         Args:
             pre_mapped: 知识库已命中映射 {源列名: 模板列名}，AI 直接采用不再分析
             tpl_data_rows: 模板数据区现有数据行数（行数不足时引导 AI 复制样式扩展）
-            src_data_rows: 源数据最大行数
         """
         self._pre_mapped = pre_mapped or {}
         self._tpl_data_rows = int(tpl_data_rows or 0)
-        self._src_data_rows = int(src_data_rows or 0)
         code, ai_response = super().generate_code(
             input_folder, rules_content, template_path, manual_headers,
             stream_callback, thinking_callback,
@@ -228,29 +224,63 @@ class AssembleCodeGenerator(TemplateCodeGenerator):
             "【输出格式硬性要求】你的输出必须是一个完整的 Python 函数定义，第一行必须是：\n"
             "def fill_template(wb, source_data, salary_year, salary_month, monthly_standard_hours):\n"
             "函数体内实现全部填充逻辑（可内部定义变量/import，但不要出现函数定义之外的顶层执行语句，"
-            "不要输出 ```python 围栏，不要输出解释性文字）。"
+            "不要输出 ```python 围栏，不要输出解释性文字）。\n\n"
+            "【B1. 进度透明化】你可以在 fill_template 函数内调用 `report_progress(msg: str)` 推送进度信息，"
+            "如 report_progress('开始填充基础列') 或 report_progress(f'已填充{i}/{total}行')，"
+            "前端会实时显示这些信息。建议在关键步骤（解析数据/填充列块/写公式/计算）加进度埋点，"
+            "让用户知道脚本在做什么，避免长时间无反馈显得卡死。"
         )
 
-        # 0.5) 主键列填充硬性要求（防止只写公式不填主键 → 全部落空）
+        # 0.3) 结构化字段映射清单（供错误反馈弹窗逐列复核，必须输出）
+        parts.append(
+            "【字段映射清单输出要求】在 `def fill_template(...)` 的**正上方、同一个代码块内**，"
+            "先输出一个模块级常量 `FIELD_MAPPING`（这是唯一允许出现在函数定义之外的顶层赋值语句），"
+            "格式严格如下：\n"
+            "```\n"
+            "FIELD_MAPPING = {\n"
+            "    \"目标模板列名\": {\"source_column\": \"对应源列名\", \"source_letter\": \"源列字母\", \"confidence\": 0.9},\n"
+            "    ...\n"
+            "}\n"
+            "```\n"
+            "规则：\n"
+            "1. **必须覆盖模板激活 sheet 的全部列**（_COL_MAP 里每个目标列名都要作为 key 出现）。\n"
+            "2. source_column 填该目标列对应取的**源列名**（_SOURCE_MAP 里 源_ sheet 的列名，不带「源_」前缀）；"
+            "source_letter 填该源列在源 sheet 里的**列字母**（如 A/B/C）。\n"
+            "3. 无法确定映射的目标列也要列出：source_column 填空字符串 \"\"、source_letter 空字符串、confidence 给 0。\n"
+            "4. confidence 是匹配把握 0~1：知识库命中/同名列 = 1.0，AI 语义近似匹配按把握给 0.5~0.95。\n"
+            "5. 该清单只用于人工复核展示，必须与 fill_template 的实际填充逻辑保持一致。"
+        )
+
+        # 0.5) 主键列填充 + 非主键列公式硬性要求（防止只写公式不填主键 → 全部落空；
+        #      也防止只填值不写公式 → 原版失去公式可追溯性）
         parts.append(
             "【主键列填充硬性要求】模板的身份主键列（列名含「外服工号/工号/员工编号/编号/Payroll ID」"
             "或「证件号码/身份证/证件号」的列）必须从源_ sheet **填入实际值**（逐行把源表对应主键列的值"
             "直接赋给模板主键列单元格，如 ws.cell(row=r, column=...).value = 源值），"
             "**绝不允许对主键列写公式**（尤其不能写引用自身行的 VLOOKUP/INDEX，会导致循环引用）。\n"
-            "非主键列可以写跨 sheet 公式（VLOOKUP/INDEX/MATCH 引用主键列）。"
-            "函数体内必须包含至少一条『值赋值』语句（.value = 非公式），只有公式没有值赋值的输出是无效的。"
+            "【非主键列必须写跨 sheet 公式】除主键列外，其他所有需要填充的列**必须写跨 sheet 公式**"
+            "（VLOOKUP/INDEX/MATCH 引用主键列与 源_ sheet，如 "
+            "=IFERROR(VLOOKUP(B2,'源_xxx'!B:C,2,FALSE),\"\")），**不要写死数值**"
+            "——原版必须保留公式、可追溯，纯值版才会在后续转成值。\n"
+            "函数体内必须包含至少一条『值赋值』语句（主键列 .value = 非公式）；"
+            "只有公式没有值赋值、或只有值没有公式的输出都是无效的。"
         )
 
-        # 1) 数据行数处理指引（模板模式同款：AI 在 openpyxl 内直接写入/扩展行）
-        if self._src_data_rows > 0:
-            hint = (f"【数据行数指引】模板激活 sheet 数据区现有数据行数为 {self._tpl_data_rows}，"
-                    f"源数据最大行数为 {self._src_data_rows}。"
-                    f"若源数据行数超过模板数据区行数，fill_template 写入时超出模板数据区的行"
-                    f"必须复制模板最后一行数据行的样式（openpyxl: "
-                    f"from copy import copy; dst_cell._style = copy(src_cell._style)，"
-                    f"并复制行高 ws.row_dimensions）。"
-                    f"不要使用插入行/删除行（会破坏模板样式），直接在新行上写值并复制样式即可。")
-            parts.append(hint)
+        # 1) 数据行数处理指引：源样例仅前 3 行（结构示例，避免 prompt 膨胀），实际源行数
+        #    可能远大于模板数据区。不依赖"源行数估计值"，无条件引导 AI 按 source_data
+        #    实际行数全量循环 + 超行复制样式扩展，避免源多行时结果表下半部分丢样式。
+        hint = (f"【数据行数指引】模板激活 sheet 数据区现有数据行数为 {self._tpl_data_rows}。"
+                f"⚠️ 前面给出的源文件样例数据**仅前 3 行**（结构示例，不是完整数据）——"
+                f"源数据实际行数可能远大于模板数据区行数。fill_template 必须按 "
+                f"source_data / 源_ sheet 的**实际行数**循环填充全部数据行，"
+                f"绝不能只填样例中出现的行数。"
+                f"写入超出模板数据区的行时，必须复制模板最后一行数据行的样式"
+                f"（openpyxl: from copy import copy; dst_cell._style = copy(src_cell._style)，"
+                f"并复制行高 ws.row_dimensions）。"
+                f"若模板数据区为空（只有表头），则从表头下一行开始逐行写入，"
+                f"新行样式复制表头行样式或保持默认。"
+                f"不要使用插入行/删除行（会破坏模板样式），直接在新行上写值并复制样式即可。")
+        parts.append(hint)
 
         # 1.5) 单元格格式规范（硬性要求：防止数值被套日期格式 → 结果表百万级错误显示）
         parts.append(
