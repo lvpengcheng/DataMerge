@@ -584,6 +584,15 @@ class BaseAIProvider(ABC):
         # 修复f-string引号嵌套冲突
         code = self._fix_fstring_quotes(code)
 
+        # 语义修复：AI 常写"裸 import copy"后 copy(...) 当函数调用（复制样式），
+        # 结果是调用模块本身 → TypeError: 'module' object is not callable。
+        # 裸 import copy 且代码里有 copy( 调用时，改为 from copy import copy
+        # （保留 _copy_module 别名供 copy.deepcopy 等继续可用）。支持函数内缩进。
+        if re.search(r'^[ \t]*import copy\s*$', code, re.M) and re.search(r'\bcopy\s*\(', code):
+            code = re.sub(r'^([ \t]*)import copy\s*$',
+                          r'\1import copy as _copy_module\n\1from copy import copy',
+                          code, flags=re.M)
+
         # 尝试解析代码，如果成功则不需要修复
         try:
             ast.parse(code)
