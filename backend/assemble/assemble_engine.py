@@ -572,6 +572,41 @@ def _ai_generate_code(generator, source_struct: Dict, source_dir: Path,
 
 # ==================== 沙箱执行 ====================
 
+def _build_src_letter_lookup(source_struct: Dict, template_struct: Dict) -> Dict[str, Dict[str, str]]:
+    """构建 {源_ sheet 名: {源列名: 列字母}} 查询表（与骨架 _SOURCE_MAP 同一套命名逻辑）。
+
+    人工修正映射补全 source_letter 用：按 source_sheet + source_column 查列字母。
+    """
+    from openpyxl.utils import get_column_letter
+    from backend.utils.data_helpers import assign_sheet_keys, build_prefixed_sheet_names
+
+    pairs: List[tuple] = []
+    cols_by_pair: Dict[tuple, List[str]] = {}
+    files = (source_struct or {}).get("files", {}) or {}
+    for fname, fdesc in files.items():
+        if not isinstance(fdesc, dict):
+            continue
+        file_base = Path(fname).stem
+        for sn, sinfo in (fdesc or {}).items():
+            cols = list(sinfo.get("columns") or []) if isinstance(sinfo, dict) else []
+            pairs.append((file_base, sn))
+            cols_by_pair[(file_base, sn)] = cols
+    pairs.sort(key=lambda p: (str(p[0]), str(p[1])))
+
+    reserved = set((template_struct or {}).get("sheets", {}).keys())
+    sk_map = assign_sheet_keys(pairs, reserved_names=reserved) if pairs else {}
+    ordered_sk = sorted(set(sk_map.values()))
+    name_map = build_prefixed_sheet_names(ordered_sk, prefix="源_", reserved=reserved)
+
+    out: Dict[str, Dict[str, str]] = {}
+    for (fb, sn) in pairs:
+        final_name = name_map[sk_map[(fb, sn)]]
+        out[final_name] = {
+            c: get_column_letter(i + 1) for i, c in enumerate(cols_by_pair[(fb, sn)])
+        }
+    return out
+
+
 def _execute_in_sandbox(code: str, source_dir: Path, output_dir: Path,
                         template_to_exec: Path, file_passwords: Dict,
                         tenant_id: str, push=None,
@@ -1037,9 +1072,23 @@ def run_assemble_task(task_id: int, push, params: Dict):
         output_dir = exec_dir / "output"
         output_dir.mkdir(parents=True, exist_ok=True)
         push({"type": "status", "status": "executing", "message": "沙箱执行填充代码（约1-3分钟）..."})
+        # 人工修正映射补全 source_letter（AI 映射驱动代码读取，缺失会 KeyError）
+        fm_override = params.get("field_mapping_override")
+        if fm_override:
+            try:
+                _src_letter = _build_src_letter_lookup(source_struct, template_struct)
+                for _tgt, _info in fm_override.items():
+                    if not isinstance(_info, dict):
+                        continue
+                    _sheet = (_info.get("source_sheet") or "").strip()
+                    _col = (_info.get("source_column") or "").strip()
+                    if not _info.get("source_letter"):
+                        _info["source_letter"] = (_src_letter.get(_sheet) or {}).get(_col, "")
+            except Exception as _e:
+                logger.warning("[assemble] 补全 source_letter 失败: %s", _e)
         result = _execute_in_sandbox(code, source_dir, output_dir, clean_template,
                                      file_passwords, tenant_id, push=push,
-                                     field_mapping_override=params.get("field_mapping_override"))
+                                     field_mapping_override=fm_override)
 
         if not result.get("success"):
             err = result.get("error") or "未知错误"

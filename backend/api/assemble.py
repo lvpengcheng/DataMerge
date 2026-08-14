@@ -551,10 +551,11 @@ async def assemble_feedback(
             return {"ok": True, "correct": True, "confirmed": n,
                     "message": f"已确认 {n} 列语义映射（累计确认次数 +1）"}
 
-        # 错误：返回复核数据（映射清单 + 源样例），不连坐停用
+        # 错误：返回复核数据（映射清单 + 上次修正映射预填），不连坐停用
         src_arc = _TENANTS_DIR / task.tenant_id / "assemble_results" / str(task_id) / "_source"
         return {"ok": True, "correct": False,
                 "field_mapping": task.field_mapping or {},
+                "corrected_mapping": task.corrected_mapping or {},
                 "samples": _load_review_samples(src_arc)}
     finally:
         db.close()

@@ -2791,6 +2791,21 @@ const Tools = {
     // 错误反馈弹窗：逐列复核映射（目标列 → 源表/源列下拉可改）
     _saShowReviewModal(data) {
         const fm = data.field_mapping || {};
+        const cm = data.corrected_mapping || {};   // 上次人工修正映射（"源表|源列"），预填
+        // 用上次修正覆盖对应列的当前值
+        Object.keys(cm).forEach(tgt => {
+            if (fm[tgt] && cm[tgt]) {
+                const v = String(cm[tgt]);
+                if (v.indexOf('|') >= 0) {
+                    const parts = v.split('|');
+                    fm[tgt].source_sheet = parts[0];
+                    fm[tgt].source_column = parts[1];
+                } else {
+                    fm[tgt].source_column = v;
+                    fm[tgt].source_sheet = '';
+                }
+            }
+        });
         // 汇总所有 (源表, 源列) 选项；值编码 "源表|源列"（多源表同名列可区分）
         const srcOpts = [];
         const seen = {};
