@@ -1134,10 +1134,21 @@ def run_assemble_task(task_id: int, push, params: Dict):
                                      ai_semantic, task_id)
             push({"type": "log", "message": "✅ 代码执行成功，已存入代码存档并更新知识库"})
         elif params.get("prewritten_code"):
-            # 人工修正映射直接执行成功：落库 code_path，后续再次 rematch 可直接复用
+            # 人工修正映射直接执行成功：把修正映射【写进代码】再存档。
+            # 若不写进代码，下次同源同模板的 submit 命中存档执行的仍是原映射代码
+            # （运行时 FIELD_MAPPING 覆盖不持久化）→ 结果还是旧映射（真实事故）。
+            # 追加模块级 FIELD_MAPPING 覆盖块（位于 AI 赋值之后、main 调用之前执行）。
+            import pprint as _pp
+            _fm_ov2 = params.get("field_mapping_override") or {}
+            if _fm_ov2:
+                _persist_block = (
+                    "\n\n# ===== 人工复核修正映射（持久化，覆盖 AI 输出） =====\n"
+                    "FIELD_MAPPING = " + _pp.pformat(_fm_ov2, width=120, sort_dicts=False) + "\n"
+                )
+                code = code + _persist_block
             task.code_path = _save_cached_code(db, tenant_id, signature, code)
             push({"type": "log", "message":
-                  "✅ 修正映射执行成功，代码已存入存档（下次复核修正可直接复用）"})
+                  "✅ 修正映射执行成功，修正映射已持久化进代码存档（下次同结构直接生效）"})
 
         # 7. 结果后处理 + 落盘
         push({"type": "status", "status": "executing", "message": "生成结果文件（原版+纯值版）..."})
