@@ -2806,9 +2806,16 @@ const Tools = {
                 }
             }
         });
-        // 汇总所有 (源表, 源列) 选项；值编码 "源表|源列"（多源表同名列可区分）
+        // 候选选项 = 全部源表的所有列（source_options，修正后也能选回其它表）+ 当前映射值
+        // 值编码 "源表|源列"（多源表同名列可区分）
         const srcOpts = [];
         const seen = {};
+        (data.source_options || []).forEach(so => {
+            (so.columns || []).forEach(c => {
+                const key = so.source_sheet + '|' + c;
+                if (!seen[key]) { seen[key] = 1; srcOpts.push({ sheet: so.source_sheet, col: c, key }); }
+            });
+        });
         Object.values(fm).forEach(info => {
             const src = info && info.source_column;
             const sheet = (info && info.source_sheet) || '';

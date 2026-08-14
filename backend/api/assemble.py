@@ -512,6 +512,55 @@ def _load_review_samples(src_arc: Path, limit: int = 3) -> List[dict]:
     return out
 
 
+def _list_source_options(src_arc: Path) -> List[dict]:
+    """解析归档源文件的全部可见 sheet 列，生成复核弹窗的候选源表清单。
+
+    返回 [{source_sheet: "源_名", columns: [列名...]}]，source_sheet 与骨架追加后的
+    实际 sheet 名一致（assign_sheet_keys + build_prefixed_sheet_names 同套命名），
+    供弹窗下拉选择其它源表（修正后 field_mapping 只剩选中表，须从全表候选恢复）。
+    """
+    from excel_parser import IntelligentExcelParser
+    from backend.utils.data_helpers import assign_sheet_keys, build_prefixed_sheet_names
+
+    if not src_arc.exists():
+        return []
+    parser = IntelligentExcelParser()
+    files = sorted(p for p in src_arc.iterdir()
+                   if p.is_file() and p.suffix.lower() in EXCEL_EXTS)
+
+    pairs: List[tuple] = []
+    cols_by_pair: Dict[tuple, List[str]] = {}
+    for fp in files:
+        try:
+            sheets = parser.parse_excel_file(
+                str(fp), max_data_rows=1, read_formulas=False,
+                active_sheet_only=False, best_region_only=True)
+        except Exception:
+            continue
+        file_base = Path(fp.name).stem
+        for sd in sheets:
+            region = (sd.regions or [None])[0]
+            if region is None:
+                continue
+            pairs.append((file_base, sd.sheet_name))
+            cols_by_pair[(file_base, sd.sheet_name)] = list((region.head_data or {}).keys())
+
+    if not pairs:
+        return []
+    pairs.sort(key=lambda p: (str(p[0]), str(p[1])))
+    sk_map = assign_sheet_keys(pairs, reserved_names=set())
+    ordered_sk = sorted(set(sk_map.values()))
+    name_map = build_prefixed_sheet_names(ordered_sk, prefix="源_", reserved=set())
+
+    out = []
+    for (fb, sn) in pairs:
+        out.append({
+            "source_sheet": name_map[sk_map[(fb, sn)]],
+            "columns": cols_by_pair[(fb, sn)],
+        })
+    return out
+
+
 def _batch_confirm(db, task: AssembleTask) -> int:
     """对任务 field_mapping 里的语义列批量确认（同名列跳过）。返回确认的列数。"""
     n = 0
@@ -551,11 +600,12 @@ async def assemble_feedback(
             return {"ok": True, "correct": True, "confirmed": n,
                     "message": f"已确认 {n} 列语义映射（累计确认次数 +1）"}
 
-        # 错误：返回复核数据（映射清单 + 上次修正映射预填），不连坐停用
+        # 错误：返回复核数据（映射清单 + 全部源表候选 + 上次修正预填），不连坐停用
         src_arc = _TENANTS_DIR / task.tenant_id / "assemble_results" / str(task_id) / "_source"
         return {"ok": True, "correct": False,
                 "field_mapping": task.field_mapping or {},
                 "corrected_mapping": task.corrected_mapping or {},
+                "source_options": _list_source_options(src_arc),
                 "samples": _load_review_samples(src_arc)}
     finally:
         db.close()
