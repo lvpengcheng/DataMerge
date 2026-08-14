@@ -2788,22 +2788,27 @@ const Tools = {
         }
     },
 
-    // 错误反馈弹窗：逐列复核映射（目标列 → 源列下拉可改）
+    // 错误反馈弹窗：逐列复核映射（目标列 → 源表/源列下拉可改）
     _saShowReviewModal(data) {
         const fm = data.field_mapping || {};
-        // 汇总所有源列名（下拉选项）
-        const srcCols = [];
+        // 汇总所有 (源表, 源列) 选项；值编码 "源表|源列"（多源表同名列可区分）
+        const srcOpts = [];
         const seen = {};
         Object.values(fm).forEach(info => {
             const src = info && info.source_column;
-            if (src && !seen[src]) { seen[src] = 1; srcCols.push(src); }
+            const sheet = (info && info.source_sheet) || '';
+            if (!src) return;
+            const key = sheet + '|' + src;
+            if (!seen[key]) { seen[key] = 1; srcOpts.push({ sheet, col: src, key }); }
         });
 
         const rows = Object.keys(fm).map(tgt => {
             const info = fm[tgt] || {};
-            const curSrc = info.source_column || '';
+            const curSheet = (info && info.source_sheet) || '';
+            const curSrc = (info && info.source_column) || '';
+            const curKey = curSheet ? curSheet + '|' + curSrc : curSrc;
             const opts = ['<option value="">（无映射）</option>']
-                .concat(srcCols.map(c => `<option value="${_escape(c)}"${c === curSrc ? ' selected' : ''}>${_escape(c)}</option>`))
+                .concat(srcOpts.map(o => `<option value="${_escape(o.key)}"${o.key === curKey ? ' selected' : ''}>${_escape(o.sheet ? o.sheet + ' / ' + o.col : o.col)}</option>`))
                 .join('');
             return `<tr data-target="${_escape(tgt)}">
                 <td>${_escape(tgt)}</td>

@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from ..auth.dependencies import require_permission, get_operable_tenants
 from ..database.connection import SessionLocal
 from ..database.models import AssembleTask, AssembleFieldMapping
+from ..assemble.assemble_engine import _confirm_mapping, CONFIRM_THRESHOLD
 
 router = APIRouter(prefix="/api/assemble", tags=["智能组表"])
 
@@ -36,6 +37,24 @@ _DONE = "@@DONE@@"
 def _buffer_key(task_id: int) -> str:
     """TaskLogBuffer key：加 "a" 前缀避免与智算自增 id 冲突。"""
     return f"a{task_id}"
+
+
+def _check_task_access(task: AssembleTask, current_user, db):
+    """校验当前用户对该组表任务的访问权，防跨租户越权（IDOR）。
+
+    admin → 全部放行；工具租户 __assemble__ 的任务 → 仅创建者本人；
+    其余租户任务 → 租户必须在本用户可访问集合内（与 submit 校验一致）。
+    """
+    if current_user.role and current_user.role.name == "admin":
+        return
+    from ..auth.dependencies import get_accessible_tenants
+    if task.tenant_id == "__assemble__":
+        if task.user_id and task.user_id == current_user.id:
+            return
+        raise HTTPException(status_code=403, detail="无权访问该任务")
+    if task.tenant_id in get_accessible_tenants(current_user=current_user, db=db):
+        return
+    raise HTTPException(status_code=403, detail="无权访问该任务")
 
 
 # ==================== 提交 ====================
@@ -224,6 +243,23 @@ async def _run_assemble_subprocess(buffer_key: str, buffer, params_file: str):
     elif state["returncode"] not in (0, None):
         _mark_failed(buffer_key, f"组表子进程异常退出(code={state['returncode']})")
 
+    # 清理临时工作目录（源文件/模板/exec 输出都在其中；结果已复制到 tenants 结果目录，
+    # 这里无论成功/失败/启动异常都删，防止每个任务永久泄漏一个 temp 目录）
+    try:
+        _tmp = Path(params_file).parent
+        if _tmp.name.startswith("assemble_") and _tmp.exists():
+            shutil.rmtree(_tmp, ignore_errors=True)
+            logger.info(f"[assemble/subproc] 已清理临时目录: {_tmp}")
+    except Exception:
+        pass
+
+    # 标记缓冲区完成（与 compute 路径 main.py finally 一致）：否则 SSE 生成器永不结束、
+    # TaskLogBuffer 该任务的所有事件永久驻留内存（cleanup_expired 只清理 finish 过的任务）
+    try:
+        buffer.finish(buffer_key)
+    except Exception:
+        pass
+
 
 def _mark_failed(buffer_key: str, msg: str):
     """子进程异常退出时兜底标记任务失败。"""
@@ -252,11 +288,28 @@ def _mark_failed(buffer_key: str, msg: str):
 # ==================== SSE 流 / 状态 ====================
 
 @router.get("/tasks/{task_id}/stream")
-async def assemble_task_stream(task_id: int, last_event_id: int = 0):
-    """SSE 流：从 last_event_id 续读，支持断线重连。"""
+async def assemble_task_stream(
+    task_id: int,
+    last_event_id: int = 0,
+    current_user=Depends(require_permission("tools.assemble", "tools.assemble.manage")),
+):
+    """SSE 流：从 last_event_id 续读，支持断线重连。
+
+    已加鉴权（前端改为 fetch+ReadableStream 携带 Bearer token 消费），并校验任务归属。
+    """
     from backend.compute.task_log_buffer import TaskLogBuffer
     buffer = TaskLogBuffer.get_instance()
     key = _buffer_key(task_id)
+
+    # 鉴权 + 归属校验（防未登录/跨租户按 task_id 探测他人任务）
+    db = SessionLocal()
+    try:
+        task = db.query(AssembleTask).filter_by(id=task_id).first()
+        if not task:
+            raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
+        _check_task_access(task, current_user, db)
+    finally:
+        db.close()
 
     status = buffer.get_status(key)
     if status is None:
@@ -292,8 +345,11 @@ async def assemble_task_stream(task_id: int, last_event_id: int = 0):
 
 
 @router.get("/tasks/{task_id}/status")
-async def assemble_task_status(task_id: int):
-    """轮询兜底。"""
+async def assemble_task_status(
+    task_id: int,
+    current_user=Depends(require_permission("tools.assemble", "tools.assemble.manage")),
+):
+    """轮询兜底。已加鉴权 + 归属校验。"""
     from backend.compute.task_log_buffer import TaskLogBuffer
     buffer = TaskLogBuffer.get_instance()
     key = _buffer_key(task_id)
@@ -309,6 +365,7 @@ async def assemble_task_status(task_id: int):
         task = db.query(AssembleTask).filter_by(id=task_id).first()
         if not task:
             raise HTTPException(status_code=404, detail="任务不存在")
+        _check_task_access(task, current_user, db)
         out.update({
             "status": task.status,
             "matched_from_cache": bool(task.matched_from_cache),
@@ -332,6 +389,7 @@ async def assemble_task_result(task_id: int,
         task = db.query(AssembleTask).filter_by(id=task_id).first()
         if not task:
             raise HTTPException(status_code=404, detail="任务不存在")
+        _check_task_access(task, current_user, db)
         return {"task_id": task_id, "status": task.status,
                 "output_files": task.output_files or [],
                 "matched_from_cache": bool(task.matched_from_cache)}
@@ -374,12 +432,37 @@ async def assemble_history(
     limit: int = Query(50, ge=1, le=200),
     current_user=Depends(require_permission("tools.assemble", "tools.assemble.manage")),
 ):
-    """任务历史列表（按租户过滤）。"""
+    """任务历史列表（按租户过滤）。
+
+    非 admin：历史限制为本人可访问租户 ∪ 自己的工具租户(__assemble__)任务，
+    避免空 tenant_id 时返回全部租户数据（越权）。
+    """
     db = SessionLocal()
     try:
+        from sqlalchemy import and_, or_
+        from ..auth.dependencies import get_accessible_tenants
+
         q = db.query(AssembleTask)
+        is_admin = current_user.role and current_user.role.name == "admin"
         if tenant_id:
-            q = q.filter(AssembleTask.tenant_id == tenant_id)
+            if is_admin:
+                q = q.filter(AssembleTask.tenant_id == tenant_id)
+            elif tenant_id == "__assemble__":
+                q = q.filter(and_(AssembleTask.tenant_id == "__assemble__",
+                                  AssembleTask.user_id == current_user.id))
+            else:
+                accessible = set(get_accessible_tenants(current_user=current_user, db=db))
+                if tenant_id in accessible:
+                    q = q.filter(AssembleTask.tenant_id == tenant_id)
+                else:
+                    q = q.filter(False)   # 非可访问租户 → 空结果，不泄露任务存在性
+        elif not is_admin:
+            accessible = set(get_accessible_tenants(current_user=current_user, db=db))
+            q = q.filter(or_(
+                AssembleTask.tenant_id.in_(accessible),
+                and_(AssembleTask.tenant_id == "__assemble__",
+                     AssembleTask.user_id == current_user.id),
+            ))
         rows = q.order_by(AssembleTask.id.desc()).limit(limit).all()
         items = [{
             "id": t.id,
@@ -397,7 +480,49 @@ async def assemble_history(
         db.close()
 
 
-# ==================== 结果确认反馈 ====================
+# ==================== 结果确认反馈（置信度闭环） ====================
+
+def _load_review_samples(src_arc: Path, limit: int = 3) -> List[dict]:
+    """读归档源文件前几行样例（不脱敏），供错误弹窗人工核对映射。"""
+    from excel_parser import IntelligentExcelParser
+    if not src_arc.exists():
+        return []
+    parser = IntelligentExcelParser()
+    out = []
+    files = sorted(p for p in src_arc.iterdir()
+                   if p.is_file() and p.suffix.lower() in EXCEL_EXTS)
+    for fp in files:
+        try:
+            sheets = parser.parse_excel_file(
+                str(fp), max_data_rows=limit, read_formulas=False,
+                active_sheet_only=False, best_region_only=True)
+        except Exception:
+            continue
+        for sd in sheets:
+            region = (sd.regions or [None])[0]
+            if region is None:
+                continue
+            out.append({
+                "file": fp.name,
+                "sheet": sd.sheet_name,
+                "columns": list((region.head_data or {}).keys()),
+                "head_data": region.head_data or {},
+                "rows": (region.data or [])[:limit],
+            })
+    return out
+
+
+def _batch_confirm(db, task: AssembleTask) -> int:
+    """对任务 field_mapping 里的语义列批量确认（同名列跳过）。返回确认的列数。"""
+    n = 0
+    for tgt, info in (task.field_mapping or {}).items():
+        if not isinstance(info, dict):
+            continue
+        src = (info.get("source_column") or "").strip()
+        if _confirm_mapping(db, task.tenant_id, task.template_signature, src, tgt) is not None:
+            n += 1
+    return n
+
 
 @router.post("/tasks/{task_id}/feedback")
 async def assemble_feedback(
@@ -405,30 +530,181 @@ async def assemble_feedback(
     correct: str = Form("true"),
     current_user=Depends(require_permission("tools.assemble", "tools.assemble.manage")),
 ):
-    """结果确认：✅ correct=true → 命中条目 hit_count+1；
-    ❌ correct=false → 该任务命中的知识库条目全部标 review_needed（不再自动采用）。"""
+    """结果确认：
+    ✅ correct=true → 对 field_mapping 里所有语义列批量 confirm+1（达阈值转 active）
+    ❌ correct=false → 返回逐列复核数据（映射清单 + 源样例不脱敏），不立即停用任何条目
+    """
     db = SessionLocal()
     try:
         task = db.query(AssembleTask).filter_by(id=task_id).first()
         if not task:
             raise HTTPException(status_code=404, detail="任务不存在")
+        _check_task_access(task, current_user, db)
+        if task.feedback_status:
+            raise HTTPException(status_code=409, detail="该任务已反馈过，不能重复反馈")
 
-        used_ids = task.used_mapping_ids or []
         is_correct = correct.lower() in ("true", "1", "on")
         if is_correct:
-            if used_ids:
-                for m in db.query(AssembleFieldMapping).filter(AssembleFieldMapping.id.in_(used_ids)).all():
-                    m.hit_count = (m.hit_count or 1) + 1
-                db.commit()
-            return {"ok": True, "correct": True,
-                    "message": f"已确认结果正确，知识库 {len(used_ids)} 条映射可信度 +1"}
-        else:
-            if used_ids:
-                for m in db.query(AssembleFieldMapping).filter(AssembleFieldMapping.id.in_(used_ids)).all():
-                    m.status = "review_needed"
-                db.commit()
-            return {"ok": True, "correct": False,
-                    "message": f"已停用 {len(used_ids)} 条知识库映射（待复核），"
-                               "建议勾选「强制重新匹配」后重新组表"}
+            n = _batch_confirm(db, task)
+            task.feedback_status = "confirmed"
+            db.commit()
+            return {"ok": True, "correct": True, "confirmed": n,
+                    "message": f"已确认 {n} 列语义映射（累计确认次数 +1）"}
+
+        # 错误：返回复核数据（映射清单 + 源样例），不连坐停用
+        src_arc = _TENANTS_DIR / task.tenant_id / "assemble_results" / str(task_id) / "_source"
+        return {"ok": True, "correct": False,
+                "field_mapping": task.field_mapping or {},
+                "samples": _load_review_samples(src_arc)}
     finally:
         db.close()
+
+
+@router.post("/tasks/{task_id}/confirm-corrected")
+async def assemble_confirm_corrected(
+    task_id: int,
+    corrected_mapping: str = Form(""),
+    current_user=Depends(require_permission("tools.assemble", "tools.assemble.manage")),
+):
+    """弹窗「确认」：对最终采用的映射（corrected_mapping，{目标列: 源列}）逐列 confirm+1。"""
+    db = SessionLocal()
+    try:
+        task = db.query(AssembleTask).filter_by(id=task_id).first()
+        if not task:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        _check_task_access(task, current_user, db)
+        if task.feedback_status == "confirmed":
+            raise HTTPException(status_code=409, detail="该任务已确认过，不能重复确认")
+        try:
+            cm = json.loads(corrected_mapping) if corrected_mapping else {}
+        except Exception:
+            raise HTTPException(status_code=400, detail="corrected_mapping 必须是 JSON")
+        if not isinstance(cm, dict):
+            raise HTTPException(status_code=400, detail="corrected_mapping 必须是对象")
+
+        n = 0
+        for tgt, src in cm.items():
+            _src_col = str(src).strip()
+            if "|" in _src_col:          # "源表|源列" → 知识库只存源列名
+                _src_col = _src_col.split("|", 1)[1].strip()
+            if _confirm_mapping(db, task.tenant_id, task.template_signature, _src_col, tgt) is not None:
+                n += 1
+        task.corrected_mapping = cm
+        task.feedback_status = "confirmed"
+        db.commit()
+        return {"ok": True, "confirmed": n, "message": f"已确认 {n} 列映射（累计确认次数 +1）"}
+    finally:
+        db.close()
+
+
+@router.post("/tasks/{task_id}/rematch")
+async def assemble_rematch(
+    task_id: int,
+    corrected_mapping: str = Form(""),
+    current_user=Depends(require_permission("tools.assemble", "tools.assemble.manage")),
+):
+    """用修正映射重新组表：读归档源文件+模板 → 建新任务 → spawn 子进程。"""
+    from backend.compute.task_log_buffer import TaskLogBuffer
+
+    try:
+        cm = json.loads(corrected_mapping) if corrected_mapping else {}
+    except Exception:
+        raise HTTPException(status_code=400, detail="corrected_mapping 必须是 JSON")
+    if not isinstance(cm, dict):
+        raise HTTPException(status_code=400, detail="corrected_mapping 必须是对象")
+
+    db = SessionLocal()
+    try:
+        task = db.query(AssembleTask).filter_by(id=task_id).first()
+        if not task:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        _check_task_access(task, current_user, db)
+        if task.status != "completed":
+            raise HTTPException(status_code=400, detail="仅已完成的任务可重新组表")
+
+        src_arc = _TENANTS_DIR / task.tenant_id / "assemble_results" / str(task_id) / "_source"
+        tpl_arc = _TENANTS_DIR / task.tenant_id / "assemble_results" / str(task_id) / "_template"
+        src_files = sorted(p for p in src_arc.iterdir()
+                           if p.is_file() and p.suffix.lower() in EXCEL_EXTS) if src_arc.exists() else []
+        tpl_files = sorted(p for p in tpl_arc.iterdir()
+                           if p.is_file() and p.suffix.lower() in EXCEL_EXTS) if tpl_arc.exists() else []
+        if not src_files or not tpl_files:
+            raise HTTPException(status_code=404, detail="未找到归档的源文件/模板，无法重新组表")
+
+        # 记录修正映射到原任务（供追溯），标记进入修正流程
+        task.corrected_mapping = cm
+        task.feedback_status = "corrected"
+        db.commit()
+
+        tenant_id = task.tenant_id
+        rule_id = task.rule_id
+        ai_provider = task.ai_provider
+        tpl_path_src = tpl_files[0]
+    finally:
+        db.close()
+
+    # 方向转换：{目标列: 源表|源列} → {源列: 目标列}（engine 的 pre_mapped 方向）
+    # 值带源表信息：目标列后附 @源表名，生成器 prompt 解析显示（旧格式"源列"无源表，兼容）
+    pre_mapped = {}
+    for tgt, src in cm.items():
+        if src and tgt:
+            _v = str(src).strip()
+            if "|" in _v:
+                _sheet, _col = _v.split("|", 1)
+                pre_mapped[_col.strip()] = f"{str(tgt).strip()}@{_sheet.strip()}"
+            else:
+                pre_mapped[_v] = str(tgt).strip()
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="assemble_"))
+    try:
+        source_dir = tmp_dir / "source"
+        source_dir.mkdir(exist_ok=True)
+        for p in src_files:
+            shutil.copy2(p, source_dir / p.name)
+        new_tpl = tmp_dir / "template" / tpl_path_src.name
+        new_tpl.parent.mkdir(exist_ok=True)
+        shutil.copy2(tpl_path_src, new_tpl)
+
+        db = SessionLocal()
+        try:
+            new_task = AssembleTask(
+                tenant_id=tenant_id, user_id=current_user.id,
+                rule_id=rule_id, status="pending",
+                ai_provider=ai_provider, corrected_mapping=cm,
+            )
+            db.add(new_task)
+            db.commit()
+            db.refresh(new_task)
+            new_id = new_task.id
+        finally:
+            db.close()
+
+        buffer = TaskLogBuffer.get_instance()
+        buffer.create_task(_buffer_key(new_id))
+        buffer.push(_buffer_key(new_id), json.dumps(
+            {"type": "status", "status": "pending",
+             "message": "重新组表任务已提交（使用人工修正映射）..."}, ensure_ascii=False))
+
+        params = {
+            "task_id": new_id,
+            "tenant_id": tenant_id,
+            "rule_id": rule_id,
+            "source_dir": str(source_dir),
+            "template_path": str(new_tpl),
+            "force_rematch": True,          # 修正映射必须跳过存档/知识库，按 pre_mapped 生成
+            "file_passwords": {},
+            "ai_provider": ai_provider,
+            "pre_mapped": pre_mapped,
+        }
+        params_file = tmp_dir / "params.json"
+        params_file.write_text(json.dumps(params, ensure_ascii=False), encoding="utf-8")
+
+        asyncio.create_task(_run_assemble_subprocess(_buffer_key(new_id), buffer, str(params_file)))
+        return {"task_id": new_id}
+    except HTTPException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    except Exception as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        logger.error(f"[assemble/rematch] 重新组表失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))

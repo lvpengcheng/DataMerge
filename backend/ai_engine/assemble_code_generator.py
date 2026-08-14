@@ -269,11 +269,13 @@ class AssembleCodeGenerator(TemplateCodeGenerator):
             "【字段映射输出要求】在 def fill_template 函数定义的上方（同一代码块内），"
             "必须额外输出结构化字段映射，供人工复核：\n"
             "FIELD_MAPPING = {\n"
-            "    \"目标列名\": {\"source_column\": \"源列名\", \"source_letter\": \"源列字母\", \"confidence\": 0.95},\n"
+            "    \"目标列名\": {\"source_sheet\": \"源_表名\", \"source_column\": \"源列名\", "
+            "\"source_letter\": \"源列字母\", \"confidence\": 0.95},\n"
             "    ...\n"
             "}\n"
-            "覆盖所有参与填充的列（含主键列，source_column 为对应源列名）；"
-            "source_letter 是源_ sheet 中该列的字母；confidence 为 0~1 的匹配置信度。\n"
+            "覆盖所有参与填充的列（含主键列）；source_sheet 是该源列实际取数所在的 源_ sheet 名"
+            "（必须与 _SOURCE_MAP 的 key 完全一致），source_column 为对应源列名，"
+            "source_letter 是源_ sheet 中该列的字母，confidence 为 0~1 的匹配置信度。\n"
             "函数体内必须包含至少一条『值赋值』语句（主键列 .value = 非公式）；"
             "只有公式没有值赋值、或只有值没有公式的输出都是无效的。"
         )
@@ -313,9 +315,14 @@ class AssembleCodeGenerator(TemplateCodeGenerator):
 
         # 2) 知识库已命中映射（直接采用，不要重新分析）
         if self._pre_mapped:
-            lines = ["【已有确定匹配关系（来自匹配知识库，直接采用，不要改动）】"]
+            lines = ["【已有确定匹配关系（来自匹配知识库/人工复核，直接采用，不要改动）】"]
             for src, dst in self._pre_mapped.items():
-                lines.append(f"- 源列「{src}」→ 模板列「{dst}」")
+                # 值格式：目标列 或 目标列@源表名（人工复核指定源表）
+                _tgt, _, _sheet = str(dst).partition("@")
+                if _sheet:
+                    lines.append(f"- 源列「{src}」→ 模板列「{_tgt}」（源表 {_sheet}）")
+                else:
+                    lines.append(f"- 源列「{src}」→ 模板列「{dst}」")
             parts.append("\n".join(lines))
 
         # 3) 脱敏样例数据
