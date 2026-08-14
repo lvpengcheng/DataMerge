@@ -640,19 +640,36 @@ async def assemble_rematch(
         rule_id = task.rule_id
         ai_provider = task.ai_provider
         tpl_path_src = tpl_files[0]
+        # 复用原任务代码（匹配关系已定，不重新 AI 生成，直接覆盖 FIELD_MAPPING 执行）
+        prewritten_code = None
+        if task.code_path and Path(task.code_path).exists():
+            try:
+                prewritten_code = Path(task.code_path).read_text(encoding="utf-8")
+            except Exception:
+                prewritten_code = None
     finally:
         db.close()
 
-    # 方向转换：{目标列: 源表|源列} → {源列: 目标列}（engine 的 pre_mapped 方向）
-    # 值带源表信息：目标列后附 @源表名，生成器 prompt 解析显示（旧格式"源列"无源表，兼容）
+    # 方向转换：{目标列: 源表|源列} → 两个结构
+    #   field_mapping_override: {目标列: {source_sheet, source_column}}（骨架 FIELD_MAPPING 覆盖）
+    #   pre_mapped: {源列: 目标列@源表}（供 AI 生成兜底，本次直接执行不需要，保留兼容）
+    field_mapping_override = {}
     pre_mapped = {}
     for tgt, src in cm.items():
         if src and tgt:
             _v = str(src).strip()
             if "|" in _v:
                 _sheet, _col = _v.split("|", 1)
+                field_mapping_override[str(tgt).strip()] = {
+                    "source_sheet": _sheet.strip(),
+                    "source_column": _col.strip(),
+                }
                 pre_mapped[_col.strip()] = f"{str(tgt).strip()}@{_sheet.strip()}"
             else:
+                field_mapping_override[str(tgt).strip()] = {
+                    "source_sheet": "",
+                    "source_column": _v,
+                }
                 pre_mapped[_v] = str(tgt).strip()
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="assemble_"))
@@ -691,10 +708,12 @@ async def assemble_rematch(
             "rule_id": rule_id,
             "source_dir": str(source_dir),
             "template_path": str(new_tpl),
-            "force_rematch": True,          # 修正映射必须跳过存档/知识库，按 pre_mapped 生成
+            "force_rematch": True,          # 跳过存档/知识库
             "file_passwords": {},
             "ai_provider": ai_provider,
             "pre_mapped": pre_mapped,
+            "prewritten_code": prewritten_code,          # 复用原代码直接执行，不走 AI
+            "field_mapping_override": field_mapping_override,  # 修正映射覆盖 FIELD_MAPPING
         }
         params_file = tmp_dir / "params.json"
         params_file.write_text(json.dumps(params, ensure_ascii=False), encoding="utf-8")

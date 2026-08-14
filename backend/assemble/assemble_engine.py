@@ -574,7 +574,8 @@ def _ai_generate_code(generator, source_struct: Dict, source_dir: Path,
 
 def _execute_in_sandbox(code: str, source_dir: Path, output_dir: Path,
                         template_to_exec: Path, file_passwords: Dict,
-                        tenant_id: str, push=None) -> dict:
+                        tenant_id: str, push=None,
+                        field_mapping_override: Optional[Dict] = None) -> dict:
     """B1. 沙箱执行（子进程隔离），通过 progress_cb 推送执行进度。
 
     ⚠️ progress_cb 不能放进 execution_env —— env 会整体 pickle 进子进程，
@@ -598,6 +599,8 @@ def _execute_in_sandbox(code: str, source_dir: Path, output_dir: Path,
         "_template_override_path": str(template_to_exec),
         "tenant_id": tenant_id,
     }
+    if field_mapping_override:
+        env["_field_mapping_override"] = field_mapping_override   # 人工修正映射覆盖 FIELD_MAPPING
     return CodeSandbox().execute_script(code, env, progress_cb=progress_cb)
 
 
@@ -941,10 +944,15 @@ def run_assemble_task(task_id: int, push, params: Dict):
         task.template_signature = template_signature
         db.commit()
 
-        # 3. 查代码存档
+        # 3. 查代码存档（人工修正映射 rematch 用 prewritten_code 直接执行，不查存档不走 AI）
         code = None
         matched_from_cache = False
-        if not force_rematch:
+        prewritten = params.get("prewritten_code")
+        if prewritten:
+            code = prewritten
+            push({"type": "log", "message":
+                  "♻️ 使用人工修正映射直接执行（复用原代码，覆盖 FIELD_MAPPING，不重新 AI 生成）"})
+        elif not force_rematch:
             code = _lookup_cached_code(db, tenant_id, signature)
             if code:
                 matched_from_cache = True
@@ -956,7 +964,7 @@ def run_assemble_task(task_id: int, push, params: Dict):
         else:
             push({"type": "log", "message": "已勾选「强制重新匹配」，跳过代码存档和知识库，全量 AI 分析"})
 
-        # 4. AI 分析 + 知识库 + 生成（未命中存档时）
+        # 4. AI 分析 + 知识库 + 生成（未命中存档且非人工修正执行时）
         used_mapping_ids: List[int] = []
         auto_mappings: Dict[str, str] = {}
         ai_generated = False        # 本次是否由 AI 新生成代码（执行成功后才存档/回写知识库）
@@ -1030,7 +1038,8 @@ def run_assemble_task(task_id: int, push, params: Dict):
         output_dir.mkdir(parents=True, exist_ok=True)
         push({"type": "status", "status": "executing", "message": "沙箱执行填充代码（约1-3分钟）..."})
         result = _execute_in_sandbox(code, source_dir, output_dir, clean_template,
-                                     file_passwords, tenant_id, push=push)
+                                     file_passwords, tenant_id, push=push,
+                                     field_mapping_override=params.get("field_mapping_override"))
 
         if not result.get("success"):
             err = result.get("error") or "未知错误"

@@ -762,6 +762,14 @@ _SK_TO_SHEET = {sk_to_sheet_literal}
 # 若 AI 判定规则要求"按名单增删行"，会在下方【AI 生成】块顶部用
 #   CLEANING_SPEC = {{...}}  覆盖此默认值（详见 fill_template 上方约定）。
 CLEANING_SPEC = None
+# 结构化字段映射（智能组表专用）：默认 None。AI 若输出了 FIELD_MAPPING = {{...}}
+# （在 def fill_template 上方、同一个代码块内），此处被覆盖，main() 导出 JSON 供引擎落库。
+FIELD_MAPPING = None
+# 运行时人工复核修正映射（智能组表 rematch 注入 _field_mapping_override）：覆盖 FIELD_MAPPING，
+# fill_template 若按 FIELD_MAPPING 驱动则修正立即生效，无需重新 AI 生成。
+_field_ov = globals().get("_field_mapping_override")
+if _field_ov:
+    FIELD_MAPPING = _field_ov
 # 阶段0 执行后的行布局：{{sheet_name: {{"key_to_row": {{主键:0based行}}, "data_start":.., "data_end":.., "removed":.., "added":..}}}}
 _ROW_LAYOUT = None
 # ==================================================================
@@ -1496,6 +1504,18 @@ def main():
 
     wb.save(out_path)
     print(f"保存成功：{{out_path}}")
+
+    # 结构化字段映射导出（智能组表）：AI 输出了 FIELD_MAPPING 时写 JSON 供引擎落库
+    if FIELD_MAPPING:
+        try:
+            import json as _json_fm
+            _fm_path = os.path.join(output_folder, "field_mapping.json")
+            with open(_fm_path, "w", encoding="utf-8") as _fm_fp:
+                _json_fm.dump(FIELD_MAPPING, _fm_fp, ensure_ascii=False, indent=2)
+            print(f"字段映射已导出：{{_fm_path}}")
+        except Exception as _fm_e:
+            print(f"[字段映射导出] 失败（不阻断）：{{_fm_e}}")
+
     print("=" * 60)
     print("处理完成!")
     print("=" * 60)

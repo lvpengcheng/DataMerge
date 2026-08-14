@@ -61,7 +61,7 @@ class AssembleCodeGenerator(TemplateCodeGenerator):
             target_sheets=target_sheets,
             expected_structure=expected_structure,
         )
-        # 静态检查：fill_template 必须包含"值赋值"（主键列填充）。
+        # 静态检查 1：fill_template 必须包含"值赋值"（主键列填充）。
         # 只写公式的代码会导致主键列为空、全部公式落空（真实事故）。
         assignments = re.findall(r'\.value\s*=\s*([^\n]+)', code)
         value_assigns = [a for a in assignments if not a.strip().startswith(
@@ -70,6 +70,13 @@ class AssembleCodeGenerator(TemplateCodeGenerator):
             raise RuntimeError(
                 "AI 生成的代码只有公式、没有主键列的值赋值（主键列必须从源_表填入实际值），"
                 "无法填充主键，请重新生成")
+        # 静态检查 2：fill_template 必须从 FIELD_MAPPING 驱动（人工修正映射 rematch 才能
+        # 直接替换常量生效，无需重新 AI 生成）
+        if "FIELD_MAPPING" not in code:
+            raise RuntimeError(
+                "AI 生成的代码没有从 FIELD_MAPPING 读取映射驱动（映射必须集中定义在 "
+                "FIELD_MAPPING 常量中，fill_template 遍历它动态构造公式/取值），"
+                "请重新生成")
         return code, ai_response
 
     # ==================== 模板解析：只读激活 sheet ====================
@@ -266,6 +273,10 @@ class AssembleCodeGenerator(TemplateCodeGenerator):
             "（如 =VLOOKUP(...)、=INDEX(...)）。查不到就是 #N/A、类型不对就是 #VALUE!，"
             "错了就留错误值，不要吞掉。每个公式必须括号匹配、逗号分隔参数个数正确，"
             "IFERROR 绝不允许出现 3 个参数。\n"
+            "【字段映射驱动要求】fill_template 的填充逻辑**必须从 FIELD_MAPPING 常量读取映射驱动**"
+            "（遍历 FIELD_MAPPING，按 {目标列: {source_sheet, source_column}} 动态构造公式/取值），"
+            "**不得把列映射硬编码在代码里**（如写死 source_col_letter('ID') 之类）——"
+            "人工复核修正映射时只替换 FIELD_MAPPING 就能生效，无需重新生成代码。\n"
             "【字段映射输出要求】在 def fill_template 函数定义的上方（同一代码块内），"
             "必须额外输出结构化字段映射，供人工复核：\n"
             "FIELD_MAPPING = {\n"
