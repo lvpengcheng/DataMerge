@@ -31,12 +31,11 @@ EXCEL_EXTS = {".xlsx", ".xls", ".xlsm"}
 
 # ==================== 解析 ====================
 
-def _parse_source_files(source_dir: Path, file_passwords: Dict, push) -> Tuple[Dict, str, int]:
+def _parse_source_files(source_dir: Path, file_passwords: Dict, push) -> Tuple[Dict, str]:
     """解析源文件（全部可见 sheet，样例取前 3 行并脱敏）。
 
     Returns:
-        (source_struct, source_signature, max_source_rows)
-        max_source_rows: 各文件数据行数最大值（预扩展用）
+        (source_struct, source_signature)
     """
     from excel_parser import IntelligentExcelParser
     from backend.utils.desensitize import build_structure_json
@@ -69,12 +68,14 @@ def _parse_source_files(source_dir: Path, file_passwords: Dict, push) -> Tuple[D
             head = region.head_data or {}
             cols = list(head.keys())
             rows = list(region.data or [])
-            max_rows = max(max_rows, len(rows))
+            # 真实数据行数（region.data 仅样例 ≤3 行，data_row_end 不受 max_data_rows 限制）
+            real_rows = region.data_row_end - region.data_row_start + 1
+            max_rows = max(max_rows, real_rows)
             fdesc[sd.sheet_name] = {
                 "columns": cols,
                 "head_data": head,
                 "data": rows[:3],                       # 传给 AI 的原始样例（下面统一脱敏）
-                "column_letters": {c: l for l, c in head.items()} if False else None,
+                "column_letters": None,
             }
         if fdesc:
             raw[fp.name] = fdesc
@@ -93,8 +94,8 @@ def _parse_source_files(source_dir: Path, file_passwords: Dict, push) -> Tuple[D
     source_signature = hashlib.sha256("\n".join(sig_items).encode("utf-8")).hexdigest()[:16]
 
     push({"type": "log", "message":
-          f"✅ 源文件解析完成：{len(raw)} 个文件，最大数据行数 {max_rows}（样例已脱敏）"})
-    return source_struct, source_signature, max_rows
+          f"✅ 源文件解析完成：{len(raw)} 个文件，最大数据行数 {max_rows}（样例仅前 3 行并已脱敏）"})
+    return source_struct, source_signature
 
 
 def _parse_template(template_path: Path, push) -> Tuple[Dict, str, Dict]:
@@ -150,10 +151,32 @@ def _parse_template(template_path: Path, push) -> Tuple[Dict, str, Dict]:
         },
     }
 
+    # ========== A1. 模板校验：防止静默失败 ==========
+    # 校验1：数据区列必须非空（已在 124 行检查）
+    # 校验2：数据区起始行必须合法（header_end 下一行）
+    if data_area["data_start_row"] <= header_end:
+        raise RuntimeError(
+            f"模板数据区识别失败：数据起始行 {data_area['data_start_row']} "
+            f"≤ 表头结束行 {header_end}，请确保模板有清晰的表头行")
+
+    # 校验3：列名不能重复（同名列会导致AI生成代码KeyError）
+    seen = {}
+    for c in cols:
+        if c in seen:
+            raise RuntimeError(
+                f"模板表头列名重复：「{c}」在第 {seen[c]+1} 列和第 {cols.index(c)+1} 列，"
+                f"请修正模板使每列名称唯一")
+        seen[c] = cols.index(c)
+
+    # 校验4：警告纯表头模板（无示例行）
+    if data_area["data_end_row"] == 0 or data_area["data_end_row"] < data_area["data_start_row"]:
+        push({"type": "log", "message":
+              "⚠️ 模板只有表头无数据行（纯空模板），AI 将无法参考示例格式，建议至少保留1行示例"})
+
     template_signature = hashlib.sha256(
         "\n".join(sorted(cols)).encode("utf-8")).hexdigest()[:16]
     push({"type": "log", "message":
-          f"✅ 模板解析完成：激活 sheet「{sheet_name}」{len(cols)} 列，"
+          f"✅ 模板校验通过：激活 sheet「{sheet_name}」{len(cols)} 列（无重复），"
           f"数据区 {data_area['data_start_row']}-{data_area['data_end_row']} 行"})
     return template_struct, template_signature, data_area
 
@@ -196,6 +219,68 @@ def _reset_default_cell_format(xlsx_path: Path) -> bool:
         return True
     except Exception:
         return False
+
+
+def _analyze_result_stats(result_path: Path) -> dict:
+    """C4. 统计结果文件：填充行数、列覆盖率、空列提醒。
+
+    返回: {
+        "filled_rows": int,           # 数据区非空行数
+        "total_columns": int,         # 总列数
+        "filled_columns": int,        # 至少有1个非空值的列数
+        "empty_columns": [列名],       # 全空列列表
+    }
+    """
+    import openpyxl
+
+    wb = openpyxl.load_workbook(str(result_path), data_only=True, read_only=True)
+    ws = wb.active
+    if ws is None:
+        wb.close()
+        return {"filled_rows": 0, "total_columns": 0, "filled_columns": 0, "empty_columns": []}
+
+    # 找数据区：第一行作为表头，往下找第一个非空行作为数据起始
+    header_row = 1
+    cols = []
+    for cell in ws[header_row]:
+        if cell.value:
+            cols.append(str(cell.value).strip())
+        else:
+            break   # 遇到空表头停止（假设表头连续）
+
+    if not cols:
+        wb.close()
+        return {"filled_rows": 0, "total_columns": 0, "filled_columns": 0, "empty_columns": []}
+
+    # 统计每列是否有非空值
+    col_has_data = {c: False for c in cols}
+    filled_rows = 0
+
+    # 从表头下一行开始扫描（最多扫1000行，防超大文件卡死）
+    max_scan = min(ws.max_row, header_row + 1000)
+    for row_idx in range(header_row + 1, max_scan + 1):
+        row_values = []
+        for col_idx, col_name in enumerate(cols, start=1):
+            cell_val = ws.cell(row=row_idx, column=col_idx).value
+            row_values.append(cell_val)
+            if cell_val not in (None, ""):
+                col_has_data[col_name] = True
+
+        # 整行非空才算有效填充行
+        if any(v not in (None, "") for v in row_values):
+            filled_rows += 1
+
+    wb.close()
+
+    filled_columns = sum(1 for has_data in col_has_data.values() if has_data)
+    empty_columns = [c for c, has_data in col_has_data.items() if not has_data]
+
+    return {
+        "filled_rows": filled_rows,
+        "total_columns": len(cols),
+        "filled_columns": filled_columns,
+        "empty_columns": empty_columns,
+    }
 
 
 def _prepare_clean_template(template_path: Path, push) -> Path:
@@ -308,6 +393,10 @@ def _save_cached_code(db: Session, tenant_id: str, signature: str, code: str) ->
 
 # ==================== 字段级匹配知识库 ====================
 
+# 语义匹配列的人工确认次数阈值：confirm_count 达到该值才从 pending 转 active（下次自动采用）
+CONFIRM_THRESHOLD = 2
+
+
 def _query_knowledge_mappings(db: Session, tenant_id: str, template_signature: str,
                               source_columns: List[str],
                               target_columns: List[str]) -> Tuple[Dict[str, str], List[int], List[dict]]:
@@ -316,9 +405,10 @@ def _query_knowledge_mappings(db: Session, tenant_id: str, template_signature: s
     Returns:
         (auto_mappings {源列: 模板列}, used_mapping_ids, 日志行列表)
     逻辑：
-      1. 精确锚定：template_signature 相同且 status=active 的条目 → 采用；
-         同源列多目标（矛盾）→ 该源列交 AI，不采用
-      2. 同名列兜底：源列名 = 模板列名 → 确定性采用
+      1. 锚定采用：template_signature 相同、status=active 且 confirm_count >= 阈值 的语义条目 → 采用；
+         同源列多目标（矛盾）→ 该源列停用交 AI，不采用
+      2. pending（未达确认阈值）/ review_needed → 交 AI 重新匹配，不采用
+      3. 同名列兜底：源列名 = 模板列名 → 确定性白名单直接采用（不进 used_ids，不受错误反馈连坐）
     """
     target_set = set(target_columns)
     rows = (db.query(AssembleFieldMapping)
@@ -327,32 +417,36 @@ def _query_knowledge_mappings(db: Session, tenant_id: str, template_signature: s
                     AssembleFieldMapping.source_column.in_(source_columns))
             .all())
 
-    # 锚定映射 + 矛盾检测
-    anchored: Dict[str, List[str]] = {}
-    used_ids: List[int] = []
+    # 只采用「已确认达阈值」的 active 语义条目
+    anchored: Dict[str, List[Tuple[int, str]]] = {}   # src -> [(mapping_id, target)]
     for m in rows:
-        if m.status != "active":
-            continue
-        anchored.setdefault(m.source_column, []).append(m.target_column)
-        used_ids.append(m.id)
+        if m.status == "active" and (m.confirm_count or 0) >= CONFIRM_THRESHOLD:
+            anchored.setdefault(m.source_column, []).append((m.id, m.target_column))
 
     auto: Dict[str, str] = {}
+    used_ids: List[int] = []
     log_lines: List[dict] = []
-    for src, dsts in anchored.items():
-        uniq = list(dict.fromkeys(dsts))
+    conflict_srcs = set()
+
+    for src, pairs in anchored.items():
+        uniq = list(dict.fromkeys(d for _, d in pairs))
         if len(uniq) == 1:
             auto[src] = uniq[0]
-            log_lines.append({"message": f"[知识库] {src} → {uniq[0]}（锚定命中）"})
+            used_ids.extend(pid for pid, _ in pairs)
+            log_lines.append({"message": f"[知识库] {src} → {uniq[0]}（已确认命中）"})
         else:
-            # 矛盾：同一模板下同源列映射到多个不同目标 → 停用相关条目，交 AI
-            log_lines.append({"message": f"⚠️ [知识库] 源列「{src}」存在矛盾映射 {uniq}，已停用交 AI 重新匹配"})
-            for m in rows:
-                if m.source_column == src and m.status == "active":
-                    m.status = "review_needed"
-            db.commit()
-            used_ids = [i for i in used_ids if i not in [m.id for m in rows if m.source_column == src]]
+            conflict_srcs.add(src)
+            log_lines.append({"message":
+                              f"⚠️ [知识库] 源列「{src}」存在矛盾映射 {uniq}，已停用交 AI 重新匹配"})
 
-    # 同名列兜底
+    # 矛盾条目一次性停用（避免循环内多次 commit + O(n²) 过滤）
+    if conflict_srcs:
+        for m in rows:
+            if m.source_column in conflict_srcs and m.status == "active":
+                m.status = "review_needed"
+        db.commit()
+
+    # 同名列兜底：确定性白名单，直接采用，不进 used_ids（不受错误反馈连坐）
     for c in source_columns:
         if c in target_set and c not in auto:
             auto[c] = c
@@ -362,10 +456,16 @@ def _query_knowledge_mappings(db: Session, tenant_id: str, template_signature: s
 
 
 def _save_knowledge_mappings(db: Session, tenant_id: str, template_signature: str,
-                             new_mappings: Dict[str, str], task_id: int):
-    """AI 分析出的新映射回写知识库（同键已存在 → 更新目标列 + 次数+1）。"""
+                             new_mappings: Dict[str, str], task_id: int,
+                             match_type: str = "semantic"):
+    """AI 新匹配出的语义映射回写知识库（仅新增尚不存在的源列为 pending 候选）。
+
+    - 已存在的源列条目（active/pending/review_needed）**不动**：人工确认过的映射不被 AI 覆盖；
+    - 同名列（src == dst）白名单不写库；
+    - 新条目 confirm_count=0、status=pending，等人工确认达到阈值才转 active。
+    """
     for src, dst in (new_mappings or {}).items():
-        if not src or not dst:
+        if not src or not dst or src == dst:
             continue
         existing = (db.query(AssembleFieldMapping)
                     .filter(AssembleFieldMapping.tenant_id == tenant_id,
@@ -373,16 +473,48 @@ def _save_knowledge_mappings(db: Session, tenant_id: str, template_signature: st
                             AssembleFieldMapping.source_column == src)
                     .first())
         if existing:
-            existing.target_column = dst
-            existing.hit_count = (existing.hit_count or 1) + 1
-            existing.status = "active"
-        else:
-            db.add(AssembleFieldMapping(
-                tenant_id=tenant_id, source_column=src, target_column=dst,
-                template_signature=template_signature, hit_count=1,
-                source_task_id=task_id, status="active",
-            ))
+            continue
+        db.add(AssembleFieldMapping(
+            tenant_id=tenant_id, source_column=src, target_column=dst,
+            template_signature=template_signature, match_type=match_type,
+            confirm_count=0, hit_count=0,
+            source_task_id=task_id, status="pending",
+        ))
     db.commit()
+
+
+def _confirm_mapping(db: Session, tenant_id: str, template_signature: str,
+                     src: str, dst: str) -> Optional[AssembleFieldMapping]:
+    """人工确认一对语义映射正确：confirm_count+1，达到阈值转 active。
+
+    - 同名列（src==dst）是确定性白名单，无需确认，返回 None；
+    - 无条目 → 新建 pending（confirm_count=1，未达阈值仍需再确认一次）。
+    不在此函数内 commit，由调用方统一提交。
+    """
+    src = (src or "").strip()
+    dst = (dst or "").strip()
+    if not src or not dst or src == dst:
+        return None
+    m = (db.query(AssembleFieldMapping)
+         .filter(AssembleFieldMapping.tenant_id == tenant_id,
+                 AssembleFieldMapping.template_signature == template_signature,
+                 AssembleFieldMapping.source_column == src)
+         .first())
+    if m:
+        m.target_column = dst
+        m.confirm_count = (m.confirm_count or 0) + 1
+        m.hit_count = (m.hit_count or 0) + 1
+        if m.confirm_count >= CONFIRM_THRESHOLD:
+            m.status = "active"
+            m.match_type = "anchored"
+    else:
+        m = AssembleFieldMapping(
+            tenant_id=tenant_id, source_column=src, target_column=dst,
+            template_signature=template_signature, match_type="semantic",
+            confirm_count=1, hit_count=1, status="pending",
+        )
+        db.add(m)
+    return m
 
 
 # ==================== 模板数据行处理 ====================
@@ -395,10 +527,23 @@ def _save_knowledge_mappings(db: Session, tenant_id: str, template_signature: st
 
 def _ai_generate_code(generator, source_struct: Dict, source_dir: Path,
                       rule_text: str, template_path: Path, template_struct: Dict,
-                      auto_mappings: Dict[str, str], max_source_rows: int,
-                      push) -> Tuple[str, Dict[str, str], List[str]]:
-    """调用 AI 生成填充代码，返回 (代码, 新映射清单, AI 流式日志已由回调推送)。"""
+                      auto_mappings: Dict[str, str],
+                      push, retry_error: Optional[str] = None) -> Tuple[str, str]:
+    """调用 AI 生成填充代码，返回 (代码, AI 原始响应)。AI 流式日志已由回调推送。
+
+    retry_error: 上次生成失败的错误反馈，追加进 prompt，让重试时 AI 知道哪里错了。
+    """
     from ..ai_engine.assemble_code_generator import AssembleCodeGenerator
+
+    # 重试时把上次失败原因注入规则内容 → 进 prompt（只追加，不改动原始规则文本）
+    if retry_error:
+        rule_text = (rule_text or "") + (
+            "\n\n# ==================== 上次生成失败反馈（请务必修复） ====================\n"
+            f"{retry_error}\n"
+            "请检查你的输出：函数定义必须完整、语法正确，不要输出代码围栏或解释文字；\n"
+            "主键列必须包含至少一条『值赋值』语句（.value = 实际值，而非公式）；\n"
+            "FIELD_MAPPING 必须与 fill_template 的实际填充逻辑一致。"
+        )
 
     def stream_cb(msg: str):
         push({"type": "log", "message": msg})
@@ -421,7 +566,6 @@ def _ai_generate_code(generator, source_struct: Dict, source_dir: Path,
         thinking_callback=thinking_cb,
         pre_mapped=auto_mappings,
         tpl_data_rows=tpl_data_rows,
-        src_data_rows=max_source_rows,
     )
     return code, ai_response
 
@@ -430,8 +574,20 @@ def _ai_generate_code(generator, source_struct: Dict, source_dir: Path,
 
 def _execute_in_sandbox(code: str, source_dir: Path, output_dir: Path,
                         template_to_exec: Path, file_passwords: Dict,
-                        tenant_id: str) -> dict:
+                        tenant_id: str, push=None) -> dict:
+    """B1. 沙箱执行（子进程隔离），通过 progress_cb 推送执行进度。
+
+    ⚠️ progress_cb 不能放进 execution_env —— env 会整体 pickle 进子进程，
+    局部闭包不可 pickle（报 Can't pickle local object '...progress_cb'）。
+    必须走 CodeSandbox.execute_script 的 progress_cb 参数 → run_in_subprocess 的
+    @@PROG@@ stdout 通道，由父进程 reader 线程转推事件流。
+    """
     from ..sandbox.code_sandbox import CodeSandbox
+
+    def progress_cb(msg: str):
+        """沙箱进度回调：解析埋点 @@PROG@@ 并转推事件流。"""
+        if push:
+            push({"type": "log", "message": msg})
 
     env = {
         "input_folder": str(source_dir),
@@ -442,7 +598,7 @@ def _execute_in_sandbox(code: str, source_dir: Path, output_dir: Path,
         "_template_override_path": str(template_to_exec),
         "tenant_id": tenant_id,
     }
-    return CodeSandbox().execute_script(code, env)
+    return CodeSandbox().execute_script(code, env, progress_cb=progress_cb)
 
 
 # ==================== 结果后处理 ====================
@@ -517,8 +673,12 @@ def _fix_out_of_range_dates(file_path: Path, push) -> int:
     return total_fixed
 
 def _finalize_results(output_dir: Path, tenant_id: str, task_id: int,
-                      rule_name: str, push, template_path: Optional[Path] = None) -> List[str]:
-    """从脚本输出挑出结果，生成 原版 + 纯值版，落盘到 tenants/{tenant}/assemble_results/{task_id}/"""
+                      rule_name: str, push, template_path: Optional[Path] = None,
+                      source_dir: Optional[Path] = None) -> List[str]:
+    """从脚本输出挑出结果，生成 原版 + 纯值版，落盘到 tenants/{tenant}/assemble_results/{task_id}/。
+
+    同时归档源文件 + 模板到结果目录 _source/_template，供「重新组表」（弹窗修正映射后重跑）复用。
+    """
     from backend.utils.output_postprocess import make_values_only_copy
 
     outputs = sorted(p for p in output_dir.iterdir()
@@ -550,6 +710,24 @@ def _finalize_results(output_dir: Path, tenant_id: str, task_id: int,
     # _prepare_clean_template），AI 写入不再继承日期样式；AI prompt 也加了格式规范
     # （长数字按文本、数值列 General）。此修复仅剩 Excel 打开报错兜底在下方保留。
 
+    # C4. 结果统计（填充行数、列覆盖率、空列提醒）
+    try:
+        stats = _analyze_result_stats(orig_path)
+        push({"type": "result_stats", "stats": stats})
+
+        msg_parts = [f"📊 结果统计：填充 {stats['filled_rows']} 行"]
+        if stats['total_columns'] > 0:
+            coverage = stats['filled_columns'] / stats['total_columns'] * 100
+            msg_parts.append(f"列覆盖率 {coverage:.1f}% ({stats['filled_columns']}/{stats['total_columns']})")
+        if stats['empty_columns']:
+            empty_list = ', '.join(stats['empty_columns'][:5])
+            if len(stats['empty_columns']) > 5:
+                empty_list += f" 等{len(stats['empty_columns'])}列"
+            msg_parts.append(f"⚠️ 空列: {empty_list}")
+        push({"type": "log", "message": " | ".join(msg_parts)})
+    except Exception as e:
+        logger.warning("[assemble] 结果统计失败: %s", e)
+
     # 纯值版：复用智算 make_values_only_copy —— 只删 源_ sheet（模板其他 sheet 保留），
     # 公式选择性拍平（AI 新填公式→值，模板原有公式保留），防止删除源_ 后 #REF!
     try:
@@ -575,6 +753,21 @@ def _finalize_results(output_dir: Path, tenant_id: str, task_id: int,
         except Exception:
             pass
 
+    # 归档源文件 + 模板，供「重新组表」（弹窗修正映射后重跑）复用，避免用户重新上传
+    try:
+        if source_dir and source_dir.exists():
+            _src_arc = result_dir / "_source"
+            _src_arc.mkdir(exist_ok=True)
+            for _p in sorted(source_dir.iterdir()):
+                if _p.is_file() and _p.suffix.lower() in EXCEL_EXTS:
+                    shutil.copy2(_p, _src_arc / _p.name)
+        if template_path and template_path.exists():
+            _tpl_arc = result_dir / "_template"
+            _tpl_arc.mkdir(exist_ok=True)
+            shutil.copy2(template_path, _tpl_arc / template_path.name)
+    except Exception as _e:
+        logger.warning("[assemble] 归档源文件/模板失败（不影响结果）: %s", _e)
+
     return saved
 
 
@@ -593,6 +786,7 @@ def run_assemble_task(task_id: int, push, params: Dict):
     force_rematch = bool(params.get("force_rematch"))
     file_passwords = params.get("file_passwords") or {}
     ai_provider = params.get("ai_provider")
+    pre_mapped = params.get("pre_mapped")       # {源列: 目标列}：修正映射重新组表时提供，跳过知识库
 
     db = SessionLocal()
     task = db.query(AssembleTask).filter_by(id=task_id).first()
@@ -618,7 +812,7 @@ def run_assemble_task(task_id: int, push, params: Dict):
 
         # 1. 解析源 + 模板
         push({"type": "status", "status": "analyzing", "message": "解析源文件和模板..."})
-        source_struct, source_signature, max_source_rows = _parse_source_files(
+        source_struct, source_signature = _parse_source_files(
             source_dir, file_passwords, push)
         template_struct, template_signature, data_area = _parse_template(template_path, push)
         template_struct["_data_area"] = data_area
@@ -654,7 +848,8 @@ def run_assemble_task(task_id: int, push, params: Dict):
 
         # 4. AI 分析 + 知识库 + 生成（未命中存档时）
         used_mapping_ids: List[int] = []
-        new_mappings: Dict[str, str] = {}
+        auto_mappings: Dict[str, str] = {}
+        ai_generated = False        # 本次是否由 AI 新生成代码（执行成功后才存档/回写知识库）
         if code is None:
             push({"type": "status", "status": "analyzing", "message": "AI 分析字段匹配关系..."})
             all_source_cols = []
@@ -663,8 +858,11 @@ def run_assemble_task(task_id: int, push, params: Dict):
                     all_source_cols.extend(source_struct[fname][sn].get("columns") or [])
             all_source_cols = list(dict.fromkeys(all_source_cols))
 
-            auto_mappings: Dict[str, str] = {}
-            if not force_rematch:
+            if pre_mapped is not None:
+                auto_mappings = dict(pre_mapped)
+                push({"type": "log", "message":
+                      f"使用人工修正映射重新组表（{len(auto_mappings)} 列），跳过知识库匹配"})
+            elif not force_rematch:
                 auto_mappings, used_mapping_ids, map_logs = _query_knowledge_mappings(
                     db, tenant_id, template_signature, all_source_cols, data_area["columns"])
                 for line in map_logs:
@@ -673,10 +871,11 @@ def run_assemble_task(task_id: int, push, params: Dict):
             else:
                 push({"type": "log", "message": "强制重匹配：知识库映射不使用，全部交 AI"})
 
-            # AI 生成（失败自动重试 1 次，带错误反馈）
+            # AI 生成（失败自动重试 1 次，把上次错误反馈注入 prompt，避免原样重试）
             push({"type": "status", "status": "generating", "message": "AI 生成填充代码..."})
             gen = None
             code = None
+            last_err: Optional[str] = None
             for _attempt in range(2):
                 try:
                     from ..ai_engine.assemble_code_generator import AssembleCodeGenerator
@@ -696,22 +895,19 @@ def run_assemble_task(task_id: int, push, params: Dict):
                                 os.environ.pop("AI_PROVIDER", None)
                     code, _ = _ai_generate_code(
                         gen, source_struct, source_dir, rule_text, clean_template,
-                        template_struct, auto_mappings, max_source_rows, push)
+                        template_struct, auto_mappings, push, retry_error=last_err)
+                    ai_generated = True
                     break
                 except Exception as e:
                     logger.exception("[assemble] AI 生成失败（第 %d 次）", _attempt + 1)
+                    last_err = str(e)[:1500]
                     if _attempt == 0:
                         push({"type": "log", "message":
-                              f"⚠️ AI 生成失败（{e}），自动重试 1 次..."})
+                              f"⚠️ AI 生成失败（{e}），自动重试 1 次（已把错误反馈注入 prompt）..."})
                     else:
                         raise RuntimeError(f"AI 生成代码失败: {e}")
 
-            # 存档 + 知识库回写（AI 新映射由生成器 prompt 覆盖了 auto_mappings；
-            # 实际新映射 = auto_mappings 之外 AI 处理的字段 → 简单起见回写 auto_mappings 全量）
-            task.code_path = _save_cached_code(db, tenant_id, signature, code)
-            _save_knowledge_mappings(db, tenant_id, template_signature,
-                                     dict(auto_mappings), task_id)
-            push({"type": "log", "message": "✅ AI 代码已生成并存入代码存档"})
+            # （存档 + 知识库回写延后到沙箱执行成功后再做，避免失败代码/错误映射污染存档和知识库）
 
         task.used_mapping_ids = used_mapping_ids
         task.matched_from_cache = matched_from_cache
@@ -724,7 +920,7 @@ def run_assemble_task(task_id: int, push, params: Dict):
         output_dir.mkdir(parents=True, exist_ok=True)
         push({"type": "status", "status": "executing", "message": "沙箱执行填充代码（约1-3分钟）..."})
         result = _execute_in_sandbox(code, source_dir, output_dir, clean_template,
-                                     file_passwords, tenant_id)
+                                     file_passwords, tenant_id, push=push)
 
         if not result.get("success"):
             err = result.get("error") or "未知错误"
@@ -735,11 +931,46 @@ def run_assemble_task(task_id: int, push, params: Dict):
             db.commit()
             return
 
+        # 6.5 执行成功 → 落库结构化字段映射 + 代码存档 + 知识库回写
+        #      （放在成功后才做：失败任务不写入存档，也不把未经验证的映射写进知识库，
+        #        防止坏代码/错误映射污染后续任务）
+        fm_path = output_dir / "field_mapping.json"
+        if fm_path.exists():
+            try:
+                fm = json.loads(fm_path.read_text(encoding="utf-8"))
+                # 补目标列 column_letter（AI 只输出源列字母；目标列字母从模板结构取，供错误弹窗展示）
+                _tpl_cols = []
+                for _sn, _sinfo in (template_struct.get("sheets") or {}).items():
+                    for _reg in (_sinfo.get("regions") or []):
+                        _tpl_cols.extend(_reg.get("columns") or [])
+                _letter = {_c.get("name"): _c.get("column_letter") for _c in _tpl_cols}
+                if isinstance(fm, dict):
+                    for _tgt, _info in fm.items():
+                        if isinstance(_info, dict):
+                            _info["target_letter"] = _letter.get(_tgt)
+                task.field_mapping = fm
+            except Exception as _e:
+                logger.warning("[assemble] 解析 field_mapping.json 失败: %s", _e)
+        if ai_generated:
+            task.code_path = _save_cached_code(db, tenant_id, signature, code)
+            # 回写 AI 完整语义映射（来自 FIELD_MAPPING，排除同名列/空映射）为 pending 候选；
+            # 已确认的 active 条目由 _save_knowledge_mappings 内部跳过，不被 AI 覆盖。
+            ai_semantic: Dict[str, str] = {}
+            for _tgt, _info in (task.field_mapping or {}).items():
+                if not isinstance(_info, dict):
+                    continue
+                _src = (_info.get("source_column") or "").strip()
+                if _src and _src != _tgt:
+                    ai_semantic.setdefault(_src, _tgt)   # 一对多时保留首个
+            _save_knowledge_mappings(db, tenant_id, template_signature,
+                                     ai_semantic, task_id)
+            push({"type": "log", "message": "✅ 代码执行成功，已存入代码存档并更新知识库"})
+
         # 7. 结果后处理 + 落盘
         push({"type": "status", "status": "executing", "message": "生成结果文件（原版+纯值版）..."})
         saved = _finalize_results(output_dir, tenant_id, task_id,
                                   rule.name if rule else "", push,
-                                  template_path=template_path)
+                                  template_path=template_path, source_dir=source_dir)
 
         # 8. 归档
         task.status = "completed"
