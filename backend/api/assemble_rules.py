@@ -172,7 +172,12 @@ async def assemble_rules_delete(
     rule_id: int,
     current_user=Depends(require_permission("tools.assemble.manage")),
 ):
-    """删除规则 + 物理文件。"""
+    """删除规则 + 物理文件。
+
+    ⚠️ 先解除任务历史的 rule_id 引用（assemble_tasks.rule_id 外键无 ondelete，
+    直接删被引用规则会触发 FK violation 报错）；任务历史本身保留。
+    """
+    from ..database.models import AssembleTask
     db = SessionLocal()
     try:
         r = db.query(AssembleRule).filter_by(id=rule_id).first()
@@ -180,6 +185,9 @@ async def assemble_rules_delete(
             raise HTTPException(status_code=404, detail="规则文件不存在")
         d = _rule_dir(r.scope, r.tenant_id)
         names = r.file_names or []
+        # 解除任务关联后再删（历史任务保留，仅 rule_id 置空）
+        db.query(AssembleTask).filter(AssembleTask.rule_id == rule_id).update(
+            {AssembleTask.rule_id: None})
         db.delete(r)
         db.commit()
         for n in names:
