@@ -45,19 +45,27 @@ class TrainingLogger:
         self.session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log_file = self.log_dir / f"{tenant_id}_{keyword}_{self.session_timestamp}.log"
 
-        # 添加文件处理器
+        # 异步日志：业务线程只做内存 put（O(1) 不阻塞），写盘由独立 listener 线程完成。
+        # FileHandler 每次 emit 都 flush 磁盘，训练日志高频（AI 流式 chunk 每块一条）且
+        # VM 磁盘慢时，写日志会拖住训练线程；Docker 里 stdout flush 还会被 json-file 日志
+        # 驱动捕获成磁盘写 → .vhdx → 宿主 C 盘 IO。异步后训练线程零阻塞。
+        import queue as _queue_mod
+        from logging.handlers import QueueHandler, QueueListener
+
         file_handler = logging.FileHandler(self.log_file, encoding='utf-8')
         file_handler.setFormatter(logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         ))
-        self.logger.addHandler(file_handler)
-
-        # 添加控制台处理器，确保日志输出到终端
+        # 控制台处理器（也走队列，避免每行日志同步 flush stdout）
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         ))
-        self.logger.addHandler(console_handler)
+        self._async_queue = _queue_mod.Queue(-1)
+        self._async_listener = QueueListener(
+            self._async_queue, file_handler, console_handler, respect_handler_level=True)
+        self._async_listener.start()
+        self.logger.addHandler(QueueHandler(self._async_queue))
 
         # 训练状态
         self.current_iteration = 0
@@ -222,10 +230,12 @@ class TrainingLogger:
             chunk: 响应块
         """
         if chunk:
-            # 在控制台直接打印（不换行，实现流式效果）
+            # 在控制台直接打印（不换行，实现流式效果）。
+            # 注意：不做 sys.stdout.flush() —— AI 流式 chunk 每块一次 flush 在 Docker 里
+            # 会被 json-file 日志驱动捕获成一次容器磁盘写（→ .vhdx → 宿主 C 盘 IO）。
+            # stdout 块缓冲会自动合并，结束/关键点由系统刷新。
             import sys
             sys.stdout.write(chunk)
-            sys.stdout.flush()
 
             # 同时发送到SSE队列
             if self.stream_callback:
@@ -470,14 +480,12 @@ class TrainingLogger:
         """
         self.logger.error(error_message, exc_info=exception)
         self._stream_log(f"错误: {error_message}", level="ERROR")
-        # 强制输出到控制台
+        # 控制台输出（不 flush：避免每条日志一次磁盘写，见 log_streaming_chunk 注释）
         sys.stdout.write(f"[训练错误] {error_message}\n")
-        sys.stdout.flush()
 
         if exception:
             self._stream_log(f"异常详情: {str(exception)}", level="ERROR")
             sys.stdout.write(f"[训练错误] 异常详情: {str(exception)}\n")
-            sys.stdout.flush()
 
     def log_warning(self, warning_message: str):
         """记录警告
@@ -487,9 +495,8 @@ class TrainingLogger:
         """
         self.logger.warning(warning_message)
         self._stream_log(f"警告: {warning_message}", level="WARNING")
-        # 强制输出到控制台
+        # 控制台输出（不 flush）
         sys.stdout.write(f"[训练警告] {warning_message}\n")
-        sys.stdout.flush()
 
     def log_info(self, info_message: str):
         """记录信息
@@ -499,9 +506,8 @@ class TrainingLogger:
         """
         self.logger.info(info_message)
         self._stream_log(info_message)
-        # 强制输出到控制台，确保后端能看到
+        # 控制台输出（不 flush）
         sys.stdout.write(f"[训练日志] {info_message}\n")
-        sys.stdout.flush()
 
     def log_debug(self, debug_message: str):
         """记录调试信息

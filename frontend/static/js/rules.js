@@ -317,13 +317,30 @@ function _escape(s) {
     return String(s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 }
 
-// 流式渲染：思考过程（灰色区，不转 markdown 避免样式污染）+ 正式内容
-function _updateStreamingMessage(contentDiv, text, thinkingText) {
-    if (thinkingText) {
-        contentDiv.innerHTML =
-            `<div class="thinking-block">${_escape(thinkingText)}</div>` + _renderMarkdown(text || '');
-    } else {
-        contentDiv.innerHTML = _renderMarkdown(text);
+// 流式渲染（性能优化）：思考过程用【增量 textContent】更新（不重解析 HTML/markdown），
+// 内容块独立渲染 markdown。DeepSeek 思考 token 逐块回调且可能长达数分钟/数万字——
+// 每 token 全量 _escape(全部思考文本)+markdown+innerHTML 重建是 O(n²)，思考越长页面越卡
+// （表现为无响应）。textContent 赋值 O(1) 且自动转义，彻底消除该瓶颈。
+function _updateStreamingMessage(contentDiv, text, thinkingText, thinkingDirty) {
+    let tb = contentDiv.querySelector('.thinking-block');
+    if (thinkingDirty && thinkingText) {
+        if (!tb) {
+            tb = document.createElement('div');
+            tb.className = 'thinking-block';
+            contentDiv.prepend(tb);
+        }
+        tb.textContent = thinkingText;   // textContent 自动转义，安全
+    }
+    if (text !== undefined) {
+        let body = contentDiv.querySelector('.msg-content-body');
+        if (!body) {
+            body = document.createElement('div');
+            body.className = 'msg-content-body';
+            contentDiv.textContent = '';      // 清除"AI 正在思考…"占位文本（连带移除子元素，重建顺序）
+            if (tb) contentDiv.appendChild(tb);
+            contentDiv.appendChild(body);
+        }
+        body.innerHTML = _renderMarkdown(text || '');
     }
     const container = document.getElementById('chat-messages');
     container.scrollTop = container.scrollHeight;
@@ -450,6 +467,9 @@ async function _fetchSSE(url, options) {
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
+        // thinking 渲染节流：思考 token 逐块到达（每 token 一个 SSE 事件），
+        // 合并为每 100ms 渲染一次，避免密集 DOM 写；完成/出错时立即 flush。
+        let _thinkingTimer = null;
 
         while (true) {
             const { done, value } = await reader.read();
@@ -467,10 +487,15 @@ async function _fetchSSE(url, options) {
                     if (data.type === 'thinking') {
                         // DeepSeek 推理模型思考过程：灰色区流式显示（不进入最终内容）
                         thinkingText += data.content;
-                        _updateStreamingMessage(streamingDiv, fullContent, thinkingText);
+                        if (!_thinkingTimer) {
+                            _thinkingTimer = setTimeout(() => {
+                                _thinkingTimer = null;
+                                _updateStreamingMessage(streamingDiv, undefined, thinkingText, true);
+                            }, 100);
+                        }
                     } else if (data.type === 'chunk') {
                         fullContent += data.content;
-                        _updateStreamingMessage(streamingDiv, fullContent, thinkingText);
+                        _updateStreamingMessage(streamingDiv, fullContent, thinkingText, false);
                     } else if (data.type === 'ping') {
                         // 首块等待期心跳（DeepSeek 推理模型思考阶段可能 1 分钟+ 无 content）：
                         // 首块未到且无思考内容时更新占位为"已等待 N 秒"
@@ -480,7 +505,8 @@ async function _fetchSSE(url, options) {
                         }
                     } else if (data.type === 'complete') {
                         fullContent = data.content;
-                        _updateStreamingMessage(streamingDiv, fullContent, thinkingText);
+                        if (_thinkingTimer) { clearTimeout(_thinkingTimer); _thinkingTimer = null; }
+                        _updateStreamingMessage(streamingDiv, fullContent, thinkingText, true);
                         _finishStreamingMessage(streamingDiv);
                         if (data.session_id) {
                             _currentSessionId = data.session_id;
@@ -494,8 +520,10 @@ async function _fetchSSE(url, options) {
                 }
             }
         }
+        if (_thinkingTimer) { clearTimeout(_thinkingTimer); _thinkingTimer = null; }
     } catch (e) {
         console.error('SSE error:', e);
+        if (_thinkingTimer) { clearTimeout(_thinkingTimer); _thinkingTimer = null; }
         if (streamingDiv) _finishStreamingMessage(streamingDiv);
         _addMessage('assistant', '请求失败: ' + e.message);
     } finally {

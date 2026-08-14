@@ -44,11 +44,30 @@ def _is_visible_sheet(aspose_ws) -> bool:
         return True
 
 
-def calculate_excel_formulas(file_path: str, timeout: int = 120) -> bool:
+def _aspose_calc_impl(file_path: str) -> bool:
+    """Aspose 公式计算执行体（在独立子进程内运行）。
+
+    抽成模块级函数供 subprocess_runner 定位执行。子进程内完成 Aspose 许可证
+    初始化（aspose_init.ensure_license），超时/内存超限由父进程强杀进程，不会
+    残留在主进程里继续吃内存。
+    """
+    import aspose_init  # noqa: F401 — 确保 Aspose 已初始化
+    aspose_init.ensure_license()
+    from Aspose.Cells import Workbook as AsposeWorkbook
+
+    wb = AsposeWorkbook(str(file_path))
+    wb.CalculateFormula()
+    wb.Save(str(file_path))
+    return True
+
+
+def calculate_excel_formulas(file_path: str, timeout: int = None) -> bool:
     """计算Excel文件中的所有公式并保存
 
-    优先使用 Aspose.Cells 内存计算（无需 Excel 软件），失败则回退 win32com。
-    两种方案均有超时保护，防止公式计算卡死导致整个训练流程阻塞。
+    优先使用 Aspose.Cells 在【独立子进程】中计算（真超时+内存护栏：卡死/超内存会被强杀，
+    主进程内存不受影响），失败则回退 win32com。历史上曾用线程+join(timeout) 实现——
+    但 Python 线程无法强杀，超时后 Aspose 计算仍在后台继续跑、内存照涨，是 VM 假死
+    （内存耗尽→swap 风暴→宿主 C 盘 IO 100%）的根因之一。
 
     Args:
         file_path: Excel文件路径
@@ -57,36 +76,31 @@ def calculate_excel_formulas(file_path: str, timeout: int = 120) -> bool:
     Returns:
         True 表示公式计算成功，False 表示计算失败（文件中的公式值可能不正确）
     """
-    import threading
 
-    # ---- 方案1: Aspose.Cells（推荐，无进程开销） ----
+    # ---- 方案1: Aspose.Cells 子进程计算（推荐） ----
     try:
-        import aspose_init  # noqa: F401 — 确保 Aspose 已初始化
-        aspose_init.ensure_license()
-        from Aspose.Cells import Workbook as AsposeWorkbook
+        from backend.utils.subprocess_runner import run_in_subprocess, default_max_memory_mb, default_timeout
+        if timeout is None:
+            timeout = default_timeout("calc")   # .env SUBPROCESS_CALC_TIMEOUT，默认 120
 
-        logger.info(f"[Aspose] 开始计算公式（超时{timeout}s）: {file_path}")
-        result_holder = {"success": False, "error": None}
-
-        def _aspose_calc():
-            try:
-                wb = AsposeWorkbook(str(file_path))
-                wb.CalculateFormula()
-                wb.Save(str(file_path))
-                result_holder["success"] = True
-            except Exception as e:
-                result_holder["error"] = e
-
-        t = threading.Thread(target=_aspose_calc, daemon=True)
-        t.start()
-        t.join(timeout=timeout)
-        if t.is_alive():
-            logger.error(f"[Aspose] 公式计算超时（{timeout}s），跳过: {file_path}")
-            return False
-        if result_holder["success"]:
+        logger.info(f"[Aspose] 开始计算公式（子进程，超时{timeout}s）: {file_path}")
+        r = run_in_subprocess(
+            "backend.utils.excel_comparator:_aspose_calc_impl",
+            (str(file_path),),
+            timeout=timeout,
+            max_memory_mb=default_max_memory_mb(),
+        )
+        if r.success:
             logger.info(f"[Aspose] 公式计算完成: {file_path}")
             return True
-        raise result_holder["error"] or Exception("Aspose计算失败")
+        if r.timed_out:
+            logger.error(f"[Aspose] 公式计算超时（{timeout}s），已强杀: {file_path}")
+            return False
+        if r.killed_by_memory:
+            logger.error(f"[Aspose] 公式计算内存超限被杀（{r.error}）: {file_path}")
+            return False
+        # 子进程内异常（Aspose 加载失败/文件损坏等）→ 回退 win32com
+        logger.warning(f"[Aspose] 公式计算失败: {r.error}，尝试 win32com 回退")
     except ImportError:
         logger.info("Aspose.Cells 不可用，尝试 win32com")
     except Exception as e:
@@ -1109,28 +1123,19 @@ def _get_sheet_formulas(wb_formula, sheet_name: str) -> Dict[str, str]:
     return formulas
 
 
-def compare_excel_files_multi_sheet(
+def _compare_excel_files_multi_sheet_impl(
     result_file: str,
     expected_file: str,
     output_file: Optional[str] = None,
     primary_keys: Optional[List[str]] = None,
     skip_source_filter: bool = False,
 ) -> Dict[str, Any]:
-    """对比两个 Excel 文件的所有 Sheet 差异（多Sheet版本）。
+    """（子进程执行体）对比两个 Excel 文件的所有 Sheet 差异（多Sheet版本）。
 
     基于 Aspose 直读优化：
     - result: Aspose 1次(算公式+保存) + Aspose 1次(读值+公式) = 2次
     - expected: Aspose 1次(读值) = 1次
     - 总计 3次（消除读取阶段的 openpyxl 依赖，之前 4次）
-
-    Args:
-        result_file:  生成的结果文件路径
-        expected_file: 预期的结果文件路径
-        output_file:  差异报告输出文件路径(可选)
-        primary_keys: 主键列名列表，如 ["工号"]。默认自动检测
-
-    Returns:
-        兼容 compare_excel_files() 的结果字典，额外包含 per_sheet / missing_sheets / extra_sheets
     """
     import aspose_init
     aspose_init.ensure_license()
@@ -1138,11 +1143,16 @@ def compare_excel_files_multi_sheet(
 
     logger.info("[多Sheet对比] 开始...")
 
-    # 【第1次打开 result】Aspose 计算公式（expected 不需要，外部已计算）
+    # 【第1次打开 result】Aspose 计算公式（expected 不需要，外部已计算）。
+    # 直接调 _aspose_calc_impl 而非 calculate_excel_formulas：本函数已在子进程内，
+    # 外层护栏（超时/内存）已保护本进程，再开嵌套子进程会占双倍并发槽、并发=1 时互相等待。
     formula_warning = ""
-    result_calc_ok = calculate_excel_formulas(result_file)
-    if not result_calc_ok:
-        logger.error(f"[多Sheet对比] 结果文件公式计算失败: {result_file}")
+    try:
+        _aspose_calc_impl(str(result_file))
+        result_calc_ok = True
+    except Exception as _calc_e:
+        result_calc_ok = False
+        logger.error(f"[多Sheet对比] 结果文件公式计算失败: {result_file} - {_calc_e}")
         formula_warning += "结果文件公式未计算; "
 
     # 【第2次打开 result】Aspose 直读（值 + 公式）
@@ -1317,6 +1327,55 @@ def compare_excel_files_multi_sheet(
         "per_sheet": per_sheet,
         "missing_sheets": missing_sheets,
         "extra_sheets": extra_sheets,
+    }
+
+
+def compare_excel_files_multi_sheet(
+    result_file: str,
+    expected_file: str,
+    output_file: Optional[str] = None,
+    primary_keys: Optional[List[str]] = None,
+    skip_source_filter: bool = False,
+) -> Dict[str, Any]:
+    """对比两个 Excel 文件的所有 Sheet 差异（多Sheet版本）。
+
+    在【独立子进程】执行：智训每轮迭代对比结果 vs 预期文件时要打开 Aspose 读
+    两个 workbook（结果文件可能是大文件），特定文件内存暴涨会拖死主进程。
+    失败返回兼容结构（total_differences=0, success=False, warning 注明），不抛异常。
+
+    Args:
+        result_file:  生成的结果文件路径
+        expected_file: 预期的结果文件路径
+        output_file:  差异报告输出文件路径(可选)
+        primary_keys: 主键列名列表，如 ["工号"]。默认自动检测
+
+    Returns:
+        兼容 compare_excel_files() 的结果字典，额外包含 per_sheet / missing_sheets / extra_sheets
+    """
+    from backend.utils.subprocess_runner import run_in_subprocess, default_max_memory_mb, default_timeout
+
+    r = run_in_subprocess(
+        "backend.utils.excel_comparator:_compare_excel_files_multi_sheet_impl",
+        (str(result_file), str(expected_file)),
+        kwargs={
+            "output_file": output_file,
+            "primary_keys": primary_keys,
+            "skip_source_filter": skip_source_filter,
+        },
+        timeout=default_timeout("write"),   # 对比+生成差异文件，给足 600s
+        max_memory_mb=default_max_memory_mb(),
+    )
+    if r.success:
+        return r.result
+    reason = "超时" if r.timed_out else ("内存超限" if r.killed_by_memory else r.error)
+    logger.error(f"[多Sheet对比] 子进程对比失败（{reason}）: {result_file}")
+    return {
+        "total_differences": 0, "total_cells": 0, "matched_cells": 0,
+        "match_rate": 0.0, "success": False,
+        "warning": f"对比执行失败（{reason}）",
+        "per_sheet": {}, "missing_sheets": [], "extra_sheets": [],
+        "field_diff_samples": {}, "unmatched_expected": 0, "unmatched_result": 0,
+        "output_file": output_file,
     }
 
 

@@ -204,6 +204,120 @@ def eval_source_expr(expr, rows: List[dict], cols: List[str]):
     return None if val is None else round(val, 6)
 
 
+def eval_source_expr_cross(expr: str, default_file: str,
+                           source_indexes: Dict[str, dict], key: str) -> Any:
+    """跨表公式求值：expr 可引用【任意对照表】的列，语法 `文件名.列名`（如
+    `B.xlsx.基本工资*C.xlsx.补贴`）；未带文件前缀的裸列名归 default_file（兼容旧方案）。
+
+    所有列引用都按【主表行的归一化键】在各自文件里查行（各表 key_map 已对齐同一键），
+    每列跨行求和后代入 +-*/。纯单列引用：数值列→跨行求和；含非数值→取首个非空原值。
+    空/无行/公式非法/引用列不存在 → 返回 None（调用方据此保留原值/跳过）。
+    """
+    expr = str(expr or "").strip()
+    if not expr:
+        return None
+
+    # 文件名按长度降序：避免 "B.xlsx" 误配 "B2.xlsx" 的前缀
+    files = sorted(source_indexes.keys(), key=len, reverse=True)
+
+    def _cols(f):
+        return sorted([c for c in ((source_indexes.get(f) or {}).get("cols") or []) if c],
+                      key=len, reverse=True)
+
+    def _col_val(f, c):
+        """文件 f 该 key 的所有行中列 c 的 (数值和, 首非空, 是否全数值)。无行/空 → None。"""
+        rows = ((source_indexes.get(f) or {}).get("rows") or {}).get(key) or []
+        if not rows:
+            return None
+        nums, first, all_num = [], None, True
+        for row in rows:
+            v = row.get(c)
+            if _is_empty(v):
+                continue
+            if first is None:
+                first = v
+            n = _to_num(v)
+            if n is None:
+                all_num = False
+            else:
+                nums.append(n)
+        if first is None:
+            return None
+        return (round(sum(nums), 6) if nums else 0.0, first, all_num)
+
+    # 1) 扫描 expr → token：("col", f, c, val) / ("op", ch) / ("raw", ch)
+    toks, has_op = [], False
+    i, n = 0, len(expr)
+    while i < n:
+        ch = expr[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch in "+-*/()":
+            toks.append(("op", ch))
+            if ch in "+-*/":
+                has_op = True
+            i += 1
+            continue
+        hit = False
+        # 1a) `文件名.列名` 跨表引用（文件名+列名均最长匹配）
+        for f in files:
+            pfx = f + "."
+            if expr.startswith(pfx, i):
+                for c in _cols(f):
+                    if expr.startswith(c, i + len(pfx)):
+                        v = _col_val(f, c)
+                        if v is None:
+                            return None   # 引用了文件但该键无行/列空 → 视为不可用
+                        toks.append(("col", f, c, v))
+                        i += len(pfx) + len(c)
+                        hit = True
+                        break
+                break   # 文件名前缀命中但列没匹配 → 不再回退试裸列（避免误吞后缀）
+        if hit:
+            continue
+        # 1b) 裸列名 → default_file
+        for c in _cols(default_file):
+            if expr.startswith(c, i):
+                v = _col_val(default_file, c)
+                if v is None:
+                    return None
+                toks.append(("col", default_file, c, v))
+                i += len(c)
+                hit = True
+                break
+        if hit:
+            continue
+        toks.append(("raw", ch))
+        i += 1
+
+    cols = [t for t in toks if t[0] == "col"]
+    if not cols:
+        return None
+
+    # 2) 纯单列引用（无运算符、无杂字符）：数值→求和，文本→首非空
+    if not has_op:
+        if len(cols) == 1 and not any(t[0] == "raw" for t in toks):
+            _s, first, all_num = cols[0][3]
+            return _s if all_num else first
+        return None
+
+    # 3) 四则运算公式：列按数值代入（文本列按 0），出现未识别字符 → 非法
+    subst = ""
+    for t in toks:
+        if t[0] == "col":
+            _s, _first, all_num = t[3]
+            subst += f"({_s if all_num else 0})"
+        elif t[0] == "op":
+            subst += t[1]
+        else:
+            return None
+    if not _re.fullmatch(r"[0-9eE.+\-*/()\s]*", subst):
+        return None
+    val = _safe_arith_eval(subst)
+    return None if val is None else round(val, 6)
+
+
 def resolve_overwrites(key: str,
                        overwrite_pairs: List[dict],
                        source_indexes: Dict[str, dict]) -> Dict[str, Any]:
@@ -227,7 +341,8 @@ def resolve_overwrites(key: str,
         rows = (entry.get("rows") or {}).get(key)
         if not rows:
             continue
-        v = eval_source_expr(expr, rows, entry.get("cols") or [])
+        # 跨表公式：expr 里 `文件名.列名` 引用其他对照表列，裸列归本表（兼容旧方案）
+        v = eval_source_expr_cross(expr, f, source_indexes, key)
         if not _is_empty(v):
             out[ac] = v
     return out
@@ -279,7 +394,7 @@ def compute_diffs(
             if not b_rows:
                 continue  # 该对照表无此键 → 该对比对跳过
             av = row.get(ac)
-            bv = eval_source_expr(expr, b_rows, entry.get("cols") or [])   # 各列跨行求和后代入公式
+            bv = eval_source_expr_cross(expr, f, source_indexes, k)   # 跨表公式：各列跨行求和后代入
             old = _cmp2(av)   # 数值统一到 2 位小数后再比对/展示
             new = _cmp2(bv)
             if old != new:

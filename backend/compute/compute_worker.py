@@ -57,6 +57,13 @@ class _StdoutBuffer:
 
 
 def main():
+    # 以 .env 文件为准重新加载配置（override=True 覆盖父进程继承的旧环境变量，
+    # 防止父进程启动后改 .env 不生效导致 worker 用旧配置运行）。
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(override=True)
+    except Exception:
+        pass
     if len(sys.argv) < 2:
         sys.stderr.write("compute_worker: 缺少参数文件路径\n")
         sys.exit(2)

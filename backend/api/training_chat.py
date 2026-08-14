@@ -176,9 +176,9 @@ def _build_source_structure_from_generator(generator, multi_sheet_source: bool =
     return structure
 
 
-def _build_source_structure_from_dir(source_dir: str, manual_headers: Dict = None,
-                                     multi_sheet_source: bool = False) -> Dict[str, Any]:
-    """从源文件目录直接构建 source_structure（用于直接导入等无 generator 的场景）。"""
+def _build_source_structure_from_dir_impl(source_dir: str, manual_headers: Dict = None,
+                                          multi_sheet_source: bool = False) -> Dict[str, Any]:
+    """（子进程执行体）从源文件目录直接构建 source_structure。"""
     from excel_parser import IntelligentExcelParser
 
     structure = {"files": {}, "total_sheets": 0, "total_regions": 0,
@@ -219,8 +219,31 @@ def _build_source_structure_from_dir(source_dir: str, manual_headers: Dict = Non
     return structure
 
 
-def _analyze_expected_structure(expected_file: str) -> Dict[str, Any]:
-    """分析预期文件结构（与 TrainingEngine._analyze_expected_structure 一致）"""
+def _build_source_structure_from_dir(source_dir: str, manual_headers: Dict = None,
+                                     multi_sheet_source: bool = False) -> Dict[str, Any]:
+    """从源文件目录直接构建 source_structure（在【独立子进程】执行）。
+
+    结构解析虽只读表头（headers_only），但 Aspose 加载特定文件（超大/公式密集）同样
+    会内存暴涨；子进程超时/超内存强杀，失败返回空结构（调用方已有兜底）。
+    """
+    from backend.utils.subprocess_runner import run_in_subprocess, default_max_memory_mb, default_timeout
+
+    r = run_in_subprocess(
+        "backend.api.training_chat:_build_source_structure_from_dir_impl",
+        (source_dir, manual_headers),
+        kwargs={"multi_sheet_source": multi_sheet_source},
+        timeout=default_timeout("parse"), max_memory_mb=default_max_memory_mb(),
+    )
+    if r.success:
+        return r.result
+    reason = "超时" if r.timed_out else ("内存超限" if r.killed_by_memory else r.error)
+    logger.warning(f"[structure] 源文件结构解析失败（{reason}）: {source_dir}")
+    return {"files": {}, "total_sheets": 0, "total_regions": 0,
+            "multi_sheet_source": multi_sheet_source, "error": reason}
+
+
+def _analyze_expected_structure_impl(expected_file: str) -> Dict[str, Any]:
+    """（子进程执行体）分析预期文件结构（与 TrainingEngine._analyze_expected_structure 一致）"""
     from excel_parser import IntelligentExcelParser
 
     parser = IntelligentExcelParser()
@@ -253,6 +276,23 @@ def _analyze_expected_structure(expected_file: str) -> Dict[str, Any]:
         structure["total_regions"] += len(sheet_data.regions)
 
     return structure
+
+
+def _analyze_expected_structure(expected_file: str) -> Dict[str, Any]:
+    """分析预期文件结构（在【独立子进程】执行，防护同 _build_source_structure_from_dir）。"""
+    from backend.utils.subprocess_runner import run_in_subprocess, default_max_memory_mb, default_timeout
+
+    r = run_in_subprocess(
+        "backend.api.training_chat:_analyze_expected_structure_impl",
+        (str(expected_file),),
+        timeout=default_timeout("parse"), max_memory_mb=default_max_memory_mb(),
+    )
+    if r.success:
+        return r.result
+    reason = "超时" if r.timed_out else ("内存超限" if r.killed_by_memory else r.error)
+    logger.warning(f"[structure] 预期文件结构解析失败（{reason}）: {expected_file}")
+    return {"file_name": Path(expected_file).name, "sheets": {}, "total_regions": 0,
+            "error": reason}
 
 # ==================== 后台全量数据加载 ====================
 
@@ -365,6 +405,34 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None,
         logger.info(f"[后台全量加载] {final_key}: {len(merged_df)} 行")
 
     return source_data
+
+
+def _load_full_source_data_subproc(src_dir, manual_headers=None, multi_sheet_source=False,
+                                   file_passwords=None, reserved_sheet_names=None):
+    """子进程隔离版全量加载：解析在【独立子进程】执行，超时/超内存强杀，主进程内存安全。
+
+    背景: 某些文件（公式密集/超大）会让 Aspose 解析在 ThreadPoolExecutor 线程里长时间
+    计算、内存暴涨 → VM swap 风暴 → 假死。线程无法强杀，必须子进程隔离。
+    失败时返回 None，调用方现有逻辑（脚本自行解析）兜底，行为与改造前一致。
+    """
+    from backend.utils.subprocess_runner import run_in_subprocess, default_max_memory_mb, default_timeout
+
+    r = run_in_subprocess(
+        "backend.api.training_chat:_load_full_source_data",
+        (src_dir, manual_headers),
+        kwargs={
+            "multi_sheet_source": multi_sheet_source,
+            "file_passwords": file_passwords,
+            "reserved_sheet_names": reserved_sheet_names,
+        },
+        timeout=default_timeout("parse"),  # .env SUBPROCESS_PARSE_TIMEOUT，默认 300
+        max_memory_mb=default_max_memory_mb(),
+    )
+    if r.success:
+        return r.result
+    reason = "超时" if r.timed_out else ("内存超限" if r.killed_by_memory else r.error)
+    logger.warning(f"[后台全量加载] 子进程解析失败（{reason}），脚本将自行解析")
+    return None
 
 
 # ==================== 辅助函数 ====================
@@ -1689,7 +1757,7 @@ def main(source_dir, output_dir, **kwargs):
             # 【后台全量加载】在 AI 代码生成期间并行加载全量源数据
             # 这样 AI 生成代码时（耗时最长），全量数据同时解析
             _full_data_future = _executor.submit(
-                _load_full_source_data, src_dir, config.get("manual_headers"),
+                _load_full_source_data_subproc, src_dir, config.get("manual_headers"),
                 multi_sheet_source=config.get("multi_sheet_source", False),
                 file_passwords=config.get("file_passwords"),
                 reserved_sheet_names=set((config.get("expected_structure") or {}).get("sheets", {}).keys()),
@@ -2179,7 +2247,7 @@ async def send_message(
             # 【后台全量加载】修正轮次也需要全量数据
             src_dir = config.get("source_dir", "")
             _full_data_future = _executor.submit(
-                _load_full_source_data, src_dir, config.get("manual_headers"),
+                _load_full_source_data_subproc, src_dir, config.get("manual_headers"),
                 multi_sheet_source=config.get("multi_sheet_source", False),
                 file_passwords=config.get("file_passwords"),
                 reserved_sheet_names=set((config.get("expected_structure") or {}).get("sheets", {}).keys()),
@@ -2656,7 +2724,7 @@ async def send_message(
 
             # 后台全量加载
             _full_data_future = _executor.submit(
-                _load_full_source_data, src_dir, config.get("manual_headers"),
+                _load_full_source_data_subproc, src_dir, config.get("manual_headers"),
                 multi_sheet_source=config.get("multi_sheet_source", False),
                 file_passwords=config.get("file_passwords"),
                 reserved_sheet_names=set((config.get("expected_structure") or {}).get("sheets", {}).keys()),
@@ -3054,7 +3122,7 @@ async def upload_code(
     if _src_dir and os.path.isdir(_src_dir):
         try:
             _full_source_data = await run_in_threadpool(
-                _load_full_source_data,
+                _load_full_source_data_subproc,
                 _src_dir,
                 config.get("manual_headers"),
                 config.get("multi_sheet_source", False),

@@ -719,8 +719,10 @@ const Admin = {
         if (!resp.ok) return;
         const assets = await resp.json();
         const tbody = document.querySelector('#ref-data-table tbody');
+        const selAll = document.getElementById('ref-select-all');
+        if (selAll) selAll.checked = false;   // 重新加载后清空全选
         if (!assets.length) {
-            tbody.innerHTML = `<tr><td colspan="9" class="empty-state">${showInactive ? '暂无已停用的基础数据' : '暂无基础数据'}</td></tr>`;
+            tbody.innerHTML = `<tr><td colspan="10" class="empty-state">${showInactive ? '暂无已停用的基础数据' : '暂无基础数据'}</td></tr>`;
             return;
         }
         tbody.innerHTML = assets.map(a => {
@@ -733,6 +735,7 @@ const Admin = {
                    <button class="btn btn-sm btn-primary" onclick="Admin.enableAsset(${a.id})">启用</button>
                    <button class="btn btn-sm btn-danger" onclick="Admin.hardDeleteAsset(${a.id})">删除</button>`;
             return `<tr>
+            <td style="text-align:center;"><input type="checkbox" class="ref-row-check" value="${a.id}" style="margin:0;vertical-align:middle;"></td>
             <td>${a.id}</td>
             <td>${a.name}</td>
             <td>${a.category_name || '-'}</td>
@@ -744,6 +747,34 @@ const Admin = {
             <td>${actions}</td>
         </tr>`;
         }).join('');
+        // 全选联动：表头全选框 → 行选择框；行选择框变化时同步全选框状态
+        const rowChecks = () => tbody.querySelectorAll('.ref-row-check');
+        if (selAll) {
+            selAll.onchange = () => rowChecks().forEach(cb => { cb.checked = selAll.checked; });
+        }
+        rowChecks().forEach(cb => {
+            cb.addEventListener('change', () => {
+                if (selAll) {
+                    const all = rowChecks();
+                    selAll.checked = all.length > 0 && Array.from(all).every(x => x.checked);
+                }
+            });
+        });
+    },
+
+    async batchDeleteRefData() {
+        const checked = Array.from(document.querySelectorAll('#ref-data-table .ref-row-check'))
+            .filter(cb => cb.checked).map(cb => cb.value);
+        if (!checked.length) return alert('请先勾选要删除的基础数据');
+        if (!confirm(`确认物理删除选中的 ${checked.length} 条基础数据？将同时删除文件与记录，不可恢复！`)) return;
+        let ok = 0, fail = [];
+        for (const id of checked) {
+            const resp = await AUTH.authFetch(`/api/assets/${id}?hard=true`, { method: 'DELETE' });
+            if (resp.ok) ok++;
+            else fail.push(`${id}: ${await resp.text()}`);
+        }
+        this.loadRefData();
+        if (fail.length) alert(`删除完成：成功 ${ok} 个，失败 ${fail.length} 个\n${fail.join('\n')}`);
     },
 
     showUploadRefData() {

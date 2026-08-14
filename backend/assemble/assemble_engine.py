@@ -158,6 +158,96 @@ def _parse_template(template_path: Path, push) -> Tuple[Dict, str, Dict]:
     return template_struct, template_signature, data_area
 
 
+def _reset_default_cell_format(xlsx_path: Path) -> bool:
+    """把 xlsx 的默认单元格样式 cellXfs[0] numFmtId 重置为 0（General）。
+
+    根因：Excel 导出的模板，其 cellXfs[0]（s=0 默认单元格样式）会展开 Normal 的
+    numFmtId（如 164 日期格式）。openpyxl 写入 style=None 的新单元格引用 s=0 →
+    数值列全部继承日期格式（"模板只有表头"时尤其明显：没有数据行可复制样式，
+    所有新单元格都走 s=0）。openpyxl 改 NamedStyle 不重写 cellXfs，须直接手术
+    styles.xml：只改 cellXfs 块第一个 <xf> 的 numFmtId → 0，其余样式原样保留。
+    """
+    import zipfile
+    p = str(xlsx_path)
+    try:
+        z = zipfile.ZipFile(p, "r")
+        items = {n: z.read(n) for n in z.namelist()}
+        z.close()
+    except Exception:
+        return False
+    if "xl/styles.xml" not in items:
+        return False
+    styles = items["xl/styles.xml"].decode("utf-8")
+    m = re.search(r'<cellXfs count="\d+">\s*<xf\b[^>]*numFmtId="(\d+)"', styles)
+    if not m or m.group(1) == "0":
+        return False   # 默认样式已是 General → 无需处理
+
+    def _rep(match):
+        return match.group(0).replace(f'numFmtId="{match.group(1)}"', 'numFmtId="0"', 1)
+
+    styles2 = re.sub(r'<cellXfs count="\d+">\s*<xf\b[^>]*numFmtId="(\d+)"', _rep, styles, count=1)
+    if styles2 == styles:
+        return False
+    items["xl/styles.xml"] = styles2.encode("utf-8")
+    try:
+        with zipfile.ZipFile(p, "w", zipfile.ZIP_DEFLATED) as z2:
+            for n, data in items.items():
+                z2.writestr(n, data)
+        return True
+    except Exception:
+        return False
+
+
+def _prepare_clean_template(template_path: Path, push) -> Path:
+    """模板预处理：若模板默认样式是日期/异常格式，生成"已修正"的模板副本供 AI 使用。
+
+    根因：模板默认单元格样式被设成自定义日期格式（如 [$F400]h:mm:ss / Excel 导出时
+    cellXfs[0] 展开为 164 日期）时，AI 用 openpyxl 写入的数值单元格（style=None 继承
+    s=0 默认样式）全部变日期 → 结果表百万级数值显示成日期。两条腿一起修：
+    1) _reset_default_cell_format：cellXfs[0]（s=0 默认样式）numFmtId → 0 —— 治"模板
+       只有表头/新写入单元格"（openpyxl 继承 s=0 的主要通道）；
+    2) _normalize_source_sheet_formats_impl：已存在单元格中"格式恰好等于默认日期样式"
+       的拉回 General（日期关键词列保留）—— 治"模板自带数据行已污染"。
+    正常模板（默认样式 General）直接返回原模板，零开销。
+    """
+    from backend.utils.output_postprocess import (
+        _template_default_format, _normalize_source_sheet_formats_impl,
+    )
+    try:
+        _def = _template_default_format(str(template_path))
+    except Exception:
+        _def = None
+    if not _def or not _def[1]:
+        return template_path   # 默认样式 General → 无污染，直接用原模板
+
+    import tempfile as _tf
+    _fd, _copy = _tf.mkstemp(suffix=".xlsx", prefix="assemble_tpl_")
+    os.close(_fd)
+    shutil.copy2(str(template_path), _copy)
+    try:
+        # 1) 重置 s=0 默认单元格样式（模板只有表头时的主要污染源）
+        _reset = _reset_default_cell_format(Path(_copy))
+        # 2) 修已存在单元格的继承样式（模板自带数据行时）
+        n = _normalize_source_sheet_formats_impl(_copy, str(template_path),
+                                                 source_sheet_prefix="源_", match_all_sheets=True)
+        if _reset or n:
+            _detail = []
+            if _reset:
+                _detail.append("默认样式已重置为常规")
+            if n:
+                _detail.append(f"修正 {n} 个单元格")
+            push({"type": "log", "message":
+                  f"[模板预处理] 模板默认样式为日期格式，{'；'.join(_detail)}，AI 将基于干净模板生成"})
+        return Path(_copy)
+    except Exception as e:
+        logger.warning(f"[assemble] 模板预处理失败，用原模板: {e}")
+        try:
+            os.remove(_copy)
+        except Exception:
+            pass
+        return template_path
+
+
 # ==================== 规则内容 ====================
 
 def _load_rule_text(rule: Optional[AssembleRule]) -> str:
@@ -450,11 +540,15 @@ def _finalize_results(output_dir: Path, tenant_id: str, task_id: int,
     shutil.copy2(main_out, orig_path)
     saved.append(orig_name)
 
-    # 修复日期格式超范围数字（模板公式列 + 大数字导致 Excel 打开报错）
-    try:
-        _fix_out_of_range_dates(orig_path, push)
-    except Exception as e:
-        logger.warning("[assemble] 日期格式修复失败: %s", e)
+    # 【已移除】日期格式超范围修复（曾全表遍历修百万级单元格"防 Excel 打开报错"）：
+    # 实测修复后打开仍报错（根因不在序列号，见任务日志），且后处理掩盖了真实问题。
+    # 源头治理：模板预处理（_prepare_clean_template）+ AI prompt 格式规范（长数字文本/
+    # 数值 General/日期列限定）。结果文件保持 AI 产出原样，便于定位真实报错根因。
+
+    # 【已移除】"恢复常规显示"后处理（曾全表遍历修百万级被套日期格式的数值单元格）。
+    # 源头已由模板预处理接管：模板默认样式为日期时，AI 基于"干净模板副本"生成（见
+    # _prepare_clean_template），AI 写入不再继承日期样式；AI prompt 也加了格式规范
+    # （长数字按文本、数值列 General）。此修复仅剩 Excel 打开报错兜底在下方保留。
 
     # 纯值版：复用智算 make_values_only_copy —— 只删 源_ sheet（模板其他 sheet 保留），
     # 公式选择性拍平（AI 新填公式→值，模板原有公式保留），防止删除源_ 后 #REF!
@@ -466,10 +560,8 @@ def _finalize_results(output_dir: Path, tenant_id: str, task_id: int,
                                    None, tpl_for_values, None)
         if not ok:
             raise RuntimeError("make_values_only_copy 返回 None")
-        try:
-            _fix_out_of_range_dates(values_path, push)
-        except Exception as e:
-            logger.warning("[assemble] 纯值版日期格式修复失败: %s", e)
+        # （已移除）纯值版日期格式超范围修复，同上：源头治理替代全表后处理。
+        # （已移除）纯值版"恢复常规显示"后处理，同上：源头由模板预处理 + AI prompt 规范接管。
         saved.append(values_name)
         push({"type": "log", "message": f"✅ 已生成纯值版（仅目标 sheet）: {values_name}"})
     except Exception as e:
@@ -530,6 +622,10 @@ def run_assemble_task(task_id: int, push, params: Dict):
             source_dir, file_passwords, push)
         template_struct, template_signature, data_area = _parse_template(template_path, push)
         template_struct["_data_area"] = data_area
+
+        # 模板预处理：默认样式为日期 → 生成干净副本供 AI 使用（源头杜绝数值变日期，
+        # 替代百万级后处理修复）。原模板保留用于结果后处理/纯值版。
+        clean_template = _prepare_clean_template(template_path, push)
 
         # 2. 总签名
         signature = hashlib.sha256(
@@ -599,7 +695,7 @@ def run_assemble_task(task_id: int, push, params: Dict):
                             else:
                                 os.environ.pop("AI_PROVIDER", None)
                     code, _ = _ai_generate_code(
-                        gen, source_struct, source_dir, rule_text, template_path,
+                        gen, source_struct, source_dir, rule_text, clean_template,
                         template_struct, auto_mappings, max_source_rows, push)
                     break
                 except Exception as e:
@@ -627,7 +723,7 @@ def run_assemble_task(task_id: int, push, params: Dict):
         output_dir = exec_dir / "output"
         output_dir.mkdir(parents=True, exist_ok=True)
         push({"type": "status", "status": "executing", "message": "沙箱执行填充代码（约1-3分钟）..."})
-        result = _execute_in_sandbox(code, source_dir, output_dir, template_path,
+        result = _execute_in_sandbox(code, source_dir, output_dir, clean_template,
                                      file_passwords, tenant_id)
 
         if not result.get("success"):
@@ -664,4 +760,11 @@ def run_assemble_task(task_id: int, push, params: Dict):
         db.commit()
         push({"type": "error", "message": f"组表失败: {e}"})
     finally:
+        # 清理模板预处理生成的临时副本（正常/异常/失败都清）
+        try:
+            if 'clean_template' in locals() and clean_template is not None \
+                    and clean_template != template_path and clean_template.exists():
+                clean_template.unlink(missing_ok=True)
+        except Exception:
+            pass
         db.close()

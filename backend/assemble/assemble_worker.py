@@ -47,6 +47,14 @@ class _StdoutBuffer:
 
 
 def main():
+    # 以 .env 文件为准重新加载配置（override=True 覆盖父进程继承的旧环境变量）：
+    # 父进程（uvicorn）启动后修改 .env 不会热重载，其 os.environ 里可能是旧值（如
+    # CODE_SANDBOX_MAX_MEMORY=1024），worker 若继承旧值会导致内存上限/超时配置失效。
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(override=True)
+    except Exception:
+        pass
     if len(sys.argv) < 2:
         sys.stderr.write("assemble_worker: 缺少参数文件路径\n")
         sys.exit(2)

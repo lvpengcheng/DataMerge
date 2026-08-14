@@ -892,7 +892,7 @@ def _rename_sheets_by_token(wb, source_sheet_names=None, sys_vars=None) -> None:
             logger.warning(f"[报表·sheet名] '{old}' -> '{final}' 改名失败（忽略）: {_re}")
 
 
-def generate_from_template(
+def _generate_from_template_impl(
     output_path: str,
     template_path: str,
     data: Dict,
@@ -907,7 +907,8 @@ def generate_from_template(
     sheet_source_names: Optional[List[str]] = None,
     sheet_vars: Optional[Dict] = None,
 ) -> str:
-    """
+    """（子进程执行体）SmartMarker 填充模板生成文件。
+
     使用 Aspose WorkbookDesigner（SmartMarker 引擎）填充模板生成文件。
 
     四种模式:
@@ -975,6 +976,55 @@ def generate_from_template(
             password=password, watermark_text=watermark_text,
             sheet_source_names=sheet_source_names, sheet_vars=sheet_vars,
         )
+
+
+def generate_from_template(
+    output_path: str,
+    template_path: str,
+    data: Dict,
+    password: Optional[str] = None,
+    watermark_text: Optional[str] = None,
+    mode: str = "fill",
+    group_by: str = "",
+    skip_rows: int = 1,
+    name_field: str = "",
+    show_empty_period: bool = True,
+    split_by: str = "",
+    sheet_source_names: Optional[List[str]] = None,
+    sheet_vars: Optional[Dict] = None,
+) -> str:
+    """SmartMarker 填充模板生成文件（在【独立子进程】执行）。
+
+    在子进程内打开模板 + WorkbookDesigner.Process + CalculateFormula + Save：
+    特定文件（大模板/大 DataFrame/公式密集）在主进程跑会内存暴涨，此处超时/超内存
+    强杀；失败 raise RuntimeError。所有调用方（多表合并套模板、报表生成等）自动受益。
+
+    data 示例: {"DT": pd.DataFrame(...), "$year": "2026", "$month": "03"}
+    Returns: fill/block/sheet → output_path (xlsx)；zip / 有split_by → output_path (zip)
+    """
+    from backend.utils.subprocess_runner import run_in_subprocess, default_max_memory_mb, default_timeout
+
+    r = run_in_subprocess(
+        "backend.utils.aspose_helper:_generate_from_template_impl",
+        (str(output_path), str(template_path), data),
+        kwargs={
+            "password": password,
+            "watermark_text": watermark_text,
+            "mode": mode,
+            "group_by": group_by,
+            "skip_rows": skip_rows,
+            "name_field": name_field,
+            "show_empty_period": show_empty_period,
+            "split_by": split_by,
+            "sheet_source_names": sheet_source_names,
+            "sheet_vars": sheet_vars,
+        },
+        timeout=default_timeout("write"), max_memory_mb=default_max_memory_mb(),
+    )
+    if r.success:
+        return r.result
+    reason = "超时" if r.timed_out else ("内存超限" if r.killed_by_memory else r.error)
+    raise RuntimeError(f"模板填充失败（{reason}）: {template_path}")
 
 
 def _smartmarker_fill(template_path: str, data: Dict) -> Workbook:

@@ -65,7 +65,7 @@ def _put_value(cell, value):
             logger.warning(f"[integrate] 写值失败，跳过: {value!r}")
 
 
-def apply_integration(
+def _apply_integration_impl(
     main_path: str,
     out_path: str,
     sheet_name: Optional[str],
@@ -80,7 +80,7 @@ def apply_integration(
     diff_order: str = "id_name",
     date_key_mode: str = "off",
 ) -> Dict[str, Any]:
-    """原地回填主表并（可选）追加差异 sheet，另存到 out_path。
+    """（子进程执行体）原地回填主表并（可选）追加差异 sheet，另存到 out_path。
 
     Returns: {"overwritten_cells": int, "matched_rows": int, "diff_rows": int}
     """
@@ -137,25 +137,98 @@ def apply_integration(
         wb.CalculateFormula()
     except Exception as _ce:
         logger.warning(f"[integrate] CalculateFormula 跳过（不阻断）: {_ce}")
+    # 兜底：Aspose 算不了的复杂公式（INDIRECT/数组公式等）缓存值缺失，Excel 打开时
+    # 不显示值、需点进单元格按回车才重算。保存时写 calcPr fullCalcOnLoad=1，
+    # Excel 打开文件时自动全量重算所有公式，彻底消除"回车才生效"。
+    try:
+        wb.Settings.ForceFullCalculate = True
+    except Exception as _ffc:
+        logger.warning(f"[integrate] ForceFullCalculate 设置失败（忽略）: {_ffc}")
     wb.Save(out_path, SaveFormat.Xlsx)
     logger.info(f"[integrate] 回填完成: 命中 {matched} 行, 覆盖 {overwritten} 格, 差异 {n_diff} 行 → {out_path}")
     return {"overwritten_cells": overwritten, "matched_rows": matched, "diff_rows": n_diff}
 
 
-def append_diff_sheet(path: str, diff_rows: Optional[List[dict]], diff_order: str = "id_name") -> int:
-    """往【已生成文件】末尾追加差异 sheet 并原地另存。
+def apply_integration(
+    main_path: str,
+    out_path: str,
+    sheet_name: Optional[str],
+    head_data: Dict[str, str],       # {A 列名 -> 列字母}
+    a_key_col: str,
+    data_row_start: int,             # 1-based 绝对行
+    data_row_end: int,               # 1-based 绝对行
+    overwrite_pairs: List[dict],
+    source_indexes: Dict[str, Dict[str, dict]],
+    normalize_keys: bool = True,
+    diff_rows: Optional[List[dict]] = None,
+    diff_order: str = "id_name",
+    date_key_mode: str = "off",
+) -> Dict[str, Any]:
+    """原地回填主表并（可选）追加差异 sheet，另存到 out_path（在【独立子进程】执行）。
 
-    差异值须由调用方基于最终生成文件（覆盖回填 + 公式重算后）重新解析比对得出，
-    不能用主表覆盖前的缓存旧值。diff_rows 为空则不动文件、返回 0。
+    防护背景: Aspose 打开主表 + CalculateFormula + Save 在特定文件（公式密集/超大）上
+    会长时间计算、内存暴涨 → VM 假死。子进程超时（600s）/超内存强杀，主进程安全；
+    失败时 raise ValueError，由端点转 4xx/5xx 明确报错。
+
+    Returns: {"overwritten_cells": int, "matched_rows": int, "diff_rows": int}
     """
+    from backend.utils.subprocess_runner import run_in_subprocess, default_max_memory_mb, default_timeout
+
+    r = run_in_subprocess(
+        "backend.utils.integrate_writer:_apply_integration_impl",
+        (str(main_path), str(out_path), sheet_name, head_data, a_key_col,
+         data_row_start, data_row_end, overwrite_pairs, source_indexes),
+        kwargs={
+            "normalize_keys": normalize_keys,
+            "diff_rows": diff_rows,
+            "diff_order": diff_order,
+            "date_key_mode": date_key_mode,
+        },
+        timeout=default_timeout("write"), max_memory_mb=default_max_memory_mb(),
+    )
+    if r.success:
+        return r.result
+    reason = "超时（600s）" if r.timed_out else ("内存超限" if r.killed_by_memory else r.error)
+    raise ValueError(f"整合回填失败（{reason}）: {main_path}")
+
+
+def _append_diff_sheet_impl(path: str, diff_rows: Optional[List[dict]], diff_order: str = "id_name") -> int:
+    """（子进程执行体）往【已生成文件】末尾追加差异 sheet 并原地另存。"""
     if not diff_rows:
         return 0
     aspose_init.ensure_license()
     wb = Workbook(path)
     n = _append_diff_sheet(wb, diff_rows, diff_order)
+    # 与 _apply_integration_impl 一致：Excel 打开时全量重算（Aspose 算不了的复杂公式兜底）
+    try:
+        wb.Settings.ForceFullCalculate = True
+    except Exception:
+        pass
     wb.Save(path, SaveFormat.Xlsx)
     logger.info(f"[integrate] 追加差异 sheet: {n} 行 → {path}")
     return n
+
+
+def append_diff_sheet(path: str, diff_rows: Optional[List[dict]], diff_order: str = "id_name") -> int:
+    """往【已生成文件】末尾追加差异 sheet 并原地另存（在【独立子进程】执行）。
+
+    差异值须由调用方基于最终生成文件（覆盖回填 + 公式重算后）重新解析比对得出，
+    不能用主表覆盖前的缓存旧值。diff_rows 为空则不动文件、返回 0。
+    失败时 raise ValueError（打开的就是整合结果=主表文件，特定文件需防护）。
+    """
+    from backend.utils.subprocess_runner import run_in_subprocess, default_max_memory_mb, default_timeout
+
+    if not diff_rows:
+        return 0
+    r = run_in_subprocess(
+        "backend.utils.integrate_writer:_append_diff_sheet_impl",
+        (str(path), diff_rows, diff_order),
+        timeout=default_timeout("write"), max_memory_mb=default_max_memory_mb(),
+    )
+    if r.success:
+        return r.result
+    reason = "超时" if r.timed_out else ("内存超限" if r.killed_by_memory else r.error)
+    raise ValueError(f"追加差异 sheet 失败（{reason}）: {path}")
 
 
 def _append_diff_sheet(wb, diff_rows: List[dict], diff_order: str) -> int:

@@ -8,6 +8,7 @@ import shutil
 import tempfile
 import logging
 import hashlib
+import asyncio
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
@@ -295,7 +296,8 @@ async def execute_compute(
             "MONTHLY_STANDARD_HOURS": str(params.get("standard_hours", "")),
         }
 
-        exec_result = sandbox.execute(
+        exec_result = await asyncio.to_thread(
+            sandbox.execute,
             script_path=str(script_path),
             source_dir=str(source_dir),
             output_dir=str(output_dir),
@@ -355,22 +357,22 @@ async def execute_compute(
 
                 dest_path = tenant_output_dir / new_filename
                 shutil.copy2(output_file, dest_path)
-                # 源_ sheet 格式兜底：修复继承模板默认样式导致数字显示成日期/时间（覆盖旧脚本）。
+                # 源_ sheet 格式兜底（子进程执行：结果文件可能很大，主进程跑会内存失控/极慢）。
                 # 不再要求 _tpl_for_values：模板路径跨环境常不存在，兜底会回退用输出文件自身默认样式。
                 try:
-                    normalize_source_sheet_formats(str(dest_path), _tpl_for_values)
+                    await asyncio.to_thread(normalize_source_sheet_formats, str(dest_path), _tpl_for_values)
                 except Exception as _nse:
                     logger.warning(f"[源_格式兜底] 跳过: {_nse}")
                 # 汇总行格式兜底：老脚本 openpyxl 增删行致汇总行格式不跟随 → Aspose 按模板重刷
                 # （只对单一底部汇总行 sheet 生效，多区域小计 sheet 自动跳过）。须在源_兜底之后跑。
                 try:
                     if _tpl_for_values and os.path.exists(_tpl_for_values) and restore_summary_format_enabled():
-                        restore_template_region_format(str(dest_path), _tpl_for_values, script.code)
+                        await asyncio.to_thread(restore_template_region_format, str(dest_path), _tpl_for_values, script.code)
                 except Exception as _sfe:
                     logger.warning(f"[汇总格式] 跳过: {_sfe}")
                 # 主键归一：两端类型统一成文本，修 VLOOKUP 跨源 #N/A（在纯值版之前跑）
                 try:
-                    normalize_key_columns_to_text(str(dest_path))
+                    await asyncio.to_thread(normalize_key_columns_to_text, str(dest_path))
                 except Exception as _ke:
                     logger.warning(f"[主键归一] 跳过: {_ke}")
                 _register_result(dest_path, new_filename)
@@ -378,7 +380,7 @@ async def execute_compute(
                 # 双结果：再出纯值版（模版公式保留、新列公式→值；模版所有 sheet 保留）
                 if _dual:
                     _vp = tenant_output_dir / values_only_name(new_filename)
-                    if make_values_only_copy(dest_path, _vp, template_path=_tpl_for_values):
+                    if await asyncio.to_thread(make_values_only_copy, dest_path, _vp, template_path=_tpl_for_values):
                         _register_result(_vp, _vp.name)
                     else:
                         # 生成失败（内部已重试3次）→ 明确标记，别静默只剩原版

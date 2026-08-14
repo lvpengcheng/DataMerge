@@ -29,12 +29,35 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
-    # 资源上限：把失控计算（如卡死的 CalculateFormula、超大文件）的爆炸半径锁在容器内，
+    # ===== 资源上限 =====
+    # 把失控计算（如卡死的 CalculateFormula、超大文件、AI 脚本吃内存）的爆炸半径锁在容器内，
     # OOM 时被杀的是容器而不是宿主机 VM，避免拖垮整机/无法重启。可在 .env 调整：
-    #   APP_MEM_LIMIT=4g   APP_MEM_RESERVATION=1g   APP_CPUS=2
-    mem_limit: ${APP_MEM_LIMIT:-4g}
-    mem_reservation: ${APP_MEM_RESERVATION:-1g}
-    cpus: ${APP_CPUS:-2}
+    #   APP_MEM_LIMIT=12g   APP_MEM_RESERVATION=2g   APP_CPUS=4
+    # 默认 12g 贴合 Ubuntu 32G 双环境方案（2 容器 × 12g + 系统/redis 3g + 余量 5g = 32g）。
+    # 单容器 / 小内存机器务必按实际内存调小（如 APP_MEM_LIMIT=4g APP_CPUS=2）。
+    # 容器内子进程并发预算必须 < 容器上限：SUBPROCESS_CONCURRENCY=6 × 1g + 主进程 2.5g ≈ 8.5g < 12g（.env 配）。
+    mem_limit: ${APP_MEM_LIMIT:-12g}
+    mem_reservation: ${APP_MEM_RESERVATION:-2g}
+    cpus: ${APP_CPUS:-4}
+    # ===== 容器日志限制 =====
+    # json-file 驱动默认无上限：智训/智算高频 stdout 日志（每行 flush 即一次磁盘写）会无限增长，
+    # 持续写盘（overlay → Ubuntu → .vhdx → 宿主 Windows C 盘 IO）。限制单文件 50m、保留 3 个，
+    # 日志写满自动轮转。应用侧日志已异步化（QueueListener），此处再压一档磁盘 IO。
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    # ===== 磁盘 IO 限速（可选，按实际设备启用）=====
+    # 智训/智算突发读写（xlsx 保存、日志、overlay 写放大）不打满 VM 磁盘 → 宿主 C 盘 IO 可控。
+    # 容器内 `df -h /` 或 `cat /proc/diskstats` 查设备名（常见 /dev/sda 或 /dev/vda），
+    # 确认后取消注释并填对 path 即可生效：
+    # device_write_bps:
+    #   - path: /dev/sda
+    #     rate: 100mb
+    # device_read_bps:
+    #   - path: /dev/sda
+    #     rate: 100mb
 
   redis:
     image: redis:7-alpine

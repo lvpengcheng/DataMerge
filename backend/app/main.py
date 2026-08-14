@@ -63,7 +63,20 @@ _file_handler = TimedRotatingFileHandler(
 )
 _file_handler.setFormatter(_log_fmt)
 
-logging.basicConfig(level=logging.INFO, handlers=[_console_handler, _file_handler])
+# ===== 异步日志：QueueHandler + QueueListener =====
+# FileHandler/StreamHandler 每次 emit 都 flush 磁盘/管道（同步写盘）——智训日志高频（AI 流式
+# chunk 每块 flush）且 VM 磁盘慢时，写日志线程被 IO 拖住；在 Docker 里每次 stdout flush 还会被
+# json-file 日志驱动捕获成一次容器磁盘写 → Ubuntu → .vhdx → 宿主 C 盘 IO。
+# 改为：业务线程只做内存 put（O(1) 不阻塞），写盘由独立 listener 线程完成。
+import queue as _queue_mod
+from logging.handlers import QueueHandler, QueueListener
+LOG_QUEUE = _queue_mod.Queue(-1)          # 全局共享：main logger 与 TrainingLogger 共用
+LOG_QUEUE_HANDLER = QueueHandler(LOG_QUEUE)
+LOG_QUEUE_HANDLER.setFormatter(_log_fmt)
+_log_listener = QueueListener(LOG_QUEUE, _console_handler, _file_handler, respect_handler_level=True)
+_log_listener.start()
+
+logging.basicConfig(level=logging.INFO, handlers=[LOG_QUEUE_HANDLER])
 logger = logging.getLogger(__name__)
 
 # 创建FastAPI应用
@@ -578,6 +591,16 @@ async def rules_chat_endpoint(
 
 @app.on_event("startup")
 async def startup_event():
+    # 异步日志兜底：uvicorn 启动时用 run.py 的 log_config（dictConfig）重置了 root logger
+    # 的 handlers（只留 console）——这里把全局异步队列 handler 重新挂回 root，
+    # 保证 app.log 继续由 QueueListener 独立线程异步写入（业务线程零阻塞）。
+    try:
+        _root_logger = logging.getLogger()
+        _root_logger.handlers.clear()
+        _root_logger.addHandler(LOG_QUEUE_HANDLER)
+    except Exception as _log_e:
+        logger.warning(f"重挂异步日志 handler 失败（继续）: {_log_e}")
+
     # Windows IOCP 监听 socket 在客户端 RST 时偶发抛 WinError 64，listener 不会挂掉
     # 但 asyncio 会把每次失败打成 ERROR 级日志（IIS ARR 反向代理高频探测时会刷屏）
     # 这里安装 filter 屏蔽这类无害噪音，不影响真正的 socket 故障日志
@@ -1608,7 +1631,7 @@ async def calculate_data(
         logger.info(f"执行环境设置 - 输出文件夹: {execution_env['output_folder']}")
 
         # 在沙箱中执行脚本
-        execution_result = code_sandbox.execute_script(script_content, execution_env)
+        execution_result = await asyncio.to_thread(code_sandbox.execute_script, script_content, execution_env)
 
         if not execution_result["success"]:
             return {
@@ -1879,10 +1902,11 @@ async def export_history_data(
         merged_data = {sn: [] for sn in template_structure}
 
         # 对每个数据文件先用COM计算公式（兜底处理历史遗留的未计算文件）
+        # to_thread：等待子进程计算期间不冻结事件循环（多客户并发时其他请求照常响应）
         from backend.utils.excel_comparator import calculate_excel_formulas
         for label, file_path in data_files:
             try:
-                calculate_excel_formulas(file_path)
+                await asyncio.to_thread(calculate_excel_formulas, file_path)
             except Exception as calc_err:
                 logger.warning(f"公式计算失败（继续读取）: {label} - {calc_err}")
 
@@ -2630,7 +2654,7 @@ async def calculate_data_split(
         logger.info(f"执行环境设置 - 输出文件夹: {execution_env['output_folder']}")
 
         # 在沙箱中执行脚本
-        execution_result = code_sandbox.execute_script(script_content, execution_env)
+        execution_result = await asyncio.to_thread(code_sandbox.execute_script, script_content, execution_env)
 
         if not execution_result["success"]:
             return {
@@ -2931,7 +2955,7 @@ async def revalidate_script(
             execution_env["monthly_standard_hours"] = monthly_standard_hours
 
         start_time = _time.time()
-        exec_result = code_sandbox.execute_script(script_content, execution_env)
+        exec_result = await asyncio.to_thread(code_sandbox.execute_script, script_content, execution_env)
         execution_time = _time.time() - start_time
 
         if not exec_result["success"]:
@@ -3226,7 +3250,7 @@ async def _execute_email_calculation(
         }
 
         # 执行脚本
-        exec_result = code_sandbox.execute_script(script_content, execution_env)
+        exec_result = await asyncio.to_thread(code_sandbox.execute_script, script_content, execution_env)
 
         if not exec_result["success"]:
             return {"success": False, "error": exec_result.get("error", "脚本执行失败")}
@@ -3581,7 +3605,7 @@ async def adjust_code(
             execution_env["monthly_standard_hours"] = monthly_standard_hours
 
         start_time = _time.time()
-        exec_result = code_sandbox.execute_script(adjusted_code, execution_env)
+        exec_result = await asyncio.to_thread(code_sandbox.execute_script, adjusted_code, execution_env)
         execution_time = _time.time() - start_time
 
         if not exec_result["success"]:
@@ -3606,7 +3630,7 @@ async def adjust_code(
 
         # COM公式计算
         try:
-            calculate_excel_formulas(str(output_file))
+            await asyncio.to_thread(calculate_excel_formulas, str(output_file))
         except Exception as calc_err:
             logger.warning(f"公式计算失败: {calc_err}")
 
@@ -4292,8 +4316,16 @@ async def _run_compute_subprocess(task_id: str, buffer, params_file: str, temp_d
     import subprocess as _subprocess
     import threading as _threading
     loop = asyncio.get_running_loop()
-    _state = {"saw_terminal": False, "returncode": None, "start_error": None}
+    _state = {"saw_terminal": False, "returncode": None, "start_error": None, "proc": None}
     done = asyncio.Event()
+
+    # 子进程超时（秒）：读取 .env COMPUTE_PROC_TIMEOUT，默认 3600。
+    # 历史上 await done.wait() 无超时——子进程假死（如 Aspose 计算卡死）时父进程永久等待，
+    # 任务挂死。超时后强杀进程树并推送失败事件。
+    try:
+        _proc_timeout = int(os.getenv("COMPUTE_PROC_TIMEOUT", "3600"))
+    except (TypeError, ValueError):
+        _proc_timeout = 3600
 
     def _reader():
         proc = None
@@ -4308,6 +4340,7 @@ async def _run_compute_subprocess(task_id: str, buffer, params_file: str, temp_d
                 stderr=_subprocess.STDOUT,
                 env=_env,
             )
+            _state["proc"] = proc   # 供主协程超时后强杀
             for raw in proc.stdout:
                 line = raw.decode("utf-8", "replace").rstrip("\r\n")
                 if line.startswith(_EVT_PREFIX):
@@ -4329,7 +4362,37 @@ async def _run_compute_subprocess(task_id: str, buffer, params_file: str, temp_d
     _t = _threading.Thread(target=_reader, name=f"compute-subproc-{task_id}", daemon=True)
     _t.start()
     try:
-        await done.wait()
+        try:
+            await asyncio.wait_for(done.wait(), timeout=_proc_timeout)
+        except asyncio.TimeoutError:
+            # 真超时：强杀子进程树（taskkill /F /T），推送失败事件并持久化失败状态。
+            # 历史上 await done.wait() 无超时——子进程假死（Aspose 计算卡死/内存失控）时
+            # 永久等待，任务挂死且子进程继续吃内存 → VM swap 风暴假死。
+            _proc = _state.get("proc")
+            if _proc is not None and _proc.poll() is None:
+                logger.error(f"[compute/subproc] 计算子进程超时（{_proc_timeout}s），强杀: {_proc.pid}")
+                try:
+                    from backend.utils.subprocess_runner import _kill_tree
+                    _kill_tree(_proc.pid)
+                except Exception:
+                    try:
+                        _proc.kill()
+                    except Exception:
+                        pass
+            _msg = f"计算超时（{_proc_timeout}s），已强制终止"
+            try:
+                buffer.push(task_id, json.dumps({"type": "error", "message": _msg}, ensure_ascii=False))
+            except Exception:
+                pass
+            try:
+                from backend.database.connection import SessionLocal as _SL2
+                _db2 = _SL2()
+                try:
+                    _persist_compute_failed(_db2, int(task_id), _msg)
+                finally:
+                    _db2.close()
+            except Exception:
+                pass
         if _state["start_error"] is not None:
             e = _state["start_error"]
             logger.error(f"[compute/subproc] 子进程启动/读取失败: {e}", exc_info=e)
@@ -5026,7 +5089,7 @@ async def run_compute_task(
                             if (template_override_path and os.path.exists(template_override_path))
                             else _tpl_for_fmt)
             from backend.utils.output_postprocess import (
-                restore_formats_from_template, normalize_source_sheet_formats,
+                restore_formats_from_template, _normalize_source_sheet_formats_impl,
             )
             _tpl_ok = bool(_eff_tpl_fmt and os.path.exists(_eff_tpl_fmt))
             for _of in output_files:
@@ -5037,7 +5100,8 @@ async def run_compute_task(
                 # 源_ sheet 兜底：修复继承模板"日期/时间默认样式"导致数字显示成日期的问题
                 # （覆盖旧脚本，零误伤：只拉回恰好等于默认格式的单元格）。模板不可用时（跨环境
                 # 烘焙路径不存在）内部回退用输出文件自身默认样式，故无论模板在不在都跑。
-                await asyncio.to_thread(normalize_source_sheet_formats, str(_of),
+                # 注意：本段已在智算子进程内，直接调 _impl（防嵌套子进程占双倍并发槽/死锁）。
+                await asyncio.to_thread(_normalize_source_sheet_formats_impl, str(_of),
                                         _eff_tpl_fmt if _tpl_ok else None)
         except Exception as _fmt_e:
             logger.warning(f"[fmt兜底] 跳过: {_fmt_e}")
@@ -7145,7 +7209,7 @@ async def get_training_detail(
                         if monthly_standard_hours is not None:
                             execution_env["monthly_standard_hours"] = monthly_standard_hours
 
-                        exec_result = code_sandbox.execute_script(script_content, execution_env)
+                        exec_result = await asyncio.to_thread(code_sandbox.execute_script, script_content, execution_env)
 
                         if exec_result["success"]:
                             output_files = list(output_dir.glob("*.xlsx"))
@@ -7153,7 +7217,7 @@ async def get_training_detail(
                                 output_file = output_files[0]
                                 # COM公式计算
                                 try:
-                                    calculate_excel_formulas(str(output_file))
+                                    await asyncio.to_thread(calculate_excel_formulas, str(output_file))
                                 except Exception:
                                     pass
 

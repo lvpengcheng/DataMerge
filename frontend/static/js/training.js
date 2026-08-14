@@ -14,6 +14,7 @@ let _filePasswordsMap = {};
 let _chatStreamEl = null;   // AI 对话流式输出的 DOM 元素
 let _chatStreamBuf = '';    // AI 对话流式输出的文本缓冲
 let _chatThinkingBuf = '';  // DeepSeek 推理模型思考过程缓冲（灰色区显示，不进入正式内容）
+let _chatThinkingTimer = null;  // 思考渲染节流器（100ms 合并一次 DOM 更新，防 O(n²) 卡死页面）
 let _pendingScriptName = null;  // 新建训练时由用户命名的脚本名（仅新建会话首次提交时使用）
 
 // ===== 对话历史分页（B 方案：初始最近 5 轮，上划加载更早）=====
@@ -716,13 +717,29 @@ function _addSystemMessage(content, msgType, metadata, target) {
     return contentDiv;
 }
 
-function _updateStreamingMessage(contentDiv, text, thinkingText) {
-    // 思考过程（灰色区，不转 markdown 避免样式污染）+ 正式内容
-    if (thinkingText) {
-        contentDiv.innerHTML =
-            `<div class="thinking-block">${_escapeHtml(thinkingText)}</div>` + _renderMarkdown(text || '');
-    } else {
-        contentDiv.innerHTML = _renderMarkdown(text);
+function _updateStreamingMessage(contentDiv, text, thinkingText, thinkingDirty) {
+    // 思考过程用【增量 textContent】更新（不重解析 HTML/markdown）：DeepSeek 思考 token 逐块
+    // 到达且思考可能长达数分钟/数万字，每 token 全量 _escapeHtml(全部思考)+markdown 重建是
+    // O(n²)，思考越长页面越卡（表现为无响应）。textContent 赋值 O(1) 且自动转义。
+    let tb = contentDiv.querySelector('.thinking-block');
+    if (thinkingDirty && thinkingText) {
+        if (!tb) {
+            tb = document.createElement('div');
+            tb.className = 'thinking-block';
+            contentDiv.prepend(tb);
+        }
+        tb.textContent = thinkingText;
+    }
+    if (text !== undefined) {
+        let body = contentDiv.querySelector('.msg-content-body');
+        if (!body) {
+            body = document.createElement('div');
+            body.className = 'msg-content-body';
+            contentDiv.textContent = '';      // 清除占位文本（连带移除子元素，重建顺序）
+            if (tb) contentDiv.appendChild(tb);
+            contentDiv.appendChild(body);
+        }
+        body.innerHTML = _renderMarkdown(text || '');
     }
     const container = document.getElementById('chat-messages');
     container.scrollTop = container.scrollHeight;
@@ -732,9 +749,12 @@ function _finishStreamingMessage(contentDiv) {
     contentDiv.classList.remove('streaming-cursor');
 }
 
-// 代码流式追加：将 AI 生成的代码片段逐步显示
+// 代码流式追加：将 AI 生成的代码片段逐步显示。
+// 性能优化：每 chunk 全量 _renderMarkdown(全部代码) 是 O(n²)（长代码/多轮修正时页面卡死），
+// 改为累积 + 100ms 节流渲染；_finishCodeStream 时 flush 最终完整代码。
 let _codeStreamEl = null;
 let _codeStreamBuf = '';
+let _codeStreamTimer = null;
 
 function _appendCodeStream(chunk) {
     const container = document.getElementById('chat-messages');
@@ -762,13 +782,24 @@ function _appendCodeStream(chunk) {
     }
 
     _codeStreamBuf += chunk;
-    // 渲染为 markdown 代码块
+    if (_codeStreamTimer) return;   // 节流：已有排程
+    _codeStreamTimer = setTimeout(() => {
+        _codeStreamTimer = null;
+        _renderCodeStreamOnce();
+    }, 100);
+}
+
+function _renderCodeStreamOnce() {
+    if (!_codeStreamEl) return;
     _codeStreamEl.innerHTML = _renderMarkdown('```python\n' + _codeStreamBuf + '\n```');
+    const container = document.getElementById('chat-messages');
     container.scrollTop = container.scrollHeight;
 }
 
 function _finishCodeStream() {
     if (_codeStreamEl) {
+        if (_codeStreamTimer) { clearTimeout(_codeStreamTimer); _codeStreamTimer = null; }
+        _renderCodeStreamOnce();   // flush：渲染完整最终代码
         _codeStreamEl.classList.remove('streaming-cursor');
         _codeStreamEl = null;
         _codeStreamBuf = '';
@@ -1249,26 +1280,30 @@ function _handleSSEEvent(event) {
             break;
 
         case 'thinking':
-            // DeepSeek 推理模型思考过程：灰色区流式显示（不进入正式内容）
+            // DeepSeek 推理模型思考过程：灰色区流式显示（不进入正式内容）。
+            // 思考 token 逐块到达（可能数分钟/数万字），每 token 全量重渲染是 O(n²) 页面卡死源；
+            // 改为累积 + 100ms 节流 + 增量 textContent（_updateStreamingMessage 已优化）。
             if (!_chatStreamEl) {
                 _chatStreamEl = _addMessage('assistant', '', true);
                 _chatStreamBuf = '';
                 _chatThinkingBuf = '';
             }
             _chatThinkingBuf += event.content;
-            _updateStreamingMessage(_chatStreamEl, _chatStreamBuf, _chatThinkingBuf);
+            if (!_chatThinkingTimer) {
+                _chatThinkingTimer = setTimeout(() => {
+                    _chatThinkingTimer = null;
+                    _updateStreamingMessage(_chatStreamEl, undefined, _chatThinkingBuf, true);
+                }, 100);
+            }
             break;
 
         case 'chat_done':
             // AI 对话完成
             if (_chatStreamEl) {
+                if (_chatThinkingTimer) { clearTimeout(_chatThinkingTimer); _chatThinkingTimer = null; }
                 _finishStreamingMessage(_chatStreamEl);
                 // 用最终完整内容重新渲染（确保 markdown 完整；思考过程保留在灰色区）
-                _chatStreamEl.innerHTML =
-                    (_chatThinkingBuf
-                        ? `<div class="thinking-block">${_escapeHtml(_chatThinkingBuf)}</div>`
-                        : '') +
-                    _renderMarkdown(_chatStreamBuf || event.content);
+                _updateStreamingMessage(_chatStreamEl, _chatStreamBuf || event.content, _chatThinkingBuf, true);
                 _chatStreamEl = null;
                 _chatStreamBuf = '';
                 _chatThinkingBuf = '';

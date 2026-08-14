@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import logging
+import asyncio
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List
@@ -1259,7 +1260,10 @@ async def generate_report(
     logger.info(f"报表模式: {report_mode}, group_by={group_by_field}, split_by={split_by_field}, skip_rows={skip_rows_val}")
 
     try:
-        actual_output_path = aspose_helper.generate_from_template(
+        # 子进程 + to_thread：SmartMarker 填充/公式计算在子进程执行（超时/内存护栏），
+        # to_thread 保证事件循环不被同步等待冻结（多客户并发时其他请求照常响应）。
+        actual_output_path = await asyncio.to_thread(
+            aspose_helper.generate_from_template,
             output_path=output_path,
             template_path=tpl.file_path,
             data=template_data,

@@ -3570,7 +3570,8 @@ class IntelligentExcelParser:
             col = self._get_column_number(column_letter)
             cell = worksheet.cell(row, col)
             
-            data_row[column_letter] = self._unify_key_value(header, self._get_cell_value(cell))
+            # 传 header：非日期列的"日期格式数值"按原值读取（防 AI 样例把工资等数值列读成日期）
+            data_row[column_letter] = self._unify_key_value(header, self._get_cell_value(cell, header))
             
             if cell.formula:
                 cell_address = f"{column_letter}{row}"
@@ -3893,8 +3894,16 @@ class IntelligentExcelParser:
         text_lower = text.lower()
         return any(keyword.lower() in text_lower for keyword in self.HEADER_KEYWORDS)
     
-    def _get_cell_value(self, cell: Any) -> Any:
-        """获取单元格值"""
+    def _get_cell_value(self, cell: Any, header: Any = None) -> Any:
+        """获取单元格值。
+
+        header 传列名时（数据读取路径）：非日期列的"日期格式数值"按原值读取（DoubleValue）。
+        根因：源文件数值列被误套日期格式（如工资 8500 套 [$-F400]h:mm:ss），Aspose 对
+        日期格式单元格返回 DateTime（8500 → 1923-04-17），旧代码 year>1900 全部转 datetime
+        → AI 样例里工资列全是日期 → AI 按日期写入 → 结果表数值列变日期。
+        与 bulk 路径（_normalize_exported_value + 3173 的日期读取策略）逻辑一致：
+        仅"日期关键词列 或 明确日期格式(yyyy-mm-dd/年月日)"才当日期读，否则取底层数值。
+        """
         if cell.value is None:
             return None
         # .NET DateTime（逐格路径 _AsposeCell 保留的原始类型；isinstance(datetime) 对它为 False）
@@ -3902,6 +3911,24 @@ class IntelligentExcelParser:
         if type(cell.value).__name__ == 'DateTime':
             try:
                 dv = cell.value
+                # 有列名上下文（数据读取）：非日期列 → 直接取 DoubleValue 底层数字（精确无损）
+                if header is not None:
+                    try:
+                        from backend.utils.source_sheet_writer import is_date_keyword_column
+                        _is_date = bool(is_date_keyword_column(header))
+                    except Exception:
+                        _is_date = False
+                    if not _is_date:
+                        try:
+                            _st = cell._cell.GetStyle()
+                            _is_date = self._fmt_is_clear_date(_st.Number, _st.Custom)
+                        except Exception:
+                            _is_date = False
+                    if not _is_date:
+                        try:
+                            return cell._cell.DoubleValue
+                        except Exception:
+                            pass
                 # 1900 闰年 bug 兜底：year<=1900 的伪日期（被套日期格式的小数字，如金额）
                 # 用 DoubleValue 取原始序列号，避免 1900-02-29 幽灵日导致的 ±1 位差。
                 if dv.Year <= 1900:

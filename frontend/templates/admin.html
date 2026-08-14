@@ -129,13 +129,15 @@
                     <option value="tenant">仅租户级</option>
                 </select>
                 <button class="btn btn-primary" onclick="Admin.showUploadRefData()">上传基础数据</button>
-                <label style="margin-left:8px;font-size:13px;color:#555;cursor:pointer;">
-                    <input type="checkbox" id="ref-show-inactive" onchange="Admin.loadRefData()"> 显示已停用
+                <button class="btn btn-danger" onclick="Admin.batchDeleteRefData()">批量删除</button>
+                <label style="margin-left:8px;font-size:13px;color:#555;cursor:pointer;display:inline-flex;align-items:center;gap:4px;">
+                    <input type="checkbox" id="ref-show-inactive" onchange="Admin.loadRefData()" style="margin:0;"> 显示已停用
                 </label>
             </div>
             <table class="data-table" id="ref-data-table">
                 <thead>
                     <tr>
+                        <th style="width:36px;"><input type="checkbox" id="ref-select-all" title="全选" style="margin:0;vertical-align:middle;"></th>
                         <th>ID</th>
                         <th>名称</th>
                         <th>分类</th>
@@ -327,6 +329,6 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260722a"></script>
-    <script src="/static/js/admin.js?v=20260812b"></script>
+    <script src="/static/js/admin.js?v=20260813a"></script>
 </body>
 </html>

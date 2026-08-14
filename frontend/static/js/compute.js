@@ -325,6 +325,33 @@ function _showPrecheckDialog(data) {
             if (e.target && e.target.matches && e.target.matches('select[data-ai-idx]')) _markAiDup();
         });
 
+        // ===== 改名候选重复检测：同一训练期望文件被多个上传文件选中 → 红色框实时标记 =====
+        // 两个上传文件（两行）选了同一个源文件时，这两个选择框红色高亮，一眼可辨。
+        const renameSelects = () => overlay.querySelectorAll('select[data-rename-uploaded]');
+        function _markRenameDup() {
+            const cnt = new Map();
+            renameSelects().forEach(sel => {
+                sel.style.border = '';
+                sel.style.background = '';
+                const v = sel.value;
+                if (v) cnt.set(v, (cnt.get(v) || 0) + 1);
+            });
+            let hasDup = false;
+            renameSelects().forEach(sel => {
+                if (sel.value && cnt.get(sel.value) > 1) {
+                    sel.style.border = '2px solid #f44336';
+                    sel.style.background = '#fff5f5';
+                    hasDup = true;
+                }
+            });
+            return hasDup;
+        }
+        overlay.addEventListener('change', (e) => {
+            if (e.target && e.target.matches && e.target.matches('select[data-rename-uploaded]')) _markRenameDup();
+        });
+        // 弹窗打开时也标记一次：AI 推荐项默认选中，可能已经重复
+        _markRenameDup();
+
         document.getElementById('_pre_cancel').onclick = () => {
             document.body.removeChild(overlay);
             resolve(null);
@@ -376,7 +403,8 @@ function _showPrecheckDialog(data) {
                     });
                 }
                 if (renameDups.length > 0) {
-                    alert('以下训练期望文件被多个上传文件选中，理论上应一一对应，请修正后再确认：\n' + renameDups.join('\n'));
+                    _markRenameDup();   // 先高亮重复的选择框，再弹提示
+                    alert('以下训练期望文件被多个上传文件选中（已用红色框标记），理论上应一一对应，请修正后再确认：\n' + renameDups.join('\n'));
                     return;
                 }
                 // 收集用户调整后的 AI 映射 → 转换为 file_mapping 结构

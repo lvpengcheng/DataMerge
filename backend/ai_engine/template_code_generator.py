@@ -342,7 +342,7 @@ class TemplateCodeGenerator:
    - 判断依据：sheet 名出现在 `_SOURCE_MAP` → 用 (a)；出现在 `_COL_MAP` → 用 (b) 真实名
    - 两类的 sheet 名都用 `'` 单引号包裹（Excel 规范）
    - 引用模板自带 sheet 做查找时用整列范围（`A:Z`），不受其表头行数影响
-5. **绝不**修改 cell.style/fill/font/border/number_format/alignment
+5. **绝不**修改 cell.style/fill/font/border/alignment；**number_format 例外**：仅当规则文档/附加说明**明确要求**设置 number_format（如长数字文本列设 `@`、数值列设 `General`、日期列设日期格式）时，按说明设置，否则不动
 6. **绝不**调 Workbook() 创建新 wb；**绝不** wb.save（外层会调）
 7. **绝不**硬编码 sheet 名/列字母字面量；用 `_COL_MAP` / `_SOURCE_MAP` 取
 8. **【Excel 公式拼写强约束 — 必读】写 VLOOKUP/IF/SUMIFS 公式时 f-string 引号必须严格分层**：

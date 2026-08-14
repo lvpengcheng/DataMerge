@@ -11,6 +11,7 @@ import tempfile
 import zipfile
 import logging
 import hashlib
+import asyncio
 from pathlib import Path
 from typing import List, Optional
 from concurrent.futures import ThreadPoolExecutor
@@ -168,8 +169,8 @@ def _regions_to_df(sd):
     return {"sheet": sd.sheet_name, "columns": base_cols, "df": out_df}
 
 
-def _parse_file_to_df(path: str):
-    """用 excel_parser 解析单文件（激活 sheet、先算公式），返回 {sheet, columns, df}。
+def _parse_file_to_df_impl(path: str):
+    """（子进程执行体）用 excel_parser 解析单文件（激活 sheet、先算公式），返回 {sheet, columns, df}。
 
     读【全部区域】：同结构的多个区域（如按人堆叠的块）纵向拼接成一张 df，避免只命中一块。
     df 列名为表头名（excel_parser 的 region.data 按列字母键，反查 head_data 改回表头名）。
@@ -183,6 +184,26 @@ def _parse_file_to_df(path: str):
     if not results or not results[0].regions:
         return {"sheet": "", "columns": [], "df": pd.DataFrame()}
     return _regions_to_df(results[0])
+
+
+def _parse_file_to_df(path: str):
+    """用 excel_parser 解析单文件（激活 sheet、先算公式），返回 {sheet, columns, df}。
+
+    在【独立子进程】执行：某些文件（公式密集/超大）会让 Aspose 解析长时间计算、
+    内存暴涨 → VM 假死（swap 风暴）。子进程超时/超内存会被强杀，主进程安全。
+    失败返回空 df（与 parse_excel_file 失败时的旧行为一致），详情记日志。
+    """
+    from backend.utils.subprocess_runner import run_in_subprocess, default_max_memory_mb, default_timeout
+
+    r = run_in_subprocess(
+        "backend.api.tools:_parse_file_to_df_impl", (str(path),),
+        timeout=default_timeout("parse"), max_memory_mb=default_max_memory_mb(),
+    )
+    if r.success:
+        return r.result
+    reason = "超时" if r.timed_out else ("内存超限" if r.killed_by_memory else r.error)
+    logger.error(f"[parse] 子进程解析失败（{reason}）: {path}")
+    return {"sheet": "", "columns": [], "df": pd.DataFrame()}
 
 
 def _session_dir(session_id: str) -> Path:
@@ -389,12 +410,13 @@ async def merge_analyze(
                 dest = sdir / name
                 dest.write_bytes(await uf.read())
                 # 上传规范化：误设日期格式的数字单元格重置为常规（避免被当日期读错）
+                # 解析走子进程 + to_thread：不冻结事件循环（多客户并发时其他请求照常响应）
                 try:
                     from ..utils.source_normalizer import normalize_misformatted_dates
-                    normalize_misformatted_dates(str(dest))
+                    await asyncio.to_thread(normalize_misformatted_dates, str(dest))
                 except Exception as _ne:
                     logger.warning(f"[merge] 日期格式规范化失败（继续）: {_ne}")
-                info = _parse_file_to_df(str(dest))
+                info = await asyncio.to_thread(_parse_file_to_df, str(dest))
                 cols = info["columns"]
                 fp = compute_header_fingerprint(cols)
                 _sk = guess_key_column(cols, info.get("df")) or (cols[0] if cols else "")
@@ -497,7 +519,7 @@ async def merge_execute(req: MergeExecuteRequest, current_user=Depends(get_curre
         for fp_path in sorted(sdir.iterdir()):
             if fp_path.suffix.lower() not in EXCEL_EXTS:
                 continue
-            info = _parse_file_to_df(str(fp_path))
+            info = await asyncio.to_thread(_parse_file_to_df, str(fp_path))
             parsed_files[fp_path.name] = {"df": info["df"]}
             files_columns[fp_path.name] = info["columns"]
 
@@ -545,7 +567,8 @@ async def merge_execute(req: MergeExecuteRequest, current_user=Depends(get_curre
             except Exception:
                 pass
             from ..utils.aspose_helper import generate_from_template
-            generate_from_template(str(out_path), str(tpl_abs), {"DT": df}, mode="fill")
+            await asyncio.to_thread(
+                generate_from_template, str(out_path), str(tpl_abs), {"DT": df}, mode="fill")
         else:
             write_merged_xlsx(result, str(out_path))
         data = out_path.read_bytes()
@@ -750,8 +773,8 @@ def _integrate_session_dir(session_id: str) -> Path:
     return INTEGRATE_SESSION_ROOT / safe
 
 
-def _parse_file_full(path: str):
-    """解析单文件激活页最优区域，额外返回区域坐标（供原地回填主表定位）。
+def _parse_file_full_impl(path: str):
+    """（子进程执行体）解析单文件激活页最优区域，额外返回区域坐标（供原地回填主表定位）。
 
     返回 {sheet, columns, df, head_data{表头->列字母}, data_row_start, data_row_end}（1-based 行）。
     """
@@ -784,6 +807,27 @@ def _parse_file_full(path: str):
     }
 
 
+def _parse_file_full(path: str):
+    """解析单文件激活页最优区域，额外返回区域坐标（供原地回填主表定位）。
+
+    在【独立子进程】执行（同 _parse_file_to_df 的防护说明）；失败返回空结构
+    （与 parse_excel_file 失败时的旧行为一致），后续列校验会给出明确报错。
+    """
+    from backend.utils.subprocess_runner import run_in_subprocess, default_max_memory_mb, default_timeout
+
+    empty = {"sheet": "", "columns": [], "df": pd.DataFrame(),
+             "head_data": {}, "data_row_start": 0, "data_row_end": 0}
+    r = run_in_subprocess(
+        "backend.api.tools:_parse_file_full_impl", (str(path),),
+        timeout=default_timeout("parse"), max_memory_mb=default_max_memory_mb(),
+    )
+    if r.success:
+        return r.result
+    reason = "超时" if r.timed_out else ("内存超限" if r.killed_by_memory else r.error)
+    logger.error(f"[parse] 子进程解析失败（{reason}）: {path}")
+    return empty
+
+
 @router.post("/integrate/analyze")
 async def integrate_analyze(
     files: List[UploadFile] = File(...),
@@ -813,12 +857,13 @@ async def integrate_analyze(
             dest = sdir / name
             dest.write_bytes(await uf.read())
             # 上传规范化：误设日期格式的数字单元格重置为常规（避免被当日期读错）
+            # 解析走子进程 + to_thread：不冻结事件循环（多客户并发时其他请求照常响应）
             try:
                 from ..utils.source_normalizer import normalize_misformatted_dates
-                normalize_misformatted_dates(str(dest))
+                await asyncio.to_thread(normalize_misformatted_dates, str(dest))
             except Exception as _ne:
                 logger.warning(f"[integrate] 日期格式规范化失败（继续）: {_ne}")
-            info = _parse_file_to_df(str(dest))
+            info = await asyncio.to_thread(_parse_file_to_df, str(dest))
             cols = info["columns"]
             df = info.get("df")
             files_meta.append({
@@ -954,12 +999,21 @@ def _validate_integrate_columns(parsed, key_map, overwrite_pairs, compare_pairs,
             continue
         fcols = _cols(f)
         expr = str(expr)
+        # 已知列：本表裸列 + 所有对照表的 `文件名.列名` 跨表引用（与 eval_source_expr_cross 语法一致）
         refs = _expr_columns(expr, fcols)
         if expr in fcols:
             refs.append(expr)
-        # 把已知列抠掉后，剩下的非数字/运算符 token 即"引用但不存在"的列名
+        cross_refs = []
+        for _fn in parsed.keys():
+            if _fn == main_file:
+                continue
+            _fcols = _cols(_fn)
+            cross_refs += [f"{_fn}.{_c}" for _c in _fcols]
+        refs += [c for c in cross_refs if c in expr]
+        # 把已知列抠掉后，剩下的非数字/运算符 token 即"引用但不存在"的列名。
+        # 必须按长度降序抠：`B.xlsx.基本工资` 里的 `基本工资` 会被裸列先抠掉导致剩 `B.xlsx.` 误报。
         subst = expr
-        for c in refs:
+        for c in sorted(refs, key=len, reverse=True):
             subst = subst.replace(c, " ")
         unresolved = [t for t in re.split(r"[+\*/()\s]+", subst)
                       if t and not re.fullmatch(r"[0-9eE.+\-*/()]*", t)]
@@ -986,12 +1040,13 @@ async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(g
 
     try:
         # 解析：主表要区域坐标，对照表只要 df
-        main_info = _parse_file_full(str(main_path))
+        # 解析走子进程 + to_thread：不冻结事件循环（多客户并发时其他请求照常响应）
+        main_info = await asyncio.to_thread(_parse_file_full, str(main_path))
         parsed = {req.main_file: {"df": main_info["df"], "sheet": main_info["sheet"]}}
         for fp_path in sorted(sdir.iterdir()):
             if fp_path.suffix.lower() not in EXCEL_EXTS or fp_path.name == req.main_file:
                 continue
-            _info = _parse_file_to_df(str(fp_path))
+            _info = await asyncio.to_thread(_parse_file_to_df, str(fp_path))
             parsed[fp_path.name] = {"df": _info["df"], "sheet": _info["sheet"]}
 
         # 执行前预检：方案引用的列必须真实存在，报错精确到 文件+sheet+列（缺列历史上是静默的）
@@ -1012,7 +1067,7 @@ async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(g
         # 先执行覆盖回填并生成结果文件（含公式重算）。差异对比放到生成之后，
         # 基于【最终生成文件】的实时值比对，避免用主表覆盖前的缓存旧值。
         out_path = sdir / f"整合结果_{req.main_file}"
-        stat = apply_integration(
+        stat = await asyncio.to_thread(apply_integration,
             main_path=str(main_path), out_path=str(out_path),
             sheet_name=main_info["sheet"], head_data=main_info["head_data"],
             a_key_col=req.key_map.get(req.main_file),
@@ -1026,7 +1081,7 @@ async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(g
         # 对比差异（仅输出方式2且配了对比列时）：重新解析生成文件取重算后的实时值再比对。
         # 覆盖列联动的公式（如按被覆盖列计算的合计）此时已重算，比对结果才是最终文件的真实差异。
         if req.output_mode == 2 and req.compare_pairs:
-            final_info = _parse_file_full(str(out_path))
+            final_info = await asyncio.to_thread(_parse_file_full, str(out_path))
             diff_rows = compute_diffs(
                 final_info["df"], source_indexes,
                 a_key_col=req.key_map.get(req.main_file),
@@ -1036,7 +1091,8 @@ async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(g
                 label_source=(n_sources > 1),
                 date_key_mode=req.date_key_mode,
             )
-            stat["diff_rows"] = append_diff_sheet(str(out_path), diff_rows, req.diff_order)
+            stat["diff_rows"] = await asyncio.to_thread(
+                append_diff_sheet, str(out_path), diff_rows, req.diff_order)
 
         data = out_path.read_bytes()
         buf = io.BytesIO(data)

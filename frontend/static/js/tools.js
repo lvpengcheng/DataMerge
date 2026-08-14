@@ -98,6 +98,16 @@ const Tools = {
         // 内容较宽的弹窗用 modal--wide 加宽
         const modalEl = document.getElementById('modal');
         if (modalEl) modalEl.classList.toggle('modal--wide', !!(opts && opts.wide));
+        // 自定义确认按钮文案（如"确定匹配"）；无回调时隐藏底部按钮栏，避免与 body 内按钮重复成 4 个
+        const confirmBtn = document.getElementById('modal-confirm');
+        const footer = confirmBtn ? confirmBtn.closest('.modal-footer') : null;
+        if (opts && opts.confirmText && confirmBtn) confirmBtn.textContent = opts.confirmText;
+        else if (confirmBtn) confirmBtn.textContent = '确定';
+        if (onConfirm) {
+            if (footer) footer.style.display = '';
+        } else if (footer) {
+            footer.style.display = 'none';
+        }
         _modalCallback = onConfirm;
     },
 
@@ -480,11 +490,7 @@ const Tools = {
                     请为每个角色指定实际对应的上传文件（每个文件只能指定给一个角色）：
                 </div>
                 ${rows}
-                <div style="margin-top:12px;display:flex;justify-content:flex-end;gap:8px;">
-                    <button class="btn" onclick="Tools._intAmbResolve(false)">取消</button>
-                    <button class="btn btn-primary" onclick="Tools._intAmbResolve(true)">确定匹配</button>
-                </div>
-            `, null);
+            `, () => this._intAmbResolve(true), { confirmText: '确定匹配' });
             this._intAmbResolve = (ok) => {
                 if (!ok) { this.closeModal(); resolve(false); return; }
                 const mapping = {};
@@ -884,16 +890,27 @@ const Tools = {
     // 公式校验：去掉本表所有列名后，只允许 +-*/、数字、括号、小数点、空白。
     // 列名被改动/写错 → 无法识别的残余会留在 rest 里，据此判定不合法（实现「列名不可编辑」）。
     _intCheckFx(file, expr) {
-        const cols = (this._intFileMeta(file)?.columns || []).slice().sort((a, b) => b.length - a.length);
+        const cols = this._intAllCols(file);
         let rest = expr || '';
         cols.forEach(c => { if (c) rest = rest.split(c).join(' '); });
         return { ok: /^[0-9eE.+\-*/()\s]*$/.test(rest), rest: rest.trim() };
     },
 
+    // 公式可引用的全部列 token（长名优先）：本表裸列 + 其他对照表的 `文件名.列名`（跨表引用）。
+    _intAllCols(file) {
+        const cols = [];
+        (this._intColsOf(file) || []).forEach(c => { if (c) cols.push(c); });
+        this._intNonMainFiles().forEach(f => {
+            if (f.name === file) return;
+            (f.columns || []).forEach(c => { if (c) cols.push(`${f.name}.${c}`); });
+        });
+        return cols.slice().sort((a, b) => b.length - a.length);
+    },
+
     // 公式分词：按已知列名（长名优先）把公式拆成 {t:'col'|'op'|'other', v} 序列，空白丢弃。
     // 供勾选联动做增量增删列，避免整体重写冲掉用户手动写的括号/常数/运算符。
     _intTokenize(expr, file) {
-        const cols = (this._intFileMeta(file)?.columns || []).slice().filter(Boolean).sort((a, b) => b.length - a.length);
+        const cols = this._intAllCols(file);
         const s = expr || '';
         const toks = [];
         const isOp = ch => '+-*/()'.indexOf(ch) >= 0;
@@ -965,9 +982,23 @@ const Tools = {
             <div style="font-size:12px;color:#888;margin-bottom:8px;">
               每张对照表勾选列 → 下方公式框自动用「+」连接，可手动改（仅支持列名与 +-*/、数字、括号）。
               多张表都填时，靠上的优先（取首个非空）。同一主键多行会先把各列跨行求和再代入公式。
+              支持<u>跨表公式</u>：勾选「引用其他表列」即可把 <code>文件名.列名</code> 加入公式（如 B.xlsx.基本工资*C.xlsx.补贴）。
             </div>
             ${files.map((f, fi) => {
                 const preset = exprByFile[f.name] || '';
+                const otherFiles = files.filter(x => x.name !== f.name);
+                const crossHtml = otherFiles.length ? `
+                    <div style="margin-bottom:6px;padding:5px 8px;background:#f3f8ff;border-radius:4px;">
+                        <div style="font-size:11px;color:#5d8ac2;margin-bottom:3px;">↪ 引用其他表列（跨表公式，按关联键对齐）：</div>
+                        <div style="display:flex;flex-wrap:wrap;gap:2px 12px;max-height:96px;overflow:auto;">
+                        ${otherFiles.map(of => (of.columns || []).map(c => {
+                            const token = `${of.name}.${c}`;
+                            const inExpr = preset && preset.indexOf(token) >= 0 ? 'checked' : '';
+                            return `<label style="display:inline-flex;align-items:center;gap:4px;font-size:12px;">
+                                <input type="checkbox" class="int-cross-cb" data-token="${_escape(token)}" ${inExpr} style="width:auto;"> ${_escape(token)}</label>`;
+                        }).join('')).join('')}
+                        </div>
+                    </div>` : '';
                 return `
                 <div class="int-fgrp" data-file="${_escape(f.name)}" style="margin-bottom:12px;padding-bottom:8px;border-bottom:1px dashed #e0e0e0;">
                     <div style="font-weight:600;color:#2c3e50;margin-bottom:4px;">📄 ${_escape(f.name)}</div>
@@ -978,11 +1009,12 @@ const Tools = {
                                 <input type="checkbox" class="int-srcpick-cb" data-file="${_escape(f.name)}" data-col="${_escape(c)}" ${inExpr} style="width:auto;"> ${_escape(c)}</label>`;
                         }).join('')}
                     </div>
+                    ${crossHtml}
                     <div style="display:flex;align-items:flex-start;gap:6px;">
                         <span style="font-size:12px;color:#666;white-space:nowrap;padding-top:6px;">公式：</span>
                         <div style="flex:1;">
                             <textarea class="int-fx" data-file="${_escape(f.name)}" rows="5"
-                                   placeholder="勾选上方列自动相加；列名不可改，只能编辑 + - * / 括号 数字（如 (基本工资+本月奖金)*0.8）"
+                                   placeholder="勾选上方列自动相加；列名不可改，只能编辑 + - * / 括号 数字（如 (基本工资+本月奖金)*0.8，跨表如 B.xlsx.基本工资*C.xlsx.补贴）"
                                    style="width:100%;box-sizing:border-box;font-size:13px;padding:4px 6px;line-height:1.5;resize:vertical;font-family:monospace;">${_escape(preset)}</textarea>
                             <div class="int-fx-err" data-file="${_escape(f.name)}" style="font-size:11px;color:#d32f2f;min-height:14px;margin-top:2px;"></div>
                         </div>
@@ -1038,6 +1070,12 @@ const Tools = {
                 accept(cb.checked
                     ? this._intFxAddCol(fx.value, cb.dataset.col, file)
                     : this._intFxRemoveCol(fx.value, cb.dataset.col, file));
+            }));
+            // 跨表列引用：勾选/取消 `文件名.列名` token
+            grp.querySelectorAll('.int-cross-cb').forEach(cb => cb.addEventListener('change', () => {
+                accept(cb.checked
+                    ? this._intFxAddCol(fx.value, cb.dataset.token, file)
+                    : this._intFxRemoveCol(fx.value, cb.dataset.token, file));
             }));
             validate();
         });

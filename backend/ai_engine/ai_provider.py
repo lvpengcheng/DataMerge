@@ -967,7 +967,8 @@ class OpenAIProvider(BaseAIProvider):
         super().__init__()
         self.api_key = config.get("api_key", os.getenv("OPENAI_API_KEY"))
         self.base_url = config.get("base_url", os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")).rstrip("/")
-        self.model = config.get("model", "gpt-4")
+        # config 无 model 键时兜底读 .env（避免调用方传 config 时丢 OPENAI_MODEL 配置）
+        self.model = config.get("model") or os.getenv("OPENAI_MODEL") or "gpt-4"
         self.max_tokens = config.get("max_tokens", int(os.getenv("OPENAI_MAX_TOKENS", "8000")))
         self.timeout = int(config.get("timeout", os.getenv("OPENAI_TIMEOUT", "300")))
 
@@ -1339,7 +1340,8 @@ class ClaudeProvider(BaseAIProvider):
         super().__init__()
         self.api_key = config.get("api_key", os.getenv("ANTHROPIC_API_KEY"))
         self.base_url = config.get("base_url", os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")).rstrip("/")
-        self.model = config.get("model", "claude-3-sonnet-20240229")
+        # config 无 model 键时兜底读 .env（避免调用方传 config 时丢 ANTHROPIC_MODEL 配置）
+        self.model = config.get("model") or os.getenv("ANTHROPIC_MODEL") or "claude-3-sonnet-20240229"
         self.max_tokens = config.get("max_tokens", int(os.getenv("ANTHROPIC_MAX_TOKENS", "80000")))
         self.timeout = config.get("timeout", int(os.getenv("ANTHROPIC_TIMEOUT", "600")))
 
@@ -1781,7 +1783,9 @@ class DeepSeekProvider(OpenAIProvider):
         BaseAIProvider.__init__(self)
         self.api_key = config.get("api_key", os.getenv("DEEPSEEK_API_KEY"))
         self.base_url = config.get("base_url", os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")).rstrip("/")
-        self.model = config.get("model", "deepseek-chat")
+        # config 无 model 键时兜底读 .env DEEPSEEK_MODEL（否则落到硬编码 deepseek-chat，
+        # 用户 .env 配置的模型（如 deepseek-v4-flash）不生效）
+        self.model = config.get("model") or os.getenv("DEEPSEEK_MODEL") or "deepseek-chat"
         self.max_tokens = config.get("max_tokens", int(os.getenv("DEEPSEEK_MAX_TOKENS", "80000")))
         self.timeout = int(config.get("timeout", os.getenv("DEEPSEEK_TIMEOUT", "300")))
 

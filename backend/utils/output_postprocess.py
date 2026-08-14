@@ -597,8 +597,11 @@ def _template_default_format(template_path):
 
 
 
-def normalize_source_sheet_formats(output_path, template_path=None, source_sheet_prefix="源_") -> int:
-    """修复 源_ sheet 继承模板"默认(Normal)样式"导致数字被显示成错误格式的问题。
+def _normalize_source_sheet_formats_impl(output_path, template_path=None,
+                                         source_sheet_prefix="源_", match_all_sheets=False) -> int:
+    """（子进程执行体）修复 sheet 继承模板"默认(Normal)样式"导致数字被显示成错误格式的问题。
+
+    match_all_sheets=True 时处理所有 sheet（智能组表结果无"源_"前缀，结果即模板激活 sheet）。
 
     根因：部分模板的 Normal/默认单元格样式 numFmt 不是 General（可能是日期格式如
     `[$-409]dd/mmm/yy;@`，也可能是时间格式 `[$-F400]h:mm:ss AM/PM` 或别的自定义数字
@@ -667,7 +670,7 @@ def normalize_source_sheet_formats(output_path, template_path=None, source_sheet
         touched = False
         for si in range(wb.Worksheets.Count):
             ws = wb.Worksheets[si]
-            if not (source_sheet_prefix and str(ws.Name).startswith(source_sheet_prefix)):
+            if not match_all_sheets and not (source_sheet_prefix and str(ws.Name).startswith(source_sheet_prefix)):
                 continue
             cells = ws.Cells
             try:
@@ -689,8 +692,13 @@ def normalize_source_sheet_formats(output_path, template_path=None, source_sheet
                 cell = it.Current
                 try:
                     style = cell.GetStyle()
-                    # 只动"格式恰好等于模板默认样式"的单元格（继承来的伪格式）
-                    if _norm_fmt(style.Custom) != _target:
+                    # 判定"继承模板默认样式的伪格式"：
+                    # 1) 未显式设格式（numFmtId=0 / Custom 空）→ Excel 显示时继承 Normal 默认样式
+                    #    （即 _target）——这是最主流的继承方式（openpyxl 写单元格不设格式时，
+                    #    cellXfs numFmtId=0，但显示走 Normal 的日期格式）；
+                    # 2) 显式设的格式恰好等于模板默认样式（openpyxl 显式继承的旧场景）。
+                    _explicit = (style.Number or 0) != 0 or bool((style.Custom or "").strip())
+                    if _explicit and _norm_fmt(style.Custom) != _target:
                         continue
                     if cell.Row > 0 and _date_col.get(cell.Column):
                         style.Custom = "yyyy-mm-dd"   # 真日期列 → 规范日期显示
@@ -714,6 +722,29 @@ def normalize_source_sheet_formats(output_path, template_path=None, source_sheet
         except Exception:
             pass
     return fixed
+
+
+def normalize_source_sheet_formats(output_path, template_path=None,
+                                   source_sheet_prefix="源_", match_all_sheets=False) -> int:
+    """修复 sheet 继承模板默认样式导致数字显示成日期的问题（在【独立子进程】执行）。
+
+    原实现主进程内 Aspose 逐格遍历+改样式+Save：脚本生成的结果文件可能很大，
+    upload-code 执行验证等路径在主进程跑会内存暴涨/极慢（卡死主凶之一）。
+    子进程超时/超内存强杀，失败返回 0（跳过兜底，不阻断流程）。
+    match_all_sheets=True：处理所有 sheet（智能组表等无"源_"前缀的结果）。
+    """
+    from backend.utils.subprocess_runner import run_in_subprocess, default_max_memory_mb, default_timeout
+
+    r = run_in_subprocess(
+        "backend.utils.output_postprocess:_normalize_source_sheet_formats_impl",
+        (str(output_path), template_path, source_sheet_prefix, match_all_sheets),
+        timeout=default_timeout("write"), max_memory_mb=default_max_memory_mb(),
+    )
+    if r.success:
+        return r.result or 0
+    reason = "超时" if r.timed_out else ("内存超限" if r.killed_by_memory else r.error)
+    logger.warning(f"[源_格式兜底] 子进程处理失败（{reason}），跳过: {output_path}")
+    return 0
 
 
 # 主键/ID 类列名关键词：跨源时这些列可能一处数字一处文本，VLOOKUP 精确匹配会因类型不同 #N/A。
