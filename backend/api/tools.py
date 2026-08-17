@@ -857,10 +857,18 @@ async def integrate_analyze(
             dest = sdir / name
             dest.write_bytes(await uf.read())
             # 上传规范化：误设日期格式的数字单元格重置为常规（避免被当日期读错）
-            # 解析走子进程 + to_thread：不冻结事件循环（多客户并发时其他请求照常响应）
+            # Aspose 操作全部走独立子进程（防 GIL 冻结主进程），失败不阻断
             try:
-                from ..utils.source_normalizer import normalize_misformatted_dates
-                await asyncio.to_thread(normalize_misformatted_dates, str(dest))
+                from backend.utils.subprocess_runner import (
+                    run_in_subprocess, default_max_memory_mb, default_timeout,
+                )
+                await asyncio.to_thread(
+                    run_in_subprocess,
+                    "backend.utils.source_normalizer:normalize_misformatted_dates",
+                    (str(dest),),
+                    timeout=default_timeout("parse"),
+                    max_memory_mb=default_max_memory_mb(),
+                )
             except Exception as _ne:
                 logger.warning(f"[integrate] 日期格式规范化失败（继续）: {_ne}")
             info = await asyncio.to_thread(_parse_file_to_df, str(dest))

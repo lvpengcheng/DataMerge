@@ -606,6 +606,35 @@ def _get_pool() -> Optional[_WorkerPool]:
             return None
 
 
+def _run_entry_sync(entry: str, args: tuple, kwargs: dict, progress_cb) -> SubprocessResult:
+    """子进程内同步执行（防嵌套死锁）：不 Popen，直接在本进程调用 entry。
+
+    场景：对比/整合的 impl 内部还会调用 run_in_subprocess（如公式计算 _aspose_calc_impl），
+    在常驻池里 worker A 执行时嵌套请求池 → 并发满时排队等 queue_timeout(600s) → 卡死。
+    检测到 _IN_SUBPROCESS_WORKER 标记后直接同步执行，同进程内调用无并发槽占用。
+    """
+    import importlib
+    import traceback as _tb
+
+    res = SubprocessResult()
+    t0 = time.time()
+    try:
+        kwargs = dict(kwargs or {})
+        if progress_cb is not None:
+            kwargs[_PROGRESS_MARK] = True
+        module_path, _, func_name = entry.partition(":")
+        module = importlib.import_module(module_path)
+        func = getattr(module, func_name)
+        if kwargs.pop(_PROGRESS_MARK, None):
+            kwargs["progress_cb"] = progress_cb
+        res.result = func(*args, **kwargs)
+        res.success = True
+    except Exception as e:
+        res.error = "".join(_tb.format_exception_only(type(e), e)).strip()
+    res.duration = time.time() - t0
+    return res
+
+
 def run_in_subprocess(
     entry: str,
     args: tuple = (),
@@ -618,8 +647,12 @@ def run_in_subprocess(
 
     优先走常驻 worker 池（省掉每次启动的 Aspose 初始化开销，20-30s → <1s）；
     池不可用时回退单任务模式（每次新进程）。接口与行为语义不变。
+
+    子进程内（_IN_SUBPROCESS_WORKER 标记）直接同步执行：防池内嵌套请求池死锁。
     """
     max_memory_mb = default_max_memory_mb() if max_memory_mb is None else max_memory_mb
+    if os.environ.get("_IN_SUBPROCESS_WORKER") == "1":
+        return _run_entry_sync(entry, args, kwargs, progress_cb)
     pool = _get_pool()
     if pool is not None:
         return pool.run(entry, args, kwargs, timeout, max_memory_mb, progress_cb)

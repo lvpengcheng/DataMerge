@@ -117,6 +117,13 @@ def _run_task(params: dict, task_id: str = "") -> None:
         sys.stdout.flush()
 
 
+def _mark_in_subprocess():
+    """标记当前进程是 subprocess worker：run_in_subprocess 据此【直接同步执行】，
+    防止池内嵌套请求池导致并发占满排队死锁（对比/整合 impl 内部还会再调子进程）。
+    """
+    os.environ["_IN_SUBPROCESS_WORKER"] = "1"
+
+
 def daemon_main():
     """常驻 worker 循环：预加载 Aspose/excel_parser，然后循环读 stdin 任务行。
 
@@ -129,6 +136,7 @@ def daemon_main():
         load_dotenv(override=True)
     except Exception:
         pass
+    _mark_in_subprocess()
     # 预加载 Aspose + excel_parser：这是常驻 worker 省掉 20-30s 初始化开销的关键
     try:
         import aspose_init
@@ -172,6 +180,7 @@ def main():
         load_dotenv(override=True)
     except Exception:
         pass
+    _mark_in_subprocess()
     if len(sys.argv) >= 2 and sys.argv[1] == "--daemon":
         daemon_main()
         return
