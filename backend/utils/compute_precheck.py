@@ -163,17 +163,26 @@ def precheck_compute(
     # 步骤 3：表头匹配
     if not result.missing_files:
         try:
-            from .fast_header_matcher import FastHeaderMatcher
-            matcher = FastHeaderMatcher()
             input_files = _collect_input_files(source_dir)
             if input_files:
-                ok, err, file_mapping, _pre = matcher.match_parse_and_prepare(
-                    source_structure=source_structure,
-                    input_files=input_files,
-                    manual_headers=manual_headers,
-                    output_dir=None,  # 校验阶段不写 fallback
-                    expected_structure=expected_structure,
+                # 全量解析（多文件 Aspose 打开）在【独立子进程】执行：
+                # Aspose 持 GIL 会冻结主进程（其他请求全卡 → IIS 502 / 服务器假死），
+                # 日志实证：主进程跑几十个文件解析可卡 10-30 分钟。子进程内爆只炸自己。
+                from backend.utils.subprocess_runner import (
+                    run_in_subprocess, default_max_memory_mb, default_timeout,
                 )
+                _r = run_in_subprocess(
+                    "backend.utils.compute_precheck:_header_match_subprocess",
+                    (source_structure, input_files, manual_headers, expected_structure),
+                    timeout=default_timeout("parse"),
+                    max_memory_mb=default_max_memory_mb(),
+                )
+                if _r.success:
+                    ok, err, file_mapping, _pre = _r.result
+                else:
+                    reason = "超时" if _r.timed_out else ("内存超限" if _r.killed_by_memory else _r.error)
+                    logger.warning(f"[Precheck] 解析子进程失败（{reason}），跳过表头匹配")
+                    ok, err, file_mapping, _pre = False, f"解析子进程失败（{reason}）", None, None
                 if ok and file_mapping:
                     result.file_mapping = file_mapping
                 else:
@@ -199,6 +208,27 @@ def precheck_compute(
     _check_target_sheets(script_content, tenant_id, template_override_path, confirmed_target_map, result)
 
     return result
+
+
+def _header_match_subprocess(
+    source_structure: dict,
+    input_files: list,
+    manual_headers: Optional[dict],
+    expected_structure: Optional[dict],
+):
+    """模块级包装（subprocess_runner 定位入口）：全量解析 + 表头匹配在独立子进程执行。
+
+    返回 (ok, err, file_mapping, pre_loaded_data)；参数/返回均可 pickle。
+    """
+    from .fast_header_matcher import FastHeaderMatcher
+    matcher = FastHeaderMatcher()
+    return matcher.match_parse_and_prepare(
+        source_structure=source_structure,
+        input_files=input_files,
+        manual_headers=manual_headers,
+        output_dir=None,  # 校验阶段不写 fallback
+        expected_structure=expected_structure,
+    )
 
 
 def _extract_colmap(script_content: str) -> Optional[Dict[str, Any]]:
