@@ -92,6 +92,15 @@ class _AsposeMergedRange:
         self.min_col = aspose_range.StartColumn + 1
         self.max_col = aspose_range.EndColumn + 1
 
+    def __contains__(self, coord) -> bool:
+        """openpyxl CellRange 支持 `coord in range`（如 'A1'）。"""
+        try:
+            from openpyxl.utils.cell import coordinate_to_tuple
+            r, c = coordinate_to_tuple(str(coord))
+            return self.min_row <= r <= self.max_row and self.min_col <= c <= self.max_col
+        except Exception:
+            return False
+
 
 class _AsposeMergedCells:
     """适配 openpyxl merged_cells.ranges 接口"""
@@ -1640,19 +1649,27 @@ class IntelligentExcelParser:
         if len(regions) < 2:
             return
 
+        # primary 选择：真实表头（非 fake）中优先【数据行数最多】的区域
+        # （单行表头仅作平局偏好）。原逻辑只认"单行表头"，会把真实的两行表头区域
+        # 跳过、选到合并横幅伪区域（如"开票明细_B..."），随后反向覆盖真实表头（真实事故）。
         primary = None
+        best_rows = -1
+        primary_single = 0
         for r in regions:
             if self._is_fake_merged_header(r.head_data):
                 continue
-            if r.head_row_start == r.head_row_end:
+            rows = (r.data_row_end - r.data_row_start + 1) if r.data_row_start > 0 else 0
+            single = 1 if r.head_row_start == r.head_row_end else 0
+            if primary is None or (rows, single) > (best_rows, primary_single):
                 primary = r
-                break
+                best_rows, primary_single = rows, single
         if primary is None:
             return
 
         primary_sig = tuple(sorted(primary.head_data.values()))
         primary_head = dict(primary.head_data)
         primary_keys = set(primary_head.keys())
+        primary_rows = (primary.data_row_end - primary.data_row_start + 1) if primary.data_row_start > 0 else 0
 
         for r in regions:
             if r is primary or self._is_fake_merged_header(r.head_data):
@@ -1662,6 +1679,10 @@ class IntelligentExcelParser:
             if set(r.head_data.keys()) == primary_keys:
                 continue
             if not self._looks_like_data_row_keys(list(r.head_data.keys())):
+                continue
+            # 保护：数据行数更多的区域不被数据更少的伪区域覆盖（反向纠正会毁掉真实表头）
+            _r_rows = (r.data_row_end - r.data_row_start + 1) if r.data_row_start > 0 else 0
+            if _r_rows > primary_rows:
                 continue
 
             r.head_data = dict(primary_head)
