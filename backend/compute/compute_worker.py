@@ -64,6 +64,12 @@ def main():
         load_dotenv(override=True)
     except Exception:
         pass
+
+    # 标记本进程为 subprocess worker：内部所有 run_in_subprocess 直接同进程同步执行，
+    # 不再新建常驻池(孙进程各预加载 Aspose ~4GB) → 防内存翻倍/进程树过深导致 swap 假死。
+    # 本 worker 已被父进程 COMPUTE_PROC_TIMEOUT 超时监控保护，无需再嵌套子进程隔离。
+    os.environ["_IN_SUBPROCESS_WORKER"] = "1"
+
     if len(sys.argv) < 2:
         sys.stderr.write("compute_worker: 缺少参数文件路径\n")
         sys.exit(2)

@@ -2772,7 +2772,11 @@ async def compare_excel(
         output_path = session_dir / output_filename
 
         logger.info(f"开始对比: {source_file.filename} vs {compare_file.filename}, 主键: {primary_keys_list}")
-        result = compare_excel_files_multi_sheet(
+        # 必须 await asyncio.to_thread：compare_excel_files_multi_sheet 内部是阻塞的
+        # run_in_subprocess（排队最多600s + Aspose算公式 + 读值对比）。async 端点里直接
+        # 同步调用会冻结整个事件循环 → 所有用户 SSE/状态轮询/其它请求全挂 → 表现为"对比卡死"。
+        result = await asyncio.to_thread(
+            compare_excel_files_multi_sheet,
             result_file=str(compare_path),
             expected_file=str(source_path),
             output_file=str(output_path),
