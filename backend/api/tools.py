@@ -61,7 +61,6 @@ async def split_by_banner(
     if not files:
         raise HTTPException(status_code=400, detail="未上传文件")
 
-    split_one_file = _import_split_one_file()
     work_dir = Path(tempfile.mkdtemp(prefix="split_banner_"))
     src_dir = work_dir / "src"
     out_dir = work_dir / "out"
@@ -89,8 +88,23 @@ async def split_by_banner(
             out_name = f"{src_path.stem}_split.xlsx"
             out_path = out_dir / out_name
             try:
-                split_one_file(src_path, out_path)
-                if out_path.exists():
+                # 在独立子进程执行拆分：Aspose(flatten)+openpyxl 逐单元格拷贝是重活且持 GIL，
+                # 直接在 async 端点内同步跑会冻结事件循环、且无超时/内存护栏（大文件曾 504）。
+                # 子进程有真超时+内存强杀；to_thread 避免阻塞事件循环。
+                from backend.utils.subprocess_runner import (
+                    run_in_subprocess, default_max_memory_mb, default_timeout,
+                )
+                r = await asyncio.to_thread(
+                    run_in_subprocess,
+                    "split_by_banner:split_one_file",
+                    (str(src_path), str(out_path)),
+                    timeout=default_timeout("write"),
+                    max_memory_mb=default_max_memory_mb(),
+                )
+                if not r.success:
+                    reason = "超时" if r.timed_out else ("内存超限" if r.killed_by_memory else r.error)
+                    errors.append(f"{name}: 拆分失败({reason})")
+                elif out_path.exists():
                     success_files.append(out_path)
                 else:
                     errors.append(f"{name}: 拆分未生成输出")

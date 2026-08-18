@@ -302,13 +302,16 @@ def eval_source_expr_cross(expr: str, default_file: str,
             return _s if all_num else first
         return None
 
-    # 3) 四则运算公式：列按数值代入（文本列按 0），出现未识别字符 → 非法
+    # 3) 四则运算公式：列按数值代入（文本列按 0）；数字字面量（如 字段+30 里的 30、
+    #    含小数点/科学计数 eE）原样保留进表达式；其它未识别字符 → 非法。
     subst = ""
     for t in toks:
         if t[0] == "col":
             _s, _first, all_num = t[3]
             subst += f"({_s if all_num else 0})"
         elif t[0] == "op":
+            subst += t[1]
+        elif t[0] == "raw" and t[1] in "0123456789.eE":
             subst += t[1]
         else:
             return None
