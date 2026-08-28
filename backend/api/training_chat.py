@@ -34,10 +34,164 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/training/chat", tags=["对话式训练"])
 
-_executor = ThreadPoolExecutor(max_workers=4)
+def _bounded_env_int(name: str, default: int, upper: int) -> int:
+    try:
+        return max(1, min(int(os.getenv(name, str(default))), upper))
+    except (TypeError, ValueError):
+        return default
+
+
+# 智训主流程和内部全量解析分别使用有界线程池；真正的 Excel 重活还受共享槽位限制。
+_training_executor = ThreadPoolExecutor(
+    max_workers=_bounded_env_int("TRAINING_WORK_CONCURRENCY", 3, 5))
+_training_parse_executor = ThreadPoolExecutor(
+    max_workers=_bounded_env_int("TRAINING_PARSE_CONCURRENCY", 2, 3))
 
 # SSE 心跳间隔（秒），防止大文件解析时连接超时
 _SSE_HEARTBEAT_INTERVAL = 15
+
+
+async def _acquire_excel_slot_with_updates(emit=None, stage: str = "Excel 任务"):
+    """按 FIFO 等待全局 Excel 槽位，并周期推送用户可见的排队状态。"""
+    from ..utils.upload_stream import get_excel_work_semaphore
+    semaphore = get_excel_work_semaphore()
+    interval = max(5, int(os.getenv("EXCEL_QUEUE_NOTICE_INTERVAL", "15")))
+    max_wait = max(interval, int(os.getenv("EXCEL_QUEUE_MAX_WAIT", "1800")))
+    started = time.monotonic()
+    acquire_task = asyncio.create_task(semaphore.acquire())
+    try:
+        while not acquire_task.done():
+            done, _ = await asyncio.wait({acquire_task}, timeout=interval)
+            if done:
+                break
+            waited = int(time.monotonic() - started)
+            if emit:
+                emit({
+                    "type": "status",
+                    "message": f"{stage}仍在排队，已等待 {waited} 秒；当前有其他 Excel 任务正在执行...",
+                })
+            if waited >= max_wait:
+                acquire_task.cancel()
+                raise TimeoutError(f"{stage}排队超过 {max_wait} 秒，请检查是否有卡住的智算/智训任务")
+        await acquire_task
+        if emit:
+            waited = int(time.monotonic() - started)
+            emit({"type": "status", "message": f"{stage}已获得执行资源（排队 {waited} 秒）"})
+        return semaphore
+    except BaseException:
+        if acquire_task.done() and not acquire_task.cancelled():
+            # 外层请求恰在 acquire 完成后被取消时，归还已取得的槽位，避免永久锁死队列。
+            try:
+                if acquire_task.result():
+                    semaphore.release()
+            except Exception:
+                pass
+        elif not acquire_task.done():
+            acquire_task.cancel()
+        raise
+
+
+async def _run_training_serialized(func, emit=None):
+    """智训主流程与基础资料/智算共享 Excel 有界并发闸门。"""
+    semaphore = await _acquire_excel_slot_with_updates(emit, "智训执行")
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(_training_executor, func)
+    finally:
+        semaphore.release()
+
+
+def _prepare_training_uploads_subprocess(payload: dict) -> dict:
+    """智训上传预处理子进程：解密、xls 转换和列去虚高，不计算公式。"""
+    source_dir = Path(payload["source_dir"])
+    expected_file = payload.get("expected_file")
+    passwords = payload.get("passwords") or {}
+
+    from backend.utils.aspose_helper import is_encrypted, decrypt_excel
+    from backend.utils.source_normalizer import convert_xls_to_xlsx, shrink_inflated_columns
+
+    files = [(str(p), p.name) for p in source_dir.iterdir()
+             if p.is_file() and p.suffix.lower() in (".xlsx", ".xls", ".xlsm")
+             and not p.name.startswith("~")]
+    if expected_file:
+        files.append((expected_file, Path(expected_file).name))
+
+    decrypt_failures = []
+    for file_path, filename in files:
+        if is_encrypted(file_path):
+            password = passwords.get(filename)
+            if not password:
+                decrypt_failures.append(filename)
+                continue
+            try:
+                decrypted = decrypt_excel(file_path, password=password)
+                shutil.move(decrypted, file_path)
+            except Exception:
+                decrypt_failures.append(filename)
+    if decrypt_failures:
+        return {"error_type": "encrypted_files", "files": decrypt_failures}
+
+    for p in list(source_dir.iterdir()):
+        if p.is_file() and p.suffix.lower() == ".xls":
+            convert_xls_to_xlsx(str(p))
+    if expected_file and expected_file.lower().endswith(".xls"):
+        expected_file = convert_xls_to_xlsx(expected_file)
+
+    normalized_files = [(str(p), p.name) for p in source_dir.iterdir()
+                        if p.is_file() and p.suffix.lower() in (".xlsx", ".xlsm")
+                        and not p.name.startswith("~")]
+    if expected_file:
+        normalized_files.append((expected_file, Path(expected_file).name))
+    for file_path, _ in normalized_files:
+        shrink_inflated_columns(file_path)
+
+    # banner_splitter 会展平公式，上传阶段明确不执行。
+    return {"error_type": None, "expected_file": expected_file,
+            "files": normalized_files}
+
+
+def _parse_training_rule_files_subprocess(paths: list) -> str:
+    """规则附件解析也在子进程内完成，避免 xlsx/docx/pdf 解析占用 Web 进程。"""
+    from backend.ai_engine.document_parser import get_document_parser
+    parser = get_document_parser()
+    parts = []
+    for path in paths:
+        try:
+            parsed = parser.parse_document(path)
+            parts.append(f"=== 规则文件: {Path(path).name} ===\n{parsed}\n")
+        except Exception:
+            try:
+                parts.append(Path(path).read_text(encoding="utf-8", errors="replace") + "\n")
+            except Exception:
+                pass
+    return "".join(parts)
+
+
+def _peek_template_sheets_subprocess(file_path: str, password: str = None) -> list:
+    """目标模板 sheet 预览子进程执行体。"""
+    if password:
+        from backend.utils.aspose_helper import is_encrypted, decrypt_excel
+        if is_encrypted(file_path):
+            decrypted = decrypt_excel(file_path, password=password)
+            shutil.move(decrypted, file_path)
+    from backend.utils.source_normalizer import convert_xls_to_xlsx
+    file_path = convert_xls_to_xlsx(file_path)
+    from openpyxl import load_workbook
+    wb = load_workbook(file_path, read_only=True, data_only=True)
+    try:
+        sheets = []
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            preview = []
+            for index, row in enumerate(ws.iter_rows(values_only=True, max_row=3)):
+                preview.append([(str(value).strip() if value is not None else "")
+                                for value in row[:30]])
+                if index >= 2:
+                    break
+            sheets.append({"name": sheet_name, "preview": preview})
+        return sheets
+    finally:
+        wb.close()
 
 
 def _create_sse_stream(loop):
@@ -1119,59 +1273,21 @@ async def peek_template_sheets(
     避免在 /start 阶段把所有 sheet 都喂给 AI。
     """
     work_dir = tempfile.mkdtemp(prefix=f"peek_{current_user.id}_")
-    fp_path = os.path.join(work_dir, target_file.filename)
+    from ..utils.upload_stream import save_upload_file, safe_upload_name
+    fp_path = os.path.join(work_dir, safe_upload_name(target_file.filename, "template.xlsx"))
     try:
-        content = await target_file.read()
-        with open(fp_path, "wb") as fp:
-            fp.write(content)
-
-        # 加密兜底解密
-        if file_password:
-            try:
-                from ..utils.aspose_helper import is_encrypted, decrypt_excel
-                if is_encrypted(fp_path):
-                    _dec = decrypt_excel(fp_path, password=file_password)
-                    shutil.move(_dec, fp_path)
-            except Exception as _e:
-                logger.warning(f"[peek] 解密失败: {_e}")
-
-        # 老版 .xls 转 .xlsx（下面用 openpyxl 读取，不支持 .xls）
-        try:
-            from ..utils.source_normalizer import convert_xls_to_xlsx
-            _conv = convert_xls_to_xlsx(fp_path)
-            if _conv != fp_path:
-                fp_path = _conv
-        except Exception as _xe:
-            logger.warning(f"[peek] xls 转换失败: {_xe}")
-
-        # 用 openpyxl read_only 快速取 sheet 名 + 首行表头预览
-        sheets_info = []
-        try:
-            from openpyxl import load_workbook
-            wb = load_workbook(fp_path, read_only=True, data_only=True)
-            for sn in wb.sheetnames:
-                ws = wb[sn]
-                # 取前 2 行做表头预览（保留原值）
-                preview_rows = []
-                for i, row in enumerate(ws.iter_rows(values_only=True, max_row=3)):
-                    cells = [(str(v).strip() if v is not None else "") for v in row[:30]]
-                    preview_rows.append(cells)
-                    if i >= 2:
-                        break
-                # 估算列数 / 数据行数（read_only 无 max_row 准确值，给提示即可）
-                sheets_info.append({
-                    "name": sn,
-                    "preview": preview_rows,
-                })
-            wb.close()
-        except Exception as e:
-            logger.error(f"[peek] 解析失败: {e}", exc_info=True)
-            raise HTTPException(status_code=400, detail=f"目标文件解析失败: {e}")
-
-        return {
-            "file_name": target_file.filename,
-            "sheets": sheets_info,
-        }
+        await save_upload_file(target_file, fp_path)
+        from ..utils.subprocess_runner import run_in_fresh_subprocess_async
+        from ..utils.upload_stream import get_excel_work_semaphore
+        async with get_excel_work_semaphore():
+            result = await run_in_fresh_subprocess_async(
+                "backend.api.training_chat:_peek_template_sheets_subprocess",
+                args=(fp_path, file_password), timeout=180,
+                max_memory_mb=int(os.getenv("TRAINING_UPLOAD_MAX_MEMORY_MB", "1536")),
+            )
+        if not result.success:
+            raise HTTPException(status_code=400, detail=f"目标文件解析失败: {result.error}")
+        return {"file_name": target_file.filename, "sheets": result.result or []}
     finally:
         try:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -1227,18 +1343,16 @@ async def start_training(
     source_dir = os.path.join(work_dir, "source")
     os.makedirs(source_dir)
 
-    for f in source_files:
-        content = await f.read()
-        with open(os.path.join(source_dir, f.filename), "wb") as fp:
-            fp.write(content)
+    from ..utils.upload_stream import save_upload_file, safe_upload_name
+    for index, f in enumerate(source_files):
+        filename = safe_upload_name(f.filename, f"source_{index + 1}.xlsx")
+        await save_upload_file(f, os.path.join(source_dir, filename))
 
     expected_file = None
     ef = expected_result or target_file
     if ef:
-        content = await ef.read()
-        expected_file = os.path.join(work_dir, ef.filename)
-        with open(expected_file, "wb") as fp:
-            fp.write(content)
+        expected_file = os.path.join(work_dir, safe_upload_name(ef.filename, "expected.xlsx"))
+        await save_upload_file(ef, expected_file)
 
     # 解析密码并解密加密文件
     passwords = {}
@@ -1272,81 +1386,8 @@ async def start_training(
         except Exception:
             logger.warning(f"target_sheets JSON 解析失败: {target_sheets}")
 
-    from ..utils.aspose_helper import is_encrypted, decrypt_excel
-    import shutil as _shutil
-
-    # 收集所有 Excel 文件
+    # 重预处理改到 SSE 建立后执行；这些变量由后台协调任务在启动正式智训前填充。
     all_excel_files = []
-    for fn in os.listdir(source_dir):
-        if fn.endswith((".xlsx", ".xls")) and not fn.startswith("~"):
-            all_excel_files.append((os.path.join(source_dir, fn), fn))
-    if expected_file:
-        all_excel_files.append((expected_file, os.path.basename(expected_file)))
-
-    # 第一步：尝试用提供的密码解密
-    decrypt_failures = []
-    if passwords:
-        for fpath, fname in all_excel_files:
-            if is_encrypted(fpath) and passwords.get(fname):
-                try:
-                    decrypted = decrypt_excel(fpath, password=passwords[fname])
-                    _shutil.move(decrypted, fpath)
-                    logger.info(f"[chat训练] 已解密文件: {fname}")
-                except Exception as e:
-                    logger.error(f"[chat训练] 解密文件失败 {fname}: {e}")
-                    decrypt_failures.append(fname)
-        if decrypt_failures:
-            raise HTTPException(
-                status_code=422,
-                detail=f"以下文件解密失败，请检查密码是否正确: {', '.join(decrypt_failures)}"
-            )
-
-    # 第二步：无论是否提供了密码，始终检查剩余加密文件
-    encrypted_remaining = []
-    for fpath, fname in all_excel_files:
-        if is_encrypted(fpath):
-            encrypted_remaining.append(fname)
-    if encrypted_remaining:
-        logger.warning(f"[chat训练] 仍有加密文件未解密: {encrypted_remaining}, 提供的密码keys: {list(passwords.keys())}")
-        raise HTTPException(
-            status_code=422,
-            detail=f"检测到加密文件但未提供密码（或密码不匹配）: {', '.join(encrypted_remaining)}。"
-                   f"提供的密码文件名: {list(passwords.keys()) if passwords else '无'}。请检查文件名是否匹配。"
-        )
-
-    # 第三步：多区域 sheet 预处理（banner 拆分 / 头一致合并 / 头不一致 best-region）
-    # 老版 .xls 自动转 .xlsx（解密后、预处理前）。模板(expected)也转，否则 openpyxl 加载会失败
-    try:
-        from ..utils.source_normalizer import convert_xls_to_xlsx, shrink_inflated_columns
-        for fn in list(os.listdir(source_dir)):
-            if fn.lower().endswith(".xls"):
-                convert_xls_to_xlsx(os.path.join(source_dir, fn))
-        if expected_file and expected_file.lower().endswith(".xls"):
-            expected_file = convert_xls_to_xlsx(expected_file)
-        # 路径已变，重建 Excel 文件清单
-        all_excel_files = [(os.path.join(source_dir, fn), fn) for fn in os.listdir(source_dir)
-                           if fn.endswith((".xlsx", ".xlsm")) and not fn.startswith("~")]
-        if expected_file:
-            all_excel_files.append((expected_file, os.path.basename(expected_file)))
-        # 列去虚高：删数据末列后的空列 + 收窄超宽 AutoFilter，避免下游 openpyxl 维度虚高致溢出
-        for _fp, _ in all_excel_files:
-            try:
-                shrink_inflated_columns(_fp)
-            except Exception as _she:
-                logger.warning(f"[chat训练] 列去虚高跳过（不阻断）: {_she}")
-    except Exception as _xls_e:
-        logger.warning(f"[chat训练] xls 转换失败（继续）: {_xls_e}")
-
-    # 模板模式下：expected_file 是用户精心设计的模板（含公式/格式/合并），必须保留原状，不做任何拆分
-    _files_for_preprocess = [fp for fp, _ in all_excel_files]
-    if mode == "template" and expected_file and expected_file in _files_for_preprocess:
-        _files_for_preprocess.remove(expected_file)
-        logger.info(f"[chat训练] template 模式：跳过目标模板的 banner 预处理（保留原模板结构、公式、合并单元格）")
-    try:
-        from ..utils.banner_splitter import preprocess_uploaded_files
-        preprocess_uploaded_files(_files_for_preprocess)
-    except Exception as e:
-        logger.warning(f"[chat训练] banner-split 预处理整体失败（继续）: {e}")
 
     # 保存规则文件到磁盘，然后用 document_parser 解析（支持 docx/xlsx/pdf 等格式）
     rules_content = ""
@@ -1355,29 +1396,11 @@ async def start_training(
     os.makedirs(rules_dir, exist_ok=True)
     for rf in rule_files:
         try:
-            content = await rf.read()
-            rule_path = os.path.join(rules_dir, rf.filename)
-            with open(rule_path, "wb") as fp:
-                fp.write(content)
+            rule_path = os.path.join(rules_dir, safe_upload_name(rf.filename, "rule.txt"))
+            await save_upload_file(rf, rule_path)
             saved_rule_paths.append(rule_path)
         except Exception:
             pass
-
-    if saved_rule_paths:
-        try:
-            from ..ai_engine.document_parser import get_document_parser
-            doc_parser = get_document_parser()
-            for rp in saved_rule_paths:
-                parsed = doc_parser.parse_document(rp)
-                rules_content += f"=== 规则文件: {os.path.basename(rp)} ===\n{parsed}\n"
-        except Exception as e:
-            logger.warning(f"规则文件解析失败，回退到文本读取: {e}")
-            for rp in saved_rule_paths:
-                try:
-                    with open(rp, "r", encoding="utf-8", errors="replace") as f:
-                        rules_content += f.read() + "\n"
-                except Exception:
-                    pass
 
     # 解析薪资年月
     salary_year, salary_month = None, None
@@ -1756,7 +1779,7 @@ def main(source_dir, output_dir, **kwargs):
 
             # 【后台全量加载】在 AI 代码生成期间并行加载全量源数据
             # 这样 AI 生成代码时（耗时最长），全量数据同时解析
-            _full_data_future = _executor.submit(
+            _full_data_future = _training_parse_executor.submit(
                 _load_full_source_data_subproc, src_dir, config.get("manual_headers"),
                 multi_sheet_source=config.get("multi_sheet_source", False),
                 file_passwords=config.get("file_passwords"),
@@ -1983,9 +2006,68 @@ def main(source_dir, output_dir, **kwargs):
             db.close()
             _emit(None)
 
-    loop.run_in_executor(_executor, _run_first_iteration)
+    async def _prepare_then_train():
+        """SSE 已建立后再排队预处理；等待期间客户端持续收到状态/心跳，不再被代理判 504。"""
+        nonlocal expected_file, all_excel_files, rules_content
+        from ..utils.subprocess_runner import run_in_fresh_subprocess_async
+        try:
+            _emit({"type": "status", "message": "文件已接收，正在等待 Excel 预处理队列..."})
+            semaphore = await _acquire_excel_slot_with_updates(_emit, "上传文件预处理")
+            try:
+                _emit({"type": "status", "message": "正在检查并预处理上传文件..."})
+                prepared = await run_in_fresh_subprocess_async(
+                    "backend.api.training_chat:_prepare_training_uploads_subprocess",
+                    args=({"source_dir": source_dir, "expected_file": expected_file,
+                           "passwords": passwords, "mode": mode},),
+                    timeout=int(os.getenv("TRAINING_UPLOAD_TIMEOUT", "600")),
+                    max_memory_mb=int(os.getenv("TRAINING_UPLOAD_MAX_MEMORY_MB", "1536")),
+                )
+            finally:
+                semaphore.release()
+            if not prepared.success:
+                raise RuntimeError(f"智训上传预处理失败: {prepared.error}")
+            prepared_data = prepared.result or {}
+            if prepared_data.get("error_type") == "encrypted_files":
+                names = ", ".join(prepared_data.get("files") or [])
+                raise RuntimeError(f"以下文件未正确解密: {names}")
+            expected_file = prepared_data.get("expected_file") or expected_file
+            all_excel_files = prepared_data.get("files") or []
 
-    return StreamingResponse(sse_generator, media_type="text/event-stream")
+            if saved_rule_paths:
+                _emit({"type": "status", "message": "正在解析规则附件..."})
+                semaphore = await _acquire_excel_slot_with_updates(_emit, "规则附件解析")
+                try:
+                    parsed_rules = await run_in_fresh_subprocess_async(
+                        "backend.api.training_chat:_parse_training_rule_files_subprocess",
+                        args=(saved_rule_paths,),
+                        timeout=int(os.getenv("TRAINING_UPLOAD_TIMEOUT", "600")),
+                        max_memory_mb=int(os.getenv("TRAINING_UPLOAD_MAX_MEMORY_MB", "1536")),
+                    )
+                finally:
+                    semaphore.release()
+                if not parsed_rules.success:
+                    raise RuntimeError(f"智训规则附件解析失败: {parsed_rules.error}")
+                rules_content = parsed_rules.result or ""
+
+            _emit({"type": "status", "message": "预处理完成，智训已进入并发执行队列..."})
+            await _run_training_serialized(_run_first_iteration, _emit)
+        except Exception as exc:
+            logger.exception("智训启动预处理失败")
+            shutil.rmtree(work_dir, ignore_errors=True)
+            _emit({"type": "error", "message": str(exc)})
+            _emit(None)
+
+    _emit({"type": "status", "message": "上传完成，正在建立智训任务..."})
+    asyncio.create_task(_prepare_then_train())
+
+    return StreamingResponse(
+        sse_generator, media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 # ==================== 对话发消息 ====================
@@ -2018,20 +2100,19 @@ async def send_message(
     # 读取新的规则文件内容（用 document_parser 支持各种格式）
     new_rules = ""
     if rule_files:
+        from ..utils.upload_stream import save_upload_file, safe_upload_name
         tmp_dir = tempfile.mkdtemp(prefix="chat_rules_")
         for rf in rule_files:
             try:
-                content = await rf.read()
-                rule_path = os.path.join(tmp_dir, rf.filename)
-                with open(rule_path, "wb") as fp:
-                    fp.write(content)
+                rule_path = os.path.join(tmp_dir, safe_upload_name(rf.filename, "rule.txt"))
+                await save_upload_file(rf, rule_path)
                 from ..ai_engine.document_parser import get_document_parser
                 parsed = get_document_parser().parse_document(rule_path)
                 new_rules += f"=== 规则文件: {rf.filename} ===\n{parsed}\n"
             except Exception as e:
                 logger.warning(f"规则文件 {rf.filename} 解析失败: {e}")
                 try:
-                    new_rules += content.decode("utf-8", errors="replace") + "\n"
+                    new_rules += Path(rule_path).read_text(encoding="utf-8", errors="replace") + "\n"
                 except Exception:
                     pass
 
@@ -2039,19 +2120,19 @@ async def send_message(
     staged_source_dir = None
     staged_expected_path = None
     if source_files and any(getattr(sf, "filename", None) for sf in source_files):
+        from ..utils.upload_stream import save_upload_file, safe_upload_name
         staged_source_dir = tempfile.mkdtemp(prefix="chat_regen_src_")
-        for sf in source_files:
+        for index, sf in enumerate(source_files):
             if not getattr(sf, "filename", None):
                 continue
-            content = await sf.read()
-            with open(os.path.join(staged_source_dir, sf.filename), "wb") as fp:
-                fp.write(content)
+            filename = safe_upload_name(sf.filename, f"source_{index + 1}.xlsx")
+            await save_upload_file(sf, os.path.join(staged_source_dir, filename))
     if expected_result and getattr(expected_result, "filename", None):
+        from ..utils.upload_stream import save_upload_file, safe_upload_name
         staged_exp_dir = tempfile.mkdtemp(prefix="chat_regen_exp_")
-        staged_expected_path = os.path.join(staged_exp_dir, expected_result.filename)
-        content = await expected_result.read()
-        with open(staged_expected_path, "wb") as fp:
-            fp.write(content)
+        staged_expected_path = os.path.join(
+            staged_exp_dir, safe_upload_name(expected_result.filename, "expected.xlsx"))
+        await save_upload_file(expected_result, staged_expected_path)
 
     loop = asyncio.get_event_loop()
     queue, _emit, sse_generator = _create_sse_stream(loop)
@@ -2246,7 +2327,7 @@ async def send_message(
 
             # 【后台全量加载】修正轮次也需要全量数据
             src_dir = config.get("source_dir", "")
-            _full_data_future = _executor.submit(
+            _full_data_future = _training_parse_executor.submit(
                 _load_full_source_data_subproc, src_dir, config.get("manual_headers"),
                 multi_sheet_source=config.get("multi_sheet_source", False),
                 file_passwords=config.get("file_passwords"),
@@ -2581,30 +2662,20 @@ async def send_message(
                     if os.path.isfile(fp_src):
                         shutil.copy2(fp_src, str(p_source / fn))
 
-                # 解密 + banner 预处理（与 /start 一致）
+                # 替换文件后也走全新子进程，不在智训线程内打开 Workbook。
                 _passwords = config.get("file_passwords") or {}
-                try:
-                    from ..utils.aspose_helper import is_encrypted, decrypt_excel
-                    for fn in os.listdir(str(p_source)):
-                        if not fn.endswith((".xlsx", ".xls")) or fn.startswith("~"):
-                            continue
-                        fp = str(p_source / fn)
-                        if is_encrypted(fp) and _passwords.get(fn):
-                            try:
-                                _dec = decrypt_excel(fp, password=_passwords[fn])
-                                shutil.move(_dec, fp)
-                                logger.info(f"[regenerate] 已解密: {fn}")
-                            except Exception as e:
-                                logger.warning(f"[regenerate] 解密失败 {fn}: {e}")
-                except Exception as e:
-                    logger.warning(f"[regenerate] 解密阶段异常: {e}")
-
-                try:
-                    from ..utils.banner_splitter import preprocess_uploaded_files
-                    preprocess_uploaded_files([str(p_source / fn) for fn in os.listdir(str(p_source))
-                                               if fn.endswith((".xlsx", ".xls")) and not fn.startswith("~")])
-                except Exception as e:
-                    logger.warning(f"[regenerate] banner-split 预处理失败（继续）: {e}")
+                from ..utils.subprocess_runner import run_in_fresh_subprocess
+                _prep = run_in_fresh_subprocess(
+                    "backend.api.training_chat:_prepare_training_uploads_subprocess",
+                    args=({"source_dir": str(p_source), "expected_file": None,
+                           "passwords": _passwords, "mode": config.get("mode")},),
+                    timeout=int(os.getenv("TRAINING_UPLOAD_TIMEOUT", "600")),
+                    max_memory_mb=int(os.getenv("TRAINING_UPLOAD_MAX_MEMORY_MB", "1536")),
+                )
+                if not _prep.success:
+                    raise RuntimeError(f"替换源文件预处理失败: {_prep.error}")
+                if (_prep.result or {}).get("error_type"):
+                    raise RuntimeError(f"替换源文件解密失败: {(_prep.result or {}).get('files')}")
 
                 config["source_dir"] = str(p_source)
 
@@ -2723,7 +2794,7 @@ async def send_message(
                 return
 
             # 后台全量加载
-            _full_data_future = _executor.submit(
+            _full_data_future = _training_parse_executor.submit(
                 _load_full_source_data_subproc, src_dir, config.get("manual_headers"),
                 multi_sheet_source=config.get("multi_sheet_source", False),
                 file_passwords=config.get("file_passwords"),
@@ -2943,13 +3014,16 @@ async def send_message(
             _emit(None)
 
     if action == "regenerate":
-        loop.run_in_executor(_executor, _run_regenerate)
+        asyncio.create_task(_run_training_serialized(_run_regenerate, _emit))
     elif action == "generate":
-        loop.run_in_executor(_executor, _run_chat_iteration)
+        asyncio.create_task(_run_training_serialized(_run_chat_iteration, _emit))
     else:
-        loop.run_in_executor(_executor, _run_chat_conversation)
+        asyncio.create_task(_run_training_serialized(_run_chat_conversation, _emit))
 
-    return StreamingResponse(sse_generator, media_type="text/event-stream")
+    return StreamingResponse(
+        sse_generator, media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
 
 
 # ==================== 设为最佳 / 上传代码 ====================
@@ -3086,6 +3160,19 @@ async def upload_code(
     else:
         raise HTTPException(status_code=400, detail="请提供代码内容或代码文件")
 
+    # 手动上传也属于跨环境脚本导入：源文件绝对路径无法随租户/部署目录重定位，
+    # 必须明确阻止，避免验证时碰巧可用、迁到 Docker/IIS 后静默读错文件。
+    from ..utils.template_resolver import (
+        extract_template_ref, find_nonportable_absolute_paths, resolve_template_path,
+    )
+    _bad_paths = find_nonportable_absolute_paths(code_content)
+    if _bad_paths:
+        raise HTTPException(
+            status_code=400,
+            detail="脚本包含无法跨环境迁移的源文件绝对路径，请改为使用 input_folder："
+                   + "；".join(_bad_paths[:3]),
+        )
+
     config = session.config or {}
 
     # 可选：随代码一起上传的模板文件。按脚本里烘焙的 TEMPLATE_NAME 存到当前租户 templates/，
@@ -3095,13 +3182,14 @@ async def upload_code(
         try:
             from ..utils.template_resolver import extract_template_ref
             from ..storage.storage_manager import StorageManager
-            _tpl_bytes = await template_file.read()
+            from ..utils.upload_stream import save_upload_file, safe_upload_name
             _baked_name, _, _ = extract_template_ref(code_content)
-            _save_name = (_baked_name or template_file.filename).replace(" ", "_")
+            _save_name = safe_upload_name(
+                (_baked_name or template_file.filename).replace(" ", "_"), "template.xlsx")
             _tpl_dir = StorageManager().get_tenant_dir(session.tenant_id) / "templates"
             _tpl_dir.mkdir(parents=True, exist_ok=True)
             _tpl_path = _tpl_dir / _save_name
-            _tpl_path.write_bytes(_tpl_bytes)
+            await save_upload_file(template_file, _tpl_path)
             _tpl_override = str(_tpl_path)
             # 回写会话 config，训练/复算再跑也能定位
             config["template_path"] = _tpl_override
@@ -3111,6 +3199,29 @@ async def upload_code(
                         f"（存为烘焙名={bool(_baked_name)}）")
         except Exception as _te:
             logger.warning(f"[upload-code] 保存上传模板失败: {_te}")
+
+    # 没随代码上传模板时，必须在当前租户目录/绑定路径中严格找到同名同哈希模板。
+    # 找不到就拒绝保存，防止迁移显示成功但执行时误用别的同名模板。
+    if not _tpl_override:
+        _bound = config.get("template_path")
+        if _bound and os.path.exists(_bound):
+            _tpl_override = _bound
+        else:
+            _tpl_override = resolve_template_path(
+                tenant_id=session.tenant_id,
+                script_code=code_content,
+                project_root=str(Path(__file__).resolve().parent.parent.parent),
+            )
+        _tpl_name, _, _tpl_baked = extract_template_ref(code_content)
+        if (_tpl_name or _tpl_baked) and not _tpl_override:
+            raise HTTPException(
+                status_code=400,
+                detail="该脚本依赖模板，但当前环境未找到同名同哈希模板；请随代码一起上传模板文件",
+            )
+        if _tpl_override:
+            config["template_path"] = str(Path(_tpl_override).resolve())
+            session.config = dict(config)
+            db.commit()
 
     # 【全量加载源数据】与自动训练循环（_run_single_iteration 调用处）一致：
     # 用 IntelligentExcelParser 智能识别每个源 sheet 的真实表头行，产出列名正确的 DataFrame。
@@ -3227,6 +3338,12 @@ async def upload_code(
             db.commit()
         logger.info(f"[upload-code] 目标脚本名解析为: {_script_name_db}"
                     f"（复用会话活跃脚本={bool(_sess_active)}）")
+        _saved_script_cfg = {"manual_headers": config.get("manual_headers"),
+                             "source_structure": config.get("source_structure_desc", ""),
+                             "rules_content": config.get("rules_content", ""),
+                             "use_history": bool(config.get("use_history", False))}
+        if config.get("template_path"):
+            _saved_script_cfg["template_path"] = config.get("template_path")
         persistence.save_script(
             tenant_id=session.tenant_id,
             name=_script_name_db,
@@ -3235,10 +3352,7 @@ async def upload_code(
             source_session_id=session_id,
             accuracy=accuracy,
             created_by=current_user.id,
-            config={"manual_headers": config.get("manual_headers"),
-                    "source_structure": config.get("source_structure_desc", ""),
-                    "rules_content": config.get("rules_content", ""),
-                    "use_history": bool(config.get("use_history", False))},
+            config=_saved_script_cfg,
             manual_headers=config.get("manual_headers"),
             source_structure=session.source_structure,
             rules_content=config.get("rules_content", ""),

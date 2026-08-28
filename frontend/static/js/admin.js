@@ -790,7 +790,6 @@ const Admin = {
         this.openModal('上传基础数据', `
             <div style="display:flex;flex-direction:column;gap:12px;">
                 <label>分类：<select id="ref-upload-category" style="padding:6px;border:1px solid #ddd;border-radius:4px;">${catOptions}</select></label>
-                <label>名称：<input id="ref-upload-name" type="text" placeholder="留空用文件名；多选时按各自文件名（此框忽略）" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;"></label>
                 <label>作用域：
                     <select id="ref-upload-scope" style="padding:6px;border:1px solid #ddd;border-radius:4px;">
                         ${globalOption}
@@ -810,47 +809,47 @@ const Admin = {
             const ef = document.getElementById('ref-upload-from').value;
             const et = document.getElementById('ref-upload-to').value;
 
-            if (fileInput.files.length > 1) {
-                // 批量上传：每个文件用自己的文件名，共享分类/作用域/日期
-                const fd = new FormData();
-                for (const f of fileInput.files) fd.append('files', f);
-                fd.append('asset_type', 'reference');
-                if (catId) fd.append('category_id', catId);
-                if (scopeVal) fd.append('tenant_id', scopeVal);
-                if (ef) fd.append('effective_from', ef);
-                if (et) fd.append('effective_to', et);
-                const resp = await AUTH.authFetch('/api/assets/upload-batch', {method: 'POST', body: fd});
-                if (resp.ok) {
-                    const r = await resp.json();
-                    this.closeModal();
-                    this.loadRefData();
-                    const failMsg = (r.failed && r.failed.length)
-                        ? '\n失败 ' + r.failed.length + ' 个：\n' + r.failed.map(x => `${x.filename}: ${x.error}`).join('\n')
-                        : '';
-                    alert(`成功上传 ${r.created ? r.created.length : 0} 个${failMsg}`);
-                } else {
-                    alert('批量上传失败: ' + (await resp.text()));
-                }
-                return;
-            }
-
-            // 单文件（保持原路径）
+            // 单个和批量统一走异步批量端点：请求只负责分块落盘。
             const fd = new FormData();
-            fd.append('file', fileInput.files[0]);
+            for (const f of fileInput.files) fd.append('files', f);
             fd.append('asset_type', 'reference');
             if (catId) fd.append('category_id', catId);
-            fd.append('name', document.getElementById('ref-upload-name').value || fileInput.files[0].name);
             if (scopeVal) fd.append('tenant_id', scopeVal);
             if (ef) fd.append('effective_from', ef);
             if (et) fd.append('effective_to', et);
-            const resp = await AUTH.authFetch('/api/assets/upload', {method: 'POST', body: fd});
+            const resp = await AUTH.authFetch('/api/assets/upload-batch', {method: 'POST', body: fd});
             if (resp.ok) {
+                const task = await resp.json();
                 this.closeModal();
-                this.loadRefData();
+                alert(`已落盘 ${task.total_files} 个文件，后台将按顺序单并发解析。页面可继续操作。`);
+                this._pollAssetUploadTask(task.task_id);
             } else {
                 alert('上传失败: ' + (await resp.text()));
             }
         });
+    },
+
+    async _pollAssetUploadTask(taskId) {
+        // 轮询只读小型 JSON，不持有 SSE 长连接，避免代理连接堆积。
+        while (true) {
+            await new Promise(resolve => setTimeout(resolve, 1500));
+            try {
+                const resp = await AUTH.authFetch(`/api/assets/upload-tasks/${taskId}`);
+                if (!resp.ok) throw new Error(await resp.text());
+                const task = await resp.json();
+                if (task.status !== 'completed' && task.status !== 'failed') continue;
+
+                await this.loadRefData();
+                const failed = task.failed || [];
+                const failMsg = failed.length
+                    ? '\n失败 ' + failed.length + ' 个：\n' + failed.map(x => `${x.filename}: ${x.error}`).join('\n')
+                    : '';
+                alert(`上传解析完成：成功 ${task.created ? task.created.length : 0} 个${failMsg}`);
+                return;
+            } catch (e) {
+                console.warn('查询上传任务失败，稍后重试:', e);
+            }
+        }
     },
 
     async previewAsset(assetId) {
@@ -902,8 +901,9 @@ const Admin = {
             fd.append('file', picker.files[0]);
             const resp = await AUTH.authFetch(`/api/assets/${assetId}/new-version`, {method: 'POST', body: fd});
             if (!resp.ok) return alert('更新失败: ' + (await resp.text()));
-            alert('已更新为新版本');
-            this.loadRefData();
+            const task = await resp.json();
+            alert('新版本已落盘，正在后台单并发解析');
+            this._pollAssetUploadTask(task.task_id);
         };
         picker.click();
     },

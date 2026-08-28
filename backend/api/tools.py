@@ -12,6 +12,7 @@ import zipfile
 import logging
 import hashlib
 import asyncio
+import difflib
 from pathlib import Path
 from typing import List, Optional
 from concurrent.futures import ThreadPoolExecutor
@@ -20,12 +21,14 @@ from datetime import datetime
 import pandas as pd
 from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
 from ..auth.dependencies import get_current_user, require_permission
 from ..database.connection import SessionLocal
 from ..database.models import SopEntry, SopRound, SopRuleFile
 from ..ai_engine.document_parser import DocumentParser
+from ..utils.upload_stream import get_excel_work_semaphore, save_upload_file, safe_upload_name
 
 router = APIRouter(prefix="/api/tools", tags=["智能小工具"])
 
@@ -72,15 +75,15 @@ async def split_by_banner(
 
     try:
         for uf in files:
-            name = uf.filename or "unnamed.xlsx"
+            name = safe_upload_name(uf.filename, "unnamed.xlsx")
             ext = Path(name).suffix.lower()
             if ext not in EXCEL_EXTS:
+                await uf.close()
                 errors.append(f"{name}: 不支持的扩展名({ext})")
                 continue
             src_path = src_dir / name
             try:
-                content = await uf.read()
-                src_path.write_bytes(content)
+                await save_upload_file(uf, src_path)
             except Exception as e:
                 errors.append(f"{name}: 写入失败 {e}")
                 continue
@@ -92,15 +95,16 @@ async def split_by_banner(
                 # 直接在 async 端点内同步跑会冻结事件循环、且无超时/内存护栏（大文件曾 504）。
                 # 子进程有真超时+内存强杀；to_thread 避免阻塞事件循环。
                 from backend.utils.subprocess_runner import (
-                    run_in_subprocess, default_max_memory_mb, default_timeout,
+                    default_max_memory_mb, default_timeout,
                 )
-                r = await asyncio.to_thread(
-                    run_in_subprocess,
-                    "split_by_banner:split_one_file",
-                    (str(src_path), str(out_path)),
-                    timeout=default_timeout("write"),
-                    max_memory_mb=default_max_memory_mb(),
-                )
+                from backend.utils.subprocess_runner import run_in_fresh_subprocess_async
+                async with get_excel_work_semaphore():
+                    r = await run_in_fresh_subprocess_async(
+                        "split_by_banner:split_one_file",
+                        (str(src_path), str(out_path)),
+                        timeout=default_timeout("write"),
+                        max_memory_mb=default_max_memory_mb(),
+                    )
                 if not r.success:
                     reason = "超时" if r.timed_out else ("内存超限" if r.killed_by_memory else r.error)
                     errors.append(f"{name}: 拆分失败({reason})")
@@ -116,22 +120,20 @@ async def split_by_banner(
             detail = "全部失败:\n" + "\n".join(errors) if errors else "未生成任何输出"
             raise HTTPException(status_code=400, detail=detail)
 
-        # 打包 zip
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        # ZIP 直接写盘，避免输出文件在内存中再复制一份。
+        zip_path = work_dir / "split_results.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for p in success_files:
                 zf.write(p, arcname=p.name)
             if errors:
                 zf.writestr("_errors.txt", "\n".join(errors))
-        buf.seek(0)
-
-        # 同步清理(StreamingResponse 已读完 buffer)
-        shutil.rmtree(work_dir, ignore_errors=True)
-
         headers = {"Content-Disposition": 'attachment; filename="split_results.zip"'}
         if errors:
             headers["X-Split-Errors"] = str(len(errors))
-        return StreamingResponse(buf, media_type="application/zip", headers=headers)
+        return FileResponse(
+            str(zip_path), media_type="application/zip", headers=headers,
+            background=BackgroundTask(shutil.rmtree, work_dir, ignore_errors=True),
+        )
 
     except HTTPException:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -155,7 +157,8 @@ def _regions_to_df(sd):
     """
     regions = [r for r in (sd.regions or []) if (r.head_data or r.data)]
     if not regions:
-        return {"sheet": sd.sheet_name, "columns": [], "df": pd.DataFrame()}
+        return {"sheet": sd.sheet_name, "columns": [], "df": pd.DataFrame(),
+                "header_start": 0, "header_end": 0}
     # 基准：列数最多、其次行数最多的区域，定义列位置(字母)->表头名 及列顺序
     base = max(regions, key=lambda r: (len(r.head_data or {}), len(r.data or [])))
     base_head = base.head_data or {}                    # {表头: 字母}
@@ -180,27 +183,43 @@ def _regions_to_df(sd):
         out_df = pd.DataFrame(columns=base_cols)
     if n > 1:
         logger.info(f"[parse] sheet「{sd.sheet_name}」按列对齐合并 {n} 个同结构区域 → 共 {len(out_df)} 行")
-    return {"sheet": sd.sheet_name, "columns": base_cols, "df": out_df}
+    return {
+        "sheet": sd.sheet_name,
+        "columns": base_cols,
+        "df": out_df,
+        "header_start": int(getattr(base, "head_row_start", 0) or 0),
+        "header_end": int(getattr(base, "head_row_end", 0) or 0),
+    }
 
 
-def _parse_file_to_df_impl(path: str):
-    """（子进程执行体）用 excel_parser 解析单文件（激活 sheet、先算公式），返回 {sheet, columns, df}。
+def _parse_file_to_df_impl(
+    path: str,
+    manual_header_range=None,
+    sheet_name: str = None,
+    calculate_formulas: bool = True,
+):
+    """（子进程执行体）解析单文件激活 sheet；可按阶段选择是否计算公式。
 
     读【全部区域】：同结构的多个区域（如按人堆叠的块）纵向拼接成一张 df，避免只命中一块。
     df 列名为表头名（excel_parser 的 region.data 按列字母键，反查 head_data 改回表头名）。
     """
     from excel_parser import IntelligentExcelParser
     parser = IntelligentExcelParser()
+    manual_headers = None
+    if manual_header_range and sheet_name:
+        manual_headers = {sheet_name: list(manual_header_range)}
     results = parser.parse_excel_file(
-        path, read_formulas=False, calculate_formulas=True,
+        path, read_formulas=False, calculate_formulas=calculate_formulas,
         active_sheet_only=True, best_region_only=False,
+        manual_headers=manual_headers,
     )
     if not results or not results[0].regions:
-        return {"sheet": "", "columns": [], "df": pd.DataFrame()}
+        return {"sheet": "", "columns": [], "df": pd.DataFrame(),
+                "header_start": 0, "header_end": 0}
     return _regions_to_df(results[0])
 
 
-def _parse_file_to_df(path: str):
+def _parse_file_to_df(path: str, manual_header_range=None, sheet_name: str = None):
     """用 excel_parser 解析单文件（激活 sheet、先算公式），返回 {sheet, columns, df}。
 
     在【独立子进程】执行：某些文件（公式密集/超大）会让 Aspose 解析长时间计算、
@@ -210,14 +229,82 @@ def _parse_file_to_df(path: str):
     from backend.utils.subprocess_runner import run_in_subprocess, default_max_memory_mb, default_timeout
 
     r = run_in_subprocess(
-        "backend.api.tools:_parse_file_to_df_impl", (str(path),),
+        "backend.api.tools:_parse_file_to_df_impl",
+        (str(path), manual_header_range, sheet_name),
         timeout=default_timeout("parse"), max_memory_mb=default_max_memory_mb(),
     )
     if r.success:
         return r.result
     reason = "超时" if r.timed_out else ("内存超限" if r.killed_by_memory else r.error)
     logger.error(f"[parse] 子进程解析失败（{reason}）: {path}")
-    return {"sheet": "", "columns": [], "df": pd.DataFrame()}
+    return {"sheet": "", "columns": [], "df": pd.DataFrame(),
+            "header_start": 0, "header_end": 0}
+
+
+async def _parse_file_to_df_fresh(
+    path: str,
+    manual_header_range=None,
+    sheet_name: str = None,
+    calculate_formulas: bool = True,
+):
+    """在一次性子进程解析；分析阶段可跳过公式，任务结束后回收全部进程内存。"""
+    from backend.utils.subprocess_runner import (
+        run_in_fresh_subprocess_async, default_max_memory_mb, default_timeout,
+    )
+    r = await run_in_fresh_subprocess_async(
+        "backend.api.tools:_parse_file_to_df_impl",
+        (str(path), manual_header_range, sheet_name, calculate_formulas),
+        timeout=default_timeout("parse"), max_memory_mb=default_max_memory_mb(),
+    )
+    if r.success:
+        return r.result
+    reason = "超时" if r.timed_out else ("内存超限" if r.killed_by_memory else r.error)
+    logger.error(f"[parse] 一次性子进程解析失败（{reason}）: {path}")
+    return {"sheet": "", "columns": [], "df": pd.DataFrame(),
+            "header_start": 0, "header_end": 0, "error": str(reason)}
+
+
+def _merge_execute_impl(session_dir: str, request_data: dict, template_path: str = None) -> dict:
+    """一次性子进程执行完整合并，避免 DataFrame/Aspose 内存进入 Web 进程。"""
+    from backend.utils.merge_engine import merge_tables, write_merged_xlsx
+
+    sdir = Path(session_dir)
+    parsed_files = {}
+    files_columns = {}
+    for fp_path in sorted(sdir.iterdir()):
+        if fp_path.suffix.lower() not in EXCEL_EXTS:
+            continue
+        info = _parse_file_to_df_impl(str(fp_path))
+        parsed_files[fp_path.name] = {"df": info["df"]}
+        files_columns[fp_path.name] = info["columns"]
+    if not parsed_files:
+        raise ValueError("会话内无有效文件")
+
+    result = merge_tables(
+        parsed_files=parsed_files,
+        key_map=request_data["key_map"],
+        result_columns=request_data["result_columns"],
+        merge_mode=request_data["merge_mode"],
+        base_file=request_data.get("base_file"),
+        normalize_keys=request_data.get("normalize_keys", True),
+        date_key_mode=request_data.get("date_key_mode", "off"),
+    )
+    out_path = sdir / "合并结果.xlsx"
+    if template_path:
+        df = pd.DataFrame(result["rows"], columns=result["columns"])
+        try:
+            from openpyxl.utils import get_column_letter
+            for i, col in enumerate(result["columns"]):
+                letter = get_column_letter(i + 1)
+                if letter not in df.columns:
+                    df[letter] = df[col].values
+        except Exception:
+            pass
+        from backend.utils.aspose_helper import generate_from_template
+        generate_from_template(str(out_path), str(template_path), {"DT": df}, mode="fill")
+    else:
+        write_merged_xlsx(result, str(out_path))
+    return {"report": result["report"], "files_columns": files_columns}
 
 
 def _session_dir(session_id: str) -> Path:
@@ -418,19 +505,31 @@ async def merge_analyze(
         db = SessionLocal()
         try:
             for uf in files:
-                name = uf.filename or "unnamed.xlsx"
+                name = safe_upload_name(uf.filename, "unnamed.xlsx")
                 if Path(name).suffix.lower() not in EXCEL_EXTS:
+                    await uf.close()
                     raise HTTPException(status_code=400, detail=f"{name}: 不支持的扩展名")
                 dest = sdir / name
-                dest.write_bytes(await uf.read())
+                await save_upload_file(uf, dest)
                 # 上传规范化：误设日期格式的数字单元格重置为常规（避免被当日期读错）
-                # 解析走子进程 + to_thread：不冻结事件循环（多客户并发时其他请求照常响应）
+                # 规范化不计算公式；随后解析仍会完整计算一次，结果语义不变且避免重复计算。
                 try:
-                    from ..utils.source_normalizer import normalize_misformatted_dates
-                    await asyncio.to_thread(normalize_misformatted_dates, str(dest))
+                    from backend.utils.subprocess_runner import (
+                        run_in_fresh_subprocess_async, default_max_memory_mb, default_timeout,
+                    )
+                    async with get_excel_work_semaphore():
+                        nr = await run_in_fresh_subprocess_async(
+                            "backend.utils.source_normalizer:normalize_misformatted_dates",
+                            (str(dest),), kwargs={"calculate_formulas": False},
+                            timeout=default_timeout("parse"),
+                            max_memory_mb=default_max_memory_mb(),
+                        )
+                    if not nr.success:
+                        logger.warning(f"[merge] 日期格式规范化失败（继续）: {nr.error}")
                 except Exception as _ne:
                     logger.warning(f"[merge] 日期格式规范化失败（继续）: {_ne}")
-                info = await asyncio.to_thread(_parse_file_to_df, str(dest))
+                async with get_excel_work_semaphore():
+                    info = await _parse_file_to_df_fresh(str(dest))
                 cols = info["columns"]
                 fp = compute_header_fingerprint(cols)
                 _sk = guess_key_column(cols, info.get("df")) or (cols[0] if cols else "")
@@ -527,29 +626,6 @@ async def merge_execute(req: MergeExecuteRequest, current_user=Depends(get_curre
         raise HTTPException(status_code=400, detail="会话已过期，请重新上传分析")
 
     try:
-        # 重新解析会话内文件 → {file: {df}}
-        parsed_files = {}
-        files_columns = {}
-        for fp_path in sorted(sdir.iterdir()):
-            if fp_path.suffix.lower() not in EXCEL_EXTS:
-                continue
-            info = await asyncio.to_thread(_parse_file_to_df, str(fp_path))
-            parsed_files[fp_path.name] = {"df": info["df"]}
-            files_columns[fp_path.name] = info["columns"]
-
-        if not parsed_files:
-            raise HTTPException(status_code=400, detail="会话内无有效文件")
-
-        result = merge_tables(
-            parsed_files=parsed_files,
-            key_map=req.key_map,
-            result_columns=req.result_columns,
-            merge_mode=req.merge_mode,
-            base_file=req.base_file,
-            normalize_keys=req.normalize_keys,
-            date_key_mode=req.date_key_mode,
-        )
-
         out_path = sdir / "合并结果.xlsx"
 
         # 决定输出方式：套用的方案带模版文件 → Aspose SmartMarker 填充（带格式/公式）；
@@ -569,23 +645,24 @@ async def merge_execute(req: MergeExecuteRequest, current_user=Depends(get_curre
             finally:
                 _db.close()
 
-        if tpl_abs:
-            df = pd.DataFrame(result["rows"], columns=result["columns"])
-            # 追加列字母别名 A/B/C…（按结果列顺序），使模版可用 &=DT.A 或 &=DT.列名
-            try:
-                from openpyxl.utils import get_column_letter
-                for _i, _col in enumerate(result["columns"]):
-                    _L = get_column_letter(_i + 1)
-                    if _L not in df.columns:
-                        df[_L] = df[_col].values
-            except Exception:
-                pass
-            from ..utils.aspose_helper import generate_from_template
-            await asyncio.to_thread(
-                generate_from_template, str(out_path), str(tpl_abs), {"DT": df}, mode="fill")
-        else:
-            write_merged_xlsx(result, str(out_path))
-        data = out_path.read_bytes()
+        # 解析、DataFrame 合并、模板填充和最终公式计算全部在同一个一次性子进程完成。
+        # 子进程退出后 OS 直接回收 pandas/Aspose 非托管内存，Web 进程只接收小型统计结果。
+        from backend.utils.subprocess_runner import (
+            run_in_fresh_subprocess_async, default_max_memory_mb, default_timeout,
+        )
+        async with get_excel_work_semaphore():
+            rr = await run_in_fresh_subprocess_async(
+                "backend.api.tools:_merge_execute_impl",
+                (str(sdir), req.dict(), str(tpl_abs) if tpl_abs else None),
+                timeout=default_timeout("write"), max_memory_mb=default_max_memory_mb(),
+            )
+        if not rr.success:
+            reason = "超时" if rr.timed_out else ("内存超限" if rr.killed_by_memory else rr.error)
+            raise HTTPException(status_code=500, detail=f"合并执行失败（{reason}）")
+        result = rr.result
+        files_columns = result["files_columns"]
+        if not out_path.exists():
+            raise HTTPException(status_code=500, detail="合并未生成输出文件")
 
         # 写回缓存：每文件 {源列 -> 规范字段名}
         if req.tenant_id:
@@ -610,18 +687,16 @@ async def merge_execute(req: MergeExecuteRequest, current_user=Depends(get_curre
             finally:
                 db.close()
 
-        buf = io.BytesIO(data)
-        buf.seek(0)
-        shutil.rmtree(sdir, ignore_errors=True)
         headers = {
             "Content-Disposition": 'attachment; filename="merged_result.xlsx"',
             "X-Merge-Conflicts": str(result["report"].get("conflict_ids", 0)),
             "X-Merge-Rows": str(result["report"].get("output_rows", 0)),
         }
-        return StreamingResponse(
-            buf,
+        return FileResponse(
+            str(out_path),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers=headers,
+            background=BackgroundTask(shutil.rmtree, sdir, ignore_errors=True),
         )
     except HTTPException:
         raise
@@ -787,20 +862,25 @@ def _integrate_session_dir(session_id: str) -> Path:
     return INTEGRATE_SESSION_ROOT / safe
 
 
-def _parse_file_full_impl(path: str):
+def _parse_file_full_impl(path: str, manual_header_range=None, sheet_name: str = None):
     """（子进程执行体）解析单文件激活页最优区域，额外返回区域坐标（供原地回填主表定位）。
 
     返回 {sheet, columns, df, head_data{表头->列字母}, data_row_start, data_row_end}（1-based 行）。
     """
     from excel_parser import IntelligentExcelParser
     parser = IntelligentExcelParser()
+    manual_headers = None
+    if manual_header_range and sheet_name:
+        manual_headers = {sheet_name: list(manual_header_range)}
     results = parser.parse_excel_file(
         path, read_formulas=False, calculate_formulas=True,
         active_sheet_only=True, best_region_only=True,
+        manual_headers=manual_headers,
     )
     if not results or not results[0].regions:
         return {"sheet": "", "columns": [], "df": pd.DataFrame(),
-                "head_data": {}, "data_row_start": 0, "data_row_end": 0}
+                "head_data": {}, "header_start": 0, "header_end": 0,
+                "data_row_start": 0, "data_row_end": 0}
     sd = results[0]
     region = sd.regions[0]
     head = region.head_data or {}                       # {表头: 列字母}
@@ -816,12 +896,14 @@ def _parse_file_full_impl(path: str):
         "columns": list(head.keys()),
         "df": df,
         "head_data": dict(head),
+        "header_start": int(getattr(region, "head_row_start", 0) or 0),
+        "header_end": int(getattr(region, "head_row_end", 0) or 0),
         "data_row_start": int(getattr(region, "data_row_start", 0) or 0),
         "data_row_end": int(getattr(region, "data_row_end", 0) or 0),
     }
 
 
-def _parse_file_full(path: str):
+def _parse_file_full(path: str, manual_header_range=None, sheet_name: str = None):
     """解析单文件激活页最优区域，额外返回区域坐标（供原地回填主表定位）。
 
     在【独立子进程】执行（同 _parse_file_to_df 的防护说明）；失败返回空结构
@@ -830,9 +912,11 @@ def _parse_file_full(path: str):
     from backend.utils.subprocess_runner import run_in_subprocess, default_max_memory_mb, default_timeout
 
     empty = {"sheet": "", "columns": [], "df": pd.DataFrame(),
-             "head_data": {}, "data_row_start": 0, "data_row_end": 0}
+             "head_data": {}, "header_start": 0, "header_end": 0,
+             "data_row_start": 0, "data_row_end": 0}
     r = run_in_subprocess(
-        "backend.api.tools:_parse_file_full_impl", (str(path),),
+        "backend.api.tools:_parse_file_full_impl",
+        (str(path), manual_header_range, sheet_name),
         timeout=default_timeout("parse"), max_memory_mb=default_max_memory_mb(),
     )
     if r.success:
@@ -840,6 +924,47 @@ def _parse_file_full(path: str):
     reason = "超时" if r.timed_out else ("内存超限" if r.killed_by_memory else r.error)
     logger.error(f"[parse] 子进程解析失败（{reason}）: {path}")
     return empty
+
+
+async def _parse_file_full_fresh(path: str, manual_header_range=None, sheet_name: str = None):
+    """一次性子进程版完整解析，保留公式计算后的读取语义。"""
+    from backend.utils.subprocess_runner import (
+        run_in_fresh_subprocess_async, default_max_memory_mb, default_timeout,
+    )
+    empty = {"sheet": "", "columns": [], "df": pd.DataFrame(),
+             "head_data": {}, "header_start": 0, "header_end": 0,
+             "data_row_start": 0, "data_row_end": 0}
+    r = await run_in_fresh_subprocess_async(
+        "backend.api.tools:_parse_file_full_impl",
+        (str(path), manual_header_range, sheet_name),
+        timeout=default_timeout("parse"), max_memory_mb=default_max_memory_mb(),
+    )
+    if r.success:
+        return r.result
+    reason = "超时" if r.timed_out else ("内存超限" if r.killed_by_memory else r.error)
+    logger.error(f"[parse] 一次性子进程完整解析失败（{reason}）: {path}")
+    return empty
+
+
+def _integrate_file_meta(name: str, info: dict, manual: bool = False) -> dict:
+    """把解析结果转换成可持久化的整合会话元数据。"""
+    from ..utils.merge_engine import compute_header_fingerprint, guess_key_column
+    from ..utils.integrate_engine import guess_name_column, guess_id_column
+
+    cols = info.get("columns") or []
+    df = info.get("df")
+    return {
+        "name": name,
+        "sheet": info.get("sheet") or "",
+        "columns": cols,
+        "fingerprint": compute_header_fingerprint(cols),
+        "suggested_key": guess_key_column(cols, df) or (cols[0] if cols else ""),
+        "suggested_name_col": guess_name_column(cols) or "",
+        "suggested_id_col": guess_id_column(cols) or "",
+        "header_start": int(info.get("header_start") or 0),
+        "header_end": int(info.get("header_end") or 0),
+        "header_manual": bool(manual),
+    }
 
 
 @router.post("/integrate/analyze")
@@ -855,9 +980,6 @@ async def integrate_analyze(
     if not files or len(files) < 2:
         raise HTTPException(status_code=400, detail="请至少上传 2 个文件（1 主表 + 至少 1 对照表）")
 
-    from ..utils.merge_engine import compute_header_fingerprint, guess_key_column
-    from ..utils.integrate_engine import guess_name_column, guess_id_column
-
     session_id = uuid.uuid4().hex
     sdir = _integrate_session_dir(session_id)
     sdir.mkdir(parents=True, exist_ok=True)
@@ -865,42 +987,28 @@ async def integrate_analyze(
     files_meta = []
     try:
         for uf in files:
-            name = uf.filename or "unnamed.xlsx"
+            name = safe_upload_name(uf.filename, "unnamed.xlsx")
             if Path(name).suffix.lower() not in EXCEL_EXTS:
+                await uf.close()
                 raise HTTPException(status_code=400, detail=f"{name}: 不支持的扩展名")
             dest = sdir / name
-            dest.write_bytes(await uf.read())
-            # 上传规范化：误设日期格式的数字单元格重置为常规（避免被当日期读错）
-            # Aspose 操作全部走独立子进程（防 GIL 冻结主进程），失败不阻断
-            try:
-                from backend.utils.subprocess_runner import (
-                    run_in_subprocess, default_max_memory_mb, default_timeout,
-                )
-                await asyncio.to_thread(
-                    run_in_subprocess,
-                    "backend.utils.source_normalizer:normalize_misformatted_dates",
-                    (str(dest),),
-                    timeout=default_timeout("parse"),
-                    max_memory_mb=default_max_memory_mb(),
-                )
-            except Exception as _ne:
-                logger.warning(f"[integrate] 日期格式规范化失败（继续）: {_ne}")
-            info = await asyncio.to_thread(_parse_file_to_df, str(dest))
-            cols = info["columns"]
-            df = info.get("df")
-            files_meta.append({
-                "name": name,
-                "sheet": info["sheet"],
-                "columns": cols,
-                "fingerprint": compute_header_fingerprint(cols),
-                "suggested_key": guess_key_column(cols, df) or (cols[0] if cols else ""),
-                "suggested_name_col": guess_name_column(cols) or "",
-                "suggested_id_col": guess_id_column(cols) or "",
-            })
+            await save_upload_file(uf, dest)
+            # 第一阶段只识别列头/少量缓存值：不计算公式、不原地重写上传文件。
+            # 最终 execute 仍使用 _parse_file_full_impl(calculate_formulas=True)，结果语义不变。
+            async with get_excel_work_semaphore():
+                info = await _parse_file_to_df_fresh(
+                    str(dest), calculate_formulas=False)
+            if not info.get("columns"):
+                reason = info.get("error") or "激活工作表未识别到有效数据区域或列头"
+                raise HTTPException(status_code=400, detail=f"{name}: 解析失败：{reason}")
+            files_meta.append(_integrate_file_meta(name, info))
 
-        (sdir / "_meta.json").write_text(
-            json.dumps({"files": files_meta}, ensure_ascii=False), encoding="utf-8"
-        )
+        (sdir / "_meta.json").write_text(json.dumps({
+            "files": files_meta,
+            "header_ranges": {
+                f["name"]: [f["header_start"], f["header_end"]] for f in files_meta
+            },
+        }, ensure_ascii=False), encoding="utf-8")
         matched_schemes = _match_integrate_schemes(current_user, files_meta)
         return {"session_id": session_id, "files": files_meta, "matched_schemes": matched_schemes}
     except HTTPException:
@@ -910,6 +1018,59 @@ async def integrate_analyze(
         shutil.rmtree(sdir, ignore_errors=True)
         logger.exception("integrate/analyze 异常")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class IntegrateReparseRequest(BaseModel):
+    session_id: str
+    header_ranges: dict  # {file: {start_row, end_row}}
+
+
+@router.post("/integrate/reparse-headers")
+async def integrate_reparse_headers(
+    req: IntegrateReparseRequest,
+    current_user=Depends(get_current_user),
+):
+    """按人工指定的表头起止行重新解析主表/对照表，并刷新方案匹配结果。"""
+    sdir = _integrate_session_dir(req.session_id)
+    meta_path = sdir / "_meta.json"
+    if not meta_path.exists():
+        raise HTTPException(status_code=400, detail="会话已过期，请重新上传分析")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    old_files = {f.get("name"): f for f in meta.get("files", [])}
+    if not old_files:
+        raise HTTPException(status_code=400, detail="会话中没有可重新解析的文件")
+
+    new_meta = []
+    for name, old in old_files.items():
+        spec = (req.header_ranges or {}).get(name) or {}
+        try:
+            start = int(spec.get("start_row"))
+            end = int(spec.get("end_row"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"{name}: 表头起止行必须是正整数")
+        if start < 1 or end < start or end - start > 20:
+            raise HTTPException(status_code=400, detail=f"{name}: 表头范围无效（需满足 1 ≤ 起始行 ≤ 结束行，且最多 21 行）")
+        path = sdir / name
+        if not path.exists() or path.suffix.lower() not in EXCEL_EXTS:
+            raise HTTPException(status_code=400, detail=f"文件不存在: {name}")
+        async with get_excel_work_semaphore():
+            info = await _parse_file_to_df_fresh(
+                str(path), [start, end], old.get("sheet") or None,
+                calculate_formulas=False)
+        if not info.get("columns"):
+            raise HTTPException(status_code=400, detail=f"{name}: 指定的第 {start}-{end} 行未解析出有效列头")
+        new_meta.append(_integrate_file_meta(name, info, manual=True))
+
+    meta["files"] = new_meta
+    meta["header_ranges"] = {
+        f["name"]: [f["header_start"], f["header_end"]] for f in new_meta
+    }
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    return {
+        "session_id": req.session_id,
+        "files": new_meta,
+        "matched_schemes": _match_integrate_schemes(current_user, new_meta),
+    }
 
 
 class IntegrateMatchRequest(BaseModel):
@@ -992,7 +1153,7 @@ def _validate_integrate_columns(parsed, key_map, overwrite_pairs, compare_pairs,
     用户只会看到"0 行"或结果不对。这里把每个引用列逐一校验，报错精确到 文件+sheet+列。
     Returns: 错误消息列表（空则通过）。
     """
-    from ..utils.integrate_engine import _expr_columns
+    from ..utils.integrate_engine import _expr_columns, validate_formula_remainder
 
     errs = []
 
@@ -1037,11 +1198,84 @@ def _validate_integrate_columns(parsed, key_map, overwrite_pairs, compare_pairs,
         subst = expr
         for c in sorted(refs, key=len, reverse=True):
             subst = subst.replace(c, " ")
-        unresolved = [t for t in re.split(r"[+\*/()\s]+", subst)
-                      if t and not re.fullmatch(r"[0-9eE.+\-*/()]*", t)]
-        if unresolved:
-            errs.append(f"文件【{f}】的 sheet【{_sheet(f)}】的列 '{'、'.join(unresolved)}' 不存在（覆盖/对比源列）")
+        if not validate_formula_remainder(subst):
+            errs.append(
+                f"文件【{f}】的 sheet【{_sheet(f)}】的公式 '{expr}' 含不存在的列或不支持的语法"
+            )
     return errs
+
+
+def _integrate_execute_impl(session_dir: str, request_data: dict) -> dict:
+    """一次性子进程执行完整整合、公式重算和可选差异表生成。"""
+    from backend.utils.integrate_engine import build_source_indexes, compute_diffs
+    from backend.utils.integrate_writer import apply_integration, append_diff_sheet
+
+    sdir = Path(session_dir)
+    main_file = request_data["main_file"]
+    main_path = sdir / main_file
+    meta_path = sdir / "_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+    meta_by_file = {f.get("name"): f for f in meta.get("files", [])}
+    header_ranges = meta.get("header_ranges") or {}
+
+    def header_args(file_name: str):
+        rng = header_ranges.get(file_name)
+        file_meta = meta_by_file.get(file_name) or {}
+        sheet = file_meta.get("sheet")
+        return (rng, sheet) if rng and file_meta.get("header_manual") else (None, None)
+
+    main_rng, main_sheet = header_args(main_file)
+    main_info = _parse_file_full_impl(str(main_path), main_rng, main_sheet)
+    parsed = {main_file: {"df": main_info["df"], "sheet": main_info["sheet"]}}
+    for fp_path in sorted(sdir.iterdir()):
+        if fp_path.suffix.lower() not in EXCEL_EXTS or fp_path.name == main_file:
+            continue
+        rng, sheet = header_args(fp_path.name)
+        info = _parse_file_to_df_impl(str(fp_path), rng, sheet)
+        parsed[fp_path.name] = {"df": info["df"], "sheet": info["sheet"]}
+
+    errs = _validate_integrate_columns(
+        parsed, request_data["key_map"], request_data.get("overwrite_pairs", []),
+        request_data.get("compare_pairs", []), main_file,
+    )
+    if errs:
+        raise ValueError("；".join(errs))
+    n_sources = len(parsed) - 1
+    if n_sources < 1:
+        raise ValueError("至少需要 1 张对照表")
+
+    source_indexes = build_source_indexes(
+        parsed, request_data["key_map"], main_file,
+        normalize_keys=request_data.get("normalize_keys", True),
+        date_key_mode=request_data.get("date_key_mode", "off"),
+    )
+    out_path = sdir / f"整合结果_{main_file}"
+    stat = apply_integration(
+        main_path=str(main_path), out_path=str(out_path),
+        sheet_name=main_info["sheet"], head_data=main_info["head_data"],
+        a_key_col=request_data["key_map"].get(main_file),
+        data_row_start=main_info["data_row_start"], data_row_end=main_info["data_row_end"],
+        overwrite_pairs=request_data.get("overwrite_pairs", []), source_indexes=source_indexes,
+        normalize_keys=request_data.get("normalize_keys", True), diff_rows=None,
+        diff_order=request_data.get("diff_order", "id_name"),
+        date_key_mode=request_data.get("date_key_mode", "off"),
+    )
+
+    if request_data.get("output_mode") == 2 and request_data.get("compare_pairs"):
+        # apply_integration 已 CalculateFormula + Save；此处读取的就是最终计算缓存值。
+        final_info = _parse_file_full_impl(str(out_path))
+        diff_rows = compute_diffs(
+            final_info["df"], source_indexes,
+            a_key_col=request_data["key_map"].get(main_file),
+            compare_pairs=request_data["compare_pairs"],
+            a_name_col=request_data.get("name_col"), a_id_col=request_data.get("id_col"),
+            normalize_keys=request_data.get("normalize_keys", True),
+            label_source=(n_sources > 1),
+            date_key_mode=request_data.get("date_key_mode", "off"),
+        )
+        stat["diff_rows"] = append_diff_sheet(
+            str(out_path), diff_rows, request_data.get("diff_order", "id_name"))
+    return stat
 
 
 @router.post("/integrate/execute")
@@ -1049,9 +1283,6 @@ async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(g
     """按覆盖/对比配置回填主表并输出：原地覆盖主表激活页覆盖列（只写值、保全其余 sheet/公式），
     输出方式2 追加差异 sheet。返回更新后的主表 xlsx。
     """
-    from ..utils.integrate_engine import build_source_indexes, compute_diffs
-    from ..utils.integrate_writer import apply_integration, append_diff_sheet
-
     sdir = _integrate_session_dir(req.session_id)
     if not sdir.exists():
         raise HTTPException(status_code=400, detail="会话已过期，请重新上传分析")
@@ -1061,69 +1292,23 @@ async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(g
         raise HTTPException(status_code=400, detail=f"主表文件不存在: {req.main_file}")
 
     try:
-        # 解析：主表要区域坐标，对照表只要 df
-        # 解析走子进程 + to_thread：不冻结事件循环（多客户并发时其他请求照常响应）
-        main_info = await asyncio.to_thread(_parse_file_full, str(main_path))
-        parsed = {req.main_file: {"df": main_info["df"], "sheet": main_info["sheet"]}}
-        for fp_path in sorted(sdir.iterdir()):
-            if fp_path.suffix.lower() not in EXCEL_EXTS or fp_path.name == req.main_file:
-                continue
-            _info = await asyncio.to_thread(_parse_file_to_df, str(fp_path))
-            parsed[fp_path.name] = {"df": _info["df"], "sheet": _info["sheet"]}
-
-        # 执行前预检：方案引用的列必须真实存在，报错精确到 文件+sheet+列（缺列历史上是静默的）
-        errs = _validate_integrate_columns(
-            parsed, req.key_map, req.overwrite_pairs, req.compare_pairs, req.main_file)
-        if errs:
-            raise HTTPException(status_code=400, detail="；".join(errs))
-
-        n_sources = len([f for f in parsed if f != req.main_file])
-        if n_sources < 1:
-            raise HTTPException(status_code=400, detail="至少需要 1 张对照表")
-
-        source_indexes = build_source_indexes(
-            parsed, req.key_map, req.main_file, normalize_keys=req.normalize_keys,
-            date_key_mode=req.date_key_mode,
-        )
-
-        # 先执行覆盖回填并生成结果文件（含公式重算）。差异对比放到生成之后，
-        # 基于【最终生成文件】的实时值比对，避免用主表覆盖前的缓存旧值。
         out_path = sdir / f"整合结果_{req.main_file}"
-        stat = await asyncio.to_thread(apply_integration,
-            main_path=str(main_path), out_path=str(out_path),
-            sheet_name=main_info["sheet"], head_data=main_info["head_data"],
-            a_key_col=req.key_map.get(req.main_file),
-            data_row_start=main_info["data_row_start"], data_row_end=main_info["data_row_end"],
-            overwrite_pairs=req.overwrite_pairs, source_indexes=source_indexes,
-            normalize_keys=req.normalize_keys,
-            diff_rows=None, diff_order=req.diff_order,
-            date_key_mode=req.date_key_mode,
+        from backend.utils.subprocess_runner import (
+            run_in_fresh_subprocess_async, default_max_memory_mb, default_timeout,
         )
-
-        # 对比差异（仅输出方式2且配了对比列时）：重新解析生成文件取重算后的实时值再比对。
-        # 覆盖列联动的公式（如按被覆盖列计算的合计）此时已重算，比对结果才是最终文件的真实差异。
-        if req.output_mode == 2 and req.compare_pairs:
-            final_info = await asyncio.to_thread(_parse_file_full, str(out_path))
-            diff_rows = compute_diffs(
-                final_info["df"], source_indexes,
-                a_key_col=req.key_map.get(req.main_file),
-                compare_pairs=req.compare_pairs,
-                a_name_col=req.name_col, a_id_col=req.id_col,
-                normalize_keys=req.normalize_keys,
-                label_source=(n_sources > 1),
-                date_key_mode=req.date_key_mode,
+        async with get_excel_work_semaphore():
+            rr = await run_in_fresh_subprocess_async(
+                "backend.api.tools:_integrate_execute_impl",
+                (str(sdir), req.dict()), timeout=default_timeout("write"),
+                max_memory_mb=default_max_memory_mb(),
             )
-            stat["diff_rows"] = await asyncio.to_thread(
-                append_diff_sheet, str(out_path), diff_rows, req.diff_order)
+        if not rr.success:
+            reason = "超时" if rr.timed_out else ("内存超限" if rr.killed_by_memory else rr.error)
+            raise HTTPException(status_code=500, detail=f"整合执行失败（{reason}）")
+        stat = rr.result
+        if not out_path.exists():
+            raise HTTPException(status_code=500, detail="整合未生成输出文件")
 
-        data = out_path.read_bytes()
-        buf = io.BytesIO(data)
-        buf.seek(0)
-        # 不删会话：支持"先下载看看，再改配置/重新生成/保存方案"等后续操作
-        try:
-            out_path.unlink(missing_ok=True)   # 仅清理本次生成的临时结果文件，保留上传的源文件与 _meta
-        except Exception:
-            pass
         from urllib.parse import quote
         fname = f"整合结果_{req.main_file}"
         headers = {
@@ -1132,10 +1317,12 @@ async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(g
             "X-Integrate-Cells": str(stat.get("overwritten_cells", 0)),
             "X-Integrate-Diffs": str(stat.get("diff_rows", 0)),
         }
-        return StreamingResponse(
-            buf,
+        return FileResponse(
+            str(out_path),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers=headers,
+            # 保留上传源文件和会话配置，仅在客户端下载完成后删除本次结果。
+            background=BackgroundTask(out_path.unlink, missing_ok=True),
         )
     except HTTPException:
         raise
@@ -1209,36 +1396,284 @@ def _real_header_set(cols):
     return {_norm_header(c) for c in (cols or []) if not _PHANTOM_COL.match(str(c))}
 
 
-def _file_matches_role(f, expected_fp, expected_cols) -> bool:
-    """该文件是否可作为方案角色的候选：精确指纹，或忽略幻影列后真实列头集合一致。"""
-    if f.get("fingerprint") == expected_fp:
-        return True
-    exp_set = _real_header_set(expected_cols)
-    if exp_set:
-        return _real_header_set(f.get("columns", [])) == exp_set
-    return False
+_HEADER_PERIOD_RE = re.compile(
+    r"(?:20\d{2}\s*[年./_-]\s*)?(?:1[0-2]|0?[1-9])\s*月|"
+    r"20\d{2}\s*年|20\d{2}[-_/](?:1[0-2]|0?[1-9])"
+)
 
 
-def _pick_file_for_role(used: set, expected_fp, expected_cols, files_meta):
-    """为方案角色挑上传文件：优先精确指纹；否则按忽略幻影列后的列集合一致兜底。
+def _semantic_header(header) -> str:
+    """去掉列名中的年月周期，用于识别“2026年5月…”→“2026年6月…”一类变化。"""
+    from ..utils.merge_engine import _norm_header
+    text = _HEADER_PERIOD_RE.sub("", _norm_header(header))
+    return re.sub(r"[\s._/\-—（）()【】\[\]]+", "", text)
 
-    Returns: 命中文件 dict（未命中 None），不修改 used。
-    """
-    for f in files_meta:
-        if f["name"] not in used and _file_matches_role(f, expected_fp, expected_cols):
-            return f
+
+def _column_match_score(expected, actual) -> tuple:
+    """返回 (置信度, 方法)；低于 0.72 不建议自动建立关系。"""
+    from ..utils.merge_engine import _norm_header
+    e, a = _norm_header(expected), _norm_header(actual)
+    if not e or not a:
+        return 0.0, ""
+    if e == a:
+        return 1.0, "exact"
+    es, ass = _semantic_header(e), _semantic_header(a)
+    if es and es == ass:
+        return 0.98, "period"
+    if es and ass and min(len(es), len(ass)) >= 4 and (es in ass or ass in es):
+        return 0.88, "contains"
+    score = max(difflib.SequenceMatcher(None, e, a).ratio(),
+                difflib.SequenceMatcher(None, es, ass).ratio() if es and ass else 0.0)
+    return (round(score, 4), "similar") if score >= 0.72 else (0.0, "")
+
+
+def _suggest_column_map(required_cols, actual_cols) -> dict:
+    """把方案必需列一对一映射到当前列；返回 mapping/suggestions/missing/score。"""
+    actual = [c for c in (actual_cols or []) if not _PHANTOM_COL.match(str(c))]
+    required = list(dict.fromkeys(c for c in (required_cols or [])
+                                  if c and not _PHANTOM_COL.match(str(c))))
+    mapping, suggestions, missing, used = {}, [], [], set()
+    scores = []
+    for expected in required:
+        ranked = []
+        for cur in actual:
+            if cur in used:
+                continue
+            score, method = _column_match_score(expected, cur)
+            if score:
+                ranked.append((score, method, cur))
+        ranked.sort(key=lambda x: (-x[0], str(x[2])))
+        if not ranked:
+            missing.append(expected)
+            continue
+        score, method, cur = ranked[0]
+        used.add(cur)
+        mapping[expected] = cur
+        scores.append(score)
+        if str(expected) != str(cur):
+            suggestions.append({
+                "saved_col": expected, "current_col": cur,
+                "confidence": score, "method": method,
+            })
+    return {
+        "mapping": mapping,
+        "suggestions": suggestions,
+        "missing": missing,
+        "score": (sum(scores) / len(required)) if required else 1.0,
+    }
+
+
+def _scheme_roles(cfg: dict) -> List[dict]:
+    roles = cfg.get("roles") or []
+    if roles:
+        return [dict(r) for r in roles]
+    main_fp = cfg.get("main_fp")
+    source_fps = cfg.get("source_fps") or []
+    files_by_fp = cfg.get("files_by_fp") or {}
+    return [{"fp": fp, "file": files_by_fp.get(fp, "")}
+            for fp in ([main_fp] + list(source_fps)) if fp]
+
+
+def _required_cols_by_role(cfg: dict) -> dict:
+    """只提取方案执行真正依赖的列；未参与方案的多列/少列不影响复用。"""
+    roles = _scheme_roles(cfg)
+    cols_by_fp = cfg.get("cols_by_fp") or {}
+    required = {i: [] for i in range(len(roles))}
+
+    def add(idx, col):
+        if idx is not None and idx in required and col and col not in required[idx]:
+            required[idx].append(col)
+
+    for idx, cols in (cfg.get("required_cols_by_role") or {}).items():
+        try:
+            role_idx = int(idx)
+        except (TypeError, ValueError):
+            continue
+        for col in cols if isinstance(cols, list) else []:
+            add(role_idx, col)
+
+    key_by_role = cfg.get("key_map_by_role") or {}
+    if key_by_role:
+        for idx, col in key_by_role.items():
+            try:
+                add(int(idx), col)
+            except (TypeError, ValueError):
+                pass
+    else:
+        key_by_fp = cfg.get("key_map_by_fp") or {}
+        for i, role in enumerate(roles):
+            add(i, key_by_fp.get(role.get("fp")))
+
+    add(0, cfg.get("name_col"))
+    add(0, cfg.get("id_col"))
+    for pair in list(cfg.get("overwrite_pairs") or []) + list(cfg.get("compare_pairs") or []):
+        add(0, pair.get("a_col"))
+        src_idx = pair.get("source_role")
+        if src_idx is None:
+            src_fp = pair.get("source_fp")
+            src_idx = next((i for i, r in enumerate(roles) if i > 0 and r.get("fp") == src_fp), None)
+        try:
+            src_idx = int(src_idx) if src_idx is not None else None
+        except (TypeError, ValueError):
+            src_idx = None
+        expr = str(pair.get("source_expr") or pair.get("source_col") or "")
+        saw_known_source_col = False
+        for i, role in enumerate(roles):
+            known_cols = cols_by_fp.get(role.get("fp")) or []
+            saved_file = str(role.get("file") or "")
+            for col in sorted(known_cols, key=lambda x: len(str(x)), reverse=True):
+                qualified = f"{saved_file}.{col}" if saved_file else ""
+                if qualified and qualified in expr:
+                    add(i, col)
+                    if i == src_idx:
+                        saw_known_source_col = True
+                elif i == src_idx and str(col) in expr:
+                    add(i, col)
+                    saw_known_source_col = True
+        if src_idx is not None and expr and not saw_known_source_col and not re.search(r"[+\-*/(),<>=!]", expr):
+            # 极旧方案可能没有 cols_by_fp，且 source_col 只保存了一个裸列名。
+            add(src_idx, expr)
+    return required
+
+
+def _role_candidate(role: dict, required_cols, file_meta: dict, expected_cols) -> Optional[dict]:
+    """评估一个上传文件能否承担方案角色。优先指纹，否则只要求执行所需列可映射。"""
+    if file_meta.get("fingerprint") == role.get("fp"):
+        colmap = _suggest_column_map(required_cols or expected_cols, file_meta.get("columns", []))
+        return {"file": file_meta, "colmap": colmap, "score": 2.0}
+    if required_cols:
+        colmap = _suggest_column_map(required_cols, file_meta.get("columns", []))
+        if not colmap["missing"]:
+            return {"file": file_meta, "colmap": colmap, "score": 1.0 + colmap["score"]}
+        return None
+    # 旧空配置兜底：仍按完整真实列集合判断，避免无依赖信息时误配任意文件。
+    if _real_header_set(expected_cols) == _real_header_set(file_meta.get("columns", [])):
+        return {"file": file_meta, "colmap": _suggest_column_map(expected_cols, file_meta.get("columns", [])),
+                "score": 1.5}
     return None
 
 
-def _match_integrate_schemes(current_user, files_meta: List[dict]) -> List[dict]:
-    """按列头指纹把【当前用户可见】方案匹配到本次上传的文件，解析出角色(主表/各对照表)。
+def _match_scheme_config(cfg: dict, files_meta: List[dict]) -> Optional[dict]:
+    """为单个方案求一组不重复的角色文件分配及列名映射。"""
+    roles = _scheme_roles(cfg)
+    if not roles or len(files_meta) < len(roles):
+        return None
+    cols_by_fp = cfg.get("cols_by_fp") or {}
+    required = _required_cols_by_role(cfg)
+    candidates = []
+    for i, role in enumerate(roles):
+        cands = []
+        for f in files_meta:
+            c = _role_candidate(role, required.get(i) or [], f, cols_by_fp.get(role.get("fp")) or [])
+            if c:
+                cands.append(c)
+        cands.sort(key=lambda c: (-c["score"], c["file"]["name"]))
+        if not cands:
+            return None
+        candidates.append(cands)
 
-    Returns: [{id, name, main_file, fp_to_file{fp:file}, ambiguous, config}]
-    - 仅返回能完整匹配的方案（每个角色至少一个候选文件）。
-    - ambiguous: [{"label","fp","candidates":[文件名...],"saved_file"}] —— 存在同结构表竞争
-      同一角色（候选集合与其它角色相交）时的歧义角色，由前端弹匹配框让操作人员手动确认
-      对应关系；无歧义为空列表。
-    """
+    # 增广路求一对一角色分配，避免同结构表较多时全排列回溯呈阶乘增长。
+    file_to_role, chosen_by_role = {}, {}
+
+    def assign(role_idx, seen_files):
+        for cand in candidates[role_idx]:
+            name = cand["file"]["name"]
+            if name in seen_files:
+                continue
+            seen_files.add(name)
+            previous = file_to_role.get(name)
+            if previous is None or assign(previous, seen_files):
+                file_to_role[name] = role_idx
+                chosen_by_role[role_idx] = cand
+                return True
+        return False
+
+    for role_idx in sorted(range(len(candidates)), key=lambda i: (len(candidates[i]), i)):
+        if not assign(role_idx, set()):
+            return None
+    chosen = [chosen_by_role[i] for i in range(len(candidates))]
+    role_files = [c["file"]["name"] for c in chosen]
+    maps = {i: c["colmap"]["mapping"] for i, c in enumerate(chosen)}
+    suggestions = []
+    for i, c in enumerate(chosen):
+        label = "主表" if i == 0 else f"对照表{i}"
+        for item in c["colmap"]["suggestions"]:
+            suggestions.append({"role_index": i, "label": label, "file": role_files[i], **item})
+    return {
+        "roles": roles,
+        "role_files": role_files,
+        "column_maps_by_role": maps,
+        "mapping_suggestions": suggestions,
+        "candidates": candidates,
+    }
+
+
+def _replace_expr_tokens(expr: str, replacements: dict) -> str:
+    """用占位符一次性替换公式 token，避免新列名再次被后续规则误替换。"""
+    text = str(expr or "")
+    placeholders = {}
+    for i, (old, new) in enumerate(sorted(replacements.items(), key=lambda kv: len(str(kv[0])), reverse=True)):
+        if not old or old == new or str(old) not in text:
+            continue
+        key = f"\u0002INTMAP{i}\u0003"
+        text = text.replace(str(old), key)
+        placeholders[key] = str(new)
+    for key, val in placeholders.items():
+        text = text.replace(key, val)
+    return text
+
+
+def _resolved_scheme_config(cfg: dict, match: dict) -> dict:
+    """把保存时的列名/文件名翻译成本次上传文件，供前端确认后直接沿用方案。"""
+    resolved = json.loads(json.dumps(cfg, ensure_ascii=False))
+    roles = match["roles"]
+    role_files = match["role_files"]
+    maps = match["column_maps_by_role"]
+    key_by_role = resolved.get("key_map_by_role") or {}
+    if not key_by_role:
+        key_by_fp = resolved.get("key_map_by_fp") or {}
+        key_by_role = {str(i): key_by_fp.get(role.get("fp"))
+                       for i, role in enumerate(roles) if key_by_fp.get(role.get("fp"))}
+    translated_keys = {}
+    for i, col in key_by_role.items():
+        try:
+            idx = int(i)
+        except (TypeError, ValueError):
+            continue
+        translated_keys[str(idx)] = maps.get(idx, {}).get(col, col)
+    resolved["key_map_by_role"] = translated_keys
+    main_map = maps.get(0, {})
+    for field in ("name_col", "id_col"):
+        if resolved.get(field):
+            resolved[field] = main_map.get(resolved[field], resolved[field])
+
+    for list_name in ("overwrite_pairs", "compare_pairs"):
+        new_pairs = []
+        for pair in resolved.get(list_name) or []:
+            p = dict(pair)
+            p["a_col"] = main_map.get(p.get("a_col"), p.get("a_col"))
+            src_idx = p.get("source_role")
+            if src_idx is None:
+                src_fp = p.get("source_fp")
+                src_idx = next((i for i, r in enumerate(roles) if i > 0 and r.get("fp") == src_fp), None)
+            src_idx = int(src_idx) if src_idx is not None else None
+            repl = {}
+            for i, role in enumerate(roles):
+                old_file, new_file = str(role.get("file") or ""), role_files[i]
+                for old_col, new_col in maps.get(i, {}).items():
+                    if old_file:
+                        repl[f"{old_file}.{old_col}"] = f"{new_file}.{new_col}"
+                    if i == src_idx:
+                        repl[old_col] = new_col
+            expr = _replace_expr_tokens(p.get("source_expr") or p.get("source_col") or "", repl)
+            p.update({"source_role": src_idx, "source_expr": expr, "source_col": expr})
+            new_pairs.append(p)
+        resolved[list_name] = new_pairs
+    return resolved
+
+
+def _match_integrate_schemes(current_user, files_meta: List[dict]) -> List[dict]:
+    """按“执行所需列”匹配可见方案；允许无关列增删，并产出列名变化建议。"""
     from ..database.connection import SessionLocal
 
     out: List[dict] = []
@@ -1247,69 +1682,34 @@ def _match_integrate_schemes(current_user, files_meta: List[dict]) -> List[dict]
         rows = _visible_integrate_schemes(db, current_user)
         for row in rows:
             cfg = row.config or {}
-            main_fp = cfg.get("main_fp")
-            source_fps = cfg.get("source_fps", [])
-            if not main_fp:
+            match = _match_scheme_config(cfg, files_meta)
+            if not match:
                 continue
-            cols_by_fp = cfg.get("cols_by_fp", {})
-            roles = [("主表", main_fp)] + [(f"对照表{i + 1}", fp) for i, fp in enumerate(source_fps)]
-
-            # 1) 每个角色的全部候选文件（不排除占用），先保证方案完整
-            role_cands = []
-            incomplete = False
-            for label, fp in roles:
-                cands = [f["name"] for f in files_meta
-                         if _file_matches_role(f, fp, cols_by_fp.get(fp) or [])]
-                if not cands:
-                    incomplete = True
-                    break
-                role_cands.append((label, fp, cands))
-            if incomplete:
-                continue
-
-            # 2) 默认分配：顺序取首个未占用（保持原有行为）。
-            #    role_files 直接按角色顺序收集（同指纹角色 fp_to_file 会互相覆盖，不能反查）
-            used = set()
-            fp_to_file = {}
-            role_files = []
-            ok = True
-            for label, fp, cands in role_cands:
-                hit = next((c for c in cands if c not in used), None)
-                if not hit:
-                    ok = False
-                    break
-                used.add(hit)
-                fp_to_file[fp] = hit
-                role_files.append(hit)
-            if not ok:
-                continue
-
-            # 3) 歧义检测：同结构表竞争（候选集合相交）或单角色多候选（>1 个同结构文件可选）→
-            #    无法自动确定对应关系，交由前端弹匹配框人工确认。
-            #    角色用【角色索引】标识（同结构角色指纹相同，fp 不能作唯一键）。
-            files_by_fp = cfg.get("files_by_fp") or {}
-            roles_cfg = cfg.get("roles") or []
+            roles_cfg = match["roles"]
+            role_files = match["role_files"]
+            fp_to_file = {r.get("fp"): role_files[i] for i, r in enumerate(roles_cfg)}
             ambiguous = []
-            for i, (label, fp, cands) in enumerate(role_cands):
+            all_cand_names = [[c["file"]["name"] for c in cs] for cs in match["candidates"]]
+            for i, (role, cands) in enumerate(zip(roles_cfg, all_cand_names)):
                 set_i = set(cands)
-                involved = len(cands) > 1 or any(
-                    set_i & set(rc[2]) for j, rc in enumerate(role_cands) if j != i)
+                involved = len(cands) > 1 or any(set_i & set(other)
+                                                 for j, other in enumerate(all_cand_names) if j != i)
                 if involved:
-                    saved = (roles_cfg[i].get("file", "") if roles_cfg and i < len(roles_cfg)
-                             else files_by_fp.get(fp, ""))
                     ambiguous.append({
-                        "label": label,
-                        "fp": fp,
+                        "label": "主表" if i == 0 else f"对照表{i}",
+                        "fp": role.get("fp"),
                         "role_index": i,
                         "candidates": sorted(cands),
-                        "saved_file": saved,
+                        "saved_file": role.get("file", ""),
                     })
 
             out.append({"id": row.id, "name": row.name,
-                        "main_file": fp_to_file.get(main_fp, ""),
+                        "main_file": role_files[0],
                         "fp_to_file": fp_to_file,
                         "role_files": role_files,
                         "ambiguous": ambiguous,
+                        "mapping_suggestions": match["mapping_suggestions"],
+                        "column_maps_by_role": match["column_maps_by_role"],
                         "config": cfg})
     finally:
         db.close()
@@ -1409,6 +1809,13 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
         "diff_order": req.diff_order, "output_mode": req.output_mode,
         "normalize_keys": req.normalize_keys,
         "date_key_mode": req.date_key_mode,
+        "header_ranges_by_role": {
+            str(role_of_file[f]): (meta.get("header_ranges") or {}).get(f)
+            for f in role_of_file if (meta.get("header_ranges") or {}).get(f)
+        },
+    }
+    config["required_cols_by_role"] = {
+        str(k): v for k, v in _required_cols_by_role(config).items()
     }
 
     from ..database.connection import SessionLocal
@@ -1494,6 +1901,116 @@ async def integrate_schemes_list(current_user=Depends(get_current_user)):
         db.close()
 
 
+def _validate_integrate_import_config(config) -> dict:
+    """校验方案归档内容，只接受整合方案需要的纯 JSON 配置。"""
+    if not isinstance(config, dict):
+        raise HTTPException(status_code=400, detail="方案文件中的 config 格式无效")
+    if not isinstance(config.get("main_fp"), str) or not config.get("main_fp"):
+        raise HTTPException(status_code=400, detail="方案文件缺少主表指纹 main_fp")
+    if not isinstance(config.get("source_fps", []), list) or len(config.get("source_fps", [])) > 50:
+        raise HTTPException(status_code=400, detail="方案文件中的对照表角色无效")
+    if any(not isinstance(fp, str) for fp in config.get("source_fps", [])):
+        raise HTTPException(status_code=400, detail="方案文件中的对照表指纹无效")
+    roles = config.get("roles", [])
+    if not isinstance(roles, list) or len(roles) > 51 or any(not isinstance(r, dict) for r in roles):
+        raise HTTPException(status_code=400, detail="方案文件中的 roles 无效")
+    for key in ("cols_by_fp", "files_by_fp", "key_map_by_fp", "key_map_by_role",
+                "required_cols_by_role", "header_ranges_by_role"):
+        if key in config and not isinstance(config[key], dict):
+            raise HTTPException(status_code=400, detail=f"方案文件中的 {key} 无效")
+    for key in ("overwrite_pairs", "compare_pairs"):
+        pairs = config.get(key, [])
+        if not isinstance(pairs, list) or len(pairs) > 2000 or any(not isinstance(p, dict) for p in pairs):
+            raise HTTPException(status_code=400, detail=f"方案文件中的 {key} 无效")
+        for pair in pairs:
+            expr = str(pair.get("source_expr") or pair.get("source_col") or "")
+            if len(expr) > 10000:
+                raise HTTPException(status_code=400, detail="方案中的公式长度超过限制")
+    # JSON 往返生成独立、可序列化副本，避免带入非标准对象。
+    return json.loads(json.dumps(config, ensure_ascii=False))
+
+
+@router.get("/integrate/scheme/{scheme_id}/export")
+async def integrate_scheme_export(scheme_id: int, current_user=Depends(get_current_user)):
+    """导出可见方案为可归档/迁移的 JSON 文件（不包含用户及组织信息）。"""
+    from urllib.parse import quote
+    db = SessionLocal()
+    try:
+        visible = {r.id: r for r in _visible_integrate_schemes(db, current_user)}
+        row = visible.get(scheme_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="方案不存在或无权访问")
+        payload = {
+            "format": "datamerge.integrate-scheme",
+            "version": 1,
+            "exported_at": datetime.utcnow().isoformat() + "Z",
+            "name": row.name,
+            "config": row.config or {},
+        }
+        data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        safe_name = re.sub(r"[\\/:*?\"<>|]+", "_", row.name).strip() or "整合方案"
+        return StreamingResponse(
+            io.BytesIO(data), media_type="application/json; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(safe_name + '.json')}"},
+        )
+    finally:
+        db.close()
+
+
+@router.post("/integrate/scheme/import")
+async def integrate_scheme_import(
+    file: UploadFile = File(...),
+    name: Optional[str] = Form(None),
+    current_user=Depends(get_current_user),
+):
+    """导入方案归档并归属到当前用户组织；同名时要求用户改名。"""
+    from ..auth.dependencies import has_permission
+    from ..database.models import IntegrateTemplate
+    if not has_permission(current_user, "tools.data_integrate.create"):
+        raise HTTPException(status_code=403, detail="缺少权限: 导入/新增方案")
+    raw = await file.read(2 * 1024 * 1024 + 1)
+    if len(raw) > 2 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="方案文件不能超过 2MB")
+    try:
+        payload = json.loads(raw.decode("utf-8-sig"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="方案文件不是有效的 UTF-8 JSON")
+    if (not isinstance(payload, dict) or
+            payload.get("format") != "datamerge.integrate-scheme" or
+            payload.get("version") != 1):
+        raise HTTPException(status_code=400, detail="不支持的方案文件格式或版本")
+    config = _validate_integrate_import_config(payload.get("config"))
+    imported_name = (name or payload.get("name") or "").strip()
+    if not imported_name or len(imported_name) > 200:
+        raise HTTPException(status_code=400, detail="导入后的方案名称不能为空且不能超过 200 字")
+
+    uid = getattr(current_user, "id", None)
+    org_id = getattr(current_user, "org_id", None)
+    tenant_id = f"org:{org_id}" if org_id else f"user:{uid}"
+    db = SessionLocal()
+    try:
+        dup = db.query(IntegrateTemplate).filter_by(tenant_id=tenant_id, name=imported_name).first()
+        if dup:
+            raise HTTPException(status_code=400, detail=f"同组织内已存在同名方案「{imported_name}」，请修改导入名称")
+        row = IntegrateTemplate(
+            tenant_id=tenant_id, name=imported_name, config=config,
+            org_id=org_id, created_by=uid, updated_by=uid,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return {"ok": True, "id": row.id, "name": row.name}
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.exception("integrate/scheme/import 异常")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
 @router.delete("/integrate/scheme/{scheme_id}")
 async def integrate_scheme_delete(scheme_id: int, current_user=Depends(get_current_user)):
     """删除整合对比方案：需 delete 权限，且仅创建人/管理员可删。"""
@@ -1526,14 +2043,14 @@ class IntegrateApplyValidateRequest(BaseModel):
 
 @router.post("/integrate/scheme/apply-validate")
 async def integrate_scheme_apply_validate(req: IntegrateApplyValidateRequest, current_user=Depends(get_current_user)):
-    """应用方案前校验：上传文件数 + 表头结构是否与原方案一致（硬阻断，列出不一致理由）。
-    通过后前端用 analyze 返回的 matched_schemes 里对应方案（含 fp_to_file）套用并执行。"""
+    """应用方案前校验：无关列可增删；必需列改名时返回建议映射供用户确认。"""
     from ..auth.dependencies import has_permission
     from ..utils.merge_engine import _norm_header
     from ..database.connection import SessionLocal
 
-    if not has_permission(current_user, "tools.data_integrate.apply"):
-        raise HTTPException(status_code=403, detail="缺少权限: 应用方案")
+    if not (has_permission(current_user, "tools.data_integrate.apply") or
+            has_permission(current_user, "tools.data_integrate.edit")):
+        raise HTTPException(status_code=403, detail="缺少权限: 应用或修改方案")
 
     sdir = _integrate_session_dir(req.session_id)
     meta_path = sdir / "_meta.json"
@@ -1553,66 +2070,51 @@ async def integrate_scheme_apply_validate(req: IntegrateApplyValidateRequest, cu
     finally:
         db.close()
 
-    main_fp = cfg.get("main_fp")
-    source_fps = cfg.get("source_fps", [])
-    cols_by_fp = cfg.get("cols_by_fp", {})
-    files_by_fp = cfg.get("files_by_fp") or {}
-    roles_cfg = cfg.get("roles") or []
-    expected = [("主表", main_fp)] + [(f"对照表{i + 1}", fp) for i, fp in enumerate(source_fps)]
-
-    def _saved_file(i: int, fp: str) -> str:
-        """该角色的保存时文件名（roles 按索引取，兼容旧方案回退 files_by_fp）"""
-        if roles_cfg and i < len(roles_cfg):
-            return str(roles_cfg[i].get("file") or "")
-        return str(files_by_fp.get(fp) or "")
-
-    def _label_txt(i: int, label: str, fp: str) -> str:
-        sf = _saved_file(i, fp)
-        return f"{label}（方案中表名：{sf}）" if sf else label
-
+    roles = _scheme_roles(cfg)
     reasons: List[str] = []
-    # 1) 文件数校验（列出方案需要的具体表名，方便用户对照）
-    if len(uploaded) != len(expected):
-        names = "；".join(_label_txt(i, label, fp) for i, (label, fp) in enumerate(expected))
-        reasons.append(f"方案需要 {len(expected)} 张表，实际上传 {len(uploaded)} 张。方案表清单：{names}")
+    if len(uploaded) < len(roles):
+        reasons.append(f"方案至少需要 {len(roles)} 张表，实际上传 {len(uploaded)} 张")
+    match = _match_scheme_config(cfg, uploaded)
+    if not match:
+        required = _required_cols_by_role(cfg)
+        for i, role in enumerate(roles):
+            label = "主表" if i == 0 else f"对照表{i}"
+            saved_file = role.get("file") or ""
+            best = None
+            for f in uploaded:
+                cm = _suggest_column_map(required.get(i) or [], f.get("columns") or [])
+                hit_count = len(cm["mapping"])
+                if best is None or hit_count > best[0]:
+                    best = (hit_count, f, cm)
+            if best and best[2]["missing"]:
+                reasons.append(
+                    f"{label}（方案中表名：{saved_file}）缺少无法可靠映射的必需列："
+                    + "、".join(map(str, best[2]["missing"]))
+                )
+        if not reasons:
+            reasons.append("上传文件无法与方案中的主表/对照表角色建立唯一对应关系")
+        return {"ok": False, "reasons": reasons, "scheme_id": req.scheme_id,
+                "scheme_name": row.name}
 
-    # 2) 表头结构校验：逐个期望角色按"精确指纹→忽略幻影列后列集合一致"找上传文件（消耗式），
-    #    找不到则对最接近文件做列级 diff（同样忽略幻影列，避免空表头样式列干扰）。
-    used = set()
-    for i, (label, fp) in enumerate(expected):
-        exp_cols = cols_by_fp.get(fp) or []
-        hit = _pick_file_for_role(used, fp, exp_cols, uploaded)
-        if hit:
-            used.add(hit["name"])
-            continue
-        # 在未占用文件里按列名重合度找最接近的
-        best, best_score = None, -1.0
-        exp_norm = _real_header_set(exp_cols)
-        for f in uploaded:
-            if f["name"] in used:
-                continue
-            up_norm = _real_header_set(f.get("columns", []))
-            inter = len(exp_norm & up_norm)
-            union = len(exp_norm | up_norm) or 1
-            score = inter / union
-            if score > best_score:
-                best_score, best = score, f
-        if best is not None and exp_norm:
-            up_norm = _real_header_set(best.get("columns", []))
-            missing = [c for c in exp_cols if not _PHANTOM_COL.match(str(c)) and _norm_header(c) not in up_norm]
-            extra = [c for c in best.get("columns", []) if not _PHANTOM_COL.match(str(c)) and _norm_header(c) not in exp_norm]
-            detail = []
-            if extra:
-                detail.append("多列 " + "、".join(map(str, extra)))
-            if missing:
-                detail.append("缺列 " + "、".join(map(str, missing)))
-            sheet = best.get("sheet") or "?"
-            tail = (f"；最接近的是文件【{best['name']}】的 sheet【{sheet}】：" + "；".join(detail)) if detail else ""
-            reasons.append(f"缺少表头结构为【{_label_txt(i, label, fp)}】的表" + tail)
-        else:
-            reasons.append(f"缺少表头结构为【{_label_txt(i, label, fp)}】的表")
-
-    return {"ok": len(reasons) == 0, "reasons": reasons, "scheme_id": req.scheme_id, "scheme_name": row.name}
+    role_files = match["role_files"]
+    fp_to_file = {r.get("fp"): role_files[i] for i, r in enumerate(match["roles"])}
+    resolved_scheme = {
+        "id": row.id,
+        "name": row.name,
+        "main_file": role_files[0],
+        "role_files": role_files,
+        "fp_to_file": fp_to_file,
+        "config": _resolved_scheme_config(cfg, match),
+    }
+    return {
+        "ok": True,
+        "reasons": [],
+        "scheme_id": req.scheme_id,
+        "scheme_name": row.name,
+        "requires_confirmation": bool(match["mapping_suggestions"]),
+        "mapping_suggestions": match["mapping_suggestions"],
+        "resolved_scheme": resolved_scheme,
+    }
 
 
 # ==================== SOP 维护 ====================

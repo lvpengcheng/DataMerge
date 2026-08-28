@@ -95,6 +95,58 @@ docker-compose logs -f
 docker-compose down
 ```
 
+#### 方式三：Ubuntu 原生部署（不使用 Docker）
+
+项目提供 `deploy_native_ubuntu.sh`，使用 Python 虚拟环境和 systemd 运行。脚本会安装
+Redis、.NET 9、字体与系统库，验证 Aspose.Cells，并为服务设置内存、Swap、CPU 和任务数护栏。
+
+```bash
+chmod +x deploy_native_ubuntu.sh
+sudo APP_USER="$USER" ./deploy_native_ubuntu.sh install
+
+# 查看状态与日志
+sudo ./deploy_native_ubuntu.sh status
+sudo ./deploy_native_ubuntu.sh logs
+
+# 更新代码或 requirements.txt 后
+sudo ./deploy_native_ubuntu.sh update
+```
+
+默认使用单 Uvicorn worker，并设置 `MemoryMax=6G`、禁止服务使用 Swap、
+`CPUQuota=200%`。可按服务器容量覆盖：
+
+```bash
+sudo APP_USER="$USER" MEMORY_MAX=8G MEMORY_HIGH=7G \
+  CPU_QUOTA=300% ./deploy_native_ubuntu.sh install
+```
+
+原生部署仍使用项目根目录的 `.env`。本机 PostgreSQL/Redis 的连接地址应使用
+`127.0.0.1`，不要使用 Docker Compose 的服务名。
+
+##### 从 Windows 一键打包、上传并发布
+
+第一次双击 `publish_native.bat`，脚本会生成并打开 `deploy.native.config.json`。
+填写服务器地址、SSH用户和远程目录后，再运行一次。以后每次发布只需运行：
+
+```bat
+publish_native.bat
+```
+
+发布器会自动排除 `.env`、租户数据、数据库、日志和结果目录，上传前备份服务器当前
+代码，随后执行 systemd 原生安装或更新。配置了 `env_file` 时，`.env` 只在服务器首次
+部署、尚不存在时上传；如确实需要覆盖服务器配置，显式执行：
+
+```bat
+publish_native.bat --update-env
+```
+
+普通 SSH 用户需要配置免密 `sudo`；否则建议首次使用 `root` 发布。服务器运行数据不会
+随代码更新被删除或覆盖。配置 SSH 密钥后可以完全免交互运行：
+
+```bat
+publish_native.bat --yes
+```
+
 ## 📡 API接口
 
 ### 训练接口

@@ -13,6 +13,7 @@ import logging
 import ast as _ast
 import re as _re
 import operator as _operator
+from decimal import Decimal as _Decimal, ROUND_HALF_UP as _ROUND_HALF_UP
 from typing import Dict, List, Any, Optional
 
 from .merge_engine import (
@@ -95,16 +96,63 @@ def build_source_indexes(parsed: Dict[str, dict], key_map: Dict[str, str],
     return out
 
 
-# ==================== 覆盖/对比取值：多行汇总 + 四则运算公式 ====================
+# ==================== 覆盖/对比取值：多行汇总 + 受控 Excel 公式 ====================
 
 _ARITH_BINOPS = {_ast.Add: _operator.add, _ast.Sub: _operator.sub,
                  _ast.Mult: _operator.mul, _ast.Div: _operator.truediv}
+_COMPARE_OPS = {
+    _ast.Eq: _operator.eq, _ast.NotEq: _operator.ne,
+    _ast.Gt: _operator.gt, _ast.GtE: _operator.ge,
+    _ast.Lt: _operator.lt, _ast.LtE: _operator.le,
+}
+_FORMULA_FUNCTIONS = {"ROUND", "IF", "ABS", "MIN", "MAX", "SUM", "AND", "OR", "NOT"}
+
+
+def _excel_round(value, digits=0):
+    """Excel ROUND 的四舍五入（远离 0），避免 Python 银行家舍入差异。"""
+    try:
+        digits = int(digits)
+        if digits < -15 or digits > 15:
+            return None
+        quant = _Decimal("1").scaleb(-digits)
+        dec = _Decimal(str(float(value)))
+        # 四则运算的二进制浮点可能把 6.235 留成 6.234999999999999；Excel ROUND
+        # 会按显示十进制语义得到 6.24，先消除这一量级的机器误差。
+        eps = _Decimal("1e-12") if dec >= 0 else _Decimal("-1e-12")
+        return float((dec + eps).quantize(quant, rounding=_ROUND_HALF_UP))
+    except Exception:
+        return None
+
+
+def _normalize_excel_formula(expr: str) -> str:
+    text = str(expr or "").strip()
+    if text.startswith("="):
+        text = text[1:].lstrip()
+    text = text.replace("<>", "!=")
+    text = _re.sub(r"(?<![<>=!])=(?!=)", "==", text)
+    # Excel 函数名不区分大小写；IF/AND/OR/NOT 的小写形式会与 Python 关键字冲突，
+    # 统一大写后再交给 AST 解析。
+    for name in _FORMULA_FUNCTIONS:
+        text = _re.sub(rf"\b{_re.escape(name)}\s*(?=\()", name, text, flags=_re.IGNORECASE)
+    return text
+
+
+def validate_formula_remainder(rest: str) -> bool:
+    """列 token 被移除后，是否只剩受支持的 Excel 公式语法。"""
+    text = _normalize_excel_formula(rest)
+    probe = _re.sub(r"(?<![A-Za-z0-9_.])(?:\d+(?:\.\d*)?|\.\d+)[eE][+\-]?\d+", "0", text)
+    names = _re.findall(r"[A-Za-z_][A-Za-z0-9_]*", probe)
+    if any(name.upper() not in _FORMULA_FUNCTIONS and name.lower() not in {"true", "false"}
+           for name in names):
+        return False
+    without_names = _re.sub(r"[A-Za-z_][A-Za-z0-9_]*", "", probe)
+    return bool(_re.fullmatch(r"[0-9eE.+\-*/(),<>=!\s]*", without_names))
 
 
 def _safe_arith_eval(expr: str) -> Optional[float]:
-    """只对 +-*/、一元正负、数字与括号求值；出现任何其它节点/名字/函数调用 → 返回 None。"""
+    """安全计算受控 Excel 子集：四则、比较、ROUND/IF/ABS/MIN/MAX/SUM/AND/OR/NOT。"""
     try:
-        node = _ast.parse(expr, mode="eval").body
+        node = _ast.parse(_normalize_excel_formula(expr), mode="eval").body
     except Exception:
         return None
 
@@ -123,8 +171,54 @@ def _safe_arith_eval(expr: str) -> Optional[float]:
             return v if isinstance(n.op, _ast.UAdd) else -v
         if isinstance(n, _ast.Constant) and isinstance(n.value, (int, float)) and not isinstance(n.value, bool):
             return float(n.value)
+        if isinstance(n, _ast.Constant) and isinstance(n.value, bool):
+            return n.value
         if isinstance(n, getattr(_ast, "Num", ())):   # py<3.8 兼容
             return float(n.n)
+        if isinstance(n, _ast.Name) and n.id.lower() in {"true", "false"}:
+            return n.id.lower() == "true"
+        if isinstance(n, _ast.Compare) and len(n.ops) == len(n.comparators):
+            left = ev(n.left)
+            if left is None:
+                return None
+            for op, rhs_node in zip(n.ops, n.comparators):
+                right = ev(rhs_node)
+                fn = _COMPARE_OPS.get(type(op))
+                if fn is None or right is None or not fn(left, right):
+                    return False if fn is not None and right is not None else None
+                left = right
+            return True
+        if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name):
+            name = n.func.id.upper()
+            if name not in _FORMULA_FUNCTIONS or n.keywords:
+                return None
+            if name == "IF":
+                if len(n.args) != 3:
+                    return None
+                cond = ev(n.args[0])
+                return ev(n.args[1] if bool(cond) else n.args[2]) if cond is not None else None
+            if name in {"AND", "OR"}:
+                if not n.args:
+                    return None
+                vals = [ev(a) for a in n.args]
+                if any(v is None for v in vals):
+                    return None
+                return all(bool(v) for v in vals) if name == "AND" else any(bool(v) for v in vals)
+            if name == "NOT":
+                if len(n.args) != 1:
+                    return None
+                val = ev(n.args[0])
+                return (not bool(val)) if val is not None else None
+            args = [ev(a) for a in n.args]
+            if any(v is None or isinstance(v, bool) for v in args):
+                return None
+            if name == "ROUND" and len(args) in (1, 2):
+                return _excel_round(args[0], args[1] if len(args) == 2 else 0)
+            if name == "ABS" and len(args) == 1:
+                return abs(args[0])
+            if name in {"MIN", "MAX", "SUM"} and args:
+                return min(args) if name == "MIN" else (max(args) if name == "MAX" else sum(args))
+            return None
         return None
 
     return ev(node)
@@ -141,21 +235,23 @@ def _expr_columns(expr: str, cols: List[str]) -> List[str]:
 
 
 def _expr_has_operator(expr: str, cols: List[str]) -> bool:
-    """expr 去掉所有列名后是否还含 +-*/（判"纯单列引用"还是"公式"）。
+    """expr 去掉所有列名后是否还含运算符/受支持函数（判“纯单列引用”还是“公式”）。
 
     先扣掉列名再看运算符：列名本身可能含 '-'（如"太保填写-姓名"），不能误当运算符。
     """
     rest = expr
     for c in _cols_by_len_desc(cols):
         rest = rest.replace(c, " ")
-    return any(op in rest for op in "+-*/")
+    return (any(op in rest for op in "+-*/<>=!,") or
+            any(_re.search(rf"\b{name}\s*\(", rest, _re.IGNORECASE)
+                for name in _FORMULA_FUNCTIONS))
 
 
 def eval_source_expr(expr, rows: List[dict], cols: List[str]):
     """按【各列先跨行求和，再代入公式】算一个覆盖/对比值。
 
     - expr 是纯单列名：数值列→跨行求和；含非数值→取首个非空原值（保住姓名/备注等文本列）。
-    - expr 是四则运算公式：每个被引用列跨行求和(非数值按 0)，代入 +-*/ 求值，返回数值。
+    - expr 是公式：每个被引用列跨行求和(非数值按 0)，按受控 Excel 子集求值。
     空/无行/公式非法/引用列不存在 → 返回 None（调用方据此保留原值/跳过）。
     """
     expr = str(expr or "").strip()
@@ -197,8 +293,7 @@ def eval_source_expr(expr, rows: List[dict], cols: List[str]):
             if n is not None:
                 s += n
         subst = subst.replace(c, f"({s})")
-    # 替换后应只剩数字/运算符/括号/小数点/空白；含其它字符 → 判为非法，返回 None
-    if not _re.fullmatch(r"[0-9eE.+\-*/()\s]*", subst):
+    if not validate_formula_remainder(subst):
         return None
     val = _safe_arith_eval(subst)
     return None if val is None else round(val, 6)
@@ -210,7 +305,7 @@ def eval_source_expr_cross(expr: str, default_file: str,
     `B.xlsx.基本工资*C.xlsx.补贴`）；未带文件前缀的裸列名归 default_file（兼容旧方案）。
 
     所有列引用都按【主表行的归一化键】在各自文件里查行（各表 key_map 已对齐同一键），
-    每列跨行求和后代入 +-*/。纯单列引用：数值列→跨行求和；含非数值→取首个非空原值。
+    每列跨行求和后代入公式。纯单列引用：数值列→跨行求和；含非数值→取首个非空原值。
     空/无行/公式非法/引用列不存在 → 返回 None（调用方据此保留原值/跳过）。
     """
     expr = str(expr or "").strip()
@@ -253,9 +348,9 @@ def eval_source_expr_cross(expr: str, default_file: str,
         if ch.isspace():
             i += 1
             continue
-        if ch in "+-*/()":
+        if ch in "+-*/(),<>=!":
             toks.append(("op", ch))
-            if ch in "+-*/":
+            if ch in "+-*/<>=!,":
                 has_op = True
             i += 1
             continue
@@ -296,13 +391,15 @@ def eval_source_expr_cross(expr: str, default_file: str,
         return None
 
     # 2) 纯单列引用（无运算符、无杂字符）：数值→求和，文本→首非空
-    if not has_op:
+    has_formula = has_op or any(_re.search(rf"\b{name}\s*\(", expr, _re.IGNORECASE)
+                                for name in _FORMULA_FUNCTIONS)
+    if not has_formula:
         if len(cols) == 1 and not any(t[0] == "raw" for t in toks):
             _s, first, all_num = cols[0][3]
             return _s if all_num else first
         return None
 
-    # 3) 四则运算公式：列按数值代入（文本列按 0）；数字字面量（如 字段+30 里的 30、
+    # 3) 公式：列按数值代入（文本列按 0）；数字字面量（如 字段+30 里的 30、
     #    含小数点/科学计数 eE）原样保留进表达式；其它未识别字符 → 非法。
     subst = ""
     for t in toks:
@@ -311,11 +408,11 @@ def eval_source_expr_cross(expr: str, default_file: str,
             subst += f"({_s if all_num else 0})"
         elif t[0] == "op":
             subst += t[1]
-        elif t[0] == "raw" and t[1] in "0123456789.eE":
+        elif t[0] == "raw" and (t[1].isalnum() or t[1] in "._"):
             subst += t[1]
         else:
             return None
-    if not _re.fullmatch(r"[0-9eE.+\-*/()\s]*", subst):
+    if not validate_formula_remainder(subst):
         return None
     val = _safe_arith_eval(subst)
     return None if val is None else round(val, 6)
@@ -331,7 +428,7 @@ def resolve_overwrites(key: str,
         source_indexes:  {file: {"cols":[...], "rows": {key -> [行,...]}}}
     Returns:
         {a_col: value}  仅含解析到【非空】值的列（未命中/空的列不写，保留 A 原值）。
-        同一 a_col 被多对映射时，取首个非空源值。source_expr 支持"各列跨行求和后代入 +-*/"。
+        同一 a_col 被多对映射时，取首个非空源值。source_expr 支持各列跨行求和后代入受控公式。
     """
     out: Dict[str, Any] = {}
     for pair in overwrite_pairs or []:

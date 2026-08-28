@@ -356,6 +356,10 @@ def flatten_formulas_to_values(src_path: str, dst_path: str = None, password: st
 
     fmt = _ext_save_format(dst_path) or SaveFormat.Xlsx
     wb.Save(dst_path, fmt)
+    try:
+        wb.Dispose()
+    except Exception:
+        pass
     return dst_path
 
 
@@ -1062,18 +1066,24 @@ def _finalize_workbook(
     watermark_text: Optional[str] = None,
 ) -> str:
     """统一收尾: 水印 → 加密 → 保存"""
-    if watermark_text:
-        add_excel_watermark(wb, watermark_text)
-    if password:
-        wb.SetEncryptionOptions(EncryptionType.StrongCryptographicProvider, 128)
-        wb.Settings.Password = password
-    else:
-        # 主动清除模板可能继承的密码属性
+    try:
+        if watermark_text:
+            add_excel_watermark(wb, watermark_text)
+        if password:
+            wb.SetEncryptionOptions(EncryptionType.StrongCryptographicProvider, 128)
+            wb.Settings.Password = password
+        else:
+            # 主动清除模板可能继承的密码属性
+            try:
+                wb.Settings.Password = ""
+            except Exception:
+                pass
+        return save_as(wb, output_path)
+    finally:
         try:
-            wb.Settings.Password = ""
+            wb.Dispose()
         except Exception:
             pass
-    return save_as(wb, output_path)
 
 
 def append_carryover_sheets(target_path: str, source_path: str, specs: List[str],
@@ -1680,9 +1690,12 @@ def encrypt_excel(
         output_path = tempfile.mktemp(suffix=".xlsx")
 
     wb = _licensed_workbook(input_path)
-    wb.SetEncryptionOptions(EncryptionType.StrongCryptographicProvider, 128)
-    wb.Settings.Password = password
-    wb.Save(output_path)
+    try:
+        wb.SetEncryptionOptions(EncryptionType.StrongCryptographicProvider, 128)
+        wb.Settings.Password = password
+        wb.Save(output_path)
+    finally:
+        wb.Dispose()
 
     logger.info(f"Excel加密完成: {input_path} -> {output_path}")
     return output_path
@@ -1718,8 +1731,11 @@ def decrypt_excel(
                 ) from e
         else:
             raise
-    wb.Settings.Password = None
-    wb.Save(output_path)
+    try:
+        wb.Settings.Password = None
+        wb.Save(output_path)
+    finally:
+        wb.Dispose()
 
     logger.info(f"Excel解密完成: {input_path} -> {output_path}")
     return output_path
@@ -1735,9 +1751,12 @@ def write_protect_excel(
         output_path = tempfile.mktemp(suffix=".xlsx")
 
     wb = _licensed_workbook(input_path)
-    wb.Settings.WriteProtection.Password = password
-    wb.Settings.WriteProtection.RecommendReadOnly = True
-    wb.Save(output_path)
+    try:
+        wb.Settings.WriteProtection.Password = password
+        wb.Settings.WriteProtection.RecommendReadOnly = True
+        wb.Save(output_path)
+    finally:
+        wb.Dispose()
 
     logger.info(f"Excel写保护完成: {input_path} -> {output_path}")
     return output_path

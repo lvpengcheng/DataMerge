@@ -4,6 +4,7 @@
  */
 
 let _modalCallback = null;
+let _modalCancelCallback = null;
 let _splitFiles = [];
 let _mergeFiles = [];
 let _mergeAnalysis = null;   // analyze 返回的结果
@@ -24,13 +25,15 @@ const _ALLOWED_EXT = new Set(['xlsx', 'xls', 'xlsm']);
 async function _alertErr(resp, fallback) {
     let msg = fallback;
     try {
-        const j = await resp.json();
+        // clone 后读取，避免 json() 失败把原响应体消费掉，最终只能显示笼统 fallback。
+        const j = await resp.clone().json();
         // detail 可能是对象/数组（FastAPI 422 校验错误），序列化后展示，避免弹出 [object Object]
         msg = typeof j.detail === 'object' ? JSON.stringify(j.detail) : (j.detail || j.message || fallback);
     } catch (_) {
         try { msg = await resp.text(); } catch (__) {}
     }
     alert(msg);
+    return msg;
 }
 
 function _escape(s) {
@@ -109,17 +112,22 @@ const Tools = {
             footer.style.display = 'none';
         }
         _modalCallback = onConfirm;
+        _modalCancelCallback = (opts && opts.onCancel) || null;
     },
 
     closeModal() {
         document.getElementById('modal-overlay').style.display = 'none';
         _modalCallback = null;
+        const onCancel = _modalCancelCallback;
+        _modalCancelCallback = null;
+        if (onCancel) onCancel();
     },
 
     confirmModal() {
         if (_modalCallback) {
             const cb = _modalCallback;
             _modalCallback = null;
+            _modalCancelCallback = null;
             cb();
         }
     },
@@ -248,6 +256,10 @@ const Tools = {
         document.getElementById('btn-integrate-analyze').addEventListener('click', () => this._analyzeIntegrate());
         const btnNew = document.getElementById('btn-int-new-scheme');
         if (btnNew) btnNew.addEventListener('click', () => this._intShowWork('create'));
+        const btnImport = document.getElementById('btn-int-import-scheme');
+        const importFile = document.getElementById('int-import-scheme-file');
+        if (btnImport && importFile) btnImport.addEventListener('click', () => importFile.click());
+        if (importFile) importFile.addEventListener('change', () => this._intImportScheme(importFile.files[0], importFile));
         const btnBack = document.getElementById('btn-int-back');
         if (btnBack) btnBack.addEventListener('click', () => this._intShowList());
     },
@@ -324,6 +336,7 @@ const Tools = {
             const t = ((s.updated_at || s.created_at) || '').replace('T', ' ').slice(0, 19);
             const btns = [];
             if (canApply) btns.push(`<button class="btn btn-sm btn-primary int-row-apply" data-id="${s.id}">应用</button>`);
+            btns.push(`<button class="btn btn-sm int-row-export" data-id="${s.id}">导出</button>`);
             // 同组织可见即可修改配置（非创建人只能另存为，保存区会禁用「保存修改」）
             if (canEditPerm && s.can_modify) btns.push(`<button class="btn btn-sm int-row-edit" data-id="${s.id}">修改</button>`);
             if (canDelPerm && s.can_edit) btns.push(`<button class="btn btn-sm int-row-del" data-id="${s.id}">删除</button>`);
@@ -340,6 +353,8 @@ const Tools = {
             b.addEventListener('click', () => this._intStartApply(findById(parseInt(b.dataset.id, 10)))));
         tbody.querySelectorAll('.int-row-edit').forEach(b =>
             b.addEventListener('click', () => this._intStartEdit(findById(parseInt(b.dataset.id, 10)))));
+        tbody.querySelectorAll('.int-row-export').forEach(b =>
+            b.addEventListener('click', () => this._intExportScheme(findById(parseInt(b.dataset.id, 10)))));
         tbody.querySelectorAll('.int-row-del').forEach(b =>
             b.addEventListener('click', () => this._intDeleteSchemeRow(findById(parseInt(b.dataset.id, 10)))));
         this._intRenderPagination(filtered.length);
@@ -405,6 +420,47 @@ const Tools = {
         } catch (e) { alert('删除失败: ' + e.message); }
     },
 
+    async _intExportScheme(scheme) {
+        if (!scheme) return;
+        try {
+            const resp = await AUTH.authFetch(`/api/tools/integrate/scheme/${scheme.id}/export`);
+            if (!resp.ok) { await _alertErr(resp, '导出失败'); return; }
+            const blob = await resp.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = `${scheme.name || '整合方案'}.json`;
+            document.body.appendChild(a); a.click(); a.remove();
+            URL.revokeObjectURL(url);
+        } catch (e) { alert('导出失败: ' + e.message); }
+    },
+
+    async _intImportScheme(file, inputEl) {
+        if (!file) return;
+        try {
+            let archive = null;
+            try { archive = JSON.parse(await file.text()); }
+            catch (_) { alert('请选择有效的方案 JSON 文件'); return; }
+            const base = String(archive?.name || '').trim() || '导入方案';
+            let suggested = base;
+            if (_integrateSchemeList.some(s => s.name === suggested)) suggested = `${base}-导入`;
+            const name = window.prompt('请输入导入后的方案名称', suggested);
+            if (name == null) return;
+            if (!name.trim()) { alert('方案名称不能为空'); return; }
+            const fd = new FormData();
+            fd.append('file', file);
+            fd.append('name', name.trim());
+            this._intSetListStatus('导入中...');
+            const resp = await AUTH.authFetch('/api/tools/integrate/scheme/import', { method: 'POST', body: fd });
+            if (!resp.ok) { await _alertErr(resp, '导入失败'); this._intSetListStatus('导入失败', 'error'); return; }
+            await this.loadIntegrateSchemes();
+            this._intSetListStatus(`方案「${name.trim()}」已导入`, 'ok');
+        } catch (e) {
+            this._intSetListStatus('导入失败: ' + e.message, 'error');
+        } finally {
+            if (inputEl) inputEl.value = '';
+        }
+    },
+
     _addIntegrateFiles(fileList) {
         for (const f of Array.from(fileList || [])) {
             const ext = (f.name.split('.').pop() || '').toLowerCase();
@@ -450,12 +506,19 @@ const Tools = {
             _integrateFiles.forEach(f => fd.append('files', f));
             fd.append('tenant_id', '__tools_integrate__');
             const resp = await AUTH.authFetch('/api/tools/integrate/analyze', { method: 'POST', body: fd });
-            if (!resp.ok) { await _alertErr(resp, '解析失败'); this._setIntegrateStatus('解析失败', 'error'); return; }
+            if (!resp.ok) {
+                const msg = await _alertErr(resp, '解析失败');
+                this._setIntegrateStatus(msg || '解析失败', 'error');
+                return;
+            }
             _integrateAnalysis = await resp.json();
             this._renderIntegrateConfig(_integrateAnalysis);
-            this._setIntegrateStatus('解析完成', 'ok');
-            if (_intMode === 'apply') await this._intRunApply();
-            else if (_intMode === 'edit') this._intPrefillForEdit();
+            if (_intMode === 'apply') {
+                this._setIntegrateStatus('解析完成，请检查列头范围后点击「确认列头并应用方案」', 'ok');
+            } else {
+                this._setIntegrateStatus('解析完成，可按需要重新定义列头范围', 'ok');
+                if (_intMode === 'edit') await this._intPrefillForEdit();
+            }
         } catch (e) {
             this._setIntegrateStatus(`失败: ${e.message}`, 'error');
         } finally {
@@ -472,6 +535,7 @@ const Tools = {
     // 确认后更新 scheme.fp_to_file；取消返回 false。
     _intAskMatchMapping(scheme, ambiguous) {
         return new Promise(resolve => {
+            const originalRoleFiles = [...(scheme.role_files || [])];
             const rows = ambiguous.map((a, i) => {
                 const cur = (a.role_index != null && scheme.role_files && scheme.role_files[a.role_index])
                     ? scheme.role_files[a.role_index]
@@ -490,7 +554,9 @@ const Tools = {
                     请为每个角色指定实际对应的上传文件（每个文件只能指定给一个角色）：
                 </div>
                 ${rows}
-            `, () => this._intAmbResolve(true), { confirmText: '确定匹配' });
+            `, () => this._intAmbResolve(true), {
+                confirmText: '确定匹配', onCancel: () => resolve(false),
+            });
             this._intAmbResolve = (ok) => {
                 if (!ok) { this.closeModal(); resolve(false); return; }
                 const mapping = {};
@@ -504,13 +570,53 @@ const Tools = {
                     fileUsed.add(sel);
                     // 以角色索引为准（同结构角色指纹相同，fp 键会互相覆盖）
                     if (a.role_index != null && scheme.role_files) scheme.role_files[a.role_index] = sel;
+                    if (a.role_index === 0) scheme.main_file = sel;
                     mapping[a.fp] = sel;
                 });
                 if (dup) { alert(`文件「${dup}」被指定给了多个角色，请重新确认`); return; }
+                // 已解析配置里的跨表公式使用“本次文件名.列名”；若人工调整了角色文件，
+                // 同步改写文件名前缀，裸列仍按 source_role 解析，无需改动。
+                const fileRemap = {};
+                (scheme.role_files || []).forEach((newFile, idx) => {
+                    const oldFile = originalRoleFiles[idx];
+                    if (oldFile && newFile && oldFile !== newFile) fileRemap[oldFile + '.'] = newFile + '.';
+                });
+                ['overwrite_pairs', 'compare_pairs'].forEach(key => {
+                    ((scheme.config || {})[key] || []).forEach((pair, pi) => {
+                        let expr = pair.source_expr || pair.source_col || '';
+                        const held = {};
+                        Object.entries(fileRemap).sort((a, b) => b[0].length - a[0].length).forEach(([oldPrefix, newPrefix], ri) => {
+                            const token = `\u0002INTFILE${pi}_${ri}\u0003`;
+                            if (expr.includes(oldPrefix)) { expr = expr.split(oldPrefix).join(token); held[token] = newPrefix; }
+                        });
+                        Object.entries(held).forEach(([token, prefix]) => { expr = expr.split(token).join(prefix); });
+                        pair.source_expr = expr; pair.source_col = expr;
+                    });
+                });
                 Object.assign(scheme.fp_to_file, mapping);
                 this.closeModal();
                 resolve(true);
             };
+        });
+    },
+
+    _intConfirmColumnMappings(items) {
+        return new Promise(resolve => {
+            const rows = (items || []).map(it => `<tr>
+                <td>${_escape(it.label || '')}</td><td>${_escape(it.file || '')}</td>
+                <td>${_escape(it.saved_col || '')}</td><td>→</td>
+                <td><strong>${_escape(it.current_col || '')}</strong></td>
+                <td>${Math.round((Number(it.confidence) || 0) * 100)}%</td>
+            </tr>`).join('');
+            this.openModal('确认方案列名映射', `
+                <div style="font-size:13px;color:#555;margin-bottom:10px;">
+                    系统发现方案列名与本次文件不同，并给出以下建议。确认后将只在本次执行中建立映射，不修改原方案。
+                </div>
+                <table class="data-table"><thead><tr><th>角色</th><th>本次文件</th><th>方案列名</th><th></th><th>本次列名</th><th>置信度</th></tr></thead>
+                <tbody>${rows}</tbody></table>
+            `, () => {
+                this.closeModal(); resolve(true);
+            }, { confirmText: '确认映射', onCancel: () => resolve(false) });
         });
     },
 
@@ -537,9 +643,14 @@ const Tools = {
                 return;
             }
             if (rz) { rz.style.display = 'none'; rz.innerHTML = ''; }
-            const scheme = this._intFindMatched(_intApplyTarget.id);
+            const matched = this._intFindMatched(_intApplyTarget.id);
+            const scheme = res.resolved_scheme || matched;
             if (!scheme) { this._setIntegrateStatus('方案未能匹配到上传文件', 'error'); return; }
-            const ambiguous = (scheme.ambiguous || []).filter(a => (a.candidates || []).length > 0);
+            if (res.requires_confirmation) {
+                const confirmed = await this._intConfirmColumnMappings(res.mapping_suggestions || []);
+                if (!confirmed) { this._setIntegrateStatus('已取消列名映射', ''); return; }
+            }
+            const ambiguous = ((matched && matched.ambiguous) || []).filter(a => (a.candidates || []).length > 0);
             if (ambiguous.length) {
                 const ok = await this._intAskMatchMapping(scheme, ambiguous);
                 if (!ok) { this._setIntegrateStatus('已取消应用', ''); return; }
@@ -553,14 +664,27 @@ const Tools = {
     },
 
     // edit 模式：若上传文件结构与原方案匹配则回填配置供修改，否则从空白配置起
-    _intPrefillForEdit() {
+    async _intPrefillForEdit() {
         if (!_intEditingSchemeId) return;
-        const scheme = this._intFindMatched(_intEditingSchemeId);
-        if (scheme) {
-            this._intFillFromScheme(scheme);
+        try {
+            const resp = await AUTH.authFetch('/api/tools/integrate/scheme/apply-validate', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ session_id: _integrateAnalysis.session_id, scheme_id: _intEditingSchemeId }),
+            });
+            if (!resp.ok) { await _alertErr(resp, '方案匹配失败'); return; }
+            const res = await resp.json();
+            if (!res.ok || !res.resolved_scheme) {
+                this._setIntegrateStatus('上传文件缺少方案必需列，请调整列头或从当前配置重新设置', 'error');
+                return;
+            }
+            if (res.requires_confirmation) {
+                const confirmed = await this._intConfirmColumnMappings(res.mapping_suggestions || []);
+                if (!confirmed) { this._setIntegrateStatus('未加载建议映射，可手动配置', ''); return; }
+            }
+            this._intFillFromScheme(res.resolved_scheme);
             this._setIntegrateStatus('已回填原方案配置，可调整后保存修改', 'ok');
-        } else {
-            this._setIntegrateStatus('上传文件结构与原方案不同，将按当前配置另存为该方案', '');
+        } catch (e) {
+            this._setIntegrateStatus('方案匹配失败: ' + e.message, 'error');
         }
     },
 
@@ -574,19 +698,64 @@ const Tools = {
         return (cols || []).map(c => `<option value="${_escape(c)}" ${c === sel ? 'selected' : ''}>${_escape(c)}</option>`).join('');
     },
 
+    async _intReparseHeaders() {
+        const ranges = {};
+        let invalid = null;
+        document.querySelectorAll('.int-header-range').forEach(row => {
+            const start = parseInt(row.querySelector('.int-header-start')?.value, 10);
+            const end = parseInt(row.querySelector('.int-header-end')?.value, 10);
+            if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start) invalid = row.dataset.file;
+            ranges[row.dataset.file] = { start_row: start, end_row: end };
+        });
+        if (invalid) { alert(`文件「${invalid}」的列头起止行无效`); return; }
+        this._setIntegrateStatus('正在按人工列头范围重新解析...');
+        const btn = document.getElementById('int-reparse-headers');
+        if (btn) btn.disabled = true;
+        try {
+            const resp = await AUTH.authFetch('/api/tools/integrate/reparse-headers', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ session_id: _integrateAnalysis.session_id, header_ranges: ranges }),
+            });
+            if (!resp.ok) { await _alertErr(resp, '重新解析失败'); this._setIntegrateStatus('重新解析失败', 'error'); return; }
+            _integrateAnalysis = await resp.json();
+            this._renderIntegrateConfig(_integrateAnalysis);
+            this._setIntegrateStatus('已按人工范围重新解析列头', 'ok');
+            if (_intMode === 'edit') await this._intPrefillForEdit();
+        } catch (e) {
+            this._setIntegrateStatus('重新解析失败: ' + e.message, 'error');
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    },
+
     _renderIntegrateConfig(data) {
         const files = data.files || [];
         const box = document.getElementById('integrate-config');
         box.style.display = 'block';
         const fileOpts = files.map((f, i) => `<option value="${_escape(f.name)}" ${i === 0 ? 'selected' : ''}>${_escape(f.name)}</option>`).join('');
         box.innerHTML = `
-            <h3>① 选择主表（模板）</h3>
+            <h3>① 确认列头范围（主表和参照表均可人工调整）</h3>
+            <div style="font-size:12px;color:#777;margin-bottom:8px;">系统已自动解析列头。若识别位置不正确，可修改每个文件的起止行后重新解析；行号从 1 开始。</div>
+            <div id="int-header-ranges" style="padding:8px 10px;background:#f6f8fb;border:1px solid #e3e7ed;border-radius:6px;">
+                ${files.map(f => `<div class="int-header-range" data-file="${_escape(f.name)}" style="display:flex;align-items:center;gap:8px;margin:5px 0;flex-wrap:wrap;">
+                    <span style="min-width:240px;">${_escape(f.name)} <span style="color:#999;">· ${_escape(f.sheet || '')}</span></span>
+                    <label style="font-size:13px;">起始行 <input type="number" min="1" class="int-header-start" value="${Number(f.header_start) || 1}" style="width:72px;"></label>
+                    <label style="font-size:13px;">结束行 <input type="number" min="1" class="int-header-end" value="${Number(f.header_end) || Number(f.header_start) || 1}" style="width:72px;"></label>
+                    <span style="font-size:12px;color:${f.header_manual ? '#2e7d32' : '#888'};">${f.header_manual ? '人工范围' : '自动解析'}</span>
+                </div>`).join('')}
+                <div style="margin-top:8px;display:flex;align-items:center;gap:8px;">
+                    <button type="button" class="btn btn-sm" id="int-reparse-headers">按指定范围重新解析</button>
+                    ${_intMode === 'apply' ? '<button type="button" class="btn btn-sm btn-primary" id="int-apply-confirm">确认列头并应用方案</button>' : ''}
+                </div>
+            </div>
+
+            <h3 style="margin-top:16px;">② 选择主表（模板）</h3>
             <div class="form-group">
                 <select id="int-main-file" style="min-width:280px;">${fileOpts}</select>
                 <span style="color:#888;font-size:12px;margin-left:8px;">主表将被原地更新（保留其余 sheet 与公式），对照表的值按关联键回填到主表。</span>
             </div>
 
-            <h3 style="margin-top:16px;">② 关联键（每个文件）</h3>
+            <h3 style="margin-top:16px;">③ 关联键（每个文件）</h3>
             <div id="int-key-map"></div>
             <div class="form-group" style="margin-top:6px;">
                 <label style="font-size:13px;">日期关联键归一：</label>
@@ -600,7 +769,7 @@ const Tools = {
                 <span style="color:#888;font-size:12px;margin-left:8px;">关联键是日期/月份时用：把 datetime、2026-02、2月26日 等归到同一粒度再匹配，两边同粒度才对得上。</span>
             </div>
 
-            <h3 style="margin-top:16px;">③ 覆盖字段（勾选基准列 → 匹配对照列 / 公式）</h3>
+            <h3 style="margin-top:16px;">④ 覆盖字段（勾选基准列 → 匹配对照列 / 公式）</h3>
             <div style="margin:6px 0;">
                 <button type="button" class="btn btn-sm" id="int-ow-all">全选</button>
                 <button type="button" class="btn btn-sm" id="int-ow-none">全不选</button>
@@ -611,9 +780,9 @@ const Tools = {
             <div id="int-ow-picker" style="border:1px solid #e3e7ed;border-radius:6px;padding:8px;max-height:150px;overflow:auto;"></div>
             <table class="data-table"><thead><tr><th>基准字段（主表列）</th><th>匹配的对照列（来源）</th><th style="width:32px;"></th></tr></thead>
                 <tbody id="int-ow-list-rows"></tbody></table>
-            <div style="color:#888;font-size:12px;margin-top:4px;">点单元格可选多列并用公式(基本工资+本月奖金，支持 +-*/、括号)组合；对照表同一主键多行时各列先跨行求和再代入。多张对照表都填时靠上优先取首个非空。</div>
+            <div style="color:#888;font-size:12px;margin-top:4px;">点单元格可选多列并用公式组合；支持四则、比较、ROUND、IF、ABS、MIN、MAX、SUM、AND、OR、NOT。对照表同一主键多行时各列先跨行求和再代入。</div>
 
-            <h3 style="margin-top:16px;">④ 对比字段（可选，输出方式2用）</h3>
+            <h3 style="margin-top:16px;">⑤ 对比字段（可选，输出方式2用）</h3>
             <div style="margin:6px 0;">
                 <button type="button" class="btn btn-sm" id="int-cmp-all">全选</button>
                 <button type="button" class="btn btn-sm" id="int-cmp-none">全不选</button>
@@ -625,7 +794,7 @@ const Tools = {
             <table class="data-table"><thead><tr><th>基准字段（主表列）</th><th>匹配的对照列（来源）</th><th style="width:32px;"></th></tr></thead>
                 <tbody id="int-cmp-list-rows"></tbody></table>
 
-            <h3 style="margin-top:16px;">⑤ 输出方式</h3>
+            <h3 style="margin-top:16px;">⑥ 输出方式</h3>
             <div class="form-group">
                 <label style="margin-right:16px;"><input type="radio" name="int-output-mode" value="1" checked style="width:auto;"> 方式1：只更新主表</label>
                 <label><input type="radio" name="int-output-mode" value="2" style="width:auto;"> 方式2：主表 + 差异 sheet</label>
@@ -653,6 +822,8 @@ const Tools = {
         this._intRenderDiffCols();
         this._intRenderPicker('ow');
         this._intRenderPicker('cmp');
+        document.getElementById('int-reparse-headers')?.addEventListener('click', () => this._intReparseHeaders());
+        document.getElementById('int-apply-confirm')?.addEventListener('click', () => this._intRunApply());
         document.getElementById('int-main-file').addEventListener('change', () => {
             this._intRenderKeyMap();
             this._intRenderDiffCols();
@@ -681,6 +852,8 @@ const Tools = {
         const nameInp = document.getElementById('int-scheme-name');
         if (_intMode === 'apply') {
             if (saveRow) saveRow.style.display = 'none';
+            const execBtn = document.getElementById('int-execute');
+            if (execBtn && execBtn.parentElement) execBtn.parentElement.style.display = 'none';
         } else if (_intMode === 'edit') {
             const cur = _integrateSchemeList.find(s => s.id === _intEditingSchemeId);
             if (nameInp && cur) nameInp.value = cur.name;
@@ -887,13 +1060,20 @@ const Tools = {
             : '<span style="color:#999;">点击选择对照列…</span>';
     },
 
-    // 公式校验：去掉本表所有列名后，只允许 +-*/、数字、括号、小数点、空白。
+    // 公式校验：列名之外允许受控 Excel 子集（四则、比较、ROUND/IF 等），后端同规则安全求值。
     // 列名被改动/写错 → 无法识别的残余会留在 rest 里，据此判定不合法（实现「列名不可编辑」）。
     _intCheckFx(file, expr) {
         const cols = this._intAllCols(file);
         let rest = expr || '';
         cols.forEach(c => { if (c) rest = rest.split(c).join(' '); });
-        return { ok: /^[0-9eE.+\-*/()\s]*$/.test(rest), rest: rest.trim() };
+        let probe = rest.trim().replace(/^=/, '').replace(/<>/g, '!=');
+        probe = probe.replace(/(^|[^A-Za-z0-9_.])(?:\d+(?:\.\d*)?|\.\d+)[eE][+\-]?\d+/g, (_, prefix) => prefix + '0');
+        const allowed = new Set(['round', 'if', 'abs', 'min', 'max', 'sum', 'and', 'or', 'not', 'true', 'false']);
+        const names = probe.match(/[A-Za-z_][A-Za-z0-9_]*/g) || [];
+        const badNames = names.filter(n => !allowed.has(n.toLowerCase()));
+        const punctuation = probe.replace(/[A-Za-z_][A-Za-z0-9_]*/g, '');
+        const ok = !badNames.length && /^[0-9eE.+\-*/(),<>=!\s]*$/.test(punctuation);
+        return { ok, rest: badNames.length ? badNames.join('、') : (ok ? '' : rest.trim()) };
     },
 
     // 公式可引用的全部列 token（长名优先）：本表裸列 + 其他对照表的 `文件名.列名`（跨表引用）。
@@ -913,7 +1093,7 @@ const Tools = {
         const cols = this._intAllCols(file);
         const s = expr || '';
         const toks = [];
-        const isOp = ch => '+-*/()'.indexOf(ch) >= 0;
+        const isOp = ch => '+-*/(),<>=!'.indexOf(ch) >= 0;
         const colAt = pos => cols.find(c => s.startsWith(c, pos));
         let i = 0;
         while (i < s.length) {
@@ -968,7 +1148,7 @@ const Tools = {
     },
 
     // 弹出勾选对照列：按对照文件分组（支持多表）。每个对照表勾选若干列后，底部公式框自动
-    // 用「+」连接已选列，可手动改成任意四则运算(基本工资+本月奖金 / (应发-扣款)*0.8)。
+    // 用「+」连接已选列，可手动改成受支持的 Excel 公式（如 ROUND、IF 与四则/比较运算）。
     // 每张对照表产出一条 {file, expr}；多表并存=优先级回退（靠上的先取，非空即用）。
     // 同一主键在对照表里有多行时，公式里每个列会先跨行求和再代入（后端 eval_source_expr）。
     _intOpenSrcPicker(kind, tr) {
@@ -980,7 +1160,7 @@ const Tools = {
         const files = this._intNonMainFiles();
         const body = `
             <div style="font-size:12px;color:#888;margin-bottom:8px;">
-              每张对照表勾选列 → 下方公式框自动用「+」连接，可手动改（仅支持列名与 +-*/、数字、括号）。
+              每张对照表勾选列 → 下方公式框自动用「+」连接，可手动改；支持 +-*/、比较，以及 ROUND、IF、ABS、MIN、MAX、SUM、AND、OR、NOT。
               多张表都填时，靠上的优先（取首个非空）。同一主键多行会先把各列跨行求和再代入公式。
               支持<u>跨表公式</u>：勾选「引用其他表列」即可把 <code>文件名.列名</code> 加入公式（如 B.xlsx.基本工资*C.xlsx.补贴）。
             </div>
@@ -1014,7 +1194,7 @@ const Tools = {
                         <span style="font-size:12px;color:#666;white-space:nowrap;padding-top:6px;">公式：</span>
                         <div style="flex:1;">
                             <textarea class="int-fx" data-file="${_escape(f.name)}" rows="5"
-                                   placeholder="勾选上方列自动相加；列名不可改，只能编辑 + - * / 括号 数字（如 (基本工资+本月奖金)*0.8，跨表如 B.xlsx.基本工资*C.xlsx.补贴）"
+                                   placeholder="例如 ROUND(基本工资+奖金,2) 或 IF(奖金>0,ROUND(奖金,2),0)；跨表可写 B.xlsx.基本工资+C.xlsx.补贴"
                                    style="width:100%;box-sizing:border-box;font-size:13px;padding:4px 6px;line-height:1.5;resize:vertical;font-family:monospace;">${_escape(preset)}</textarea>
                             <div class="int-fx-err" data-file="${_escape(f.name)}" style="font-size:11px;color:#d32f2f;min-height:14px;margin-top:2px;"></div>
                         </div>
@@ -1028,10 +1208,10 @@ const Tools = {
                 const fx = grp.querySelector('.int-fx');
                 const expr = (fx?.value || '').trim();
                 if (!expr) continue;
-                // 校验：列名不可修改，去掉本表所有列名后只允许 +-*/、数字、括号、小数点、空白
+                // 校验：列名不可修改；支持受控 Excel 公式函数和比较运算
                 const chk = this._intCheckFx(file, expr);
                 if (!chk.ok) {
-                    alert(`「${file}」的公式含不支持的内容：列名不可修改，只能编辑 +、-、*、/、括号、数字。\n无法识别的部分：${chk.rest}`);
+                    alert(`「${file}」的公式含不存在的列或不支持的语法。\n无法识别的部分：${chk.rest}`);
                     return; // 不关闭，让用户改
                 }
                 picks.push({ file, expr });
@@ -1052,7 +1232,7 @@ const Tools = {
                 const expr = (fx.value || '').trim();
                 if (!expr) { err.textContent = ''; return; }
                 const chk = this._intCheckFx(file, expr);
-                err.textContent = chk.ok ? '' : `只能编辑 + - * / 括号 数字；无法识别：${chk.rest}`;
+                err.textContent = chk.ok ? '' : `含不存在的列或不支持的语法：${chk.rest}`;
             };
             const accept = (val) => { fx.value = val; prev = val; prevSig = this._intColSig(val, file); validate(); };
             // 键盘编辑：列名集合变了就回退（列名不可删/改，只能靠勾选）；只改运算符/括号/数字才放行

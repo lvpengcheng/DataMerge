@@ -159,6 +159,40 @@ class DataAsset(Base):
     )
 
 
+class AssetUploadTask(Base):
+    """资产上传异步任务。
+
+    HTTP 请求只流式落盘并记录任务；单消费者依次把每个 Excel
+    交给独立子进程，避免 Aspose 占用主 Web 进程。
+    """
+    __tablename__ = "asset_upload_tasks"
+
+    id = Column(String(64), primary_key=True)
+    tenant_id = Column(String(100), nullable=True, index=True)
+    asset_type = Column(String(20), nullable=False, default="reference")
+    category_id = Column(Integer, ForeignKey("reference_categories.id"), nullable=True)
+    description = Column(Text, default="")
+    effective_from = Column(Date, nullable=True)
+    effective_to = Column(Date, nullable=True)
+    tags = Column(JSON, nullable=True)
+    uploaded_by = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    status = Column(String(30), nullable=False, default="queued", index=True)
+    total_files = Column(Integer, default=0)
+    completed_files = Column(Integer, default=0)
+    failed_files = Column(Integer, default=0)
+    current_file = Column(String(200), nullable=True)
+    staging_dir = Column(String(500), nullable=False)
+    files = Column(JSON, nullable=False, default=list)
+    result = Column(JSON, nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    uploader = relationship("User", foreign_keys=[uploaded_by])
+
+
 # ==================== 训练会话 ====================
 
 class TrainingSession(Base):
@@ -468,6 +502,8 @@ class IntegrateTemplate(Base):
         "key_map_by_fp": {"<fp>": "关联键列名", ...},
         "overwrite_pairs": [{"a_col","source_fp","source_col"}, ...],
         "compare_pairs":   [{"a_col","source_fp","source_col"}, ...],
+        "required_cols_by_role": {"0": ["方案实际依赖列", ...], ...},
+        "header_ranges_by_role": {"0": [表头起始行, 表头结束行], ...},
         "name_col", "id_col", "diff_order", "output_mode", "normalize_keys"
       }
     """

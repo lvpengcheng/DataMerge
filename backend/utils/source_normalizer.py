@@ -370,7 +370,8 @@ def _date_protected_columns(ws, scan_rows: int = 25) -> set:
     return protected
 
 
-def normalize_misformatted_dates(file_path: str, out_path: str = None) -> int:
+def normalize_misformatted_dates(file_path: str, out_path: str = None,
+                                  calculate_formulas: bool = True) -> int:
     """将源文件中"被误设成日期格式的数字单元格"格式重置为常规。
 
     判定（三个条件同时满足才重置）：
@@ -407,11 +408,13 @@ def normalize_misformatted_dates(file_path: str, out_path: str = None) -> int:
 
     fixed = 0
     try:
-        # 先重算公式，使"公式结果被设成日期格式"的单元格类型落定为 IsDateTime，便于识别
-        try:
-            wb.CalculateFormula()
-        except Exception as _ce:
-            logger.warning(f"[normalize] CalculateFormula 跳过: {file_path} - {_ce}")
+        # 上传解析链路显式传 False：只读文件内已有缓存值，
+        # 避免 SUMIF/SUMIFS/VLOOKUP 等全工作簿依赖重算造成内存峰值。
+        if calculate_formulas:
+            try:
+                wb.CalculateFormula()
+            except Exception as _ce:
+                logger.warning(f"[normalize] CalculateFormula 跳过: {file_path} - {_ce}")
 
         for i in range(wb.Worksheets.Count):
             ws = wb.Worksheets[i]

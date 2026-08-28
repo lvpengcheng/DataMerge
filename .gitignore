@@ -15,6 +15,8 @@ nul
 deploy.config.json
 deploy.config.*.json
 !deploy.config.example.json
+deploy.native.config.json
+!deploy.native.config.example.json
 
 # 本地配置（含API密钥，勿提交）
 /.env

@@ -36,19 +36,19 @@ _PROJ_ROOT = str(Path(__file__).resolve().parent.parent.parent)
 
 # 并发上限：最多同时跑 N 个子进程，防止多任务并发时子进程内存叠加（N × 1GB 以内可控）。
 # 其余调用排队等待（排队有上限 SUBPROCESS_QUEUE_TIMEOUT，满负载返回"系统繁忙"而非无限等）。
-# N 用 lazy 信号量：首次使用时才从 .env SUBPROCESS_CONCURRENCY 读取（默认 2），
+# N 用 lazy 信号量：首次使用时才从 .env SUBPROCESS_CONCURRENCY 读取（默认 3），
 # 避免模块 import 时 .env 尚未加载（load_dotenv 在应用启动早期执行）导致配置读不到。
 _semaphore = None
 _semaphore_lock = threading.Lock()
 
 
 def _get_semaphore() -> threading.Semaphore:
-    """lazy 创建并发信号量：读 .env SUBPROCESS_CONCURRENCY（默认 2）。"""
+    """lazy 创建并发信号量：读 .env SUBPROCESS_CONCURRENCY（默认 3）。"""
     global _semaphore
     if _semaphore is None:
         with _semaphore_lock:
             if _semaphore is None:
-                _semaphore = threading.Semaphore(env_int("SUBPROCESS_CONCURRENCY", 2))
+                _semaphore = threading.Semaphore(env_int("SUBPROCESS_CONCURRENCY", 3))
     return _semaphore
 
 
@@ -211,7 +211,7 @@ def _run_single(
     _sem = _get_semaphore()
     if not _sem.acquire(timeout=queue_timeout()):
         res.error = (f"系统繁忙：并发计算任务已满（上限 "
-                     f"{env_int('SUBPROCESS_CONCURRENCY', 2)}），排队超过 "
+                     f"{env_int('SUBPROCESS_CONCURRENCY', 3)}），排队超过 "
                      f"{queue_timeout()}s，请稍后重试")
         logger.warning(f"[subproc/{entry}] {res.error}")
         return res
@@ -467,7 +467,7 @@ class _WorkerSlot:
 
 
 class _WorkerPool:
-    """常驻 worker 池：任务按 SUBPROCESS_CONCURRENCY 并发，超时/内存超限强杀重启。"""
+    """常驻 worker 池：按 SUBPROCESS_POOL_SIZE 保留少量进程，超限时强杀重启。"""
 
     def __init__(self, size: int):
         self.slots = [_WorkerSlot(i) for i in range(size)]
@@ -596,7 +596,9 @@ def _get_pool() -> Optional[_WorkerPool]:
         if _pool is not None or _pool_failed:
             return _pool
         try:
-            size = max(1, env_int("SUBPROCESS_CONCURRENCY", 2))
+            # 常驻池与一次性子进程并发分开配置：计算可并发 3 个，但常驻 Aspose
+            # worker 默认只保留 1 个，避免空闲时也常驻多份 .NET 堆内存。
+            size = max(1, env_int("SUBPROCESS_POOL_SIZE", 1))
             _pool = _WorkerPool(size)
             logger.info(f"[subproc-pool] 常驻 worker 池已启动（{size} 个，预加载 Aspose）")
             return _pool
@@ -671,4 +673,30 @@ async def run_in_subprocess_async(entry: str, args: tuple = (), kwargs: dict = N
     return await asyncio.to_thread(
         run_in_subprocess, entry, args, kwargs or {},
         timeout=timeout, max_memory_mb=max_memory_mb, progress_cb=progress_cb,
+    )
+
+
+async def run_in_fresh_subprocess_async(entry: str, args: tuple = (), kwargs: dict = None,
+                                        timeout: float = 300, max_memory_mb: int = None,
+                                        progress_cb=None) -> SubprocessResult:
+    """每次启动一个全新子进程的 async 执行器。
+
+    适用于上传解析：Aspose/.NET 的非托管内存即使 Dispose 后也可能
+    暂留在进程堆中。文件处理完后让进程退出，操作系统可确定回收全部内存。
+    """
+    import asyncio
+    return await asyncio.to_thread(
+        run_in_fresh_subprocess, entry, args, kwargs or {}, timeout,
+        max_memory_mb, progress_cb,
+    )
+
+
+def run_in_fresh_subprocess(entry: str, args: tuple = (), kwargs: dict = None,
+                            timeout: float = 300, max_memory_mb: int = None,
+                            progress_cb=None) -> SubprocessResult:
+    """同步版全新子进程执行器，供已在后台线程中的流程使用。"""
+    return _run_single(
+        entry, args, kwargs or {}, timeout,
+        default_max_memory_mb() if max_memory_mb is None else max_memory_mb,
+        progress_cb,
     )

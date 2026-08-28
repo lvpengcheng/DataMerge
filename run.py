@@ -135,6 +135,14 @@ def main():
     from dotenv import load_dotenv
     load_dotenv()
 
+    try:
+        app_port = int(os.getenv("APP_PORT", "18000"))
+    except (TypeError, ValueError):
+        app_port = 18000
+    reload_enabled = os.getenv("APP_RELOAD", "false").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
     ai_provider = os.getenv("AI_PROVIDER", "openai").lower()
 
     # 根据配置的AI提供者检查对应的API密钥
@@ -178,7 +186,7 @@ def main():
     # 如果指定了--start参数，直接启动服务
     if args.start:
         print("\n启动FastAPI服务...")
-        print("API文档地址: http://localhost:8000/docs")
+        print(f"API文档地址: http://localhost:{app_port}/docs")
         print("按 Ctrl+C 停止服务\n")
 
         import uvicorn
@@ -205,8 +213,9 @@ def main():
         uvicorn.run(
             "backend.app.main:app",
             host="0.0.0.0",
-            port=8000,
-            reload=True,
+            port=app_port,
+            reload=reload_enabled,
+            workers=1,
             # 仅监视后端代码目录：避免根目录大文件（excel_parser.py）/ 前端 / 训练产物变化时
             # 触发热重载，导致正在跑的 SSE 流被切断（前端表现为 "Failed to fetch"）。
             reload_dirs=["backend"],
@@ -232,15 +241,16 @@ def main():
 
     if choice == "1":
         print("\n启动FastAPI服务...")
-        print("API文档地址: http://localhost:8000/docs")
+        print(f"API文档地址: http://localhost:{app_port}/docs")
         print("按 Ctrl+C 停止服务\n")
 
         import uvicorn
         uvicorn.run(
             "backend.app.main:app",
             host="0.0.0.0",
-            port=8000,
-            reload=True,
+            port=app_port,
+            reload=reload_enabled,
+            workers=1,
             reload_dirs=["backend"],
             reload_excludes=[
                 "*tenants*", "*global_assets*", "*examples*",

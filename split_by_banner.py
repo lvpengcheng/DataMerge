@@ -321,6 +321,8 @@ def split_one_file(source_path: Path, output_path: Path):
         dst_wb.create_sheet("empty")
 
     dst_wb.save(str(output_path))
+    src_wb.close()
+    dst_wb.close()
 
     # 清理临时 flatten 文件
     if 'flat_path' in locals() and load_path != str(source_path):

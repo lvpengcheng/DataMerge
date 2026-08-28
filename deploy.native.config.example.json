@@ -1,0 +1,19 @@
+{
+  "_说明": "复制为 deploy.native.config.json。该文件已被 gitignore；建议密码留空，发布时输入。",
+  "host": "你的Ubuntu服务器IP或域名",
+  "port": 22,
+  "user": "root",
+  "password": "",
+  "key_file": "",
+  "remote_path": "/opt/datamerge",
+  "app_user": "datamerge",
+  "app_port": 8000,
+  "service_name": "datamerge",
+  "env_file": ".env",
+  "memory_max": "6G",
+  "memory_high": "5G",
+  "memory_swap_max": "0",
+  "cpu_quota": "200%",
+  "tasks_max": 256,
+  "pip_index_url": ""
+}

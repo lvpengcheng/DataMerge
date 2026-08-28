@@ -16,9 +16,9 @@
 多环境说明（同机不同目录/端口）：
   - uat＝原环境，一切不变：python deploy.py（deploy.config.json、目录/镜像/端口都不动）
   - dev＝新环境：本地 deploy.config.dev.json（含 remote_path、image_name、health_url，已被 .gitignore 忽略）
-  - dev 目录的 .env 里须设 IMAGE_NAME / APP_CONTAINER_NAME / REDIS_CONTAINER_NAME / APP_PORT / REDIS_PORT / COMPOSE_PROJECT_NAME，
+  - dev 目录的 .env 里须设 IMAGE_NAME / APP_CONTAINER_NAME / APP_PORT / COMPOSE_PROJECT_NAME，
     且 IMAGE_NAME 须与 deploy.config.dev.json 的 image_name 一致（回滚打 :prev 标签靠它定位镜像）；
-    uat 目录 .env 不用加这些——docker-compose 里都有默认值＝原来的 datamerge / 8000 / 6379
+    uat 目录 .env 不用加这些——docker-compose 里都有默认值。
 
 安全保证：
   - 绝不上传 tenants/ data/ logs/ output/ .env 等（保留服务器上的数据与密钥，不会被覆盖）
@@ -52,6 +52,7 @@ EXCLUDE_PATTERNS = [
     "*.pyc", "*.pyo", "*.pyd", "*.log", "*.tmp", "*.swp",
     ".env", ".env.*", "data.db", "*.db-journal",
     "deploy.config.json", "deploy.config.*.json", "deploy.py",  # 脚本与配置不必上服务器
+    "deploy.native.config.json",  # Ubuntu 原生发布连接信息/密码，绝不进发布包
 ]
 
 
@@ -60,6 +61,9 @@ def _excluded(rel_path: str, exclude_dirs: set) -> bool:
     if any(p in exclude_dirs for p in parts):
         return True
     name = Path(rel_path).name
+    # 配置模板不含密钥，首次部署需要它生成服务器 .env；真实 .env 仍严格排除。
+    if name == ".env.example":
+        return False
     return any(fnmatch.fnmatch(name, pat) for pat in EXCLUDE_PATTERNS)
 
 

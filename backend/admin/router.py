@@ -1590,6 +1590,16 @@ def _code_hash(code: str) -> str:
     return "script_" + _hashlib.md5((code or "").encode("utf-8")).hexdigest()[:12]
 
 
+def _nonportable_absolute_paths(code: str) -> List[str]:
+    """找出脚本中除 TEMPLATE_PATH 外的环境绝对路径。
+
+    模板路径有迁移包和运行时绑定负责重定位；任意源文件/目录绝对路径无法推断目标环境
+    对应文件，必须在迁移时阻止，避免 Docker 的 /app/... 或旧租户目录被带到 IIS。
+    """
+    from ..utils.template_resolver import find_nonportable_absolute_paths
+    return find_nonportable_absolute_paths(code)
+
+
 def _test_env_conf():
     base = (os.getenv("TEST_ENV_BASE_URL") or "").strip().rstrip("/")
     user = (os.getenv("TEST_ENV_USERNAME") or "").strip()
@@ -1671,9 +1681,12 @@ def migration_export(db_id: int, db: Session = Depends(get_db), _admin: User = D
     # 导入端按【原始烘焙文件名】落到目标租户 templates/ 下——resolve_template_path 按
     # 【文件名+哈希】在租户目录递归查找，与两边 session id 是否一致无关。
     template_blob = None
+    template_required = False
+    template_error = None
     try:
         from ..utils.template_resolver import extract_template_ref
         _tname, _thash, _tbaked = extract_template_ref(s.code)
+        template_required = bool(_tname or _tbaked)
         # 读取用的实际路径：优先会话 config 里的持久化路径，回退烘焙绝对路径（均为本机路径）
         _tpl_file = None
         if session and isinstance(session.get("config"), dict):
@@ -1707,14 +1720,20 @@ def migration_export(db_id: int, db: Session = Depends(get_db), _admin: User = D
                     "data_b64": _b64.b64encode(_tbytes).decode("ascii"),
                 }
             else:
+                template_error = f"模板过大({_sz}B)，超过迁移包 60MB 上限"
                 logging.getLogger(__name__).warning(
                     f"[迁移导出] 模板过大({_sz}B)未打包，导入端需手动上传 db_id={s.id}")
+        elif template_required:
+            template_error = "脚本引用了模板，但源环境未能定位模板文件"
     except Exception as _te:
+        template_error = f"模板打包失败: {_te}"
         logging.getLogger(__name__).warning(f"[迁移导出] 模板打包失败 db_id={db_id}: {_te}")
 
     return {"hash": _code_hash(s.code), "source_db_id": s.id, "script": script,
             "session": session, "messages": messages, "iterations": iterations,
-            "template": template_blob}
+            "template": template_blob, "template_required": template_required,
+            "template_error": template_error,
+            "nonportable_paths": _nonportable_absolute_paths(s.code)}
 
 
 # ---- 导入端（当前环境，UI 调用）----
@@ -1828,6 +1847,63 @@ def migration_import(req: _MigrateReq, db: Session = Depends(get_db), _admin: Us
         if not code:
             skipped.append({"name": item.name, "reason": "无代码"})
             continue
+        _bad_paths = bundle.get("nonportable_paths") or _nonportable_absolute_paths(code)
+        if _bad_paths:
+            _sample = "、".join(str(p) for p in _bad_paths[:3])
+            skipped.append({
+                "name": item.name,
+                "reason": f"脚本含目标环境无法重定位的源文件绝对路径: {_sample}",
+            })
+            continue
+
+        # 模板模式必须先把模板完整落到【目标租户】目录，并校验内容哈希。
+        # 不能把源 Docker /app 路径或源 Windows 盘符继续带到目标环境。
+        tpl_blob = bundle.get("template") or {}
+        _template_required = bundle.get("template_required")
+        if _template_required is None:  # 兼容尚未升级的旧导出端
+            from ..utils.template_resolver import extract_template_ref
+            _tn, _th, _tp = extract_template_ref(code)
+            _template_required = bool(_tn or _tp)
+        if _template_required and not (
+                tpl_blob.get("data_b64") and tpl_blob.get("name")):
+            skipped.append({
+                "name": item.name,
+                "reason": bundle.get("template_error") or "模板模式脚本未携带模板文件",
+            })
+            continue
+        migrated_template_path = None
+        if tpl_blob.get("data_b64") and tpl_blob.get("name"):
+            try:
+                import base64 as _b64
+                from ..utils.template_resolver import portable_basename
+                templates_dir = sm.get_tenant_dir(tenant) / "templates"
+                templates_dir.mkdir(parents=True, exist_ok=True)
+                _safe_tpl_name = portable_basename(tpl_blob["name"])
+                if not _safe_tpl_name:
+                    raise ValueError("模板文件名为空")
+                _tpl_bytes = _b64.b64decode(tpl_blob["data_b64"], validate=True)
+                _declared_hash = (tpl_blob.get("hash") or "").lower()
+                _actual_hash = _hashlib.md5(_tpl_bytes).hexdigest()
+                if _declared_hash and _declared_hash != _actual_hash:
+                    raise ValueError(
+                        f"模板哈希不一致（声明={_declared_hash}，实际={_actual_hash}）")
+                _tpl_dst = templates_dir / _safe_tpl_name
+                _tpl_dst.write_bytes(_tpl_bytes)
+                migrated_template_path = str(_tpl_dst.resolve())
+                logging.getLogger(__name__).info(
+                    f"[迁移] 模板落盘并校验 -> {migrated_template_path} ({len(_tpl_bytes)}B)")
+            except Exception as _tre:
+                skipped.append({"name": item.name, "reason": f"模板导入失败: {_tre}"})
+                continue
+
+        def _target_config(raw):
+            cfg = dict(raw) if isinstance(raw, dict) else {}
+            if migrated_template_path:
+                cfg["template_path"] = migrated_template_path
+                cfg["template_name"] = portable_basename(tpl_blob.get("name"))
+                cfg["template_hash"] = (
+                    tpl_blob.get("hash") or _hashlib.md5(_tpl_bytes).hexdigest())
+            return cfg
 
         # 1) 训练会话 + 对话 + 迭代
         new_session_id = None
@@ -1839,7 +1915,7 @@ def migration_import(req: _MigrateReq, db: Session = Depends(get_db), _admin: Us
             ts = TrainingSession(
                 tenant_id=tenant, session_key=skey,
                 mode=sess.get("mode") or sc.get("mode") or "formula",
-                status=sess.get("status") or "completed", config=sess.get("config"),
+                status=sess.get("status") or "completed", config=_target_config(sess.get("config")),
                 ai_provider=sess.get("ai_provider"), salary_year=sess.get("salary_year"),
                 salary_month=sess.get("salary_month"), manual_headers=sess.get("manual_headers"),
                 rules_content=sess.get("rules_content"), source_structure=sess.get("source_structure"),
@@ -1871,7 +1947,7 @@ def migration_import(req: _MigrateReq, db: Session = Depends(get_db), _admin: Us
             tgt.name = _new_name or sc.get("name") or existing.name
             tgt.description = sc.get("description") or ""
             tgt.mode = sc.get("mode") or "formula"
-            tgt.config = sc.get("config")
+            tgt.config = _target_config(sc.get("config"))
             tgt.manual_headers = sc.get("manual_headers")
             tgt.source_structure = sc.get("source_structure")
             tgt.rules_content = sc.get("rules_content")
@@ -1883,7 +1959,7 @@ def migration_import(req: _MigrateReq, db: Session = Depends(get_db), _admin: Us
         else:
             tgt = Script(
                 tenant_id=tenant, name=_new_name or sc.get("name") or item.hash, description=sc.get("description") or "",
-                code=code, mode=sc.get("mode") or "formula", config=sc.get("config"),
+                code=code, mode=sc.get("mode") or "formula", config=_target_config(sc.get("config")),
                 manual_headers=sc.get("manual_headers"), source_structure=sc.get("source_structure"),
                 rules_content=sc.get("rules_content"), expected_structure=sc.get("expected_structure"),
                 accuracy=sc.get("accuracy"), source_session_id=new_session_id, version=1, is_active=True)
@@ -1897,39 +1973,24 @@ def migration_import(req: _MigrateReq, db: Session = Depends(get_db), _admin: Us
         # 3) 落盘 scripts/script_<hash>.py + _info.json（scripts_dir 已在前面建好）
         try:
             (scripts_dir / f"{item.hash}.py").write_text(code, encoding="utf-8")
-            info = {"script_id": item.hash, "tenant_id": tenant, "name": tgt.name,
-                    "score": sc.get("accuracy"), "migrated_from": base}
+            info = {
+                "script_id": item.hash,
+                "tenant_id": tenant,
+                "name": tgt.name,
+                "score": sc.get("accuracy"),
+                "migrated_from": base,
+                "manual_headers": sc.get("manual_headers"),
+                "source_structure": sc.get("source_structure"),
+                "expected_structure": sc.get("expected_structure"),
+            }
+            if migrated_template_path:
+                info["template_path"] = migrated_template_path
+                info["template_name"] = portable_basename(tpl_blob.get("name"))
+                info["template_hash"] = tpl_blob.get("hash")
             (scripts_dir / f"{item.hash}_info.json").write_text(
                 _json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as fe:
             logging.getLogger(__name__).warning(f"[迁移] 落盘失败: {fe}")
-
-        # 3b) 模板文件落盘：把导出包里的模板字节按【原始烘焙文件名】写到目标租户 templates/。
-        # 文件名保持源环境烘焙的名字（含源 session id 前缀），resolve_template_path 按
-        # 【文件名+哈希】在租户目录递归命中，故两边 session id 不一致也能定位到，迁移后
-        # 无需手动上传模板即可直接智算。仅模板模式脚本有 template 包。
-        tpl_blob = bundle.get("template")
-        if tpl_blob and tpl_blob.get("data_b64") and tpl_blob.get("name"):
-            try:
-                import base64 as _b64
-                templates_dir = sm.get_tenant_dir(tenant) / "templates"
-                templates_dir.mkdir(parents=True, exist_ok=True)
-                _tpl_dst = templates_dir / tpl_blob["name"]
-                _tpl_bytes = _b64.b64decode(tpl_blob["data_b64"])
-                _tpl_dst.write_bytes(_tpl_bytes)
-                # 会话 config 指向新路径，训练/复算再跑也能定位（智算另有 resolver 兜底）
-                if new_session_id:
-                    _ts = db.query(TrainingSession).filter_by(id=new_session_id).first()
-                    if _ts:
-                        _c = dict(_ts.config) if _ts.config else {}
-                        _c["template_path"] = str(_tpl_dst)
-                        _ts.config = _c
-                        from sqlalchemy.orm.attributes import flag_modified
-                        flag_modified(_ts, "config")
-                logging.getLogger(__name__).info(
-                    f"[迁移] 模板落盘 -> {_tpl_dst} ({len(_tpl_bytes)}B)")
-            except Exception as _tre:
-                logging.getLogger(__name__).warning(f"[迁移] 模板落盘失败: {_tre}")
 
         # 4) 迁移记录
         db.add(ScriptMigration(source_url=base, source_script_hash=item.hash, source_db_id=item.db_id,

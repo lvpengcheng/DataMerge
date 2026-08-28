@@ -58,7 +58,8 @@ def _progress_wrapper_for(task_id: str):
         msg = msg.replace("\n", " ")[:2000]
         _out = getattr(sys, "__stdout__", None) or sys.stdout
         try:
-            _out.write(f"@@PROG@@{task_id}@@{msg}\n")
+            task_prefix = f"{task_id}@@" if task_id else ""
+            _out.write(f"@@PROG@@{task_prefix}{msg}\n")
             _out.flush()
         except Exception:
             pass
@@ -106,13 +107,15 @@ def _run_task(params: dict, task_id: str = "") -> None:
             except Exception:
                 pass
             raise
-        sys.stdout.write(f"@@RESULT@@{task_id}@@{result_path}\n")
+        task_prefix = f"{task_id}@@" if task_id else ""
+        sys.stdout.write(f"@@RESULT@@{task_prefix}{result_path}\n")
     except SystemExit:
         raise
     except Exception:
         tb = traceback.format_exc()
+        task_prefix = f"{task_id}@@" if task_id else ""
         sys.stdout.write(
-            f"@@ERROR@@{task_id}@@{base64.b64encode(tb.encode('utf-8', 'replace')).decode('ascii')}\n")
+            f"@@ERROR@@{task_prefix}{base64.b64encode(tb.encode('utf-8', 'replace')).decode('ascii')}\n")
     finally:
         sys.stdout.flush()
 

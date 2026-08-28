@@ -183,6 +183,8 @@
                     <div class="desc">同组织/子组织创建的整合对比方案。可新增方案，或对已有方案应用（按方案配置回填计算）、修改、删除。非创建人修改时只能「另存为」。</div>
                     <div class="actions" style="margin:12px 0;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
                         <button class="btn btn-primary" id="btn-int-new-scheme" data-perm="tools.data_integrate.create">+ 新增方案</button>
+                        <button class="btn" id="btn-int-import-scheme" data-perm="tools.data_integrate.create">导入方案</button>
+                        <input type="file" id="int-import-scheme-file" accept=".json,application/json" style="display:none;">
                         <input type="text" id="int-scheme-filter" placeholder="按方案名称筛选..." style="padding:5px 10px;border:1px solid #ddd;border-radius:4px;min-width:200px;"
                             oninput="Tools._intOnFilter(this.value)">
                         <span class="status" id="int-list-status"></span>
@@ -508,6 +510,6 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260722a"></script>
-    <script src="/static/js/tools.js?v=20260814g"></script>
+    <script src="/static/js/tools.js?v=20260828a"></script>
 </body>
 </html>

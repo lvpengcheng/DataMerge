@@ -377,7 +377,11 @@ def load_source_data():
         try:
             xls = pd.ExcelFile(fp)
             for sn in xls.sheet_names:
-                df = pd.read_excel(fp, sheet_name=sn)
+                # dtype=object is required even when the Excel cell itself is text:
+                # pandas otherwise infers an all-digit text column as float64. 18-digit
+                # identifiers then exceed IEEE-754 precision and their trailing digits
+                # are already corrupted before key-column normalization can stringify them.
+                df = pd.read_excel(fp, sheet_name=sn, dtype=object)
                 _normalize_key_columns(df)
                 key = sn if sn not in out else f"{{Path(fname).stem}}_{{sn}}"
                 out[key] = {{"df": df, "columns": list(df.columns)}}

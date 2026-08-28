@@ -79,6 +79,33 @@ _log_listener.start()
 logging.basicConfig(level=logging.INFO, handlers=[LOG_QUEUE_HANDLER])
 logger = logging.getLogger(__name__)
 
+# 加密检测只读文件头/格式元数据，不参与公式计算队列；独立单并发避免多次选择文件互相叠加。
+_encryption_check_semaphore = asyncio.Semaphore(1)
+
+
+def _check_encrypted_files_subprocess(files: list) -> list:
+    encrypted = []
+    ambiguous = []
+    modern_exts = {".xlsx", ".xlsm", ".xltx", ".xltm"}
+    for path, name in files:
+        ext = Path(name).suffix.lower()
+        try:
+            with open(path, "rb") as stream:
+                head = stream.read(8)
+        except Exception:
+            head = b""
+        if ext in modern_exts and head.startswith(b"PK"):
+            continue
+        if ext in modern_exts and head.startswith(b"\xd0\xcf\x11\xe0"):
+            encrypted.append(name)
+            continue
+        ambiguous.append((path, name))
+
+    if ambiguous:
+        from backend.utils.aspose_helper import is_encrypted
+        encrypted.extend(name for path, name in ambiguous if is_encrypted(path))
+    return encrypted
+
 # 创建FastAPI应用
 app = FastAPI(
     title="AI驱动的Excel数据整合SaaS系统",
@@ -116,25 +143,28 @@ async def check_files_encrypted(
     files: List[UploadFile] = File(...),
 ):
     """检测上传的文件是否有密码保护，返回加密文件列表"""
-    from ..utils.aspose_helper import is_encrypted
     from pathlib import Path
-    encrypted_files = []
     tmp_dir = tempfile.mkdtemp(prefix="enc_check_")
     tmp_dir = str(Path(tmp_dir).resolve())  # 避免Windows短路径
     try:
-        for f in files:
-            try:
-                tmp_path = os.path.join(tmp_dir, f.filename)
-                content = await f.read()
-                with open(tmp_path, "wb") as fp:
-                    fp.write(content)
-                await f.seek(0)  # 重置文件指针
-                if is_encrypted(tmp_path):
-                    encrypted_files.append(f.filename)
-            except Exception as e:
-                logger.warning(f"检测文件加密状态失败 {f.filename}: {e}")
+        from ..utils.upload_stream import save_upload_file, safe_upload_name
+        staged = []
+        for index, f in enumerate(files):
+            filename = safe_upload_name(f.filename, f"file_{index + 1}.xlsx")
+            tmp_path = os.path.join(tmp_dir, f"{index:08d}_{filename}")
+            await save_upload_file(f, tmp_path)
+            staged.append((tmp_path, filename))
+        # 普通 OOXML 只读 8 字节即可判断；老 .xls 才调用 Aspose DetectFileFormat。
+        # 不进入长时间 Excel 公式队列，否则智训运行期间选择文件会排队到网关 504。
+        async with _encryption_check_semaphore:
+            encrypted_files = await asyncio.wait_for(
+                asyncio.to_thread(_check_encrypted_files_subprocess, staged), timeout=30,
+            )
     except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
         logger.error(f"加密检测整体失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"加密检测失败: {e}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
     return {"encrypted_files": encrypted_files}
@@ -621,6 +651,9 @@ async def startup_event():
     # 增量迁移：为已有表添加新列
     from backend.database.init_db import _migrate_add_columns
     _migrate_add_columns()
+    # 基础数据上传的单消费者：恢复中断任务，并确保解析并发恒为 1。
+    from backend.api.assets import start_asset_upload_dispatcher
+    await start_asset_upload_dispatcher()
     # 定期清理日志缓冲区
     async def _cleanup_log_buffers():
         from backend.compute.task_log_buffer import TaskLogBuffer
@@ -2760,29 +2793,42 @@ async def compare_excel(
         session_dir = compare_dir / session_id
         session_dir.mkdir(exist_ok=True)
 
-        source_path = session_dir / source_file.filename
-        compare_path = session_dir / compare_file.filename
+        from backend.utils.upload_stream import (
+            get_excel_work_semaphore, save_upload_file, safe_upload_name,
+        )
+        source_name = safe_upload_name(source_file.filename, "source.xlsx")
+        compare_name = safe_upload_name(compare_file.filename, "compare.xlsx")
+        # 两个上传文件即使同名也不能互相覆盖。
+        source_path = session_dir / f"source_{source_name}"
+        compare_path = session_dir / f"compare_{compare_name}"
 
-        with open(source_path, 'wb') as f:
-            f.write(await source_file.read())
-        with open(compare_path, 'wb') as f:
-            f.write(await compare_file.read())
+        await save_upload_file(source_file, source_path)
+        await save_upload_file(compare_file, compare_path)
 
         output_filename = f"差异对比_{timestamp}.xlsx"
         output_path = session_dir / output_filename
 
-        logger.info(f"开始对比: {source_file.filename} vs {compare_file.filename}, 主键: {primary_keys_list}")
-        # 必须 await asyncio.to_thread：compare_excel_files_multi_sheet 内部是阻塞的
-        # run_in_subprocess（排队最多600s + Aspose算公式 + 读值对比）。async 端点里直接
-        # 同步调用会冻结整个事件循环 → 所有用户 SSE/状态轮询/其它请求全挂 → 表现为"对比卡死"。
-        result = await asyncio.to_thread(
-            compare_excel_files_multi_sheet,
-            result_file=str(compare_path),
-            expected_file=str(source_path),
-            output_file=str(output_path),
-            primary_keys=primary_keys_list,
-            skip_source_filter=True,
+        logger.info(f"开始对比: {source_name} vs {compare_name}, 主键: {primary_keys_list}")
+        # 完整对比（含两份工作簿公式计算及结果写出）进入一次性子进程；最终文件仍是已计算结果。
+        from backend.utils.subprocess_runner import (
+            run_in_fresh_subprocess_async, default_max_memory_mb, default_timeout,
         )
+        async with get_excel_work_semaphore():
+            rr = await run_in_fresh_subprocess_async(
+                "backend.utils.excel_comparator:compare_excel_files_multi_sheet",
+                kwargs={
+                    "result_file": str(compare_path),
+                    "expected_file": str(source_path),
+                    "output_file": str(output_path),
+                    "primary_keys": primary_keys_list,
+                    "skip_source_filter": True,
+                },
+                timeout=default_timeout("write"), max_memory_mb=default_max_memory_mb(),
+            )
+        if not rr.success:
+            reason = "超时" if rr.timed_out else ("内存超限" if rr.killed_by_memory else rr.error)
+            raise RuntimeError(f"对比任务失败（{reason}）")
+        result = rr.result
 
         download_url = f"/api/compare/download/{session_id}/{output_filename}"
         has_download = output_path.exists()
@@ -2790,8 +2836,8 @@ async def compare_excel(
         resp = {
             "status": "completed",
             "message": "对比完成",
-            "source_file": source_file.filename,
-            "compare_file": compare_file.filename,
+            "source_file": source_name,
+            "compare_file": compare_name,
             "match_rate": min(1.0, result.get("match_rate", 0)),
             "total_cells": result.get("total_cells", 0),
             "matched_cells": result.get("matched_cells", 0),
@@ -3822,6 +3868,11 @@ def _load_script_info_for_precheck(tenant_id: str, script_id: str) -> dict:
             cfg = row.config if isinstance(row.config, dict) else {}
             if "use_history" in cfg:
                 info["use_history"] = bool(cfg.get("use_history"))
+            if row.expected_structure is not None:
+                info["expected_structure"] = row.expected_structure
+            for key in ("template_path", "template_name", "template_hash"):
+                if cfg.get(key):
+                    info[key] = cfg[key]
     except Exception as e:
         logger.warning(f"[Precheck] DB 读 script 元数据失败: {e}")
     finally:
@@ -3853,7 +3904,7 @@ def _load_script_info_for_precheck(tenant_id: str, script_id: str) -> dict:
             pass
 
     # SQLite/JSON 列可能是字符串，反序列化（最多 2 层兜底）
-    for key in ("source_structure", "manual_headers"):
+    for key in ("source_structure", "manual_headers", "expected_structure"):
         v = info.get(key)
         for _ in range(2):
             if isinstance(v, str):
@@ -4341,7 +4392,8 @@ async def _run_compute_subprocess(task_id: str, buffer, params_file: str, temp_d
     import subprocess as _subprocess
     import threading as _threading
     loop = asyncio.get_running_loop()
-    _state = {"saw_terminal": False, "returncode": None, "start_error": None, "proc": None}
+    _state = {"saw_terminal": False, "returncode": None, "start_error": None,
+              "proc": None, "killed_by_memory": False}
     done = asyncio.Event()
 
     # 子进程超时（秒）：读取 .env COMPUTE_PROC_TIMEOUT，默认 3600。
@@ -4351,6 +4403,10 @@ async def _run_compute_subprocess(task_id: str, buffer, params_file: str, temp_d
         _proc_timeout = int(os.getenv("COMPUTE_PROC_TIMEOUT", "3600"))
     except (TypeError, ValueError):
         _proc_timeout = 3600
+    try:
+        _proc_max_memory = int(os.getenv("COMPUTE_PROC_MAX_MEMORY_MB", "2048"))
+    except (TypeError, ValueError):
+        _proc_max_memory = 2048
 
     def _reader():
         proc = None
@@ -4386,6 +4442,22 @@ async def _run_compute_subprocess(task_id: str, buffer, params_file: str, temp_d
 
     _t = _threading.Thread(target=_reader, name=f"compute-subproc-{task_id}", daemon=True)
     _t.start()
+
+    async def _memory_watchdog():
+        from backend.utils.subprocess_runner import _kill_tree, _process_rss_mb
+        while not done.is_set():
+            await asyncio.sleep(0.5)
+            proc = _state.get("proc")
+            if proc is None or proc.poll() is not None:
+                continue
+            rss = _process_rss_mb(proc.pid)
+            if _proc_max_memory > 0 and rss > _proc_max_memory:
+                _state["killed_by_memory"] = True
+                logger.error(f"[compute/subproc] 内存超限 {rss:.0f}MB > {_proc_max_memory}MB，强杀: {proc.pid}")
+                _kill_tree(proc.pid)
+                return
+
+    _mem_task = asyncio.create_task(_memory_watchdog())
     try:
         try:
             await asyncio.wait_for(done.wait(), timeout=_proc_timeout)
@@ -4418,7 +4490,18 @@ async def _run_compute_subprocess(task_id: str, buffer, params_file: str, temp_d
                     _db2.close()
             except Exception:
                 pass
-        if _state["start_error"] is not None:
+        if _state["killed_by_memory"] and not _state["saw_terminal"]:
+            msg = f"计算内存超限（上限 {_proc_max_memory}MB），已强制终止"
+            buffer.push(task_id, json.dumps({"type": "error", "message": msg}, ensure_ascii=False))
+            try:
+                _dbm = SessionLocal()
+                try:
+                    _persist_compute_failed(_dbm, int(task_id), msg)
+                finally:
+                    _dbm.close()
+            except Exception:
+                pass
+        elif _state["start_error"] is not None:
             e = _state["start_error"]
             logger.error(f"[compute/subproc] 子进程启动/读取失败: {e}", exc_info=e)
             try:
@@ -4450,6 +4533,7 @@ async def _run_compute_subprocess(task_id: str, buffer, params_file: str, temp_d
             except Exception:
                 pass
     finally:
+        _mem_task.cancel()
         try:
             buffer.finish(task_id)
         except Exception:
@@ -4458,6 +4542,41 @@ async def _run_compute_subprocess(task_id: str, buffer, params_file: str, temp_d
             shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception:
             pass
+
+
+async def _run_compute_subprocess_queued(task_id: str, buffer, params_file: str, temp_dir: str):
+    """正式智算有界并发入口；超出槽位的任务排队但持续推送可见状态。"""
+    from backend.utils.upload_stream import get_excel_work_semaphore
+    semaphore = get_excel_work_semaphore()
+    acquire_task = asyncio.create_task(semaphore.acquire())
+    started = time.monotonic()
+    interval = max(5, int(os.getenv("EXCEL_QUEUE_NOTICE_INTERVAL", "15")))
+    try:
+        while not acquire_task.done():
+            done, _ = await asyncio.wait({acquire_task}, timeout=interval)
+            if not done:
+                waited = int(time.monotonic() - started)
+                buffer.push(task_id, json.dumps({
+                    "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                    "level": "info",
+                    "message": f"执行槽已满，任务继续排队（已等待 {waited} 秒）",
+                }, ensure_ascii=False))
+        await acquire_task
+        waited = int(time.monotonic() - started)
+        buffer.push(task_id, json.dumps({
+            "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "level": "info", "message": f"已获得执行槽（排队 {waited} 秒），开始计算",
+        }, ensure_ascii=False))
+        await _run_compute_subprocess(task_id, buffer, params_file, temp_dir)
+    finally:
+        if acquire_task.done() and not acquire_task.cancelled():
+            try:
+                if acquire_task.result():
+                    semaphore.release()
+            except Exception:
+                pass
+        elif not acquire_task.done():
+            acquire_task.cancel()
 
 
 async def run_compute_task(
@@ -5238,6 +5357,7 @@ async def run_compute_task(
 
         # 统计行数（使用 Aspose 轻量读取，避免额外引入 openpyxl）；放线程避免阻塞事件循环
         def _count_rows(path):
+            _cwb = None
             try:
                 from Aspose.Cells import Workbook as _CountWb
                 _cwb = _CountWb(str(path))
@@ -5245,6 +5365,12 @@ async def run_compute_task(
                            for i in range(_cwb.Worksheets.Count))
             except Exception:
                 return 0
+            finally:
+                if _cwb is not None:
+                    try:
+                        _cwb.Dispose()
+                    except Exception:
+                        pass
         rows_processed = await asyncio.to_thread(_count_rows, saved_file)
 
         log_msg = {
@@ -5322,6 +5448,70 @@ async def run_compute_task(
 
 # ==================== 新版计算接口：任务队列 + SSE 重连 ====================
 
+
+def _compute_upload_precheck_subprocess(payload: dict) -> dict:
+    """智算上传预处理子进程：解密、xls 转换、规范化和预检查。"""
+    source_dir = Path(payload["source_dir"])
+    template_override_path = payload.get("template_override_path")
+    passwords_dict = payload.get("passwords_dict") or {}
+
+    from backend.utils.aspose_helper import is_encrypted, decrypt_excel
+    from backend.utils.source_normalizer import convert_xls_to_xlsx, normalize_misformatted_dates
+    from backend.utils.compute_precheck import precheck_compute
+
+    encrypted = []
+    for fp in source_dir.iterdir():
+        if fp.is_file() and fp.suffix.lower() in (".xlsx", ".xls", ".xlsm"):
+            if is_encrypted(str(fp.resolve())) and not passwords_dict.get(fp.name):
+                encrypted.append(fp.name)
+    if encrypted:
+        return {"encrypted_files": encrypted, "pc_result": None,
+                "template_override_path": template_override_path}
+
+    for fp in list(source_dir.iterdir()):
+        if not fp.is_file() or fp.suffix.lower() not in (".xlsx", ".xls", ".xlsm"):
+            continue
+        fp_str = str(fp.resolve())
+        pwd = passwords_dict.get(fp.name)
+        if pwd and is_encrypted(fp_str):
+            decrypted = decrypt_excel(fp_str, password=pwd)
+            shutil.move(decrypted, fp_str)
+        if fp.suffix.lower() == ".xls":
+            convert_xls_to_xlsx(fp_str)
+
+    if template_override_path:
+        template_override_path = convert_xls_to_xlsx(template_override_path)
+
+    # 上传预检查只读现有缓存值，禁止全工作簿公式重算。
+    for fp in source_dir.iterdir():
+        if fp.is_file() and fp.suffix.lower() in (".xlsx", ".xls", ".xlsm"):
+            normalize_misformatted_dates(str(fp.resolve()), calculate_formulas=False)
+
+    db = SessionLocal()
+    try:
+        pc = precheck_compute(
+            source_dir=str(source_dir),
+            source_structure=payload.get("source_structure"),
+            manual_headers=payload.get("manual_headers"),
+            script_content=payload["script_content"],
+            tenant_id=payload["tenant_id"],
+            salary_year=payload.get("salary_year"),
+            salary_month=payload.get("salary_month"),
+            db_session=db,
+            ai_provider_name=_resolve_enabled_ai_provider(
+                os.environ.get("AI_PROVIDER", "deepseek")),
+            confirmed_mapping=payload.get("confirmed_mapping"),
+            confirmed_renames=payload.get("confirmed_renames"),
+            use_history=payload.get("use_history"),
+            expected_structure=payload.get("expected_structure"),
+            template_override_path=template_override_path,
+            confirmed_target_map=payload.get("confirmed_target_map"),
+        )
+        return {"encrypted_files": [], "pc_result": pc,
+                "template_override_path": template_override_path}
+    finally:
+        db.close()
+
 @app.post("/api/compute/submit")
 async def compute_submit(
     tenant_id: str = Form(...),
@@ -5343,6 +5533,7 @@ async def compute_submit(
 
     template_file: 模板模式可选上传新模板覆盖训练时模板；不传则用训练时模板。
     """
+    temp_dir = None
     try:
         # 租户隔离：只能对有权操作的租户提交计算（后端强校验，前端灰化仅辅助）
         if tenant_id not in accessible_tenants:
@@ -5364,31 +5555,20 @@ async def compute_submit(
         source_dir = temp_dir / "source"
         source_dir.mkdir(parents=True, exist_ok=True)
 
-        # 把 UploadFile 的字节预读到内存，避免跨线程访问 SpooledTemporaryFile
-        file_buffers: List[tuple] = []
-        for file in source_files:
-            data = await file.read()
-            file_buffers.append((file.filename, data))
+        # 直接分块落盘，不再把所有上传文件同时放入 file_buffers。
+        from backend.utils.upload_stream import save_upload_file, safe_upload_name
+        for index, file in enumerate(source_files):
+            filename = safe_upload_name(file.filename, f"source_{index + 1}.xlsx")
+            await save_upload_file(file, source_dir / filename)
 
         # 模板模式可选新模板：单独存到 temp_dir/template（不放进 source_dir，避免被当成源数据 sheet 追加）
         template_override_path = None
         if template_file is not None and template_file.filename:
-            _tpl_bytes = await template_file.read()
             template_dir = temp_dir / "template"
             template_dir.mkdir(parents=True, exist_ok=True)
-            _tpl_path = template_dir / template_file.filename
-            with open(_tpl_path, 'wb') as f:
-                f.write(_tpl_bytes)
+            _tpl_path = template_dir / safe_upload_name(template_file.filename, "template.xlsx")
+            await save_upload_file(template_file, _tpl_path)
             template_override_path = str(_tpl_path.resolve())
-            # 老版 .xls 模板转 .xlsx（模板模式骨架用 openpyxl 加载模板，不支持 .xls）
-            try:
-                from backend.utils.source_normalizer import convert_xls_to_xlsx
-                _conv_tpl = convert_xls_to_xlsx(template_override_path)
-                if _conv_tpl != template_override_path:
-                    template_override_path = _conv_tpl
-                    logger.info(f"[compute/submit] 上传模板 .xls 已转 .xlsx: {_conv_tpl}")
-            except Exception as _xt:
-                logger.warning(f"[compute/submit] 模板 xls 转换失败（继续）: {_xt}")
             logger.info(f"[compute/submit] 收到上传模板，将覆盖训练模板: {template_file.filename}")
 
         passwords_dict = {}
@@ -5434,116 +5614,54 @@ async def compute_submit(
                 _expected_structure = None
         _use_history_flag = _script_info.get("use_history")  # None 表示未训练标记,回退关键字扫描
 
-        from fastapi.responses import JSONResponse
-        from backend.utils.aspose_helper import is_encrypted as _is_enc, decrypt_excel as _dec_excel
-        from backend.utils.compute_precheck import precheck_compute
+        # 自动迁移会把模板绑定重写为目标环境路径。显式上传模板仍有最高优先级；
+        # 未上传时优先采用目标 Script.config 的绑定，避免再使用源 Docker /app 或源 Windows 盘符。
+        if not template_override_path:
+            _bound_tpl = _script_info.get("template_path")
+            if _bound_tpl:
+                _bound_path = Path(str(_bound_tpl))
+                if not _bound_path.is_absolute():
+                    _bound_path = Path(__file__).resolve().parent.parent.parent / _bound_path
+                if _bound_path.exists():
+                    template_override_path = str(_bound_path.resolve())
+                    logger.info(f"[compute/submit] 使用迁移后的模板绑定: {template_override_path}")
 
-        # 3. 同步重活全部丢线程池：写盘 + 加密检测 + 解密 + banner-split + precheck
-        # 不能在线程池内 raise HTTPException（依赖请求上下文），用返回值带回信号
-        def _sync_pre_compute():
-            for fname, data in file_buffers:
-                with open(source_dir / fname, 'wb') as f:
-                    f.write(data)
-
-            enc = []
-            for fp in source_dir.iterdir():
-                if fp.is_file() and fp.suffix.lower() in ('.xlsx', '.xls', '.xlsm'):
-                    if _is_enc(str(fp.resolve())) and not passwords_dict.get(fp.name):
-                        enc.append(fp.name)
-            if enc:
-                return {"encrypted_files": enc, "pc_result": None}
-
-            if passwords_dict:
-                for fp in source_dir.iterdir():
-                    if not fp.is_file() or fp.suffix.lower() not in ('.xlsx', '.xls', '.xlsm'):
-                        continue
-                    pwd = passwords_dict.get(fp.name)
-                    if pwd:
-                        fp_str = str(fp.resolve())
-                        if _is_enc(fp_str):
-                            try:
-                                decrypted = _dec_excel(fp_str, password=pwd)
-                                shutil.move(decrypted, fp_str)
-                            except Exception as _de:
-                                logger.warning(f"[compute/submit] 解密 {fp.name} 失败: {_de}")
-
-            # 老版 .xls 自动转 .xlsx（下游用 openpyxl，仅支持 xlsx/xlsm）。须在 banner 预处理之前
-            try:
-                from backend.utils.source_normalizer import convert_xls_to_xlsx
-                for p in list(source_dir.iterdir()):
-                    if p.is_file() and p.suffix.lower() == '.xls':
-                        convert_xls_to_xlsx(str(p.resolve()))
-            except Exception as _xls_err:
-                logger.warning(f"[compute/submit] xls 转换失败（继续）: {_xls_err}")
-
-            try:
-                from backend.utils.banner_splitter import preprocess_uploaded_files
-                preprocess_uploaded_files([
-                    str(p.resolve()) for p in source_dir.iterdir()
-                    if p.is_file() and p.suffix.lower() in ('.xlsx', '.xlsm')
-                ])
-            except Exception as _bs_err:
-                logger.warning(f"[compute/submit] banner-split 预处理失败（继续）: {_bs_err}")
-
-            # 上传规范化：把"被误设成日期格式的数字单元格"重置为常规，避免后续解析按日期读错
-            # （智算直传的源文件不走数据资产上传，故需在此单独规范化）
-            try:
-                from backend.utils.source_normalizer import normalize_misformatted_dates
-                for p in source_dir.iterdir():
-                    if p.is_file() and p.suffix.lower() in ('.xlsx', '.xls', '.xlsm'):
-                        normalize_misformatted_dates(str(p.resolve()))
-            except Exception as _nz_err:
-                logger.warning(f"[compute/submit] 日期格式规范化失败（继续）: {_nz_err}")
-
-            _db = SessionLocal()
-            try:
-                pc = precheck_compute(
-                    source_dir=str(source_dir),
-                    source_structure=_source_structure,
-                    manual_headers=_manual_headers,
-                    script_content=script_content,
-                    tenant_id=tenant_id,
-                    salary_year=salary_year,
-                    salary_month=salary_month,
-                    db_session=_db,
-                    # 智算 precheck 的 AI（列头匹配建议/改名裁决）也受系统配置启停约束：
-                    # 停用的 provider 传 None → precheck 跳过 AI 建议（规则校验照常）
-                    ai_provider_name=_resolve_enabled_ai_provider(
-                        os.environ.get("AI_PROVIDER", "deepseek")),
-                    confirmed_mapping=_confirmed,
-                    confirmed_renames=_confirmed_renames,
-                    use_history=_use_history_flag,
-                    expected_structure=_expected_structure,
-                    template_override_path=template_override_path,
-                    confirmed_target_map=_confirmed_target_map,
+        # 预处理和 precheck 整体在全新子进程内运行；有界并发、可超时、可超内存强杀。
+        from backend.utils.subprocess_runner import run_in_fresh_subprocess_async
+        _pre_payload = {
+            "source_dir": str(source_dir), "template_override_path": template_override_path,
+            "passwords_dict": passwords_dict, "source_structure": _source_structure,
+            "manual_headers": _manual_headers, "script_content": script_content,
+            "tenant_id": tenant_id, "salary_year": salary_year, "salary_month": salary_month,
+            "confirmed_mapping": _confirmed, "confirmed_renames": _confirmed_renames,
+            "use_history": _use_history_flag, "expected_structure": _expected_structure,
+            "confirmed_target_map": _confirmed_target_map,
+        }
+        async def _finish_compute_submission():
+            nonlocal template_override_path
+            from backend.utils.upload_stream import get_excel_work_semaphore
+            async with get_excel_work_semaphore():
+                _pre_sub = await run_in_fresh_subprocess_async(
+                    "backend.app.main:_compute_upload_precheck_subprocess",
+                    args=(_pre_payload,),
+                    timeout=int(os.getenv("COMPUTE_PRECHECK_TIMEOUT", "600")),
+                    max_memory_mb=int(os.getenv("COMPUTE_PRECHECK_MAX_MEMORY_MB", "1536")),
                 )
-            finally:
-                try:
-                    _db.close()
-                except Exception:
-                    pass
-            return {"encrypted_files": [], "pc_result": pc}
+            if not _pre_sub.success:
+                raise RuntimeError(f"智算上传预处理失败: {_pre_sub.error}")
+            _pre = _pre_sub.result
+            template_override_path = _pre.get("template_override_path") or template_override_path
 
-        loop = asyncio.get_running_loop()
-        _pre = await loop.run_in_executor(None, _sync_pre_compute)
+            if _pre["encrypted_files"]:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                return {"error_type": "encrypted_files",
+                        "encrypted_files": _pre["encrypted_files"],
+                        "message": f"检测到加密文件: {', '.join(_pre['encrypted_files'])}"}
 
-        if _pre["encrypted_files"]:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            return JSONResponse(
-                status_code=422,
-                content={"error_type": "encrypted_files",
-                         "encrypted_files": _pre["encrypted_files"],
-                         "message": f"检测到加密文件: {', '.join(_pre['encrypted_files'])}"},
-            )
-
-        pc_result = _pre["pc_result"]
-
-        # 历史数据警告：未带 skip_history_check 时也阻断（让用户确认）
-        if (not pc_result.ok) or (pc_result.history_warnings and not skip_history_check):
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            return JSONResponse(
-                status_code=422,
-                content={
+            pc_result = _pre["pc_result"]
+            if (not pc_result.ok) or (pc_result.history_warnings and not skip_history_check):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                return {
                     "error_type": "precheck_failed",
                     "missing_files": pc_result.missing_files,
                     "auto_filled": pc_result.auto_filled,
@@ -5554,50 +5672,70 @@ async def compute_submit(
                     "actual_paths": pc_result.actual_paths,
                     "history_warnings": pc_result.history_warnings,
                     "target_candidates": pc_result.target_candidates,
-                },
-            )
+                }
 
-        # 4. 创建 DB 任务
-        db_session, compute_task_id = _persist_compute_start(
-            tenant_id, script_id, salary_year=salary_year, salary_month=salary_month
+            db_session, compute_task_id = _persist_compute_start(
+                tenant_id, script_id, salary_year=salary_year, salary_month=salary_month)
+            try:
+                db_session.close()
+            except Exception:
+                pass
+            task_id_str = str(compute_task_id) if compute_task_id else str(id(temp_dir))
+
+            from backend.compute.task_log_buffer import TaskLogBuffer
+            buffer = TaskLogBuffer.get_instance()
+            buffer.create_task(task_id_str)
+            buffer.push(task_id_str, json.dumps({
+                "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "level": "info", "message": "预检完成，任务已进入 Excel 有界并发队列",
+            }, ensure_ascii=False))
+
+            compute_params = {
+                "task_id": task_id_str, "tenant_id": tenant_id, "script_id": script_id,
+                "script_content": script_content, "source_dir": str(source_dir),
+                "salary_year": salary_year, "salary_month": salary_month,
+                "standard_hours": standard_hours, "file_passwords": file_passwords,
+                "pre_validated_mapping": pc_result.file_mapping,
+                "precheck_auto_filled": pc_result.auto_filled,
+                "template_override_path": template_override_path,
+                "target_sheet_manual_map": _confirmed_target_map or pc_result.target_map or {},
+            }
+            params_file = temp_dir / "_compute_params.json"
+            params_file.write_text(
+                json.dumps(compute_params, ensure_ascii=False, default=str), encoding="utf-8")
+            asyncio.create_task(_run_compute_subprocess_queued(
+                task_id_str, buffer, str(params_file), str(temp_dir)))
+            logger.info(f"[compute/submit] 任务已提交: task_id={task_id_str}")
+            return {"task_id": task_id_str}
+
+        async def _stream_submit_result():
+            """流式 JSON：先发空白保活，最后发一个完整 JSON；JSON 解析允许前导空白。"""
+            task = asyncio.create_task(_finish_compute_submission())
+            yield " \n"
+            try:
+                while not task.done():
+                    done, _ = await asyncio.wait({task}, timeout=10)
+                    if not done:
+                        yield " \n"
+                result = await task
+            except Exception as exc:
+                logger.error(f"[compute/submit] 后台预检失败: {exc}", exc_info=True)
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                result = {"error_type": "submit_failed", "detail": str(exc)}
+            yield json.dumps(result, ensure_ascii=False, default=str)
+
+        return StreamingResponse(
+            _stream_submit_result(), media_type="application/json",
+            headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
         )
 
-        task_id_str = str(compute_task_id) if compute_task_id else str(id(temp_dir))
-
-        # 5. 创建日志缓冲区
-        from backend.compute.task_log_buffer import TaskLogBuffer
-        buffer = TaskLogBuffer.get_instance()
-        buffer.create_task(task_id_str)
-
-        # 6. 后台启动计算（独立子进程：避免 Aspose/.NET 持 GIL 冻结事件循环导致 SSE 被 WAF 502）
-        _compute_params = {
-            "task_id": task_id_str,
-            "tenant_id": tenant_id,
-            "script_id": script_id,
-            "script_content": script_content,
-            "source_dir": str(source_dir),
-            "salary_year": salary_year,
-            "salary_month": salary_month,
-            "standard_hours": standard_hours,
-            "file_passwords": file_passwords,
-            "pre_validated_mapping": pc_result.file_mapping,
-            "precheck_auto_filled": pc_result.auto_filled,
-            "template_override_path": template_override_path,
-            # 目标表人工/语义映射（②）：注入脚本 globals()['_target_sheet_manual_map']
-            "target_sheet_manual_map": _confirmed_target_map or pc_result.target_map or {},
-        }
-        _params_file = temp_dir / "_compute_params.json"
-        _params_file.write_text(json.dumps(_compute_params, ensure_ascii=False, default=str), encoding="utf-8")
-        asyncio.create_task(_run_compute_subprocess(
-            task_id_str, buffer, str(_params_file), str(temp_dir)
-        ))
-
-        logger.info(f"[compute/submit] 任务已提交: task_id={task_id_str}")
-        return {"task_id": task_id_str}
-
     except HTTPException:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
         raise
     except Exception as e:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
         logger.error(f"[compute/submit] 提交失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -6409,25 +6547,21 @@ async def compute_with_script(
                 except Exception:
                     pass
 
-            # 预读 UploadFile 字节，避免跨线程访问 SpooledTemporaryFile
-            file_buffers: List[tuple] = []
-            for file in source_files:
-                data = await file.read()
-                file_buffers.append((file.filename, data))
+            from backend.utils.upload_stream import save_upload_file, safe_upload_name
+            source_dir = temp_dir / "source"
+            source_dir.mkdir(parents=True, exist_ok=True)
+            uploaded_names = []
+            for index, file in enumerate(source_files):
+                filename = safe_upload_name(file.filename, f"source_{index + 1}.xlsx")
+                await save_upload_file(file, source_dir / filename)
+                uploaded_names.append(filename)
 
             # 整段同步重活丢线程池：写盘 + 加解密 + 脚本执行 + 行数统计
             def _sync_run():
-                source_dir = temp_dir / "source"
-                source_dir.mkdir(parents=True, exist_ok=True)
-
-                for fname, data in file_buffers:
-                    with open(source_dir / fname, 'wb') as f:
-                        f.write(data)
-
                 from ..utils.aspose_helper import is_encrypted as _is_enc, decrypt_excel as _dec_excel
 
                 encrypted_no_pwd = []
-                for fname, _data in file_buffers:
+                for fname in uploaded_names:
                     file_path = source_dir / fname
                     file_path_str = str(file_path.resolve())
                     if not _is_enc(file_path_str):
@@ -6555,8 +6689,11 @@ async def compute_with_script(
                 try:
                     from Aspose.Cells import Workbook as _CountWb
                     _cwb = _CountWb(str(saved_file))
-                    rows_processed = sum(_cwb.Worksheets[i].Cells.MaxDataRow + 1
-                                         for i in range(_cwb.Worksheets.Count))
+                    try:
+                        rows_processed = sum(_cwb.Worksheets[i].Cells.MaxDataRow + 1
+                                             for i in range(_cwb.Worksheets.Count))
+                    finally:
+                        _cwb.Dispose()
                 except Exception:
                     rows_processed = 0
 
@@ -6578,7 +6715,9 @@ async def compute_with_script(
                 }
 
             loop = asyncio.get_running_loop()
-            run_result = await loop.run_in_executor(None, _sync_run)
+            from backend.utils.upload_stream import get_excel_work_semaphore
+            async with get_excel_work_semaphore():
+                run_result = await loop.run_in_executor(None, _sync_run)
 
             if run_result["_kind"] == "encrypted":
                 from fastapi.responses import JSONResponse
@@ -7588,7 +7727,10 @@ async def get_all_training_history(
 
 if __name__ == "__main__":
     try:
-        uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+        uvicorn.run(
+            "main:app", host="0.0.0.0",
+            port=int(os.getenv("APP_PORT", "18000")), reload=True,
+        )
     except (KeyboardInterrupt, asyncio.exceptions.CancelledError):
         # 正常关闭，不打印错误
         pass

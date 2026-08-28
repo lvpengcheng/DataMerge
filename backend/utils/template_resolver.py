@@ -17,12 +17,16 @@ import os
 import re
 import hashlib
 import logging
+import ntpath
+import posixpath
+import ast
 
 logger = logging.getLogger(__name__)
 
-_NAME_RE = re.compile(r"TEMPLATE_NAME\s*=\s*(['\"])(.+?)\1")
-_HASH_RE = re.compile(r"TEMPLATE_HASH\s*=\s*(['\"])([0-9a-fA-F]*)\1")
-_PATH_RE = re.compile(r"TEMPLATE_PATH\s*=\s*(['\"])(.+?)\1")
+_STR_PREFIX = r"(?:[rRuUbB]{0,2})?"
+_NAME_RE = re.compile(r"TEMPLATE_NAME\s*=\s*" + _STR_PREFIX + r"(['\"])(.+?)\1")
+_HASH_RE = re.compile(r"TEMPLATE_HASH\s*=\s*" + _STR_PREFIX + r"(['\"])([0-9a-fA-F]*)\1")
+_PATH_RE = re.compile(r"TEMPLATE_PATH\s*=\s*" + _STR_PREFIX + r"(['\"])(.+?)\1")
 
 
 def _md5(path):
@@ -44,26 +48,60 @@ def extract_template_ref(script_code):
         m = _HASH_RE.search(script_code); hsh = m.group(2) if m else None
         m = _PATH_RE.search(script_code); baked = m.group(2) if m else None
     if not name and baked:
-        name = os.path.basename(baked)
+        # os.path.basename 只理解当前操作系统的分隔符：Linux 处理
+        # ``E:\\...\\模板.xlsx`` 时会把整条路径当文件名。迁移场景必须同时兼容
+        # Windows 与 POSIX 路径。
+        name = portable_basename(baked)
     return name, hsh, baked
 
 
+def portable_basename(path):
+    """跨 Windows/POSIX 提取文件名，不依赖当前运行平台。"""
+    value = str(path or "").strip().rstrip("/\\")
+    if not value:
+        return ""
+    return ntpath.basename(posixpath.basename(value))
+
+
+def find_nonportable_absolute_paths(script_code):
+    """返回除 TEMPLATE_PATH 外的 Windows/Docker/Ubuntu 环境绝对路径。"""
+    try:
+        tree = ast.parse(script_code or "")
+    except Exception:
+        return []
+    template_literals = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            value = node.value
+            if (any(isinstance(t, ast.Name) and t.id == "TEMPLATE_PATH" for t in targets)
+                    and isinstance(value, ast.Constant) and isinstance(value.value, str)):
+                template_literals.add(value.value)
+    found = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+            continue
+        value = node.value.strip()
+        if not value or value in template_literals:
+            continue
+        if re.match(r"^[A-Za-z]:[\\/]", value) or value.startswith(("/app/", "/www/")):
+            found.append(value)
+    return list(dict.fromkeys(found))
+
+
 def _find_by_name(root, name, want_hash=None):
-    """在 root 下递归找 basename == name 的文件；有 want_hash 时优先返回哈希一致的，否则返回首个命中。"""
+    """在 root 下递归找文件；指定哈希时只允许返回哈希一致的文件。"""
     if not root or not name or not os.path.isdir(root):
         return None
-    fallback = None
     for dirpath, _dirs, files in os.walk(root):
         if name in files:
             full = os.path.join(dirpath, name)
             if want_hash:
                 if _md5(full) == want_hash:
                     return full
-                if fallback is None:
-                    fallback = full
             else:
                 return full
-    return fallback
+    return None
 
 
 def resolve_template_path(*, tenant_id=None, script_code=None, uploaded_override=None,

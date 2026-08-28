@@ -526,6 +526,20 @@ function _escapeHtml(s) {
  * 文件选择后，调用服务端 Aspose 检测加密，有加密则立即弹窗
  * @param {File[]} filesToCheck - 要检测的文件数组
  */
+async function _probeModernExcelEncryption(file) {
+    const name = (file?.name || '').toLowerCase();
+    const modern = ['.xlsx', '.xlsm', '.xltx', '.xltm'].some(ext => name.endsWith(ext));
+    if (!modern) return null;
+    try {
+        const bytes = new Uint8Array(await file.slice(0, 8).arrayBuffer());
+        if (bytes[0] === 0x50 && bytes[1] === 0x4b) return false;
+        if (bytes[0] === 0xd0 && bytes[1] === 0xcf && bytes[2] === 0x11 && bytes[3] === 0xe0) return true;
+    } catch (e) {
+        console.warn('本地文件头检测失败，回退服务端:', file?.name, e);
+    }
+    return null;
+}
+
 async function _autoCheckEncryption(filesToCheck) {
     const btn = document.getElementById('compute-btn');
 
@@ -538,26 +552,32 @@ async function _autoCheckEncryption(filesToCheck) {
     }
 
     try {
-        const checkFd = new FormData();
-        filesToCheck.forEach(f => checkFd.append('files', f));
+        const encrypted = [];
+        const needServerCheck = [];
+        for (const file of filesToCheck) {
+            const local = await _probeModernExcelEncryption(file);
+            if (local === true) encrypted.push(file.name);
+            else if (local === null) needServerCheck.push(file);
+        }
 
-        console.log('[加密检测] 发送检测请求, 文件:', filesToCheck.map(f => f.name));
-        const checkResp = await AUTH.authFetch('/api/files/check-encrypted', {
-            method: 'POST',
-            body: checkFd
-        });
-
-        if (checkResp.ok) {
-            const checkResult = await checkResp.json();
-            console.log('[加密检测] 服务端返回:', checkResult);
-            if (checkResult.encrypted_files && checkResult.encrypted_files.length > 0) {
-                const passwords = await _promptFilePasswords(checkResult.encrypted_files);
-                if (passwords) {
-                    _filePasswordsMap = { ...(_filePasswordsMap || {}), ...passwords };
-                }
+        if (needServerCheck.length > 0) {
+            const checkFd = new FormData();
+            needServerCheck.forEach(f => checkFd.append('files', f));
+            const checkResp = await AUTH.authFetch('/api/files/check-encrypted', {
+                method: 'POST', body: checkFd
+            });
+            if (checkResp.ok) {
+                const checkResult = await checkResp.json();
+                (checkResult.encrypted_files || []).forEach(name => {
+                    if (!encrypted.includes(name)) encrypted.push(name);
+                });
             }
-        } else {
-            console.error('[加密检测] 请求失败, status:', checkResp.status);
+        }
+        if (encrypted.length > 0) {
+            const passwords = await _promptFilePasswords(encrypted);
+            if (passwords) {
+                _filePasswordsMap = { ...(_filePasswordsMap || {}), ...passwords };
+            }
         }
     } catch (e) {
         console.error('[加密检测] 异常:', e);
@@ -859,6 +879,27 @@ function checkCanCompute() {
 
 // ==================== 计算执行 ====================
 
+async function _readComputeSubmitJson(resp) {
+    if (!resp.body || !resp.body.getReader) return await resp.json();
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let body = '';
+    const started = Date.now();
+    let lastNotice = 0;
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        body += decoder.decode(value, { stream: true });
+        const waited = Math.floor((Date.now() - started) / 1000);
+        if (waited >= 10 && waited - lastNotice >= 10) {
+            lastNotice = waited;
+            addLog('info', `正在排队或执行上传预检，已等待 ${waited} 秒...`);
+        }
+    }
+    body += decoder.decode();
+    return body.trim() ? JSON.parse(body.trim()) : null;
+}
+
 async function startCompute() {
     const btn = document.getElementById('compute-btn');
     const files = document.getElementById('source-files').files;
@@ -931,6 +972,7 @@ async function startCompute() {
         // 提交循环：每次 422 + precheck_failed / encrypted_files 都弹窗补料后重试
         const MAX_RETRY = 6;
         let resp = null;
+        let responseData = null;
         let attempt = 0;
         let cancelled = false;
         while (attempt < MAX_RETRY) {
@@ -939,13 +981,16 @@ async function startCompute() {
                 method: 'POST',
                 body: formData,
             });
-            if (resp.ok) break;
+            responseData = null;
+            try { responseData = await _readComputeSubmitJson(resp); } catch (e) {}
+            // 提交端使用流式 JSON 保活：预检业务错误也以 JSON error_type 返回，
+            // 不能再只依赖 HTTP 422 判断。
+            if (resp.ok && responseData && !responseData.error_type) break;
 
-            let errorData = null;
-            try { errorData = await resp.json(); } catch (e) {}
+            const errorData = responseData;
 
-            // 事前校验失败（422 + precheck_failed）
-            if (resp.status === 422 && errorData && errorData.error_type === 'precheck_failed') {
+            // 事前校验失败
+            if (errorData && errorData.error_type === 'precheck_failed') {
                 addLog('warning', '事前校验未通过，等待用户确认...');
                 const dialogResult = await _showPrecheckDialog(errorData);
                 if (!dialogResult) {
@@ -969,8 +1014,8 @@ async function startCompute() {
                 continue;
             }
 
-            // 加密文件（422 + encrypted_files）
-            if (resp.status === 422 && errorData && errorData.error_type === 'encrypted_files') {
+            // 加密文件
+            if (errorData && errorData.error_type === 'encrypted_files') {
                 addLog('warning', `检测到加密文件: ${errorData.encrypted_files.join(', ')}`);
                 const passwords = await _promptFilePasswords(errorData.encrypted_files);
                 if (!passwords) {
@@ -997,12 +1042,12 @@ async function startCompute() {
             return;
         }
 
-        if (!resp || !resp.ok) {
+        if (!resp || !resp.ok || !responseData || responseData.error_type || !responseData.task_id) {
             throw new Error('事前校验多次未通过，已停止重试');
         }
 
         // 成功：获取 task_id，连接 SSE 流
-        const data = await resp.json();
+        const data = responseData;
         _currentTaskId = data.task_id;
         _saveActiveTask(_currentTaskId, 0);
         addLog('info', `任务已提交 (ID: ${_currentTaskId})，正在连接日志流...`);

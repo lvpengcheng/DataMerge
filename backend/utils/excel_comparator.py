@@ -56,9 +56,15 @@ def _aspose_calc_impl(file_path: str) -> bool:
     from Aspose.Cells import Workbook as AsposeWorkbook
 
     wb = AsposeWorkbook(str(file_path))
-    wb.CalculateFormula()
-    wb.Save(str(file_path))
-    return True
+    try:
+        wb.CalculateFormula()
+        wb.Save(str(file_path))
+        return True
+    finally:
+        try:
+            wb.Dispose()
+        except Exception:
+            pass
 
 
 def calculate_excel_formulas(file_path: str, timeout: int = None) -> bool:

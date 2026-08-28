@@ -35,8 +35,8 @@ if "%CHOICE%"=="1" (
     echo ========================================
     echo         启动FastAPI服务
     echo ========================================
-    echo 服务地址: http://localhost:8000
-    echo API文档: http://localhost:8000/docs
+    echo 服务端口由 .env 中 APP_PORT 决定，默认 18000
+    echo API文档启动后请访问: http://localhost:18000/docs
     echo 按 Ctrl+C 停止服务
     echo.
 

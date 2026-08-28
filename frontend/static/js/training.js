@@ -561,15 +561,45 @@ function _renderFileList(containerId, files) {
 }
 
 // ==================== 加密检测 ====================
+async function _probeModernExcelEncryption(file) {
+    const name = (file?.name || '').toLowerCase();
+    const modern = ['.xlsx', '.xlsm', '.xltx', '.xltm'].some(ext => name.endsWith(ext));
+    if (!modern) return null; // 老 .xls 仍交给服务端/Aspose 判断
+    try {
+        const bytes = new Uint8Array(await file.slice(0, 8).arrayBuffer());
+        // 未加密 OOXML 是 ZIP(PK)；加密后的 OOXML 是 OLE Compound(D0 CF 11 E0...)。
+        if (bytes[0] === 0x50 && bytes[1] === 0x4b) return false;
+        if (bytes[0] === 0xd0 && bytes[1] === 0xcf && bytes[2] === 0x11 && bytes[3] === 0xe0) return true;
+    } catch (e) {
+        console.warn('本地读取 Excel 文件头失败，回退服务端检测:', file?.name, e);
+    }
+    return null;
+}
+
 async function _checkEncryption(filesToCheck) {
     if (!filesToCheck || filesToCheck.length === 0) return;
     try {
-        const formData = new FormData();
-        filesToCheck.forEach(f => formData.append('files', f));
-        const resp = await AUTH.authFetch('/api/files/check-encrypted', { method: 'POST', body: formData });
-        if (!resp.ok) return;
-        const data = await resp.json();
-        const encrypted = data.encrypted_files || [];
+        const encrypted = [];
+        const needServerCheck = [];
+        for (const file of filesToCheck) {
+            if (_filePasswordsMap[file.name]) continue;
+            const local = await _probeModernExcelEncryption(file);
+            if (local === true) encrypted.push(file.name);
+            else if (local === null) needServerCheck.push(file);
+        }
+
+        // 普通 xlsx/xlsm 不再重复上传；仅老 .xls 或无法识别的文件请求服务端检测。
+        if (needServerCheck.length > 0) {
+            const formData = new FormData();
+            needServerCheck.forEach(f => formData.append('files', f));
+            const resp = await AUTH.authFetch('/api/files/check-encrypted', { method: 'POST', body: formData });
+            if (resp.ok) {
+                const data = await resp.json();
+                (data.encrypted_files || []).forEach(name => {
+                    if (!encrypted.includes(name)) encrypted.push(name);
+                });
+            }
+        }
         if (encrypted.length === 0) return;
         const passwords = await _promptFilePasswords(encrypted);
         if (passwords) _filePasswordsMap = { ..._filePasswordsMap, ...passwords };

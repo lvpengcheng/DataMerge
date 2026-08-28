@@ -145,6 +145,10 @@ def _apply_integration_impl(
     except Exception as _ffc:
         logger.warning(f"[integrate] ForceFullCalculate 设置失败（忽略）: {_ffc}")
     wb.Save(out_path, SaveFormat.Xlsx)
+    try:
+        wb.Dispose()
+    except Exception:
+        pass
     logger.info(f"[integrate] 回填完成: 命中 {matched} 行, 覆盖 {overwritten} 格, 差异 {n_diff} 行 → {out_path}")
     return {"overwritten_cells": overwritten, "matched_rows": matched, "diff_rows": n_diff}
 
@@ -205,6 +209,10 @@ def _append_diff_sheet_impl(path: str, diff_rows: Optional[List[dict]], diff_ord
     except Exception:
         pass
     wb.Save(path, SaveFormat.Xlsx)
+    try:
+        wb.Dispose()
+    except Exception:
+        pass
     logger.info(f"[integrate] 追加差异 sheet: {n} 行 → {path}")
     return n
 

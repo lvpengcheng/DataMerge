@@ -2,9 +2,13 @@
 数据资产管理 API
 """
 
+import asyncio
+import json
+import logging
 import os
 import shutil
-from datetime import datetime
+import uuid
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional, List
 
@@ -13,14 +17,34 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
-from ..database.connection import get_db
-from ..database.models import DataAsset, ReferenceCategory, TenantAuthorization
+from ..database.connection import SessionLocal, get_db
+from ..database.models import (
+    AssetUploadTask, DataAsset, ReferenceCategory, TenantAuthorization,
+)
 from ..auth.dependencies import get_current_user, get_accessible_tenants
 
 router = APIRouter(prefix="/api/assets", tags=["数据资产"])
 
 # 项目根目录
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+# data 在 Docker Compose 中是持久化卷；容器/服务重启后排队文件仍可恢复。
+UPLOAD_STAGING_ROOT = PROJECT_ROOT / "data" / "asset_uploads"
+_UPLOAD_CHUNK_SIZE = 1024 * 1024
+_upload_queue = None
+_upload_consumer_task = None
+logger = logging.getLogger(__name__)
+
+# Starlette 在进入端点前会先解析 multipart。把单文件的内存缓冲阈值
+# 压到 64KiB，超过即转临时文件，避免“大量小文件”在调用端点前已堆满内存。
+try:
+    from starlette.formparsers import MultiPartParser
+    _spool_bytes = int(os.getenv("UPLOAD_SPOOL_MEMORY_BYTES", str(64 * 1024)))
+    if hasattr(MultiPartParser, "spool_max_size"):
+        MultiPartParser.spool_max_size = _spool_bytes
+    if hasattr(MultiPartParser, "max_file_size"):
+        MultiPartParser.max_file_size = _spool_bytes
+except Exception:
+    pass
 
 
 # ==================== Pydantic 模型 ====================
@@ -109,6 +133,30 @@ def _parse_full_data(file_path: str) -> list:
         import logging
         logging.getLogger(__name__).warning(f"解析完整数据失败: {e}")
         return None
+
+
+def _parse_reference_once(file_path: str):
+    """基础数据只打开、解析一次，同时产生摘要和全量数据。"""
+    import dataclasses
+    from excel_parser import IntelligentExcelParser
+
+    results = IntelligentExcelParser().parse_excel_file(
+        file_path, calculate_formulas=False,
+    )
+    summary = []
+    for sheet_data in results:
+        headers = []
+        total_rows = 0
+        for region in sheet_data.regions:
+            headers.extend(list(region.head_data.keys()) if region.head_data else [])
+            total_rows += len(region.data)
+        summary.append({
+            "sheet_name": sheet_data.sheet_name,
+            "rows": total_rows,
+            "headers": headers[:50],
+            "regions": len(sheet_data.regions),
+        })
+    return summary, [dataclasses.asdict(sheet) for sheet in results]
 
 
 def _get_asset_storage_dir(tenant_id: Optional[str], asset_type: str) -> Path:
@@ -294,7 +342,7 @@ def list_assets(
     return [_asset_to_out(a) for a in assets]
 
 
-@router.post("/upload")
+@router.post("/upload", status_code=202)
 async def upload_asset(
     file: UploadFile = File(...),
     tenant_id: Optional[str] = Form(None),
@@ -309,17 +357,19 @@ async def upload_asset(
     current_user=Depends(get_current_user),
     accessible: list = Depends(get_accessible_tenants),
 ):
-    """上传文件 → 自动解析 sheet 结构 → 存入 data_assets"""
+    """单文件上传：流式落盘后返回异步任务。"""
     _assert_can_manage(tenant_id, accessible, _is_admin(current_user))
-    asset = await _process_and_register_asset(
-        file=file, tenant_id=tenant_id, asset_type=asset_type, category_id=category_id,
-        name=name, description=description, effective_from=effective_from,
-        effective_to=effective_to, tags=tags, db=db, current_user=current_user,
+    task = await _create_asset_upload_task(
+        uploads=[file], tenant_id=tenant_id, asset_type=asset_type,
+        category_id=category_id, description=description,
+        effective_from=effective_from, effective_to=effective_to, tags=tags,
+        uploaded_by=current_user.id, db=db,
+        names=[name] if name else None,
     )
-    return _asset_to_out(asset)
+    return _upload_task_to_out(task)
 
 
-@router.post("/upload-batch")
+@router.post("/upload-batch", status_code=202)
 async def upload_assets_batch(
     files: List[UploadFile] = File(...),
     tenant_id: Optional[str] = Form(None),
@@ -333,119 +383,282 @@ async def upload_assets_batch(
     current_user=Depends(get_current_user),
     accessible: list = Depends(get_accessible_tenants),
 ):
-    """批量上传：每个文件以其**文件名**作为资产名称，共享分类/作用域/日期/标签。
-
-    单个文件失败不中断整体，逐个收集错误。返回 {created:[...], failed:[{filename,error}]}。
-    """
+    """批量上传：不限人为文件数，流式落盘后立即返回异步任务。"""
     _assert_can_manage(tenant_id, accessible, _is_admin(current_user))
-    created, failed = [], []
-    for f in files:
-        try:
-            asset = await _process_and_register_asset(
-                file=f, tenant_id=tenant_id, asset_type=asset_type, category_id=category_id,
-                name=None,  # 恒用文件名
-                description=description, effective_from=effective_from,
-                effective_to=effective_to, tags=tags, db=db, current_user=current_user,
-            )
-            created.append(_asset_to_out(asset))
-        except Exception as e:
-            db.rollback()
-            import logging as _logging
-            _logging.getLogger(__name__).warning(f"[批量上传] 文件失败 {f.filename}: {e}")
-            failed.append({"filename": f.filename, "error": str(e)})
-    return {"created": created, "failed": failed}
-
-
-async def _process_and_register_asset(
-    *, file: UploadFile, tenant_id, asset_type, category_id, name,
-    description, effective_from, effective_to, tags, db, current_user,
-) -> DataAsset:
-    """存文件 → xls转换 → banner拆分 → 日期规范化 → 解析 → 建 DataAsset 入库，返回记录。
-
-    单传/批量/新版本共用。name 为空时用（可能被 .xls→.xlsx 修正过的）文件名。
-    """
-    # 保存文件
-    storage_dir = _get_asset_storage_dir(tenant_id, asset_type)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_name = f"{timestamp}_{file.filename}"
-    file_path = storage_dir / safe_name
-
-    content = await file.read()
-    with open(file_path, "wb") as f:
-        f.write(content)
-
-    # 老版 .xls 自动转 .xlsx（下游用 openpyxl，仅支持 xlsx/xlsm）
-    display_filename = file.filename
-    try:
-        from ..utils.source_normalizer import convert_xls_to_xlsx
-        _converted = convert_xls_to_xlsx(str(file_path))
-        if _converted != str(file_path):
-            file_path = Path(_converted)
-            if display_filename and display_filename.lower().endswith(".xls"):
-                display_filename = display_filename[:-4] + ".xlsx"
-    except Exception as _e:
-        import logging as _logging
-        _logging.getLogger(__name__).warning(f"xls转换失败（继续用原文件）: {_e}")
-
-    # 多区域 sheet 预处理（banner 拆分 / 头一致合并 / 头不一致 best-region）
-    try:
-        from ..utils.banner_splitter import preprocess_excel_inplace
-        preprocess_excel_inplace(str(file_path))
-    except Exception as _e:
-        import logging as _logging
-        _logging.getLogger(__name__).warning(f"banner-split 预处理失败（继续）: {_e}")
-
-    # 上传规范化：把"被误设成日期格式的数字单元格"格式重置为常规，避免后续解析
-    # 把它当日期读取（撞 Excel 1900 闰年 bug，如 60.74 被读成 59.74）
-    try:
-        from ..utils.source_normalizer import normalize_misformatted_dates
-        normalize_misformatted_dates(str(file_path))
-    except Exception as _e:
-        import logging as _logging
-        _logging.getLogger(__name__).warning(f"日期格式规范化失败（继续）: {_e}")
-
-    # 解析 sheet 结构
-    sheet_summary = _parse_sheet_summary(str(file_path))
-
-    # 基础数据：解析完整数据存入DB，后续计算可直接从DB读取
-    parsed_data = None
-    if asset_type == "reference":
-        parsed_data = _parse_full_data(str(file_path))
-
-    # 解析标签
-    import json
-    parsed_tags = None
-    if tags:
-        try:
-            parsed_tags = json.loads(tags)
-        except Exception:
-            parsed_tags = [t.strip() for t in tags.split(",") if t.strip()]
-
-    # 解析日期
-    from datetime import date
-    eff_from = date.fromisoformat(effective_from) if effective_from else None
-    eff_to = date.fromisoformat(effective_to) if effective_to else None
-
-    asset = DataAsset(
-        tenant_id=tenant_id,
-        asset_type=asset_type,
-        category_id=category_id,
-        name=name or display_filename,
-        description=description,
-        file_path=str(file_path),
-        file_name=display_filename,
-        file_size=file_path.stat().st_size,
-        sheet_summary=sheet_summary,
-        parsed_data=parsed_data,
-        effective_from=eff_from,
-        effective_to=eff_to,
-        uploaded_by=current_user.id,
-        tags=parsed_tags,
+    task = await _create_asset_upload_task(
+        uploads=files, tenant_id=tenant_id, asset_type=asset_type,
+        category_id=category_id, description=description,
+        effective_from=effective_from, effective_to=effective_to, tags=tags,
+        uploaded_by=current_user.id, db=db,
     )
-    db.add(asset)
-    db.commit()
-    db.refresh(asset)
-    return asset
+    return _upload_task_to_out(task)
+
+
+def _parse_tags(tags):
+    if not tags:
+        return None
+    try:
+        return json.loads(tags)
+    except Exception:
+        return [t.strip() for t in tags.split(",") if t.strip()]
+
+
+async def _stream_upload_to_disk(upload: UploadFile, destination: Path) -> int:
+    """固定 1MiB 分块落盘，不调用 read() 全量读入内存。"""
+    written = 0
+    try:
+        with destination.open("wb") as output:
+            while True:
+                chunk = await upload.read(_UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                output.write(chunk)
+                written += len(chunk)
+    finally:
+        await upload.close()
+    return written
+
+
+async def _create_asset_upload_task(*, uploads, tenant_id, asset_type, category_id,
+                                    description, effective_from, effective_to, tags,
+                                    uploaded_by, db, names=None, previous_asset_id=None):
+    task_id = uuid.uuid4().hex
+    staging_dir = UPLOAD_STAGING_ROOT / task_id
+    staging_dir.mkdir(parents=True, exist_ok=False)
+    manifest = []
+    try:
+        for index, upload in enumerate(uploads):
+            original_name = Path(upload.filename or f"upload_{index + 1}.xlsx").name
+            suffix = Path(original_name).suffix.lower()
+            staged_path = staging_dir / f"{index:08d}_{uuid.uuid4().hex}{suffix}"
+            size = await _stream_upload_to_disk(upload, staged_path)
+            manifest.append({
+                "path": str(staged_path),
+                "filename": original_name,
+                "size": size,
+                "name": names[index] if names and index < len(names) else None,
+                "previous_asset_id": previous_asset_id,
+            })
+        if not manifest:
+            raise HTTPException(status_code=400, detail="没有可上传的文件")
+
+        task = AssetUploadTask(
+            id=task_id, tenant_id=tenant_id, asset_type=asset_type,
+            category_id=category_id, description=description or "",
+            effective_from=date.fromisoformat(effective_from) if effective_from else None,
+            effective_to=date.fromisoformat(effective_to) if effective_to else None,
+            tags=_parse_tags(tags), uploaded_by=uploaded_by, status="queued",
+            total_files=len(manifest), staging_dir=str(staging_dir), files=manifest,
+            result={"created": [], "failed": []},
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        await _ensure_upload_dispatcher()
+        _upload_queue.put_nowait(task.id)
+        return task
+    except Exception:
+        db.rollback()
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+
+
+def _upload_task_to_out(task: AssetUploadTask) -> dict:
+    result = task.result or {"created": [], "failed": []}
+    return {
+        "task_id": task.id,
+        "status": task.status,
+        "total_files": task.total_files or 0,
+        "completed_files": task.completed_files or 0,
+        "failed_files": task.failed_files or 0,
+        "current_file": task.current_file,
+        "created": result.get("created", []),
+        "failed": result.get("failed", []),
+        "error": task.error_message,
+    }
+
+
+@router.get("/upload-tasks/{task_id}")
+def get_upload_task(
+    task_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    task = db.query(AssetUploadTask).filter_by(id=task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="上传任务不存在")
+    if not _is_admin(current_user) and task.uploaded_by != current_user.id:
+        raise HTTPException(status_code=403, detail="无权查看该上传任务")
+    return _upload_task_to_out(task)
+
+
+def _process_staged_asset_subprocess(payload: dict) -> dict:
+    """子进程入口：一个文件的预处理、解析和入库全部在这里完成。"""
+    staged_path = Path(payload["path"])
+    display_filename = payload["filename"]
+    storage_dir = _get_asset_storage_dir(payload.get("tenant_id"), payload["asset_type"])
+    final_name = f"{datetime.now():%Y%m%d_%H%M%S_%f}_{uuid.uuid4().hex[:8]}_{display_filename}"
+    file_path = storage_dir / final_name
+    shutil.move(str(staged_path), str(file_path))
+    db = SessionLocal()
+    try:
+        from ..utils.source_normalizer import convert_xls_to_xlsx, normalize_misformatted_dates
+        converted = convert_xls_to_xlsx(str(file_path))
+        if converted != str(file_path):
+            file_path = Path(converted)
+            if display_filename.lower().endswith(".xls"):
+                display_filename = display_filename[:-4] + ".xlsx"
+
+        # 上传阶段不做 banner 拆分。该预处理会为了断开跨 sheet 引用而
+        # 展平公式，不仅额外多次打开 Workbook，也违背“上传不计算公式”。
+
+        # 上传阶段禁止全工作簿公式重算。
+        normalize_misformatted_dates(str(file_path), calculate_formulas=False)
+
+        if payload["asset_type"] == "reference":
+            sheet_summary, parsed_data = _parse_reference_once(str(file_path))
+        else:
+            sheet_summary = _parse_sheet_summary(str(file_path))
+            parsed_data = None
+
+        previous_asset = None
+        if payload.get("previous_asset_id"):
+            previous_asset = db.query(DataAsset).filter_by(
+                id=payload["previous_asset_id"]
+            ).first()
+            if not previous_asset:
+                raise RuntimeError("待更新的旧版本资产不存在")
+
+        asset = DataAsset(
+            tenant_id=payload.get("tenant_id"), asset_type=payload["asset_type"],
+            category_id=payload.get("category_id"),
+            name=payload.get("name") or display_filename,
+            description=payload.get("description") or "", file_path=str(file_path),
+            file_name=display_filename, file_size=file_path.stat().st_size,
+            sheet_summary=sheet_summary, parsed_data=parsed_data,
+            effective_from=date.fromisoformat(payload["effective_from"])
+                if payload.get("effective_from") else None,
+            effective_to=date.fromisoformat(payload["effective_to"])
+                if payload.get("effective_to") else None,
+            uploaded_by=payload.get("uploaded_by"), tags=payload.get("tags"),
+            version=(previous_asset.version + 1) if previous_asset else 1,
+        )
+        db.add(asset)
+        if previous_asset:
+            previous_asset.is_active = False
+            previous_asset.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(asset)
+        return _asset_to_out(asset)
+    except Exception:
+        db.rollback()
+        try:
+            if file_path.exists():
+                file_path.unlink()
+        except Exception:
+            pass
+        raise
+    finally:
+        db.close()
+
+
+async def _run_asset_upload_task(task_id: str):
+    db = SessionLocal()
+    try:
+        task = db.query(AssetUploadTask).filter_by(id=task_id).first()
+        if not task or task.status not in ("queued", "processing"):
+            return
+        task.status = "processing"
+        task.started_at = task.started_at or datetime.utcnow()
+        task.error_message = None
+        db.commit()
+
+        result = task.result or {"created": [], "failed": []}
+        completed = task.completed_files or 0
+        already_done = completed + (task.failed_files or 0)
+        manifest = list(task.files or [])
+        for item in manifest[already_done:]:
+            task.current_file = item["filename"]
+            db.commit()
+            payload = dict(item)
+            payload.update({
+                "tenant_id": task.tenant_id, "asset_type": task.asset_type,
+                "category_id": task.category_id, "description": task.description,
+                "effective_from": str(task.effective_from) if task.effective_from else None,
+                "effective_to": str(task.effective_to) if task.effective_to else None,
+                "tags": task.tags, "uploaded_by": task.uploaded_by,
+            })
+            from ..utils.subprocess_runner import run_in_fresh_subprocess_async
+            from ..utils.upload_stream import get_excel_work_semaphore
+            async with get_excel_work_semaphore():
+                sub = await run_in_fresh_subprocess_async(
+                    "backend.api.assets:_process_staged_asset_subprocess",
+                    args=(payload,), timeout=int(os.getenv("ASSET_UPLOAD_PARSE_TIMEOUT", "900")),
+                    max_memory_mb=int(os.getenv("ASSET_UPLOAD_MAX_MEMORY_MB", "4096")),
+                )
+            if sub.success:
+                result["created"].append(sub.result)
+                task.completed_files = (task.completed_files or 0) + 1
+            else:
+                result["failed"].append({"filename": item["filename"], "error": sub.error})
+                task.failed_files = (task.failed_files or 0) + 1
+            task.result = dict(result)
+            db.commit()
+
+        task.status = "completed" if result["created"] else "failed"
+        task.current_file = None
+        task.finished_at = datetime.utcnow()
+        if task.status == "failed":
+            task.error_message = "所有文件处理失败"
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        task = db.query(AssetUploadTask).filter_by(id=task_id).first()
+        if task:
+            task.status = "failed"
+            task.error_message = str(exc)
+            task.finished_at = datetime.utcnow()
+            db.commit()
+        logger.exception("上传任务执行失败: %s", task_id)
+    finally:
+        task = db.query(AssetUploadTask).filter_by(id=task_id).first()
+        if task:
+            shutil.rmtree(task.staging_dir, ignore_errors=True)
+        db.close()
+
+
+async def _asset_upload_consumer():
+    """唯一消费者：无论一次上传多少文件，上传解析并发恒为 1。"""
+    while True:
+        task_id = await _upload_queue.get()
+        try:
+            await _run_asset_upload_task(task_id)
+        finally:
+            _upload_queue.task_done()
+
+
+async def _ensure_upload_dispatcher():
+    global _upload_queue, _upload_consumer_task
+    if _upload_queue is None:
+        _upload_queue = asyncio.Queue()
+    if _upload_consumer_task is None or _upload_consumer_task.done():
+        _upload_consumer_task = asyncio.create_task(_asset_upload_consumer())
+
+
+async def start_asset_upload_dispatcher():
+    """应用启动时恢复未完成任务并启动单消费者。"""
+    await _ensure_upload_dispatcher()
+    db = SessionLocal()
+    try:
+        tasks = db.query(AssetUploadTask).filter(
+            AssetUploadTask.status.in_(["queued", "processing"])
+        ).order_by(AssetUploadTask.created_at).all()
+        for task in tasks:
+            task.status = "queued"
+            _upload_queue.put_nowait(task.id)
+        db.commit()
+    finally:
+        db.close()
 
 
 
@@ -633,7 +846,7 @@ def delete_asset(
     return {"message": "删除成功" if hard else "已停用"}
 
 
-@router.post("/{asset_id}/new-version")
+@router.post("/{asset_id}/new-version", status_code=202)
 async def upload_new_version(
     asset_id: int,
     file: UploadFile = File(...),
@@ -641,76 +854,19 @@ async def upload_new_version(
     current_user=Depends(get_current_user),
     accessible: list = Depends(get_accessible_tenants),
 ):
-    """上传新版本（保留历史版本）"""
+    """上传新版本：流式落盘后交给同一个单并发子进程队列。"""
     asset = db.query(DataAsset).filter_by(id=asset_id).first()
     if not asset:
         raise HTTPException(status_code=404, detail="资产不存在")
     _assert_can_manage(asset.tenant_id, accessible, _is_admin(current_user))
 
-    # 保存新文件
-    storage_dir = Path(asset.file_path).parent
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_name = f"{timestamp}_{file.filename}"
-    file_path = storage_dir / safe_name
-
-    content = await file.read()
-    with open(file_path, "wb") as f:
-        f.write(content)
-
-    # 老版 .xls 自动转 .xlsx
-    display_filename = file.filename
-    try:
-        from ..utils.source_normalizer import convert_xls_to_xlsx
-        _converted = convert_xls_to_xlsx(str(file_path))
-        if _converted != str(file_path):
-            file_path = Path(_converted)
-            if display_filename and display_filename.lower().endswith(".xls"):
-                display_filename = display_filename[:-4] + ".xlsx"
-    except Exception as _e:
-        import logging as _logging
-        _logging.getLogger(__name__).warning(f"xls转换失败（继续用原文件）: {_e}")
-
-    # 多区域 sheet 预处理
-    try:
-        from ..utils.banner_splitter import preprocess_excel_inplace
-        preprocess_excel_inplace(str(file_path))
-    except Exception as _e:
-        import logging as _logging
-        _logging.getLogger(__name__).warning(f"banner-split 预处理失败（继续）: {_e}")
-
-    # 上传规范化：误设日期格式的数字单元格重置为常规
-    try:
-        from ..utils.source_normalizer import normalize_misformatted_dates
-        normalize_misformatted_dates(str(file_path))
-    except Exception as _e:
-        import logging as _logging
-        _logging.getLogger(__name__).warning(f"日期格式规范化失败（继续）: {_e}")
-
-    # 创建新版本记录
-    new_parsed_data = _parse_full_data(str(file_path)) if asset.asset_type == "reference" else None
-    new_asset = DataAsset(
-        tenant_id=asset.tenant_id,
-        asset_type=asset.asset_type,
-        category_id=asset.category_id,
-        name=asset.name,
-        description=asset.description,
-        file_path=str(file_path),
-        file_name=display_filename,
-        file_size=file_path.stat().st_size,
-        sheet_summary=_parse_sheet_summary(str(file_path)),
-        parsed_data=new_parsed_data,
-        version=asset.version + 1,
-        effective_from=asset.effective_from,
-        effective_to=asset.effective_to,
-        uploaded_by=current_user.id,
-        tags=asset.tags,
+    task = await _create_asset_upload_task(
+        uploads=[file], tenant_id=asset.tenant_id, asset_type=asset.asset_type,
+        category_id=asset.category_id, description=asset.description,
+        effective_from=str(asset.effective_from) if asset.effective_from else None,
+        effective_to=str(asset.effective_to) if asset.effective_to else None,
+        tags=json.dumps(asset.tags, ensure_ascii=False) if asset.tags is not None else None,
+        uploaded_by=current_user.id, db=db, names=[asset.name],
+        previous_asset_id=asset.id,
     )
-    db.add(new_asset)
-
-    # 停用旧版本
-    asset.is_active = False
-    asset.updated_at = datetime.utcnow()
-
-    db.commit()
-    db.refresh(new_asset)
-    return _asset_to_out(new_asset)
+    return _upload_task_to_out(task)

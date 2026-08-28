@@ -1361,6 +1361,7 @@ class IntelligentExcelParser:
             解析后的Sheet数据列表
         """
         result = []
+        aspose_wb = None
 
         try:
             # 使用 Aspose.Cells for .NET 加载
@@ -1437,6 +1438,15 @@ class IntelligentExcelParser:
 
         except Exception as e:
             logger.error(f"解析Excel文件失败 [{file_path}]: {e}", exc_info=True)
+
+        finally:
+            # Aspose Workbook 持有大量非托管内存和文件句柄，不能依赖 Python GC。
+            # 批量上传时若不显式释放，多个 Workbook 会在同一 worker 中叠加。
+            if aspose_wb is not None:
+                try:
+                    aspose_wb.Dispose()
+                except Exception:
+                    pass
 
         return result
     

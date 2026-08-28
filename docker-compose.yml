@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   app:
     build: .
@@ -8,13 +6,13 @@ services:
     image: ${IMAGE_NAME:-datamerge}:latest
     container_name: ${APP_CONTAINER_NAME:-datamerge-app}
     ports:
-      - "${APP_PORT:-8000}:8000"
+      - "${APP_PORT:-18000}:8000"
     env_file:
       - .env
     environment:
       - TZ=Asia/Shanghai
-      - REDIS_URL=redis://redis:6379/0
-      # DATABASE_URL 从 .env 读取（PostgreSQL），不在此处硬编码
+      # REDIS_URL、DATABASE_URL 均从 .env 读取，不在 Compose 中覆盖。
+      # 使用外部 Redis 时请填写其内网 IP/域名；容器内的 localhost 指向容器自身。
       - LD_LIBRARY_PATH=/app/libs:/usr/lib
       - DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
       - DOTNET_ROLL_FORWARD=LatestMajor
@@ -25,20 +23,17 @@ services:
       - ./logs:/app/logs
       - ./output:/app/output
       - ./compare_results:/app/compare_results
-    depends_on:
-      redis:
-        condition: service_healthy
     restart: unless-stopped
     # ===== 资源上限 =====
     # 把失控计算（如卡死的 CalculateFormula、超大文件、AI 脚本吃内存）的爆炸半径锁在容器内，
     # OOM 时被杀的是容器而不是宿主机 VM，避免拖垮整机/无法重启。可在 .env 调整：
-    #   APP_MEM_LIMIT=12g   APP_MEM_RESERVATION=2g   APP_CPUS=4
-    # 默认 12g 贴合 Ubuntu 32G 双环境方案（2 容器 × 12g + 系统/redis 3g + 余量 5g = 32g）。
-    # 单容器 / 小内存机器务必按实际内存调小（如 APP_MEM_LIMIT=4g APP_CPUS=2）。
-    # 容器内子进程并发预算必须 < 容器上限：SUBPROCESS_CONCURRENCY=6 × 1g + 主进程 2.5g ≈ 8.5g < 12g（.env 配）。
-    mem_limit: ${APP_MEM_LIMIT:-12g}
+    # 固定限制应用容器的内存、CPU 和进程数，避免智算失控拖垮 Ubuntu/Hyper-V 宿主机。
+    # memswap_limit 与 mem_limit 相同：不允许容器在 8G 之外继续大量使用 Swap。
+    mem_limit: 8g
     mem_reservation: ${APP_MEM_RESERVATION:-2g}
-    cpus: ${APP_CPUS:-4}
+    memswap_limit: 8g
+    cpus: 2
+    pids_limit: 512
     # ===== 容器日志限制 =====
     # json-file 驱动默认无上限：智训/智算高频 stdout 日志（每行 flush 即一次磁盘写）会无限增长，
     # 持续写盘（overlay → Ubuntu → .vhdx → 宿主 Windows C 盘 IO）。限制单文件 50m、保留 3 个，
@@ -58,22 +53,3 @@ services:
     # device_read_bps:
     #   - path: /dev/sda
     #     rate: 100mb
-
-  redis:
-    image: redis:7-alpine
-    container_name: ${REDIS_CONTAINER_NAME:-datamerge-redis}
-    environment:
-      - TZ=Asia/Shanghai
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-    restart: unless-stopped
-
-volumes:
-  redis_data:
