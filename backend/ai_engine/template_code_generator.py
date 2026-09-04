@@ -503,15 +503,19 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
         # 输出预算用 provider 配置：deepseek 推理模型的 max_tokens 是【含思考的总预算】，
         # 写死 8000 会被思考阶段吃掉大半、代码截断（Claude 思考不占输出预算所以没暴露）
         _effective_max_tokens = getattr(self.ai_provider, "max_tokens", None) or 8000
-        try:
-            # 流式：让前端实时看到 AI 生成过程
-            if stream_callback and hasattr(self.ai_provider, "chat_stream"):
-                from datetime import datetime as _dt
-                def _on_chunk(chunk: str):
-                    if not chunk:
-                        return
-                    ts = _dt.now().strftime("%H:%M:%S")
-                    stream_callback(f"[{ts}] [CODE] {chunk}")
+        # 流式：让前端实时看到 AI 生成过程。Claude/AWS 转发在长响应时可能在
+        # 首 token 前断开；模板模式过去会直接结束，普通对话却仍可用。这里与公式模式
+        # 保持一致：流式失败后改走普通调用，并用 CODE_REPLACE 把完整结果交给前端。
+        if stream_callback and hasattr(self.ai_provider, "chat_stream"):
+            from datetime import datetime as _dt
+
+            def _on_chunk(chunk: str):
+                if not chunk:
+                    return
+                ts = _dt.now().strftime("%H:%M:%S")
+                stream_callback(f"[{ts}] [CODE] {chunk}")
+
+            try:
                 resp = self.ai_provider.chat_stream(
                     messages,
                     chunk_callback=_on_chunk,
@@ -519,11 +523,36 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
                     temperature=0.1,
                     max_tokens=_effective_max_tokens,
                 )
-            else:
-                resp = self.ai_provider.chat(messages, temperature=0.1, max_tokens=_effective_max_tokens)
-        except Exception as e:
-            logger.error(f"AI 调用失败: {e}", exc_info=True)
-            raise
+            except Exception as stream_error:
+                logger.warning(
+                    "模板模式 AI 流式调用失败，切换普通调用: %s",
+                    stream_error, exc_info=True,
+                )
+                ts = _dt.now().strftime("%H:%M:%S")
+                stream_callback(
+                    f"[{ts}] 流式调用失败（{str(stream_error)[:300]}），"
+                    "正在切换普通调用重试..."
+                )
+                try:
+                    resp = self.ai_provider.chat(
+                        messages, temperature=0.1, max_tokens=_effective_max_tokens,
+                    )
+                except Exception as fallback_error:
+                    logger.error("模板模式 AI 流式及普通调用均失败", exc_info=True)
+                    raise RuntimeError(
+                        f"AI 流式调用失败，普通调用重试也失败: {fallback_error}"
+                    ) from stream_error
+                if resp:
+                    ts = _dt.now().strftime("%H:%M:%S")
+                    stream_callback(f"[{ts}] [CODE_REPLACE] {resp}")
+        else:
+            try:
+                resp = self.ai_provider.chat(
+                    messages, temperature=0.1, max_tokens=_effective_max_tokens,
+                )
+            except Exception as e:
+                logger.error(f"AI 调用失败: {e}", exc_info=True)
+                raise
         return resp or ""
 
     # ==================== 代码提取 ====================

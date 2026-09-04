@@ -819,6 +819,21 @@ function _appendCodeStream(chunk) {
     }, 100);
 }
 
+// 流式链路中断后，后端可能用普通请求重新获取一份完整代码。
+// 此时必须替换已有半截内容，不能继续追加，否则代码会重复。
+function _replaceCodeStream(code) {
+    if (!_codeStreamEl) {
+        _appendCodeStream(code || '');
+    } else {
+        _codeStreamBuf = code || '';
+    }
+    if (_codeStreamTimer) {
+        clearTimeout(_codeStreamTimer);
+        _codeStreamTimer = null;
+    }
+    _renderCodeStreamOnce();
+}
+
 function _renderCodeStreamOnce() {
     if (!_codeStreamEl) return;
     _codeStreamEl.innerHTML = _renderMarkdown('```python\n' + _codeStreamBuf + '\n```');
@@ -1236,6 +1251,16 @@ async function _fetchTrainingSSE(url, options) {
 
 function _handleSSEEvent(event) {
     switch (event.type) {
+        case 'heartbeat': {
+            // 等待 Claude thinking/text 首 token 或 Excel 预处理时确认 SSE 仍在线。
+            // 只更新按钮，不向聊天记录追加重复消息。
+            if (_isStreaming) {
+                const sendBtn = document.getElementById('send-btn');
+                if (sendBtn) sendBtn.textContent = event.message || '任务处理中（连接正常）...';
+            }
+            break;
+        }
+
         case 'session_created':
             _currentSessionId = event.session_id;
             document.getElementById('chat-title').textContent = `训练 #${event.session_id}`;
@@ -1350,10 +1375,19 @@ function _handleSSEEvent(event) {
         case 'log':
             // 训练引擎的日志输出（含代码流）— 追加到对话框
             if (event.message) {
+                // 流式失败后普通调用返回的完整代码：覆盖半截流，不重复追加。
+                const replaceMatch = event.message.match(/\[CODE_REPLACE\]\s*([\s\S]*)/);
+                if (replaceMatch) {
+                    _replaceCodeStream(replaceMatch[1]);
+                    break;
+                }
                 // 匹配 [HH:MM:SS] [CODE] chunk 格式
                 const codeMatch = event.message.match(/\[CODE\]\s*([\s\S]*)/);
                 if (codeMatch) {
                     _appendCodeStream(codeMatch[1]);
+                } else if (event.message.includes('流式调用失败')) {
+                    // 其他训练日志不刷屏，但流式降级需让用户知情。
+                    _addSystemMessage(event.message.replace(/^\[[^\]]+\]\s*/, ''), 'status');
                 }
                 // 其他日志不显示在对话框（避免刷屏），但可以 console.log
             }
@@ -1841,9 +1875,11 @@ async function _downloadOriginalFile(sessionId, category, filename) {
     }
 }
 
-// 下载"最终规则"：SSE 流式（两次 AI 调用耗时长，用心跳保活避免 504/502），完成后下载为 .md
+// 下载"最终规则"：AI 单次流式综合归纳，SSE 心跳保活，完成后下载为 .md
 async function _downloadFinalRules(sessionId, btn) {
     const oldText = btn ? btn.textContent : '';
+    const startedAt = Date.now();
+    let latestStatus = '正在综合归纳';
     if (btn) { btn.disabled = true; btn.textContent = '⏳ 整理中...'; }
     try {
         const resp = await AUTH.authFetch(`/api/training/chat/sessions/${sessionId}/final-rules`);
@@ -1866,13 +1902,17 @@ async function _downloadFinalRules(sessionId, btn) {
             const lines = buffer.split('\n');
             buffer = lines.pop() || '';
             for (const line of lines) {
-                if (!line.startsWith('data: ')) continue;   // 忽略心跳 ": heartbeat"
+                if (!line.startsWith('data: ')) continue;
                 const jsonStr = line.slice(6).trim();
                 if (!jsonStr) continue;
                 let event;
                 try { event = JSON.parse(jsonStr); } catch (e) { continue; }
                 if (event.type === 'status') {
+                    if (event.message) latestStatus = event.message.replace(/…$/, '');
                     if (btn && event.message) btn.textContent = '⏳ ' + event.message;
+                } else if (event.type === 'heartbeat') {
+                    const elapsed = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+                    if (btn) btn.textContent = `⏳ ${latestStatus}（连接正常，${elapsed}秒）`;
                 } else if (event.type === 'done') {
                     done = event;
                 } else if (event.type === 'error') {
@@ -1895,7 +1935,11 @@ async function _downloadFinalRules(sessionId, btn) {
         document.body.removeChild(a);
         URL.revokeObjectURL(objUrl);
     } catch (e) {
-        alert('生成最终规则失败: ' + e.message);
+        const rawMessage = (e && e.message) ? e.message : String(e || '未知错误');
+        const message = /failed to fetch|networkerror|load failed/i.test(rawMessage)
+            ? '与服务器的流式连接被中断。请确认服务已发布本次 SSE 修复后重试；若仍出现，请检查反向代理的流式响应配置。'
+            : rawMessage;
+        alert('生成最终规则失败: ' + message);
     } finally {
         if (btn) { btn.disabled = false; btn.textContent = oldText || '📋 最终规则'; }
     }

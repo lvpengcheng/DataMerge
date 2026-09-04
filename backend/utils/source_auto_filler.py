@@ -16,9 +16,12 @@ import shutil
 import logging
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
-from sqlalchemy.orm import Session
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+else:
+    Session = Any
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +37,9 @@ RENAME_CANDIDATE_FLOOR = 0.10  # 候选展示最低分（低于此分不按常�
                                # 若某上传文件对所有期望都低于此分，仍兜底列出全部期望供手动选择）
 RENAME_HEADER_WEIGHT = 0.7
 RENAME_NAME_WEIGHT = 0.3
+
+_CURRENT_PERIOD_WORDS = ("本月", "当月", "当前月", "本期", "当期")
+_PREVIOUS_PERIOD_WORDS = ("上月", "前月", "上期", "前期")
 
 
 def auto_fill_missing_sources(
@@ -271,6 +277,8 @@ def _get_asset_headers(asset) -> set:
 def auto_rename_uploaded_by_combined_score(
     source_dir: str,
     source_structure: dict,
+    salary_year: Optional[int] = None,
+    salary_month: Optional[int] = None,
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, object]], Dict[str, set]]:
     """对"上传文件名与训练期望不一致"的场景做组合评分匹配
 
@@ -317,6 +325,23 @@ def auto_rename_uploaded_by_combined_score(
 
     logger.info(f"[Rename] 上传未命名匹配: {[f.name for f in extras]}, 缺失期望: {missing}")
 
+    # 工资月份角色优先于模糊相似度。典型场景：训练文件叫“上月/本月”，计算上传
+    # “202607/202608”。这类文件的列头往往完全相同，仅靠 Jaccard 无法区分。
+    period_renamed = _rename_by_period_role(
+        src_path, extras, missing, salary_year=salary_year, salary_month=salary_month,
+    )
+    if period_renamed:
+        uploaded_files = [
+            f for f in src_path.iterdir()
+            if f.is_file() and not f.name.startswith("~")
+            and f.suffix.lower() in (".xlsx", ".xls", ".xlsm")
+        ]
+        uploaded_names = {f.name for f in uploaded_files}
+        extras = [f for f in uploaded_files if f.name not in expected_names]
+        missing = expected_names - uploaded_names
+        if not extras or not missing:
+            return period_renamed, [], {}
+
     # 1:1 无歧义直通：只缺 1 个期望文件、且只多出 1 个上传文件 → 直接映射，忽略文件名差异。
     # 场景：训练时模板/源叫 aa.xlsx，计算时改名成 bb.xlsx —— 只有一个候选，没有歧义，
     # 不应因文件名不同而拒绝计算（列头是否相似无关紧要，用户显然就是拿它替换）。
@@ -330,39 +355,53 @@ def auto_rename_uploaded_by_combined_score(
                 new.unlink()
             old.rename(new)
             logger.info(f"[Rename] 1:1 唯一匹配，忽略文件名差异自动映射: {u_name} → {e_name}")
-            return ([{"from": u_name, "to": e_name, "score": 1.0,
-                      "jaccard": None, "name_sim": None, "reason": "1:1 唯一匹配"}], [], {})
+            unique_record = {"from": u_name, "to": e_name, "score": 1.0,
+                             "jaccard": None, "name_sim": None, "reason": "1:1 唯一匹配"}
+            return (period_renamed + [unique_record], [], {})
         except Exception as _ex:
             logger.warning(f"[Rename] 1:1 自动映射失败，回退打分匹配: {_ex}")
 
-    # 解析每个上传文件的列头
-    uploaded_headers = {f.name: _read_uploaded_headers(str(f)) for f in extras}
+    # 解析每个上传文件的 Sheet + 列头；一次解析同时供规则评分和 AI 使用。
+    uploaded_signatures = {f.name: _read_uploaded_signature(str(f)) for f in extras}
+    uploaded_headers = {
+        name: signature["headers"] for name, signature in uploaded_signatures.items()
+    }
 
     # 提取每个 missing 期望文件的列头
     expected_headers_map: Dict[str, set] = {}
+    expected_sheets_map: Dict[str, set] = {}
     for name in missing:
-        expected_headers_map[name] = _extract_headers(expected_files.get(name) or {})
+        file_info = expected_files.get(name) or {}
+        expected_headers_map[name] = _extract_headers(file_info)
+        expected_sheets_map[name] = set((file_info.get("sheets") or {}).keys())
 
     # 全配对打分
-    scored_pairs: List[Tuple[float, str, str, float, float]] = []  # (score, uploaded, expected, jaccard, name_sim)
+    # (score, uploaded, expected, header_jaccard, name_sim, sheet_sim)
+    scored_pairs: List[Tuple[float, str, str, float, float, float]] = []
     for u_name, u_headers in uploaded_headers.items():
         for e_name, e_headers in expected_headers_map.items():
             jaccard = _jaccard(u_headers, e_headers)
             name_sim = _filename_similarity(u_name, e_name)
-            score = RENAME_HEADER_WEIGHT * jaccard + RENAME_NAME_WEIGHT * name_sim
-            scored_pairs.append((score, u_name, e_name, jaccard, name_sim))
+            sheet_sim = _set_name_similarity(
+                uploaded_signatures[u_name]["sheet_names"], expected_sheets_map[e_name]
+            )
+            if uploaded_signatures[u_name]["sheet_names"] and expected_sheets_map[e_name]:
+                score = 0.6 * jaccard + 0.2 * sheet_sim + 0.2 * name_sim
+            else:
+                score = RENAME_HEADER_WEIGHT * jaccard + RENAME_NAME_WEIGHT * name_sim
+            scored_pairs.append((score, u_name, e_name, jaccard, name_sim, sheet_sim))
 
     # 贪心匹配：按分数降序，每个 uploaded / expected 各只能用一次
     scored_pairs.sort(key=lambda x: -x[0])
-    renamed_list: List[Dict[str, str]] = []
+    renamed_list: List[Dict[str, str]] = list(period_renamed)
     consumed_uploaded: set = set()
     consumed_expected: set = set()
 
     # 第一遍：自动改名（高置信度 + 领先第二名）
     # 为了判断"领先",每个 uploaded 收集 top-2 分数
-    top_by_uploaded: Dict[str, List[Tuple[float, str, float, float]]] = {}
-    for score, u, e, j, n in scored_pairs:
-        top_by_uploaded.setdefault(u, []).append((score, e, j, n))
+    top_by_uploaded: Dict[str, List[Tuple[float, str, float, float, float]]] = {}
+    for score, u, e, j, n, sn in scored_pairs:
+        top_by_uploaded.setdefault(u, []).append((score, e, j, n, sn))
 
     for u_name, ranked in top_by_uploaded.items():
         if not ranked:
@@ -370,13 +409,13 @@ def auto_rename_uploaded_by_combined_score(
         ranked = ranked[:5]  # 已按分降序
 
         # 综合分（列头+文件名加权）的第一/二名
-        first_score, first_expected, first_j, first_n = ranked[0]
+        first_score, first_expected, first_j, first_n, first_sn = ranked[0]
         second_score = ranked[1][0] if len(ranked) >= 2 else 0.0
         score_lead = first_score - second_score
 
         # 列头主导判定：单独按 jaccard 排，找 top-1 / top-2
         by_j = sorted(ranked, key=lambda r: -r[2])
-        j_first_score, j_first_expected, j_first_j, j_first_n = by_j[0]
+        j_first_score, j_first_expected, j_first_j, j_first_n, j_first_sn = by_j[0]
         j_second_j = by_j[1][2] if len(by_j) >= 2 else 0.0
         j_lead = j_first_j - j_second_j
 
@@ -386,11 +425,11 @@ def auto_rename_uploaded_by_combined_score(
         decision = None
         if j_first_j >= RENAME_JACCARD_AUTO and j_lead >= RENAME_JACCARD_LEAD:
             auto_target = j_first_expected
-            auto_meta = (j_first_score, j_first_j, j_first_n)
+            auto_meta = (j_first_score, j_first_j, j_first_n, j_first_sn)
             decision = "header"
         elif first_score >= RENAME_AUTO_SCORE and score_lead >= RENAME_AUTO_LEAD:
             auto_target = first_expected
-            auto_meta = (first_score, first_j, first_n)
+            auto_meta = (first_score, first_j, first_n, first_sn)
             decision = "combined"
 
         if (
@@ -398,7 +437,7 @@ def auto_rename_uploaded_by_combined_score(
             and auto_target not in consumed_expected
             and u_name not in consumed_uploaded
         ):
-            picked_score, picked_j, picked_n = auto_meta
+            picked_score, picked_j, picked_n, picked_sn = auto_meta
             try:
                 old = src_path / u_name
                 new = src_path / auto_target
@@ -413,6 +452,7 @@ def auto_rename_uploaded_by_combined_score(
                     "score": round(picked_score, 3),
                     "header_jaccard": round(picked_j, 3),
                     "name_similarity": round(picked_n, 3),
+                    "sheet_similarity": round(picked_sn, 3),
                     "decision": decision,
                 })
                 logger.info(
@@ -433,15 +473,15 @@ def auto_rename_uploaded_by_combined_score(
     all_remaining_expected = [e for e in expected_names if e not in consumed_expected]
 
     # 全量配对（按 uploaded 分组，分数降序）——不依赖 top_by_uploaded 的 top-5 截断
-    pairs_by_uploaded: Dict[str, List[Tuple[float, str, float, float]]] = {}
-    for score, u, e, j, n in scored_pairs:
+    pairs_by_uploaded: Dict[str, List[Tuple[float, str, float, float, float]]] = {}
+    for score, u, e, j, n, sn in scored_pairs:
         if u not in consumed_uploaded and e not in consumed_expected:
-            pairs_by_uploaded.setdefault(u, []).append((score, e, j, n))
+            pairs_by_uploaded.setdefault(u, []).append((score, e, j, n, sn))
 
     for u_name, ranked in pairs_by_uploaded.items():
         ranked.sort(key=lambda x: -x[0])
         candidates = []
-        for score, e, j, n in ranked:
+        for score, e, j, n, sn in ranked:
             if score < RENAME_CANDIDATE_FLOOR:
                 continue
             candidates.append({
@@ -449,6 +489,7 @@ def auto_rename_uploaded_by_combined_score(
                 "score": round(score, 3),
                 "header_jaccard": round(j, 3),
                 "name_similarity": round(n, 3),
+                "sheet_similarity": round(sn, 3),
             })
         if not candidates:
             # 兜底：全部剩余期望列为候选（低分也列出，按分数排序），
@@ -461,16 +502,20 @@ def auto_rename_uploaded_by_combined_score(
                         "score": round(m[0], 3),
                         "header_jaccard": round(m[3], 3),
                         "name_similarity": round(m[4], 3),
+                        "sheet_similarity": round(m[5], 3),
                     })
             candidates.sort(key=lambda c: -c["score"])
         if candidates:
             ambiguous.append({
                 "uploaded": u_name,
                 "candidates": candidates,   # 全量候选，前端下拉可滚动选择
+                "uploaded_sheets": uploaded_signatures.get(u_name, {}).get("sheets", []),
             })
             remaining_headers[u_name] = uploaded_headers.get(u_name, set())
 
-    return renamed_list, ambiguous, remaining_headers
+    # 即使系统未启用 AI provider，也给前端预选一个结构候选；它不会自动执行，
+    # 仍需用户在事前校验弹窗中确认。
+    return renamed_list, _add_structural_fallback_recommendations(ambiguous), remaining_headers
 
 
 def ai_disambiguate_rename_candidates(
@@ -505,8 +550,15 @@ def ai_disambiguate_rename_candidates(
 
     expected_payload = []
     for name in relevant_expected:
-        headers = sorted(_extract_headers(expected_files.get(name) or {}))
-        expected_payload.append({"file": name, "headers": headers[:50]})
+        file_info = expected_files.get(name) or {}
+        headers = sorted(_extract_headers(file_info))
+        sheets = []
+        for sheet_name, sheet_info in (file_info.get("sheets") or {}).items():
+            sheet_headers = sheet_info.get("headers") or {}
+            if isinstance(sheet_headers, dict):
+                sheet_headers = list(sheet_headers.keys())
+            sheets.append({"name": sheet_name, "headers": list(sheet_headers)[:50]})
+        expected_payload.append({"file": name, "headers": headers[:50], "sheets": sheets})
 
     uploaded_payload = []
     for item in ambiguous:
@@ -516,11 +568,12 @@ def ai_disambiguate_rename_candidates(
         uploaded_payload.append({
             "file": u_name,
             "headers": headers[:50],
+            "sheets": item.get("uploaded_sheets") or [],
             "candidate_expected_files": candidate_files,
         })
 
     if not expected_payload or not uploaded_payload:
-        return ambiguous
+        return _add_structural_fallback_recommendations(ambiguous)
 
     prompt = _build_rename_disambiguation_prompt(uploaded_payload, expected_payload)
 
@@ -534,14 +587,14 @@ def ai_disambiguate_rename_candidates(
         # 带总超时：AI 卡住时原样返回程序评分结果（提交请求同步等待，超网关读超时会被判 504）
         raw = chat_with_timeout(provider, messages, max_tokens=1500)
         if raw is None:
-            return ambiguous
+            return _add_structural_fallback_recommendations(ambiguous)
     except Exception as e:
         logger.warning(f"[Rename/AI] 调用失败: {e}")
-        return ambiguous
+        return _add_structural_fallback_recommendations(ambiguous)
 
     ai_map = _parse_rename_disambiguation_response(raw)
     if not ai_map:
-        return ambiguous
+        return _add_structural_fallback_recommendations(ambiguous)
 
     # 写回 ambiguous
     for item in ambiguous:
@@ -556,8 +609,9 @@ def ai_disambiguate_rename_candidates(
             item["ai_recommended"] = rec_expected
             item["ai_confidence"] = float(rec.get("confidence", 0.0) or 0.0)
             item["ai_reason"] = str(rec.get("reason", "") or "")
+            item["recommendation_source"] = "ai"
 
-    return ambiguous
+    return _add_structural_fallback_recommendations(ambiguous)
 
 
 def _build_rename_disambiguation_prompt(uploaded_payload, expected_payload) -> str:
@@ -572,7 +626,10 @@ def _build_rename_disambiguation_prompt(uploaded_payload, expected_payload) -> s
         f"## 训练期望文件候选（共 {len(expected_payload)} 个）\n"
         + _json.dumps(expected_payload, ensure_ascii=False, indent=2)
         + "\n\n"
-        "对每个上传文件，从其 candidate_expected_files 里选一个最匹配的；如果都不像，可以省略该项。\n"
+        "请综合文件名、月份/期间语义、Sheet 名和列名判断。像‘202607/202608’与‘上月/本月’这类名称，"
+        "应按月份先后关系匹配。\n"
+        "对每个上传文件，都必须从其 candidate_expected_files 里返回一个最可能的候选；把握低也不要省略，"
+        "请降低 confidence 并说明原因，最终仍由用户确认。\n"
         "**严格只输出 JSON 数组**，每项格式：\n"
         '  {"uploaded": "上传文件名", "expected": "训练期望文件名", "confidence": 0.0-1.0, "reason": "简短中文原因"}\n'
         "不要输出任何 JSON 之外的文字、解释、代码块标记。"
@@ -646,21 +703,37 @@ def apply_confirmed_renames(source_dir: str, confirmed_renames: Dict[str, str]) 
 
 # ==================== 评分内部工具 ====================
 
-def _read_uploaded_headers(file_path: str) -> set:
-    """快速解析上传文件的列头集合（每个 sheet 第一个 region 即可）"""
+def _read_uploaded_signature(file_path: str) -> dict:
+    """快速解析上传文件的 Sheet 名和列头（每个 sheet 第一个 region 即可）。"""
     headers: set = set()
+    sheets = []
     try:
         from excel_parser import IntelligentExcelParser
         parser = IntelligentExcelParser()
         results = parser.parse_excel_file(file_path, max_data_rows=1, read_formulas=False)
         for sheet_data in results:
+            sheet_headers = set()
             for region in (sheet_data.regions or []):
                 head = region.head_data or {}
                 headers.update(head.keys())
+                sheet_headers.update(head.keys())
+            sheets.append({
+                "name": sheet_data.sheet_name,
+                "headers": sorted(str(h) for h in sheet_headers if h and str(h).strip())[:50],
+            })
     except Exception as e:
         logger.warning(f"[Rename] 解析 {file_path} 列头失败: {e}")
-    # 去除空白列名
-    return {h for h in headers if h and str(h).strip()}
+    clean_headers = {h for h in headers if h and str(h).strip()}
+    return {
+        "headers": clean_headers,
+        "sheet_names": {str(s["name"]) for s in sheets if s.get("name")},
+        "sheets": sheets,
+    }
+
+
+def _read_uploaded_headers(file_path: str) -> set:
+    """兼容旧调用：只返回上传文件列头集合。"""
+    return _read_uploaded_signature(file_path)["headers"]
 
 
 def _jaccard(a: set, b: set) -> float:
@@ -669,6 +742,16 @@ def _jaccard(a: set, b: set) -> float:
     inter = a & b
     union = a | b
     return len(inter) / len(union) if union else 0.0
+
+
+def _set_name_similarity(a: set, b: set) -> float:
+    """两个 Sheet 名集合的最佳成对相似度。"""
+    if not a or not b:
+        return 0.0
+    return max(
+        SequenceMatcher(None, str(left).lower().strip(), str(right).lower().strip()).ratio()
+        for left in a for right in b
+    )
 
 
 _BASENAME_STRIP = re.compile(r"\.(xlsx|xls|xlsm)$", re.IGNORECASE)
@@ -681,3 +764,99 @@ def _filename_similarity(a: str, b: str) -> float:
     if not a_base or not b_base:
         return 0.0
     return SequenceMatcher(None, a_base, b_base).ratio()
+
+
+def _period_index(file_name: str) -> Optional[int]:
+    """从 202607 / 2026-07 / 2026年7月 等文件名中提取连续月份索引。"""
+    base = _BASENAME_STRIP.sub("", file_name or "")
+    match = re.search(r"(?<!\d)(20\d{2})\D{0,3}(0?[1-9]|1[0-2])(?!\d)", base)
+    if not match:
+        return None
+    return int(match.group(1)) * 12 + int(match.group(2)) - 1
+
+
+def _period_role(file_name: str) -> Optional[str]:
+    base = _BASENAME_STRIP.sub("", file_name or "").lower()
+    if any(word in base for word in _CURRENT_PERIOD_WORDS):
+        return "current"
+    if any(word in base for word in _PREVIOUS_PERIOD_WORDS):
+        return "previous"
+    return None
+
+
+def _rename_by_period_role(
+    src_path: Path,
+    extras: List[Path],
+    missing: set,
+    salary_year: Optional[int] = None,
+    salary_month: Optional[int] = None,
+) -> List[Dict[str, object]]:
+    """把日期文件名确定性映射到上月/本月角色；不能唯一确定时不做自动改名。"""
+    expected_by_role: Dict[str, List[str]] = {"current": [], "previous": []}
+    for name in missing:
+        role = _period_role(name)
+        if role:
+            expected_by_role[role].append(name)
+
+    dated = [(f, _period_index(f.name)) for f in extras]
+    dated = [(f, idx) for f, idx in dated if idx is not None]
+    if not dated:
+        return []
+
+    current_idx = None
+    if salary_year and salary_month and 1 <= int(salary_month) <= 12:
+        current_idx = int(salary_year) * 12 + int(salary_month) - 1
+    elif len({idx for _, idx in dated}) >= 2:
+        current_idx = max(idx for _, idx in dated)
+    if current_idx is None:
+        return []
+
+    target_idx = {"current": current_idx, "previous": current_idx - 1}
+    planned = []
+    used_uploads = set()
+    for role in ("previous", "current"):
+        expected = expected_by_role[role]
+        matches = [f for f, idx in dated if idx == target_idx[role] and f.name not in used_uploads]
+        if len(expected) == 1 and len(matches) == 1:
+            planned.append((matches[0], expected[0], role))
+            used_uploads.add(matches[0].name)
+
+    applied: List[Dict[str, object]] = []
+    for old, target, role in planned:
+        new = src_path / target
+        try:
+            old.rename(new)
+            applied.append({
+                "from": old.name, "to": target, "score": 1.0,
+                "decision": "period_role", "reason": "按工资年月识别上月/本月",
+            })
+            logger.info(f"[Rename] 月份角色自动匹配 '{old.name}' → '{target}' ({role})")
+        except Exception as exc:
+            logger.warning(f"[Rename] 月份角色改名失败 '{old.name}' → '{target}': {exc}")
+    return applied
+
+
+def _add_structural_fallback_recommendations(
+    ambiguous: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    """AI 不返回时仍给出低置信结构候选；仅预选，前端仍要求人工确认。"""
+    claimed = {
+        str(item.get("ai_recommended"))
+        for item in ambiguous if item.get("ai_recommended")
+    }
+    for item in ambiguous:
+        if item.get("ai_recommended"):
+            continue
+        candidates = item.get("candidates") or []
+        candidate = next((c for c in candidates if c.get("expected") not in claimed), None)
+        if candidate is None and candidates:
+            candidate = candidates[0]
+        if not candidate or not candidate.get("expected"):
+            continue
+        expected = str(candidate["expected"])
+        claimed.add(expected)
+        item["ai_recommended"] = expected
+        item["ai_confidence"] = float(candidate.get("score", 0.0) or 0.0)
+        item["ai_reason"] = "AI 未返回有效建议；按文件名和列结构给出低置信候选，请人工确认"
+        item["recommendation_source"] = "structure_fallback"
+    return ambiguous

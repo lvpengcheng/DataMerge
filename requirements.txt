@@ -9,8 +9,11 @@ openpyxl==3.1.2
 xlrd==2.0.1
 
 # AI服务
-openai>=1.60.0
-anthropic>=0.39.0
+# 固定已验证版本，避免 Docker 重建时自动跨主版本导致接口行为漂移。
+openai==3.7.0
+# 1.3.0 原生包含 claude-opus-5、thinking_delta 和新版流事件类型。
+# 固定版本避免 Docker 每次构建解析到不同 SDK，导致 stream 行为漂移。
+anthropic==1.3.0
 
 # 其他工具
 python-multipart==0.0.6

@@ -72,6 +72,16 @@ def _licensed_workbook(*args, **kwargs):
     return Workbook(*args, **kwargs)
 
 
+def _force_full_formula_calculation(wb) -> None:
+    """废弃旧计算链、全量计算并写入 Excel 打开时重算标记。"""
+    try:
+        wb.Settings.ForceFullCalculate = True
+        wb.Settings.ReCalculateOnOpen = True
+    except Exception as settings_error:
+        logger.warning(f"[公式计算] 设置全量重算标记失败（继续计算）: {settings_error}")
+    wb.CalculateFormula()
+
+
 # ═══════════════════════════════════════════════════════
 # 内部工具
 # ═══════════════════════════════════════════════════════
@@ -910,6 +920,7 @@ def _generate_from_template_impl(
     split_by: str = "",
     sheet_source_names: Optional[List[str]] = None,
     sheet_vars: Optional[Dict] = None,
+    calculate_formulas: bool = True,
 ) -> str:
     """（子进程执行体）SmartMarker 填充模板生成文件。
 
@@ -949,6 +960,7 @@ def _generate_from_template_impl(
             name_field=name_field,
             password=password, watermark_text=watermark_text,
             show_empty_period=show_empty_period,
+            calculate_formulas=calculate_formulas,
         )
 
     if mode == "block":
@@ -958,6 +970,7 @@ def _generate_from_template_impl(
             password=password, watermark_text=watermark_text,
             show_empty_period=show_empty_period,
             sheet_source_names=sheet_source_names, sheet_vars=sheet_vars,
+            calculate_formulas=calculate_formulas,
         )
     elif mode == "zip":
         return _generate_zip(
@@ -965,6 +978,7 @@ def _generate_from_template_impl(
             group_by=group_by, name_field=name_field,
             password=password, watermark_text=watermark_text,
             show_empty_period=show_empty_period,
+            calculate_formulas=calculate_formulas,
         )
     elif mode == "sheet":
         return _generate_sheet(
@@ -973,12 +987,14 @@ def _generate_from_template_impl(
             password=password, watermark_text=watermark_text,
             show_empty_period=show_empty_period,
             sheet_source_names=sheet_source_names, sheet_vars=sheet_vars,
+            calculate_formulas=calculate_formulas,
         )
     else:
         return _generate_fill(
             output_path, template_path, data,
             password=password, watermark_text=watermark_text,
             sheet_source_names=sheet_source_names, sheet_vars=sheet_vars,
+            calculate_formulas=calculate_formulas,
         )
 
 
@@ -996,10 +1012,11 @@ def generate_from_template(
     split_by: str = "",
     sheet_source_names: Optional[List[str]] = None,
     sheet_vars: Optional[Dict] = None,
+    calculate_formulas: bool = True,
 ) -> str:
     """SmartMarker 填充模板生成文件（在【独立子进程】执行）。
 
-    在子进程内打开模板 + WorkbookDesigner.Process + CalculateFormula + Save：
+    在子进程内打开模板 + WorkbookDesigner.Process + 可选 CalculateFormula + Save：
     特定文件（大模板/大 DataFrame/公式密集）在主进程跑会内存暴涨，此处超时/超内存
     强杀；失败 raise RuntimeError。所有调用方（多表合并套模板、报表生成等）自动受益。
 
@@ -1022,6 +1039,7 @@ def generate_from_template(
             "split_by": split_by,
             "sheet_source_names": sheet_source_names,
             "sheet_vars": sheet_vars,
+            "calculate_formulas": calculate_formulas,
         },
         timeout=default_timeout("write"), max_memory_mb=default_max_memory_mb(),
     )
@@ -1056,7 +1074,6 @@ def _smartmarker_fill(template_path: str, data: Dict) -> Workbook:
             logger.info(f"[SmartMarker] 数据源 {name}: {len(df)} 行, 列={list(df.columns)}")
 
     designer.Process()
-    wb.CalculateFormula()
     return wb
 
 
@@ -1064,8 +1081,9 @@ def _finalize_workbook(
     wb, output_path: str,
     password: Optional[str] = None,
     watermark_text: Optional[str] = None,
+    calculate_formulas: bool = True,
 ) -> str:
-    """统一收尾: 水印 → 加密 → 保存"""
+    """统一收尾；调用方有后处理时可延迟公式计算到最终交付保存。"""
     try:
         if watermark_text:
             add_excel_watermark(wb, watermark_text)
@@ -1078,6 +1096,8 @@ def _finalize_workbook(
                 wb.Settings.Password = ""
             except Exception:
                 pass
+        if calculate_formulas:
+            _force_full_formula_calculation(wb)
         return save_as(wb, output_path)
     finally:
         try:
@@ -1173,21 +1193,58 @@ def append_carryover_sheets(target_path: str, source_path: str, specs: List[str]
         logger.info(f"[整表搬运] 已拷贝结果 sheet '{src_ws.Name}' → 报表 '{name}'")
 
     if copied:
-        try:
-            # 强制全量重算：新增 sheet 产生的跨表引用不在原计算链(calcChain)里，
-            # 普通 CalculateFormula() 会依链跳过 → 报表引用该 sheet 的公式仍是旧缓存值
-            # (搬运前该 sheet 不存在时算出的坏值)，Excel 打开需手工回车才刷新。
-            tgt_wb.Settings.ForceFullCalculate = True
-            tgt_wb.CalculateFormula()   # 拷入的公式先算并缓存，打开无需按回车
-            # 双保险：写入 fullCalcOnLoad 标记，Excel 打开时也强制重算一遍
-            tgt_wb.Settings.ReCalculateOnOpen = True
-        except Exception as _ce:
-            logger.warning(f"[整表搬运] CalculateFormula 跳过: {_ce}")
+        # 这里只保存结构变更，不计算公式。报表路由会在日期归一等全部后处理完成后
+        # 统一执行一次最终全量计算，避免大工作簿被重复计算。
         if password:
             tgt_wb.SetEncryptionOptions(EncryptionType.StrongCryptographicProvider, 128)
             tgt_wb.Settings.Password = password
         tgt_wb.Save(target_path, _ext_save_format(target_path))
+    try:
+        src_wb.Dispose()
+        tgt_wb.Dispose()
+    except Exception:
+        pass
     return copied
+
+
+def _recalculate_report_file_impl(file_path: str, password: Optional[str] = None) -> bool:
+    """报表所有后处理结束后的最终公式计算执行体。"""
+    if password:
+        options = LoadOptions()
+        options.Password = password
+        wb = _licensed_workbook(file_path, options)
+    else:
+        wb = _licensed_workbook(file_path)
+    try:
+        _force_full_formula_calculation(wb)
+        wb.Save(file_path, _ext_save_format(file_path) or SaveFormat.Xlsx)
+        return True
+    finally:
+        try:
+            wb.Dispose()
+        except Exception:
+            pass
+
+
+def recalculate_report_file(file_path: str, password: Optional[str] = None) -> bool:
+    """在受超时/内存保护的子进程中执行报表最终重算。"""
+    from backend.utils.subprocess_runner import (
+        run_in_subprocess, default_max_memory_mb, default_timeout,
+    )
+    result = run_in_subprocess(
+        "backend.utils.aspose_helper:_recalculate_report_file_impl",
+        (str(file_path), password),
+        timeout=default_timeout("calc"),
+        max_memory_mb=default_max_memory_mb(),
+    )
+    if result.success:
+        logger.info(f"[报表生成] 最终公式计算完成: {file_path}")
+        return True
+    reason = "超时" if result.timed_out else (
+        "内存超限" if result.killed_by_memory else result.error
+    )
+    logger.error(f"[报表生成] 最终公式计算失败（{reason}）: {file_path}")
+    return False
 
 
 def _fuzzy_match_column(target: str, columns) -> Optional[str]:
@@ -1205,12 +1262,16 @@ def _generate_fill(
     output_path: str, template_path: str, data: Dict,
     password: Optional[str] = None, watermark_text: Optional[str] = None,
     sheet_source_names: Optional[List[str]] = None, sheet_vars: Optional[Dict] = None,
+    calculate_formulas: bool = True,
 ) -> str:
     """整个 DataFrame 一次性填入模板"""
     logger.info(f"[报表生成] fill 模式: {template_path}")
     wb = _smartmarker_fill(template_path, data)
     _rename_sheets_by_token(wb, sheet_source_names, sheet_vars)
-    return _finalize_workbook(wb, output_path, password, watermark_text)
+    return _finalize_workbook(
+        wb, output_path, password, watermark_text,
+        calculate_formulas=calculate_formulas,
+    )
 
 
 # ── block 模式 ─────────────────────────────────────────
@@ -1221,6 +1282,7 @@ def _generate_block(
     password: Optional[str] = None, watermark_text: Optional[str] = None,
     show_empty_period: bool = True,
     sheet_source_names: Optional[List[str]] = None, sheet_vars: Optional[Dict] = None,
+    calculate_formulas: bool = True,
 ) -> str:
     """按 group_by 分组，每组用 SmartMarker 填充模板，合并到一个文件。"""
     # 找到主数据源（非 $ 开头的第一个 DataFrame）
@@ -1236,7 +1298,8 @@ def _generate_block(
     if not group_by or group_by not in full_df.columns:
         logger.warning(f"[block] group_by='{group_by}' 不在列 {list(full_df.columns)} 中，回退到 fill 模式")
         return _generate_fill(output_path, template_path, data, password, watermark_text,
-                              sheet_source_names=sheet_source_names, sheet_vars=sheet_vars)
+                              sheet_source_names=sheet_source_names, sheet_vars=sheet_vars,
+                              calculate_formulas=calculate_formulas)
 
     groups = full_df.groupby(group_by, sort=False)
     logger.info(f"[报表生成] block 模式: {len(groups)} 组, group_by={group_by}, skip_rows={skip_rows}")
@@ -1278,7 +1341,10 @@ def _generate_block(
         logger.info(f"[block] 组 {group_idx+1}/{len(groups)}: {group_key}, {len(group_df)} 行数据, 块={block_rows} 行")
 
     _rename_sheets_by_token(result_wb, sheet_source_names, sheet_vars)
-    return _finalize_workbook(result_wb, output_path, password, watermark_text)
+    return _finalize_workbook(
+        result_wb, output_path, password, watermark_text,
+        calculate_formulas=calculate_formulas,
+    )
 
 
 # ── sheet 模式 ────────────────────────────────────────
@@ -1289,6 +1355,7 @@ def _generate_sheet(
     password: Optional[str] = None, watermark_text: Optional[str] = None,
     show_empty_period: bool = True,
     sheet_source_names: Optional[List[str]] = None, sheet_vars: Optional[Dict] = None,
+    calculate_formulas: bool = True,
 ) -> str:
     """按 group_by 分组，每组生成一个独立 sheet，sheet 名取自分组值。"""
     ds_name, full_df, vars_data, extra_dfs = _extract_datasource(data)
@@ -1303,7 +1370,8 @@ def _generate_sheet(
     if not group_by or group_by not in full_df.columns:
         logger.warning(f"[sheet] group_by='{group_by}' 不在列 {list(full_df.columns)} 中，回退到 fill 模式")
         return _generate_fill(output_path, template_path, data, password, watermark_text,
-                              sheet_source_names=sheet_source_names, sheet_vars=sheet_vars)
+                              sheet_source_names=sheet_source_names, sheet_vars=sheet_vars,
+                              calculate_formulas=calculate_formulas)
 
     groups = full_df.groupby(group_by, sort=False)
     logger.info(f"[报表生成] sheet 模式: {len(groups)} 组, group_by={group_by}")
@@ -1336,7 +1404,10 @@ def _generate_sheet(
         logger.info(f"[sheet] 组 {group_idx+1}/{len(groups)}: sheet='{sheet_name}', {len(group_df)} 行数据")
 
     _rename_sheets_by_token(result_wb, sheet_source_names, sheet_vars)
-    return _finalize_workbook(result_wb, output_path, password, watermark_text)
+    return _finalize_workbook(
+        result_wb, output_path, password, watermark_text,
+        calculate_formulas=calculate_formulas,
+    )
 
 
 # ── zip 模式 ──────────────────────────────────────────
@@ -1346,6 +1417,7 @@ def _generate_zip(
     group_by: str = "", name_field: str = "",
     password: Optional[str] = None, watermark_text: Optional[str] = None,
     show_empty_period: bool = True,
+    calculate_formulas: bool = True,
 ) -> str:
     """按 group_by 分组，每组生成独立 xlsx，打包为 zip。"""
     ds_name, full_df, vars_data, extra_dfs = _extract_datasource(data)
@@ -1361,7 +1433,10 @@ def _generate_zip(
         logger.warning(f"[zip] group_by='{group_by}' 不在列 {list(full_df.columns)} 中，回退到 fill 模式")
         # 回退到 fill 模式时，输出路径改为 .xlsx（否则 Aspose 保存到 .zip 扩展名会产生无效文件）
         fill_path = os.path.splitext(output_path)[0] + ".xlsx"
-        return _generate_fill(fill_path, template_path, data, password, watermark_text)
+        return _generate_fill(
+            fill_path, template_path, data, password, watermark_text,
+            calculate_formulas=calculate_formulas,
+        )
 
     # 确保输出路径是 .zip
     if not output_path.endswith(".zip"):
@@ -1403,6 +1478,10 @@ def _generate_zip(
             with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
                 tmp_path = tmp.name
             try:
+                # zip 模式不经过 _finalize_workbook；每个内层 xlsx 都必须在最后
+                # 一次保存前单独全量计算，否则解压后仍需点进公式单元格才出值。
+                if calculate_formulas:
+                    _force_full_formula_calculation(filled_wb)
                 filled_wb.Save(tmp_path, SaveFormat.Xlsx)
                 zf.write(tmp_path, inner_name)
             finally:
@@ -1424,6 +1503,7 @@ def _generate_with_split(
     name_field: str = "",
     password: Optional[str] = None, watermark_text: Optional[str] = None,
     show_empty_period: bool = True,
+    calculate_formulas: bool = True,
 ) -> str:
     """按 split_by 字段拆分数据到多个文件，每个文件内按 mode 模式生成，打包为 zip。"""
     ds_name, full_df, vars_data, extra_dfs = _extract_datasource(data)
@@ -1440,18 +1520,22 @@ def _generate_with_split(
         if mode == "sheet":
             return _generate_sheet(output_path, template_path, data, group_by=group_by,
                                    password=password, watermark_text=watermark_text,
-                                   show_empty_period=show_empty_period)
+                                   show_empty_period=show_empty_period,
+                                   calculate_formulas=calculate_formulas)
         elif mode == "block":
             return _generate_block(output_path, template_path, data, group_by=group_by,
                                    skip_rows=skip_rows, password=password,
-                                   watermark_text=watermark_text, show_empty_period=show_empty_period)
+                                   watermark_text=watermark_text, show_empty_period=show_empty_period,
+                                   calculate_formulas=calculate_formulas)
         elif mode == "zip":
             return _generate_zip(output_path, template_path, data, group_by=group_by,
                                  name_field=name_field, password=password,
-                                 watermark_text=watermark_text, show_empty_period=show_empty_period)
+                                 watermark_text=watermark_text, show_empty_period=show_empty_period,
+                                 calculate_formulas=calculate_formulas)
         else:
             return _generate_fill(output_path, template_path, data, password=password,
-                                  watermark_text=watermark_text)
+                                  watermark_text=watermark_text,
+                                  calculate_formulas=calculate_formulas)
 
     # split_by + zip 时，split_by 覆盖 zip 的 group_by 语义
     if mode == "zip":
@@ -1459,7 +1543,8 @@ def _generate_with_split(
         return _generate_zip(output_path, template_path, data,
                              group_by=split_by, name_field=name_field,
                              password=password, watermark_text=watermark_text,
-                             show_empty_period=show_empty_period)
+                             show_empty_period=show_empty_period,
+                             calculate_formulas=calculate_formulas)
 
     # 确保输出路径是 .zip
     if not output_path.endswith(".zip"):
@@ -1482,15 +1567,18 @@ def _generate_with_split(
                     _generate_sheet(tmp_path, template_path, split_data,
                                     group_by=group_by, password=password,
                                     watermark_text=watermark_text,
-                                    show_empty_period=show_empty_period)
+                                    show_empty_period=show_empty_period,
+                                    calculate_formulas=calculate_formulas)
                 elif mode == "block":
                     _generate_block(tmp_path, template_path, split_data,
                                     group_by=group_by, skip_rows=skip_rows,
                                     password=password, watermark_text=watermark_text,
-                                    show_empty_period=show_empty_period)
+                                    show_empty_period=show_empty_period,
+                                    calculate_formulas=calculate_formulas)
                 else:
                     _generate_fill(tmp_path, template_path, split_data,
-                                   password=password, watermark_text=watermark_text)
+                                   password=password, watermark_text=watermark_text,
+                                   calculate_formulas=calculate_formulas)
 
                 file_label = re.sub(r'[\\/:*?"<>|]', '_', str(split_key).strip())
                 if not file_label:

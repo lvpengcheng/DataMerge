@@ -22,6 +22,10 @@ from .merge_engine import (
 
 logger = logging.getLogger(__name__)
 
+# 跨表公式全部引用均缺失时，明确通知写入层清空目标单元格；不能使用 None，
+# 因为 None 在普通单列映射中表示“未命中，保留主表原值”。
+CLEAR_CELL = object()
+
 
 # 姓名 / 身份证 列名关键词（用于差异 sheet 定位；可被前端人工覆盖）
 _NAME_HINTS = ["姓名", "员工姓名", "人员姓名", "name", "中文姓名"]
@@ -247,6 +251,25 @@ def _expr_has_operator(expr: str, cols: List[str]) -> bool:
                 for name in _FORMULA_FUNCTIONS))
 
 
+def _is_cross_formula_expr(expr: str, default_file: str,
+                           source_indexes: Dict[str, dict]) -> bool:
+    """去掉当前结构中可识别的列引用后，判断是否为运算公式而非普通单列映射。"""
+    rest = str(expr or "")
+    refs = []
+    for file_name, entry in (source_indexes or {}).items():
+        for col in (entry.get("cols") or []):
+            if col:
+                refs.append(f"{file_name}.{col}")
+                if file_name == default_file:
+                    refs.append(str(col))
+    for ref in sorted(set(refs), key=len, reverse=True):
+        rest = rest.replace(ref, " ")
+    stripped = rest.strip()
+    return (stripped.startswith("=") or any(op in rest for op in "+-*/<>=!,") or
+            any(_re.search(rf"\b{name}\s*\(", rest, _re.IGNORECASE)
+                for name in _FORMULA_FUNCTIONS))
+
+
 def eval_source_expr(expr, rows: List[dict], cols: List[str]):
     """按【各列先跨行求和，再代入公式】算一个覆盖/对比值。
 
@@ -306,7 +329,8 @@ def eval_source_expr_cross(expr: str, default_file: str,
 
     所有列引用都按【主表行的归一化键】在各自文件里查行（各表 key_map 已对齐同一键），
     每列跨行求和后代入公式。纯单列引用：数值列→跨行求和；含非数值→取首个非空原值。
-    空/无行/公式非法/引用列不存在 → 返回 None（调用方据此保留原值/跳过）。
+    跨表公式中部分引用无行/空值时按 0，全部引用均无行/空值时返回 None；
+    公式非法或引用列头不存在也返回 None（调用方据此保留原值/跳过）。
     """
     expr = str(expr or "").strip()
     if not expr:
@@ -320,10 +344,14 @@ def eval_source_expr_cross(expr: str, default_file: str,
                       key=len, reverse=True)
 
     def _col_val(f, c):
-        """文件 f 该 key 的所有行中列 c 的 (数值和, 首非空, 是否全数值)。无行/空 → None。"""
+        """文件 f 该 key 的列值状态：(数值和, 首非空, 是否全数值, 是否存在有效值)。
+
+        跨表公式中，缺少该主键或该列全空不立即判整个公式为空，而是先记为“不存在”；
+        只要其它引用列存在，它就按 0 参与计算。所有引用列都不存在时才返回空结果。
+        """
         rows = ((source_indexes.get(f) or {}).get("rows") or {}).get(key) or []
         if not rows:
-            return None
+            return (0.0, None, True, False)
         nums, first, all_num = [], None, True
         for row in rows:
             v = row.get(c)
@@ -337,8 +365,8 @@ def eval_source_expr_cross(expr: str, default_file: str,
             else:
                 nums.append(n)
         if first is None:
-            return None
-        return (round(sum(nums), 6) if nums else 0.0, first, all_num)
+            return (0.0, None, True, False)
+        return (round(sum(nums), 6) if nums else 0.0, first, all_num, True)
 
     # 1) 扫描 expr → token：("col", f, c, val) / ("op", ch) / ("raw", ch)
     toks, has_op = [], False
@@ -362,8 +390,6 @@ def eval_source_expr_cross(expr: str, default_file: str,
                 for c in _cols(f):
                     if expr.startswith(c, i + len(pfx)):
                         v = _col_val(f, c)
-                        if v is None:
-                            return None   # 引用了文件但该键无行/列空 → 视为不可用
                         toks.append(("col", f, c, v))
                         i += len(pfx) + len(c)
                         hit = True
@@ -375,8 +401,6 @@ def eval_source_expr_cross(expr: str, default_file: str,
         for c in _cols(default_file):
             if expr.startswith(c, i):
                 v = _col_val(default_file, c)
-                if v is None:
-                    return None
                 toks.append(("col", default_file, c, v))
                 i += len(c)
                 hit = True
@@ -395,17 +419,22 @@ def eval_source_expr_cross(expr: str, default_file: str,
                                 for name in _FORMULA_FUNCTIONS)
     if not has_formula:
         if len(cols) == 1 and not any(t[0] == "raw" for t in toks):
-            _s, first, all_num = cols[0][3]
+            _s, first, all_num, available = cols[0][3]
+            if not available:
+                return None
             return _s if all_num else first
         return None
 
     # 3) 公式：列按数值代入（文本列按 0）；数字字面量（如 字段+30 里的 30、
-    #    含小数点/科学计数 eE）原样保留进表达式；其它未识别字符 → 非法。
+    #    含小数点/科学计数 eE）原样保留进表达式；缺失引用按 0。
+    #    若全部引用均缺失/空，则整体返回 None；其它未识别字符 → 非法。
+    if not any(t[3][3] for t in cols):
+        return None
     subst = ""
     for t in toks:
         if t[0] == "col":
-            _s, _first, all_num = t[3]
-            subst += f"({_s if all_num else 0})"
+            _s, _first, all_num, available = t[3]
+            subst += f"({_s if available and all_num else 0})"
         elif t[0] == "op":
             subst += t[1]
         elif t[0] == "raw" and (t[1].isalnum() or t[1] in "._"):
@@ -427,7 +456,8 @@ def resolve_overwrites(key: str,
         overwrite_pairs: [{"a_col","source_file","source_expr"|"source_col"}]  有序，靠前优先。
         source_indexes:  {file: {"cols":[...], "rows": {key -> [行,...]}}}
     Returns:
-        {a_col: value}  仅含解析到【非空】值的列（未命中/空的列不写，保留 A 原值）。
+        {a_col: value}  仅含解析到【非空】值的列（普通映射未命中/空的列不写，
+        保留 A 原值）。跨表公式所有引用都缺失时返回 CLEAR_CELL 哨兵值，由写入层清空。
         同一 a_col 被多对映射时，取首个非空源值。source_expr 支持各列跨行求和后代入受控公式。
     """
     out: Dict[str, Any] = {}
@@ -437,12 +467,11 @@ def resolve_overwrites(key: str,
             continue  # 已被更高优先级填过
         f = pair.get("source_file")
         expr = pair.get("source_expr") or pair.get("source_col")
-        entry = source_indexes.get(f) or {}
-        rows = (entry.get("rows") or {}).get(key)
-        if not rows:
-            continue
         # 跨表公式：expr 里 `文件名.列名` 引用其他对照表列，裸列归本表（兼容旧方案）
         v = eval_source_expr_cross(expr, f, source_indexes, key)
+        if v is None and _is_cross_formula_expr(expr, f, source_indexes):
+            out[ac] = CLEAR_CELL
+            continue
         if not _is_empty(v):
             out[ac] = v
     return out
@@ -489,12 +518,10 @@ def compute_diffs(
             ac = pair.get("a_col")
             f = pair.get("source_file")
             expr = pair.get("source_expr") or pair.get("source_col")
-            entry = source_indexes.get(f) or {}
-            b_rows = (entry.get("rows") or {}).get(k)
-            if not b_rows:
-                continue  # 该对照表无此键 → 该对比对跳过
             av = row.get(ac)
             bv = eval_source_expr_cross(expr, f, source_indexes, k)   # 跨表公式：各列跨行求和后代入
+            if bv is None:
+                continue  # 公式引用的所有表均无此键/有效值 → 保持为空，不产生差异
             old = _cmp2(av)   # 数值统一到 2 位小数后再比对/展示
             new = _cmp2(bv)
             if old != new:

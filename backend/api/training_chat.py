@@ -216,8 +216,13 @@ def _create_sse_stream(loop):
                     break
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             except asyncio.TimeoutError:
-                # 超时未收到业务事件 → 发送心跳保活
-                yield f": heartbeat\n\n"
+                # 用标准 data 事件而非 SSE 注释：既能保活，也让前端确认连接仍正常。
+                # 不往聊天区追加消息，避免长任务每 15 秒刷一条记录。
+                heartbeat = {
+                    "type": "heartbeat",
+                    "message": "任务处理中（连接正常）...",
+                }
+                yield f"data: {json.dumps(heartbeat, ensure_ascii=False)}\n\n"
 
     return queue, _emit, event_generator()
 
@@ -3745,8 +3750,8 @@ async def generate_final_rules(
     目的：训练经过多轮对话才逼近最优，用户想改逻辑时不必从最原始规则重来——
     用这份整理好的最终规则作为下次训练的初始规则，可一步到位接近当前轮次的效果。
 
-    以 SSE 流式返回（两次串行 AI 调用耗时长，普通请求会被反向代理按读超时掐断成 504/502；
-    这里用 15s 心跳保活）：过程 emit status，完成 emit {type:done, rules, filename}。
+    以 SSE 流式返回（单次 AI 综合归纳仍可能耗时较长，这里用 15s 心跳保活）：
+    过程 emit status，完成 emit {type:done, rules, filename}。
     """
     session = db.query(TrainingSession).filter_by(id=session_id).first()
     if not session:
@@ -3816,26 +3821,11 @@ async def generate_final_rules(
     based_on_iterations = session.total_iterations or 0
 
     # ===== 提示词（DB 读取已在上方完成，AI 调用放后台线程，避免跨线程用 db）=====
-    stage_a_system = (
-        "你是资深数据/薪酬计算逻辑逆向分析专家。下面是一段经过多轮调试的**当前生产脚本**。"
-        "请你逐字段/逐输出列地**逆向还原它实际执行的业务逻辑**（这是系统当前真实"
-        "行为的唯一权威依据）。\n"
-        "对每个输出列/字段，尽量给出：①取数来源（哪个源表/源列）②计算公式或取值规则"
-        "（含系数、四舍五入位数、单位换算）③触发条件/分支（如某类人群不同算法）④过滤、"
-        "去重、汇总、补零、类型转换等清洗动作 ⑤特殊情况/边界处理。\n"
-        "只陈述代码**确实做了什么**，不要臆测；代码没体现的不要编。用中文，可用列表/表格，"
-        "尽量精确，不要贴大段代码。"
-    )
-    stage_a_user = (
-        f"# 输出文件结构（目标列参考）\n{exp_struct_txt}\n\n"
-        f"# 源数据结构\n{src_struct_desc or '（无）'}\n\n"
-        f"# 最终脚本\n```python\n{code_for_prompt}\n```\n\n"
-        "请输出【代码真实逻辑】的逐字段分析。"
-    )
-    stage_b_system = (
+    final_rules_system = (
         "你是数据整合规则的总编。现在要产出一份**最终规则**，作为下次训练的初始规则，目标是"
-        "让下次几乎一步到位复现当前最佳结果。你手里有三份材料，权威级别不同：\n"
-        "1）【代码真实逻辑】= 系统当前实际行为，**最高权威**，凡冲突以它为准；\n"
+        "让下次几乎一步到位复现当前最佳结果。这是一次完整的综合归纳，不要分成先逆向、后整合"
+        "的两个独立任务。你手里有三份材料，权威级别不同：\n"
+        "1）【当前代码】= 系统当前实际行为，**最高权威**，请在整合过程中直接逆向理解，凡冲突以它为准；\n"
         "2）【多轮对话】= 需求演进与修正，用于理解*为什么*这么算、术语口径、易错点；"
         "其中被后续推翻的说法要丢弃，只取最终生效的意图；\n"
         "3）【初始规则】= 最初意图，可能已过时，仅作背景与术语补充。\n\n"
@@ -3854,27 +3844,48 @@ async def generate_final_rules(
     def _worker():
         try:
             from ..ai_engine.ai_provider import AIProviderFactory
+            from ..utils.ai_retry import chat_stream_with_transient_retry
+            import time as _time
             provider = AIProviderFactory.create_provider(ai_provider_name)
+            final_rules_ai_attempts = _bounded_env_int("FINAL_RULES_AI_MAX_ATTEMPTS", 4, 8)
+            try:
+                final_rules_ai_retry_delay = max(
+                    0.0, min(float(os.getenv("FINAL_RULES_AI_RETRY_DELAY", "2")), 30.0)
+                )
+            except (TypeError, ValueError):
+                final_rules_ai_retry_delay = 2.0
 
-            # 阶段 A：逆向出"代码真实逻辑"
-            _emit({"type": "status", "message": "① 正在逆向分析当前代码的真实逻辑…"})
-            code_logic = (provider.chat([
-                {"role": "system", "content": stage_a_system},
-                {"role": "user", "content": stage_a_user},
-            ]) or "").strip()
-
-            # 阶段 B：融合原始规则与对话意图，输出最终规则
-            _emit({"type": "status", "message": "② 正在整合原始规则、对话意图与代码逻辑…"})
-            stage_b_user = (
-                f"# 代码真实逻辑（最高权威）\n{code_logic or '（无）'}\n\n"
+            # 单次综合归纳：避免原来的“两次串行非流式调用”长时间无响应。
+            _emit({"type": "status", "message": "正在综合归纳代码、对话与原始规则…"})
+            final_rules_user = (
+                f"# 输出文件结构（目标列参考）\n{exp_struct_txt}\n\n"
+                f"# 源数据结构\n{src_struct_desc or '（无）'}\n\n"
+                f"# 当前代码（最高权威）\n```python\n{code_for_prompt}\n```\n\n"
                 f"# 多轮对话（按时间正序，理解意图与修正）\n{conversation}\n\n"
                 f"# 初始规则（可能过时，仅作背景）\n{original_rules or '（无）'}\n\n"
-                "请输出深度整合与修正后的【最终规则】Markdown 正文。"
+                "请直接完成分析、归纳、去重和冲突修正，输出【最终规则】Markdown 正文。"
             )
-            final_rules = (provider.chat([
-                {"role": "system", "content": stage_b_system},
-                {"role": "user", "content": stage_b_user},
-            ]) or "").strip()
+            generated_chars = 0
+            last_progress_at = 0.0
+
+            def _progress(chunk, phase="生成"):
+                nonlocal generated_chars, last_progress_at
+                generated_chars += len(chunk or "")
+                now = _time.monotonic()
+                if now - last_progress_at >= 3.0:
+                    _emit({
+                        "type": "status",
+                        "message": f"正在综合归纳（{phase}，已生成约 {generated_chars} 字）…",
+                    })
+                    last_progress_at = now
+
+            final_rules = (chat_stream_with_transient_retry(provider, [
+                {"role": "system", "content": final_rules_system},
+                {"role": "user", "content": final_rules_user},
+            ], stage="最终规则综合归纳", max_attempts=final_rules_ai_attempts,
+                base_delay=final_rules_ai_retry_delay, emit=_emit,
+                chunk_callback=lambda chunk: _progress(chunk, "生成正文"),
+                thinking_callback=lambda chunk: _progress(chunk, "分析材料")) or "").strip()
 
             if not final_rules:
                 _emit({"type": "error", "message": "AI 未返回有效规则内容"})
@@ -3889,12 +3900,24 @@ async def generate_final_rules(
             })
         except Exception as e:
             logger.exception("生成最终规则失败")
-            _emit({"type": "error", "message": f"生成最终规则失败: {e}"})
+            # 前端已统一添加“生成最终规则失败”前缀，这里只发送原因，
+            # 避免用户看到“生成最终规则失败: 生成最终规则失败: ...”。
+            _emit({"type": "error", "message": str(e)})
         finally:
             _emit(None)
 
     loop.run_in_executor(None, _worker)
-    return StreamingResponse(event_generator, media_type="text/event-stream")
+    # 必须显式关闭 Nginx 响应缓冲，否则 15 秒心跳可能被代理攒在缓冲区里，
+    # 浏览器一直收不到字节，长任务最终只表现为 TypeError: Failed to fetch。
+    return StreamingResponse(
+        event_generator,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ==================== 辅助函数 ====================

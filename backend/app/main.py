@@ -3873,6 +3873,11 @@ def _load_script_info_for_precheck(tenant_id: str, script_id: str) -> dict:
             for key in ("template_path", "template_name", "template_hash"):
                 if cfg.get(key):
                     info[key] = cfg[key]
+            # 智算的重匹配优先复用生成该脚本时的模型；老数据再回退全局 AI_PROVIDER。
+            if cfg.get("ai_provider"):
+                info["ai_provider"] = cfg["ai_provider"]
+            elif row.source_session is not None and row.source_session.ai_provider:
+                info["ai_provider"] = row.source_session.ai_provider
     except Exception as e:
         logger.warning(f"[Precheck] DB 读 script 元数据失败: {e}")
     finally:
@@ -5283,15 +5288,72 @@ async def run_compute_task(
         }
         buffer.push(task_id, json.dumps(log_msg, ensure_ascii=False))
 
-        # 【性能优化】跳过公式计算 — 智算时 Excel 由用户打开，公式会自动重算
-        # 训练时仍需计算（compare_excel_files 负责），但计算端无需此步骤
-        logger.info(f"[compute/task] 跳过公式计算（用户打开Excel时自动重算）")
+        # 所有写值、格式修复和 sheet 重命名完成后再做最终公式计算。
+        # openpyxl 只负责写公式，不会计算缓存值；如果在这些后处理之前计算，
+        # 后续再次保存也可能让新公式/跨表引用继续保留旧缓存。
+        from backend.utils.excel_comparator import (
+            calculate_excel_formulas, inspect_formula_cache,
+            mark_excel_for_recalculation,
+        )
         buffer.push(task_id, json.dumps({
             "type": "log",
             "timestamp": datetime.now().strftime("%H:%M:%S"),
             "level": "info",
-            "message": "跳过公式计算（Excel打开时自动重算）"
+            "message": "正在执行最终公式计算并刷新缓存值..."
         }, ensure_ascii=False))
+        _formula_calc_ok = await asyncio.to_thread(
+            calculate_excel_formulas, str(output_file)
+        )
+        try:
+            _formula_report = await asyncio.to_thread(
+                inspect_formula_cache, str(output_file)
+            )
+        except Exception as _formula_scan_error:
+            logger.warning(f"[compute/task] 公式缓存校验失败: {_formula_scan_error}")
+            _formula_report = {}
+
+        _formula_total = int(_formula_report.get("formula_count", 0))
+        _formula_empty = int(_formula_report.get("empty_cache_count", 0))
+        _formula_errors = int(_formula_report.get("error_cache_count", 0))
+        _formula_bad_refs = int(_formula_report.get("invalid_ref_formula_count", 0))
+        _formula_cache_complete = _formula_calc_ok and _formula_empty == 0
+
+        if _formula_cache_complete:
+            logger.info(f"[compute/task] 最终公式计算完成: {output_file}")
+            _calc_level = "warning" if _formula_errors else "success"
+            _calc_message = f"最终公式计算完成，已刷新 {_formula_total} 个公式缓存"
+            if _formula_errors:
+                _calc_message += (
+                    f"；其中 {_formula_errors} 个结果为公式错误"
+                    f"（含 {_formula_bad_refs} 个损坏引用 #REF!），请检查模板/规则"
+                )
+            buffer.push(task_id, json.dumps({
+                "type": "log",
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "level": _calc_level,
+                "message": _calc_message,
+                "formula_report": _formula_report,
+            }, ensure_ascii=False))
+        else:
+            # 不把整次智算判失败：仍交付带公式文件；另起一个轻量受控进程，
+            # 只保存 ReCalculateOnOpen / ForceFullCalculate 标记作为兜底。
+            _recalc_marked = await asyncio.to_thread(
+                mark_excel_for_recalculation, str(output_file)
+            )
+            logger.warning(f"[compute/task] 最终公式计算未完成: {output_file}")
+            buffer.push(task_id, json.dumps({
+                "type": "log",
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "level": "warning",
+                "message": (
+                    f"公式计算未能完整刷新缓存（共 {_formula_total} 个公式，"
+                    f"仍有 {_formula_empty} 个缓存为空），已设置 Excel 打开时全量重算"
+                    if _recalc_marked else
+                    f"公式计算未完成且仍有 {_formula_empty} 个缓存为空；"
+                    "重算标记也未能保存，请检查该文件中的复杂公式"
+                ),
+                "formula_report": _formula_report,
+            }, ensure_ascii=False))
 
         # 保存到租户目录
         tenant_dir = storage_manager.get_tenant_dir(tenant_id)
@@ -5499,7 +5561,7 @@ def _compute_upload_precheck_subprocess(payload: dict) -> dict:
             salary_month=payload.get("salary_month"),
             db_session=db,
             ai_provider_name=_resolve_enabled_ai_provider(
-                os.environ.get("AI_PROVIDER", "deepseek")),
+                payload.get("ai_provider_name") or os.environ.get("AI_PROVIDER", "deepseek")),
             confirmed_mapping=payload.get("confirmed_mapping"),
             confirmed_renames=payload.get("confirmed_renames"),
             use_history=payload.get("use_history"),
@@ -5636,6 +5698,7 @@ async def compute_submit(
             "confirmed_mapping": _confirmed, "confirmed_renames": _confirmed_renames,
             "use_history": _use_history_flag, "expected_structure": _expected_structure,
             "confirmed_target_map": _confirmed_target_map,
+            "ai_provider_name": _script_info.get("ai_provider"),
         }
         async def _finish_compute_submission():
             nonlocal template_override_path

@@ -1260,8 +1260,10 @@ async def generate_report(
     logger.info(f"报表模式: {report_mode}, group_by={group_by_field}, split_by={split_by_field}, skip_rows={skip_rows_val}")
 
     try:
-        # 子进程 + to_thread：SmartMarker 填充/公式计算在子进程执行（超时/内存护栏），
+        # 子进程 + to_thread：SmartMarker 填充在子进程执行（超时/内存护栏），
         # to_thread 保证事件循环不被同步等待冻结（多客户并发时其他请求照常响应）。
+        # 单文件报表此阶段不计算，等整表搬运、日期归一全部结束后统一计算一次；
+        # zip/split 没有后续逐文件处理，因此每个内层 xlsx 在打包前计算一次。
         actual_output_path = await asyncio.to_thread(
             aspose_helper.generate_from_template,
             output_path=output_path,
@@ -1277,6 +1279,7 @@ async def generate_report(
             # sheet 名占位符：DT/DT1… → 第 idx 个数据源 sheet 名；{year}/{month}/{date}/{tenant} 子串替换
             sheet_source_names=list(all_sheet_dfs.keys()),
             sheet_vars=system_vars,
+            calculate_formulas=bool(report_mode == "zip" or split_by_field),
         )
         # 实际输出路径可能和请求路径不同（如 zip 回退到 fill 时扩展名变为 .xlsx）
         output_path = actual_output_path
@@ -1318,6 +1321,20 @@ async def generate_report(
                 logger.info(f"[报表] 日期值归一 {_dn} 格: {output_path}")
     except Exception as _dne:
         logger.warning(f"[报表] 日期值归一跳过（不阻断）: {_dne}")
+
+    # 9.7 最终公式计算：必须位于 SmartMarker、分组/Sheet 复制、整表搬运、日期归一
+    # 等所有可能修改工作簿并再次保存的步骤之后。否则前面即使算过，最后保存仍可能留下
+    # 空公式缓存，下载后要点进单元格才显示结果。
+    if not output_path.lower().endswith(".zip"):
+        _report_calc_ok = await asyncio.to_thread(
+            aspose_helper.recalculate_report_file, output_path, password,
+        )
+        if not _report_calc_ok:
+            logger.error(f"[报表] 最终公式计算失败，停止交付: {output_path}")
+            raise HTTPException(
+                status_code=500,
+                detail="报表数据已填充，但最终公式计算失败，未交付可能不完整的文件；请稍后重试",
+            )
 
     # 10. 留痕 — 保存为 DataAsset
     #     磁盘文件名带时间戳前缀（防同模版同任务重复生成时互相覆盖），

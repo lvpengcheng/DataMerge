@@ -177,6 +177,8 @@ function _showPrecheckDialog(data) {
                         const aiRec = rc.ai_recommended || '';
                         const aiConf = rc.ai_confidence != null ? Number(rc.ai_confidence).toFixed(2) : '';
                         const aiReason = rc.ai_reason || '';
+                        const recSource = rc.recommendation_source === 'ai' ? 'AI'
+                            : (rc.recommendation_source === 'structure_fallback' ? '结构兜底' : '规则');
                         const opts = ['<option value="">（不映射）</option>']
                             .concat((rc.candidates || []).map(c => {
                                 const isAi = aiRec && c.expected === aiRec;
@@ -186,7 +188,7 @@ function _showPrecheckDialog(data) {
                             }))
                             .join('');
                         const aiCell = aiRec
-                            ? `<div style="font-size:11px;color:#2e7d32;"><b>✨ ${_escapeHtml(aiRec)}</b>${aiConf ? ` (置信度 ${aiConf})` : ''}</div>${aiReason ? `<div style="font-size:11px;color:#666;margin-top:2px;">${_escapeHtml(aiReason)}</div>` : ''}`
+                            ? `<div style="font-size:11px;color:#2e7d32;"><b>✨ ${_escapeHtml(aiRec)}</b>${aiConf ? ` (置信度 ${aiConf})` : ''} <span style="color:#888;">[${recSource}]</span></div>${aiReason ? `<div style="font-size:11px;color:#666;margin-top:2px;">${_escapeHtml(aiReason)}</div>` : ''}`
                             : '<span style="color:#999;font-size:11px;">无</span>';
                         return `<tr>
                             <td style="padding:6px;border:1px solid #ffe0b2;font-family:monospace;font-size:12px;vertical-align:top;">${_escapeHtml(rc.uploaded)}</td>

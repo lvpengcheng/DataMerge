@@ -10,8 +10,91 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List
 import platform
 import shutil
+import zipfile
+from xml.etree import ElementTree as ET
 
 logger = logging.getLogger(__name__)
+
+_OOXML_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_OOXML_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_OOXML_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+
+def inspect_formula_cache(file_path: str, sample_limit: int = 20) -> Dict[str, Any]:
+    """直接检查 xlsx 内公式缓存，不触发任何重算或保存。
+
+    openpyxl 的 data_only 只能看到值，无法同时可靠区分“公式缓存为空”和
+    “公式已计算为错误值”。这里直接读取 OOXML，供智算完成后做质量闸门。
+    """
+    report = {
+        "formula_count": 0,
+        "empty_cache_count": 0,
+        "error_cache_count": 0,
+        "invalid_ref_formula_count": 0,
+        "external_formula_count": 0,
+        "empty_cache_samples": [],
+        "error_cache_samples": [],
+        "invalid_ref_samples": [],
+    }
+    main = f"{{{_OOXML_MAIN_NS}}}"
+    rel = f"{{{_OOXML_REL_NS}}}"
+    package_rel = f"{{{_OOXML_PACKAGE_REL_NS}}}"
+
+    with zipfile.ZipFile(str(file_path)) as archive:
+        workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+        relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+        rel_targets = {
+            item.attrib["Id"]: item.attrib["Target"]
+            for item in relationships.findall(f"{package_rel}Relationship")
+        }
+        for sheet in workbook.findall(f"{main}sheets/{main}sheet"):
+            sheet_name = sheet.attrib.get("name", "")
+            target = rel_targets.get(sheet.attrib.get(f"{rel}id", ""), "")
+            if not target:
+                continue
+            target = target.lstrip("/")
+            if not target.startswith("xl/"):
+                target = "xl/" + target
+            try:
+                sheet_xml = ET.fromstring(archive.read(target))
+            except (KeyError, ET.ParseError):
+                continue
+            for cell in sheet_xml.findall(f".//{main}c"):
+                formula = cell.find(f"{main}f")
+                if formula is None:
+                    continue
+                report["formula_count"] += 1
+                address = cell.attrib.get("r", "")
+                formula_text = formula.text or ""
+                value_node = cell.find(f"{main}v")
+                cached_value = None if value_node is None else value_node.text
+                sample = {
+                    "sheet": sheet_name,
+                    "cell": address,
+                    "formula": formula_text[:300],
+                }
+
+                if cached_value in (None, ""):
+                    report["empty_cache_count"] += 1
+                    if len(report["empty_cache_samples"]) < sample_limit:
+                        report["empty_cache_samples"].append(sample)
+
+                if cell.attrib.get("t") == "e" or (cached_value or "").startswith("#"):
+                    report["error_cache_count"] += 1
+                    if len(report["error_cache_samples"]) < sample_limit:
+                        report["error_cache_samples"].append({
+                            **sample, "value": cached_value,
+                        })
+
+                if "#REF!" in formula_text.upper():
+                    report["invalid_ref_formula_count"] += 1
+                    if len(report["invalid_ref_samples"]) < sample_limit:
+                        report["invalid_ref_samples"].append(sample)
+
+                if re.search(r"\[[^\]]+\]", formula_text):
+                    report["external_formula_count"] += 1
+
+    return report
 
 
 def normalize_emp_code(emp_code) -> str:
@@ -57,6 +140,17 @@ def _aspose_calc_impl(file_path: str) -> bool:
 
     wb = AsposeWorkbook(str(file_path))
     try:
+        # 先废弃旧计算链并要求全量计算。仅调用 CalculateFormula() 时，
+        # 某些由 openpyxl 新写入/移动过的跨表公式不在原 calcChain 中，
+        # 可能保留旧缓存，表现为打开 Excel 后还要点进单元格才更新。
+        try:
+            wb.Settings.ForceFullCalculate = True
+            wb.Settings.ReCalculateOnOpen = True
+        except Exception as settings_error:
+            logger.warning(
+                "[Aspose] 设置强制全量重算标记失败（继续计算）: %s",
+                settings_error,
+            )
         wb.CalculateFormula()
         wb.Save(str(file_path))
         return True
@@ -65,6 +159,50 @@ def _aspose_calc_impl(file_path: str) -> bool:
             wb.Dispose()
         except Exception:
             pass
+
+
+def _aspose_mark_recalculation_impl(file_path: str) -> bool:
+    """只写入 Excel 全量重算标记，不执行公式计算。
+
+    用于 CalculateFormula 超时、内存受限或遇到 Aspose 暂不支持的公式时兜底，
+    保证 Excel 打开文件后主动重建计算链，而不是必须逐格按回车。
+    """
+    import aspose_init  # noqa: F401
+    aspose_init.ensure_license()
+    from Aspose.Cells import Workbook as AsposeWorkbook
+
+    wb = AsposeWorkbook(str(file_path))
+    try:
+        wb.Settings.ForceFullCalculate = True
+        wb.Settings.ReCalculateOnOpen = True
+        wb.Save(str(file_path))
+        return True
+    finally:
+        try:
+            wb.Dispose()
+        except Exception:
+            pass
+
+
+def mark_excel_for_recalculation(file_path: str, timeout: int = 60) -> bool:
+    """在受控子进程中给工作簿写入打开时全量重算标记。"""
+    try:
+        from backend.utils.subprocess_runner import (
+            run_in_subprocess, default_max_memory_mb,
+        )
+        result = run_in_subprocess(
+            "backend.utils.excel_comparator:_aspose_mark_recalculation_impl",
+            (str(file_path),),
+            timeout=max(10, int(timeout)),
+            max_memory_mb=default_max_memory_mb(),
+        )
+        if result.success:
+            logger.info("[Aspose] 已写入 Excel 打开时全量重算标记: %s", file_path)
+            return True
+        logger.warning("[Aspose] 写入全量重算标记失败: %s", result.error)
+    except Exception as exc:
+        logger.warning("[Aspose] 写入全量重算标记异常: %s", exc)
+    return False
 
 
 def calculate_excel_formulas(file_path: str, timeout: int = None) -> bool:

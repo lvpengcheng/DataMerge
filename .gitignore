@@ -8,6 +8,17 @@
 /compare_results
 /_pptx_extract
 /temp
+/tmp
+/output
+/tenants
+/global_assets
+/design_docs
+/docs
+/data
+/examples
+/参考
+/_pptx_extract
+/__pycache__
 *.docx
 *.xlsx
 nul

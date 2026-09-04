@@ -305,6 +305,8 @@ const Admin = {
                 { key: 'tools.sop.create', label: '　　└ 新建SOP / 上传文件' },
                 { key: 'tools.sop.review', label: '　　└ 人工审核' },
                 { key: 'tools.sop.manage', label: '　　└ 规则文件管理 / 删除SOP' },
+                { key: 'tools.assemble', label: '└ 智能组表（应用 / 执行）' },
+                { key: 'tools.assemble.manage', label: '　　└ 规则文件 / 匹配知识库管理' },
             ]
         },
         {

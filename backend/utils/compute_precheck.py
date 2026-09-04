@@ -101,6 +101,8 @@ def precheck_compute(
         renamed, ambiguous, uploaded_headers_map = auto_rename_uploaded_by_combined_score(
             source_dir=source_dir,
             source_structure=source_structure,
+            salary_year=salary_year,
+            salary_month=salary_month,
         )
         if renamed:
             result.auto_renamed.extend(renamed)

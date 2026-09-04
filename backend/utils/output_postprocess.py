@@ -291,6 +291,7 @@ def normalize_date_formatted_values(output_path) -> int:
                 except Exception:
                     continue
         if touched:
+            # 此处只保存日期值变更；报表全部后处理完成后统一做一次最终公式计算。
             wb.Save(str(output_path))
             logger.info(f"[日期值归一] 已把 {changed} 个日期格式格从文本转成真日期"
                         f"（模板格式立即生效，Aspose 保值）: {output_path}")

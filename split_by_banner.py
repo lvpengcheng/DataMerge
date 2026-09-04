@@ -17,11 +17,18 @@ from pathlib import Path
 import openpyxl
 from openpyxl.utils import get_column_letter
 
-from excel_parser import IntelligentExcelParser
-
-
 _INVALID_SHEET_CHARS = re.compile(r"[\\/*?\[\]:]")
 _MAX_SHEET_NAME = 31
+
+
+def _get_parser():
+    """惰性加载解析器。
+
+    某些账单可以直接通过人员明细表头精确分段，不应因 Aspose/通用解析器
+    对特殊工作簿的解析失败而整个无法拆分。
+    """
+    from excel_parser import IntelligentExcelParser
+    return IntelligentExcelParser()
 
 
 def _sanitize_sheet_name(name: str, used: set) -> str:
@@ -215,9 +222,102 @@ def _scan_banner_rows(ws) -> list:
     return banners
 
 
+def _norm_header_text(value) -> str:
+    """归一化英文/中英文表头，便于识别 S/N、Name 等稳定标识。"""
+    if value is None:
+        return ""
+    return re.sub(r"[\s　]", "", str(value)).casefold().replace("／", "/")
+
+
+def _is_serial_value(value) -> bool:
+    """人员明细行的首列序号：整数或可转为整数的文本。"""
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, int):
+        return value >= 0
+    if isinstance(value, float):
+        return value >= 0 and value.is_integer()
+    return bool(re.fullmatch(r"\d+", str(value).strip()))
+
+
+def _scan_person_detail_blocks(ws) -> list:
+    """识别同一 sheet 内并列的“正常人员明细 / 历月补收明细”。
+
+    这类账单的两段数据通常都有稳定的英文次表头 ``S/N`` + ``Name``，
+    但第二段标题可能紧跟在上一段合计后，不满足“banner 上方必须是空行”。
+    只识别同时含 S/N 和 Name 的人员明细，因此不会把后续服务费、增值税表误拆为人员数据。
+
+    Returns:
+        [{"title", "header_start", "header_end", "data_start", "data_end"}, ...]
+    """
+    max_row = ws.max_row or 0
+    max_col = ws.max_column or 0
+    blocks = []
+    for r in range(1, max_row + 1):
+        headers = {_norm_header_text(ws.cell(r, c).value) for c in range(1, max_col + 1)}
+        if "s/n" not in headers or "name" not in headers:
+            continue
+
+        # 账单常用两行中英文表头：上一行有至少两个标题时一并保留。
+        header_start = r
+        if r > 1:
+            prev_count = sum(
+                1 for c in range(1, max_col + 1)
+                if ws.cell(r - 1, c).value is not None and str(ws.cell(r - 1, c).value).strip()
+            )
+            if prev_count >= 2:
+                header_start = r - 1
+
+        data_start = r + 1
+        data_end = data_start - 1
+        started = False
+        for dr in range(data_start, max_row + 1):
+            if _is_serial_value(ws.cell(dr, 1).value):
+                data_end = dr
+                started = True
+                continue
+            if started:
+                break
+        if not started:
+            continue
+
+        title = "正常数据" if not blocks else f"数据{len(blocks) + 1}"
+        # 只在紧邻表头上方的少量行中找“明细”标题，避免把公司名/账单号当名称。
+        for tr in range(header_start - 1, max(0, header_start - 4), -1):
+            vals = [
+                str(ws.cell(tr, c).value).strip()
+                for c in range(1, max_col + 1)
+                if ws.cell(tr, c).value is not None and str(ws.cell(tr, c).value).strip()
+            ]
+            if len(vals) == 1 and re.search(r"明细|detail|retro|adjust", vals[0], re.IGNORECASE):
+                title = vals[0]
+                break
+
+        blocks.append({
+            "title": title,
+            "header_start": header_start,
+            "header_end": r,
+            "data_start": data_start,
+            "data_end": data_end,
+        })
+    return blocks
+
+
 def split_one_file(source_path: Path, output_path: Path):
-    parser = IntelligentExcelParser()
-    results = parser.parse_excel_file(str(source_path), max_data_rows=1, read_formulas=False)
+    # 先用 openpyxl 扫描可精确识别的人员明细分段。单 sheet 账单若已识别到
+    # 两段明细，则无需先经过通用解析器，避免特殊格式在拆分前就报错。
+    probe_wb = openpyxl.load_workbook(str(source_path), data_only=False, read_only=False)
+    detail_blocks_by_sheet = {
+        name: _scan_person_detail_blocks(probe_wb[name]) for name in probe_wb.sheetnames
+    }
+    source_sheet_names = list(probe_wb.sheetnames)
+    probe_wb.close()
+
+    has_precise_detail_split = any(len(v) >= 2 for v in detail_blocks_by_sheet.values())
+    results = []
+    if not (len(source_sheet_names) == 1 and has_precise_detail_split):
+        parser = _get_parser()
+        results = parser.parse_excel_file(str(source_path), max_data_rows=1, read_formulas=False)
 
     # 拆分前先把所有公式计算并落为字面值，避免跨 sheet 引用断链导致 #REF!
     import tempfile, os
@@ -249,6 +349,21 @@ def split_one_file(source_path: Path, output_path: Path):
 
     for sheet_name in src_wb.sheetnames:
         src_ws = src_wb[sheet_name]
+
+        # 人员账单专用分段：精确产出“正常数据”和“历月补收明细”，
+        # 不包含合计/服务费/增值税等后续非人员区域。
+        detail_blocks = detail_blocks_by_sheet.get(sheet_name) or []
+        if len(detail_blocks) >= 2:
+            for block in detail_blocks:
+                rows = list(range(block["header_start"], block["data_end"] + 1))
+                composed = block["title"] if single_source_sheet else f"{sheet_name}-{block['title']}"
+                sub_name = _sanitize_sheet_name(composed, used_names)
+                dst_ws = dst_wb.create_sheet(sub_name)
+                row_map = {}
+                _copy_region_rows(src_ws, dst_ws, rows, 1, style_cache, row_map)
+                _copy_col_dims(src_ws, dst_ws)
+                _copy_merges(src_ws, dst_ws, row_map)
+            continue
 
         # 优先：banner-line 扫描（不依赖 parser 精度）
         # 当扫到 ≥2 个 banner 行，直接按 banner 行做切片，避免 parser 合并/截断 bug

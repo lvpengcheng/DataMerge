@@ -354,10 +354,15 @@ class FormulaCodeGenerator:
             last_error = None
 
             for retry_idx in range(max_stream_retries):
+                # 记住本次外层尝试前的长度。provider 内部已会从断点续传；
+                # 如果内部恢复仍耗尽而抛错，外层重新发起整请求前必须丢弃
+                # 该次失败请求的局部输出，否则会把新的完整响应拼到半截代码后。
+                attempt_start_len = len(current_response)
                 try:
                     if is_claude:
                         for text_chunk, sr in self.ai_provider._claude_chat_stream(
-                            system_prompt, messages, max_tokens=effective_max_tokens
+                            system_prompt, messages, max_tokens=effective_max_tokens,
+                            thinking_callback=thinking_callback,
                         ):
                             if text_chunk:
                                 current_response += text_chunk
@@ -380,6 +385,7 @@ class FormulaCodeGenerator:
                     break  # 成功则跳出重试循环
                 except Exception as e:
                     last_error = e
+                    current_response = current_response[:attempt_start_len]
                     if retry_idx < max_stream_retries - 1:
                         import time
                         wait_time = (retry_idx + 1) * 2  # 2秒、4秒、6秒
@@ -3732,7 +3738,8 @@ def main():
         try:
             if is_claude:
                 for text_chunk, sr in self.ai_provider._claude_chat_stream(
-                    system_prompt, messages, max_tokens=effective_max_tokens
+                    system_prompt, messages, max_tokens=effective_max_tokens,
+                    thinking_callback=thinking_callback,
                 ):
                     if text_chunk:
                         response += text_chunk
@@ -3747,7 +3754,10 @@ def main():
                         _forward_chunk(content_chunk)
         except Exception as e:
             if log:
-                log(f"流式调用失败({e})，回退到普通调用")
+                log(
+                    f"流式调用失败({e})，已切换到普通调用；"
+                    "代码会在生成完成后一次性显示"
+                )
             if is_claude:
                 response, _ = self.ai_provider._claude_chat(
                     system_prompt, messages, max_tokens=effective_max_tokens
@@ -3756,4 +3766,12 @@ def main():
                 response, _ = self.ai_provider._openai_chat(
                     messages, max_tokens=effective_max_tokens
                 )
+            # 流式连接在首 token 前失败时，普通调用虽然能拿到
+            # 完整结果，但之前没有任何回调，前端会一直是空白。
+            # 使用 CODE_REPLACE 让前端用完整结果覆盖可能已收到的
+            # 半截流式内容，同时避免重复拼接。
+            if stream_callback and response:
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                stream_callback(f"[{timestamp}] [CODE_REPLACE] {response}")
         return response

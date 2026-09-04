@@ -14,12 +14,19 @@ from backend.utils.indentation_fixer import IndentationFixer
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_BEDROCK_ANTHROPIC_VERSION = "bedrock-2023-05-31"
+# 某些自定义 Claude 网关从错误中才能确认后端是 Bedrock。在进程内
+# 记住已确认的 base_url，避免后续新建 provider 时每次都先收到一个 400。
+_BEDROCK_VERSION_BASE_URLS = set()
+
 
 def _model_omits_temperature(model_name: str) -> bool:
     """判断该模型是否**不接受** temperature 参数（传了会被 Anthropic/Bedrock 以
     ValidationException: temperature is deprecated 拒绝）。
 
-    覆盖：Claude 4.x 全系（claude-*-4-6 / -4-7 / -4-8 …）、Fable 系列。
+    覆盖：Claude 4.x 新版（claude-*-4-6 / -4-7 / -4-8 …）、
+         Claude 5+ 系列（claude-opus-5 / claude-sonnet-5 / claude-haiku-5 …）、
+         Fable 系列。
     兜底：设环境变量 AI_DISABLE_TEMPERATURE=true 可对**任意模型**强制不传 temperature，
          部署遇到新模型报"temperature deprecated"时无需改代码，先置此开关即可。
     """
@@ -31,7 +38,33 @@ def _model_omits_temperature(model_name: str) -> bool:
     # 匹配 claude-opus-4-8 / claude-sonnet-4-6 / claude-4-7 等「-4-<数字>」新模型
     if re.search(r"-4-\d", m):
         return True
+    # Claude 5 开始的模型命名如 claude-opus-5，当前 Anthropic/SDK
+    # 不接受 temperature。兼容带版本日期和 Bedrock/网关前缀的名称。
+    # 主版本只取1–2位，避免把 claude-3-sonnet-20240229 的日期
+    # 20240229 误判为 Sonnet 主版本。
+    family_major = re.search(r"(?:opus|sonnet|haiku)[._-](\d{1,2})(?:[._-]|$)", m)
+    if family_major and int(family_major.group(1)) >= 5:
+        return True
+    claude_major = re.search(r"(?:^|[._-])claude[._-](\d{1,2})(?:[._-]|$)", m)
+    if claude_major and int(claude_major.group(1)) >= 5:
+        return True
     return False
+
+
+def _is_claude_5_plus_model(model_name: str) -> bool:
+    """识别 Claude 5+（含 Anthropic/Bedrock/自定义网关常见模型名）。"""
+    m = (model_name or "").lower()
+    family_major = re.search(r"(?:opus|sonnet|haiku)[._-](\d{1,2})(?:[._-]|$)", m)
+    if family_major and int(family_major.group(1)) >= 5:
+        return True
+    claude_major = re.search(r"(?:^|[._-])claude[._-](\d{1,2})(?:[._-]|$)", m)
+    return bool(claude_major and int(claude_major.group(1)) >= 5)
+
+
+def _is_openai_reasoning_model(model_name: str) -> bool:
+    """GPT-5 / o-series 使用推理模型参数约束。"""
+    m = (model_name or "").lower().split("/")[-1]
+    return bool(re.match(r"^(?:gpt-5(?:[.\-_]|$)|o[1-9](?:[.\-_]|$))", m))
 
 
 class BaseAIProvider(ABC):
@@ -981,6 +1014,16 @@ class OpenAIProvider(BaseAIProvider):
         self.model = config.get("model") or os.getenv("OPENAI_MODEL") or "gpt-4"
         self.max_tokens = config.get("max_tokens", int(os.getenv("OPENAI_MAX_TOKENS", "8000")))
         self.timeout = int(config.get("timeout", os.getenv("OPENAI_TIMEOUT", "300")))
+        self.api_mode = str(
+            config.get("api_mode") or os.getenv("OPENAI_API_MODE", "auto")
+        ).strip().lower()
+        self.reasoning_effort = (
+            config.get("reasoning_effort") or os.getenv("OPENAI_REASONING_EFFORT")
+        )
+        self.reasoning_summary = (
+            config.get("reasoning_summary") or os.getenv("OPENAI_REASONING_SUMMARY")
+        )
+        self.verbosity = config.get("verbosity") or os.getenv("OPENAI_VERBOSITY")
 
         from openai import OpenAI
         self._client = OpenAI(
@@ -989,15 +1032,114 @@ class OpenAIProvider(BaseAIProvider):
             timeout=self.timeout,
         )
 
+    def _use_responses_api(self) -> bool:
+        """官方 GPT-5/o-series 默认走 Responses；兼容网关默认保留 Chat。"""
+        api_mode = getattr(self, "api_mode", "chat")
+        if api_mode == "responses":
+            return True
+        if api_mode == "chat":
+            return False
+        official_endpoint = self.base_url.lower().startswith(
+            ("https://api.openai.com", "http://api.openai.com")
+        )
+        return official_endpoint and _is_openai_reasoning_model(self.model)
+
+    def _responses_params(self, messages, max_tokens, temperature, kwargs, stream=False):
+        """把项目统一对话参数转换为 Responses API 参数。"""
+        filtered = {
+            k: v for k, v in kwargs.items()
+            if k not in (
+                "stream", "max_tokens", "max_completion_tokens",
+                "reasoning_effort", "reasoning_summary", "verbosity",
+            )
+        }
+        effort = kwargs.get("reasoning_effort") or getattr(self, "reasoning_effort", None)
+        summary = kwargs.get("reasoning_summary") or getattr(self, "reasoning_summary", None)
+        verbosity = kwargs.get("verbosity") or getattr(self, "verbosity", None)
+        reasoning = {}
+        if effort:
+            reasoning["effort"] = effort
+        if summary:
+            reasoning["summary"] = summary
+        params = {
+            "model": self.model,
+            "input": messages,
+            "max_output_tokens": max_tokens or self.max_tokens,
+            "stream": stream,
+            **({"reasoning": reasoning} if reasoning else {}),
+            **({"text": {"verbosity": verbosity}} if verbosity else {}),
+            **filtered,
+        }
+        if not _is_openai_reasoning_model(self.model):
+            params["temperature"] = temperature
+        return params
+
+    @staticmethod
+    def _responses_finish_reason(response) -> str:
+        status = getattr(response, "status", None)
+        if status == "incomplete":
+            details = getattr(response, "incomplete_details", None)
+            reason = getattr(details, "reason", None)
+            return "length" if reason == "max_output_tokens" else (reason or "incomplete")
+        return "stop" if status == "completed" else (status or "stop")
+
+    def _responses_chat(self, messages, temperature=0.1, max_tokens=None, **kwargs):
+        response = self._client.responses.create(**self._responses_params(
+            messages, max_tokens, temperature, kwargs, stream=False,
+        ))
+        content = getattr(response, "output_text", None) or ""
+        if not content and getattr(response, "status", None) == "failed":
+            error = getattr(response, "error", None)
+            raise RuntimeError(getattr(error, "message", None) or "OpenAI Responses API 调用失败")
+        return content, self._responses_finish_reason(response)
+
+    def _responses_chat_stream(self, messages, temperature=0.1, max_tokens=None,
+                               thinking_callback=None, **kwargs):
+        stream = self._client.responses.create(**self._responses_params(
+            messages, max_tokens, temperature, kwargs, stream=True,
+        ))
+        finish_reason = None
+        for event in stream:
+            event_type = getattr(event, "type", "")
+            if event_type == "response.output_text.delta":
+                delta = getattr(event, "delta", "") or ""
+                if delta:
+                    yield delta, finish_reason
+            elif event_type in (
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_text.delta",
+            ):
+                delta = getattr(event, "delta", "") or ""
+                if delta and thinking_callback:
+                    thinking_callback(delta)
+            elif event_type in ("response.completed", "response.incomplete"):
+                finish_reason = self._responses_finish_reason(
+                    getattr(event, "response", None)
+                )
+            elif event_type == "response.failed":
+                response = getattr(event, "response", None)
+                error = getattr(response, "error", None)
+                raise RuntimeError(
+                    getattr(error, "message", None) or "OpenAI Responses API 流式调用失败"
+                )
+        yield "", finish_reason
+
     def _openai_chat(self, messages, temperature=0.1, max_tokens=None, **kwargs):
         """非流式调用 OpenAI SDK，返回 (content, finish_reason)"""
+        if self._use_responses_api():
+            return self._responses_chat(messages, temperature, max_tokens, **kwargs)
         filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ("stream",)}
         try:
+            token_param = (
+                {"max_completion_tokens": max_tokens or self.max_tokens}
+                if _is_openai_reasoning_model(self.model)
+                else {"max_tokens": max_tokens or self.max_tokens}
+            )
             response = self._client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                **({} if _model_omits_temperature(self.model) else {"temperature": temperature}),
-                max_tokens=max_tokens or self.max_tokens,
+                **({} if _is_openai_reasoning_model(self.model) else {"temperature": temperature}),
+                **token_param,
                 **filtered_kwargs,
             )
             # 调试：检查响应类型
@@ -1005,9 +1147,31 @@ class OpenAIProvider(BaseAIProvider):
                 logger.error(f"API返回了字符串而不是对象: {response[:500]}")
                 raise ValueError(f"API返回格式错误，期望对象但得到字符串")
 
-            choice = response.choices[0]
-            content = choice.message.content or ""
-            finish_reason = choice.finish_reason
+            # DeepSeek/OpenAI 兼容网关在过载时偶尔会返回 HTTP 200，但
+            # choices=[]/None。直接取 [0] 只会暴露为无意义的 IndexError，且
+            # 上层无法判断是可重试的服务繁忙。
+            choices = getattr(response, "choices", None)
+            if not choices:
+                from backend.utils.ai_retry import AITransientResponseError
+                response_id = getattr(response, "id", None) or "unknown"
+                logger.warning(
+                    "AI API 返回空 choices[]，按临时服务故障交由上层重试; "
+                    "provider=%s model=%s response_id=%s",
+                    type(self).__name__, self.model, response_id,
+                )
+                raise AITransientResponseError(
+                    "AI 服务返回空 choices[]，可能正在繁忙"
+                )
+
+            choice = choices[0]
+            message = getattr(choice, "message", None)
+            if message is None:
+                from backend.utils.ai_retry import AITransientResponseError
+                raise AITransientResponseError(
+                    "AI 服务返回的 choice 缺少 message，可能正在繁忙"
+                )
+            content = getattr(message, "content", None) or ""
+            finish_reason = getattr(choice, "finish_reason", None)
             return content, finish_reason
         except Exception as e:
             logger.error(f"_openai_chat 调用失败: {e}, response type: {type(response) if 'response' in locals() else 'N/A'}")
@@ -1020,12 +1184,22 @@ class OpenAIProvider(BaseAIProvider):
         thinking_callback: DeepSeek 推理模型思考阶段（content 未出）只发 reasoning_content，
         通过该回调逐块透传思考过程，供前端流式展示；不污染 content 流。
         """
+        if self._use_responses_api():
+            yield from self._responses_chat_stream(
+                messages, temperature, max_tokens, thinking_callback, **kwargs,
+            )
+            return
         filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ("stream",)}
+        token_param = (
+            {"max_completion_tokens": max_tokens or self.max_tokens}
+            if _is_openai_reasoning_model(self.model)
+            else {"max_tokens": max_tokens or self.max_tokens}
+        )
         stream = self._client.chat.completions.create(
             model=self.model,
             messages=messages,
-            **({} if _model_omits_temperature(self.model) else {"temperature": temperature}),
-            max_tokens=max_tokens or self.max_tokens,
+            **({} if _is_openai_reasoning_model(self.model) else {"temperature": temperature}),
+            **token_param,
             stream=True,
             **filtered_kwargs,
         )
@@ -1354,6 +1528,33 @@ class ClaudeProvider(BaseAIProvider):
         self.model = config.get("model") or os.getenv("ANTHROPIC_MODEL") or "claude-3-sonnet-20240229"
         self.max_tokens = config.get("max_tokens", int(os.getenv("ANTHROPIC_MAX_TOKENS", "80000")))
         self.timeout = config.get("timeout", int(os.getenv("ANTHROPIC_TIMEOUT", "600")))
+        # Opus 5 仅支持 adaptive thinking，且默认 display=omitted 时 SDK 不会收到
+        # thinking_delta。默认显式请求 summarized，前端才能边生成边展示思考摘要。
+        # 可用 ANTHROPIC_THINKING_DISPLAY=omitted 关闭摘要展示。
+        thinking_display = str(
+            config.get("thinking_display")
+            or os.getenv("ANTHROPIC_THINKING_DISPLAY", "summarized")
+        ).strip().lower()
+        if thinking_display not in ("summarized", "omitted"):
+            logger.warning(
+                "无效的 ANTHROPIC_THINKING_DISPLAY=%r，已回退为 summarized",
+                thinking_display,
+            )
+            thinking_display = "summarized"
+        configured_thinking = config.get("thinking")
+        if configured_thinking is not None:
+            self.thinking = configured_thinking
+        elif _is_claude_5_plus_model(self.model):
+            self.thinking = {"type": "adaptive", "display": thinking_display}
+        else:
+            self.thinking = None
+        self.anthropic_version = (
+            config.get("anthropic_version")
+            or os.getenv("ANTHROPIC_VERSION")
+            or os.getenv("ANTHROPIC_BEDROCK_VERSION")
+            or (_DEFAULT_BEDROCK_ANTHROPIC_VERSION
+                if self.base_url in _BEDROCK_VERSION_BASE_URLS else "")
+        )
 
         import anthropic
         self._client = anthropic.Anthropic(
@@ -1362,6 +1563,74 @@ class ClaudeProvider(BaseAIProvider):
             timeout=self.timeout,
             default_headers={"anthropic-beta": "context-1m-2025-08-07"},
         )
+
+    @staticmethod
+    def _missing_anthropic_version(exc: Exception) -> bool:
+        """是否为 AWS Bedrock 转发层缺少 anthropic_version 的验证错误。"""
+        text = str(exc).casefold().replace("\\_", "_")
+        return ("anthropic_version" in text and
+                ("field required" in text or "required" in text) and
+                ("bedrock" in text or "invoke" in text or "aws" in text))
+
+    def _enable_bedrock_anthropic_version(self, exc: Exception) -> bool:
+        """首次收到缺字段错误时自动启用 Bedrock 版本字段；成功启用返回 True。"""
+        if self.anthropic_version or not self._missing_anthropic_version(exc):
+            return False
+        self.anthropic_version = _DEFAULT_BEDROCK_ANTHROPIC_VERSION
+        _BEDROCK_VERSION_BASE_URLS.add(self.base_url)
+        logger.warning(
+            "Claude 转发网关要求 anthropic_version，已自动补入 %s 并重试; base_url=%s",
+            self.anthropic_version, self.base_url,
+        )
+        return True
+
+    def _downgrade_thinking_after_validation(self, exc: Exception) -> bool:
+        """兼容尚未完整实现 Opus 5 thinking 字段的第三方/AWS 转发层。
+
+        优先仅移除 display；若网关连 thinking 都不认识，再禁用 thinking。
+        只对明确的 400/ValidationException 生效，避免掩盖鉴权等真实错误。
+        """
+        text = str(exc).casefold().replace("\\_", "_")
+        if not ("validation" in text or "statuscode: 400" in text or "error code: 400" in text):
+            return False
+        thinking = getattr(self, "thinking", None)
+        if not thinking or "thinking" not in text:
+            return False
+        if isinstance(thinking, dict) and thinking.get("display") and "display" in text:
+            self.thinking = dict(thinking)
+            self.thinking.pop("display", None)
+            logger.warning(
+                "Claude 转发网关不支持 thinking.display，已仅移除 display 后重试; base_url=%s",
+                self.base_url,
+            )
+            return True
+        self.thinking = None
+        logger.warning(
+            "Claude 转发网关不支持 thinking 配置，已禁用 thinking 后重试; base_url=%s",
+            self.base_url,
+        )
+        return True
+
+    def _claude_extra_body(self, kwargs: dict):
+        """合并调用方 extra_body 与 Bedrock 必需版本字段。"""
+        body = kwargs.get("extra_body")
+        body = dict(body) if isinstance(body, dict) else {}
+        if self.anthropic_version:
+            body.setdefault("anthropic_version", self.anthropic_version)
+        return body or None
+
+    @staticmethod
+    def _claude_transport_retry_settings():
+        """Claude/AWS 转发连接中断时的有界重试参数。"""
+        try:
+            attempts = max(1, min(int(os.getenv("CLAUDE_TRANSPORT_MAX_ATTEMPTS", "3")), 6))
+        except (TypeError, ValueError):
+            attempts = 3
+        try:
+            delay = max(0.0, min(float(os.getenv("CLAUDE_TRANSPORT_RETRY_DELAY", "2")), 30.0))
+        except (TypeError, ValueError):
+            delay = 2.0
+        return attempts, delay
 
     def _claude_chat(self, system_prompt, messages, max_tokens=None, temperature=0.1, use_cache=True, **kwargs):
         """非流式调用 Anthropic SDK，返回 (content, stop_reason)
@@ -1374,7 +1643,8 @@ class ClaudeProvider(BaseAIProvider):
             use_cache: 是否启用提示词缓存（默认True）
             **kwargs: 其他参数
         """
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ("extra_headers", "stream", "use_cache")}
+        filtered_kwargs = {k: v for k, v in kwargs.items()
+                           if k not in ("extra_headers", "extra_body", "stream", "use_cache", "thinking")}
 
         # 如果启用缓存，将system_prompt转换为数组格式并添加cache_control
         if use_cache and isinstance(system_prompt, str) and system_prompt.strip():
@@ -1397,19 +1667,65 @@ class ClaudeProvider(BaseAIProvider):
                     "content": [{"type": "text", "text": first_content, "cache_control": {"type": "ephemeral"}}]
                 }
 
-        response = self._client.messages.create(
-            model=self.model,
-            max_tokens=max_tokens or max(self.max_tokens, 64000),
-            **({} if _model_omits_temperature(self.model) else {"temperature": temperature}),
-            system=system_prompt,
-            messages=messages,
-            **filtered_kwargs,
+        def _create():
+            extra_body = self._claude_extra_body(kwargs)
+            thinking = kwargs.get("thinking", getattr(self, "thinking", None))
+            return self._client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens or max(self.max_tokens, 64000),
+                **({} if _model_omits_temperature(self.model) else {"temperature": temperature}),
+                system=system_prompt,
+                messages=messages,
+                **({"thinking": thinking} if thinking else {}),
+                **({"extra_body": extra_body} if extra_body else {}),
+                **filtered_kwargs,
+            )
+
+        from backend.utils.ai_retry import is_transient_ai_error
+        import time as _time
+        transport_attempts, retry_delay = self._claude_transport_retry_settings()
+        transport_failures = 0
+        while True:
+            try:
+                response = _create()
+                break
+            except Exception as exc:
+                if self._enable_bedrock_anthropic_version(exc):
+                    continue
+                if self._downgrade_thinking_after_validation(exc):
+                    continue
+                transport_failures += 1
+                if (not is_transient_ai_error(exc) or
+                        transport_failures >= transport_attempts):
+                    raise
+                delay = retry_delay * (2 ** (transport_failures - 1))
+                logger.warning(
+                    "Claude 非流式连接中断，%.1f 秒后重试（%d/%d）: %s",
+                    delay, transport_failures, transport_attempts - 1, exc,
+                )
+                _time.sleep(delay)
+        # 开启 thinking 后 content[0] 通常是 thinking block，不能再假设首块为文本。
+        # 只拼接正式 text block，避免把思考摘要当作最终代码/对话内容。
+        content = "".join(
+            getattr(block, "text", "") or ""
+            for block in response.content
+            if (getattr(block, "type", None) == "text"
+                or (isinstance(block, dict) and block.get("type") == "text"))
         )
-        content = response.content[0].text
+        if not content and response.content:
+            # 兼容少数网关返回的无 type 简化对象。
+            content = "".join(
+                (block.get("text", "") if isinstance(block, dict)
+                 else getattr(block, "text", "")) or ""
+                for block in response.content
+            )
         stop_reason = response.stop_reason
         return content, stop_reason
 
-    def _claude_chat_stream(self, system_prompt, messages, max_tokens=None, temperature=0.1, use_cache=True, **kwargs):
+    def _claude_chat_stream(
+        self, system_prompt, messages, max_tokens=None, temperature=0.1,
+        use_cache=True, thinking_callback=None, **kwargs,
+    ):
         """流式调用 Anthropic SDK，yield (text_chunk, stop_reason)
 
         Args:
@@ -1418,9 +1734,11 @@ class ClaudeProvider(BaseAIProvider):
             max_tokens: 最大token数
             temperature: 温度参数
             use_cache: 是否启用提示词缓存（默认True）
+            thinking_callback: Claude thinking_delta 逐块回调；与正式文本分离
             **kwargs: 其他参数
         """
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ("extra_headers", "stream", "use_cache")}
+        filtered_kwargs = {k: v for k, v in kwargs.items()
+                           if k not in ("extra_headers", "extra_body", "stream", "use_cache", "thinking")}
 
         # 如果启用缓存，将system_prompt转换为数组格式并添加cache_control
         if use_cache and isinstance(system_prompt, str) and system_prompt.strip():
@@ -1443,22 +1761,128 @@ class ClaudeProvider(BaseAIProvider):
                     "content": [{"type": "text", "text": first_content, "cache_control": {"type": "ephemeral"}}]
                 }
 
-        stop_reason = None
-        with self._client.messages.stream(
-            model=self.model,
-            max_tokens=max_tokens or max(self.max_tokens, 64000),
-            **({} if _model_omits_temperature(self.model) else {"temperature": temperature}),
-            system=system_prompt,
-            messages=messages,
-            **filtered_kwargs,
-        ) as stream:
-            for text in stream.text_stream:
-                if text:
-                    yield text, stop_reason
-            final_message = stream.get_final_message()
-            stop_reason = final_message.stop_reason
-        # 最后 yield 确保调用方拿到 stop_reason
-        yield "", stop_reason
+        # Bedrock 转发网关可能在进入 stream context 时才返回 400，
+        # 也可能在已输出部分 token 后中断 chunked 连接。前者补字段重试；
+        # 后者把已收到内容作为 assistant 上下文续传，避免重新生成导致代码重复。
+        from backend.utils.ai_retry import is_transient_ai_error
+        import time as _time
+        transport_attempts, retry_delay = self._claude_transport_retry_settings()
+        transport_failures = 0
+        request_messages = messages
+        received_text = ""
+        while True:
+            stop_reason = None
+            attempt_text = ""
+            extra_body = self._claude_extra_body(kwargs)
+            thinking = kwargs.get("thinking", getattr(self, "thinking", None))
+            try:
+                with self._client.messages.stream(
+                    model=self.model,
+                    max_tokens=max_tokens or max(self.max_tokens, 64000),
+                    **({} if _model_omits_temperature(self.model) else {"temperature": temperature}),
+                    system=system_prompt,
+                    messages=request_messages,
+                    **({"thinking": thinking} if thinking else {}),
+                    **({"extra_body": extra_body} if extra_body else {}),
+                    **filtered_kwargs,
+                ) as stream:
+                    # text_stream 只暴露 text_delta，会静默吞掉 Claude 的 thinking_delta。
+                    # 直接遍历原始事件，同时兼容新版 SDK 在原始 delta 后追加的合成
+                    # text/thinking 事件（用 skip 标记防止同一 token 重复）。
+                    try:
+                        event_iter = iter(stream)
+                    except TypeError:
+                        event_iter = None
+
+                    if event_iter is None:
+                        # 旧版/定制 SDK 没有事件迭代器时保持原来的文本流能力。
+                        for text in stream.text_stream:
+                            if text:
+                                attempt_text += text
+                                received_text += text
+                                yield text, stop_reason
+                    else:
+                        skip_synthetic_text = False
+                        skip_synthetic_thinking = False
+
+                        def _field(obj, name, default=None):
+                            if isinstance(obj, dict):
+                                return obj.get(name, default)
+                            return getattr(obj, name, default)
+
+                        for event in event_iter:
+                            event_type = _field(event, "type", "")
+                            if event_type == "content_block_delta":
+                                delta = _field(event, "delta")
+                                delta_type = _field(delta, "type", "")
+                                if delta_type == "text_delta":
+                                    text = _field(delta, "text", "") or ""
+                                    if text:
+                                        attempt_text += text
+                                        received_text += text
+                                        yield text, stop_reason
+                                    skip_synthetic_text = True
+                                elif delta_type == "thinking_delta":
+                                    thinking = _field(delta, "thinking", "") or ""
+                                    if thinking and thinking_callback:
+                                        thinking_callback(thinking)
+                                    skip_synthetic_thinking = True
+                                # signature_delta 仅用于协议校验，不展示、不混入代码。
+                            elif event_type == "text":
+                                # 新版 SDK 会在 raw text_delta 后紧跟一个合成 text 事件。
+                                if skip_synthetic_text:
+                                    skip_synthetic_text = False
+                                    continue
+                                text = _field(event, "text", "") or ""
+                                if text:
+                                    attempt_text += text
+                                    received_text += text
+                                    yield text, stop_reason
+                            elif event_type == "thinking":
+                                if skip_synthetic_thinking:
+                                    skip_synthetic_thinking = False
+                                    continue
+                                thinking = _field(event, "thinking", "") or ""
+                                if thinking and thinking_callback:
+                                    thinking_callback(thinking)
+                    final_message = stream.get_final_message()
+                    stop_reason = final_message.stop_reason
+                yield "", stop_reason
+                return
+            except Exception as exc:
+                if not attempt_text and self._enable_bedrock_anthropic_version(exc):
+                    continue
+                if not attempt_text and self._downgrade_thinking_after_validation(exc):
+                    continue
+                transport_failures += 1
+                if (not is_transient_ai_error(exc) or
+                        transport_failures >= transport_attempts):
+                    raise
+
+                # 有部分输出时请模型从断点续传；完全没有输出则原请求重试。
+                if received_text:
+                    request_messages = list(messages) + [
+                        {"role": "assistant", "content": received_text},
+                        {
+                            "role": "user",
+                            "content": (
+                                "上一次响应因网络连接中断。请严格从已输出内容的"
+                                "末尾继续，不要重复任何已输出内容。"
+                            ),
+                        },
+                    ]
+                else:
+                    request_messages = messages
+
+                delay = retry_delay * (2 ** (transport_failures - 1))
+                logger.warning(
+                    "Claude 流式连接中断，已收到 %d 字符，%.1f 秒后%s"
+                    "（%d/%d）: %s",
+                    len(received_text), delay,
+                    "从断点续传" if received_text else "原请求重试",
+                    transport_failures, transport_attempts - 1, exc,
+                )
+                _time.sleep(delay)
 
     def generate_code(self, prompt: str, **kwargs) -> str:
         """生成代码（流式接收避免超时，max_tokens截断时循环续写，完成后再检查代码完整性）"""
@@ -1616,8 +2040,7 @@ if __name__ == "__main__":
                     thinking_callback: callable = None, **kwargs) -> str:
         """流式对话接口。
 
-        thinking_callback: 仅兼容统一调用签名（Claude 的思考在 content blocks 内，
-        无独立 reasoning_content 流，暂不透传；必须显式接住，否则会误传给 API 报错）。
+        thinking_callback: Claude thinking_delta 逐块回调，与正式内容分开。
         """
         anthropic_messages = []
         system_message = ""
@@ -1627,12 +2050,14 @@ if __name__ == "__main__":
             else:
                 anthropic_messages.append({"role": msg["role"], "content": msg["content"]})
 
+        requested_max_tokens = kwargs.get("max_tokens") or self.max_tokens
         filtered_kwargs = {k: v for k, v in kwargs.items()
                            if k not in ("model", "messages", "max_tokens", "system", "thinking_callback")}
         full_content = ""
         for text_chunk, _sr in self._claude_chat_stream(
             system_message or "", anthropic_messages,
-            max_tokens=self.max_tokens, **filtered_kwargs
+            max_tokens=requested_max_tokens, thinking_callback=thinking_callback,
+            **filtered_kwargs,
         ):
             if text_chunk:
                 full_content += text_chunk
@@ -1654,8 +2079,7 @@ if __name__ == "__main__":
         Args:
             prompt: 提示词
             chunk_callback: 每个chunk的回调函数
-            thinking_callback: 仅兼容统一签名（Claude 思考在 content blocks 内，无
-                独立 reasoning_content 流，暂不透传；显式接住避免误传给 API）
+            thinking_callback: Claude thinking_delta 逐块回调，与代码内容分离
             **kwargs: 其他参数
 
         Yields:
@@ -1694,7 +2118,10 @@ if __name__ == "__main__":
                 current_chunk = ""
                 stop_reason = None
 
-                for text_chunk, sr in self._claude_chat_stream(system_prompt, messages, max_tokens=effective_max_tokens, **kwargs):
+                for text_chunk, sr in self._claude_chat_stream(
+                    system_prompt, messages, max_tokens=effective_max_tokens,
+                    thinking_callback=thinking_callback, **kwargs,
+                ):
                     if text_chunk:
                         current_chunk += text_chunk
                         full_raw_response += text_chunk
@@ -1739,7 +2166,12 @@ if __name__ == "__main__":
                 logger.info(f"ClaudeProvider: 流式代码不完整，第 {retry+1} 次完整性续写")
                 continuation_prompt = self._build_continuation_prompt(prompt, extracted_code)
                 new_raw = ""
-                for text_chunk, _ in self._claude_chat_stream(system_prompt, [{"role": "user", "content": continuation_prompt}], max_tokens=effective_max_tokens):
+                for text_chunk, _ in self._claude_chat_stream(
+                    system_prompt,
+                    [{"role": "user", "content": continuation_prompt}],
+                    max_tokens=effective_max_tokens,
+                    thinking_callback=thinking_callback,
+                ):
                     if text_chunk:
                         new_raw += text_chunk
                         if chunk_callback:
@@ -1798,6 +2230,12 @@ class DeepSeekProvider(OpenAIProvider):
         self.model = config.get("model") or os.getenv("DEEPSEEK_MODEL") or "deepseek-chat"
         self.max_tokens = config.get("max_tokens", int(os.getenv("DEEPSEEK_MAX_TOKENS", "80000")))
         self.timeout = int(config.get("timeout", os.getenv("DEEPSEEK_TIMEOUT", "300")))
+        # DeepSeek 等 OpenAI 兼容服务仍使用 Chat Completions，并保留
+        # reasoning_content 的现有解析逻辑。
+        self.api_mode = "chat"
+        self.reasoning_effort = None
+        self.reasoning_summary = None
+        self.verbosity = None
 
         # 创建 OpenAI 客户端（DeepSeek 兼容 OpenAI API）
         from openai import OpenAI
@@ -2025,9 +2463,16 @@ class AIProviderFactory:
                 "api_key": os.getenv("ANTHROPIC_API_KEY"),
                 "base_url": os.getenv("ANTHROPIC_BASE_URL"),
                 "model": model_name,
-                "max_tokens": int(os.getenv("ANTHROPIC_MAX_TOKENS", "8000")),
+                # Opus 5 的 thinking 和长代码共享输出额度；max_tokens 只是上限，
+                # 提高默认值可避免智训代码在 8K 附近被截断。
+                "max_tokens": int(os.getenv("ANTHROPIC_MAX_TOKENS", "64000")),
+                "anthropic_version": (
+                    os.getenv("ANTHROPIC_VERSION")
+                    or os.getenv("ANTHROPIC_BEDROCK_VERSION")
+                ),
             }
-            # 新模型（Claude 4.x / Fable）不接受 temperature；其他模型若 .env 配置了则读取
+            # 新模型（Claude 4.x 新版 / Claude 5+ / Fable）不接受 temperature；
+            # 其他模型若 .env 配置了则读取。
             if not _model_omits_temperature(model_name) and os.getenv("ANTHROPIC_TEMPERATURE"):
                 claude_cfg["temperature"] = float(os.getenv("ANTHROPIC_TEMPERATURE"))
             config.update(claude_cfg)

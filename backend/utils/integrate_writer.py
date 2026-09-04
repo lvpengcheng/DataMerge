@@ -5,7 +5,8 @@
   往返（会丢公式/坏格式，触发数字+日期格式的 1900 闰年错位）。
 - 逐行按【绝对行号 data_row_start..data_row_end】读 A 的关联键单元格（不依赖 parser 的
   region.data 位置——它会跳过空行/汇总行导致位置错位）；汇总/空行的键匹配不到源自然跳过。
-- 覆盖只写【值】：命中源则 PutValue 覆盖（A 原有公式被替换为值），未命中/空值保留 A 原值。
+- 覆盖只写【值】：命中源则 PutValue 覆盖（A 原有公式被替换为值）；普通映射未命中
+  保留 A 原值，跨表公式的所有引用都未命中时明确清空目标格。
 - 长数字文本（身份证/卡号等）设 '@' 文本格式写入，避免科学计数/丢精度。
 """
 
@@ -18,7 +19,7 @@ from Aspose.Cells import Workbook, SaveFormat  # type: ignore
 from openpyxl.utils import column_index_from_string
 
 from .merge_engine import normalize_key
-from .integrate_engine import resolve_overwrites
+from .integrate_engine import CLEAR_CELL, resolve_overwrites
 from .source_sheet_writer import is_long_digit_text
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,17 @@ def _read_cell_str(cell) -> str:
 
 def _put_value(cell, value):
     """写值到单元格（只写值，替换任何原公式）。长数字文本设 '@' 文本格式防科学计数。"""
+    if value is CLEAR_CELL:
+        # None 在本模块一直表示“不写，保留原值”，因此用独立哨兵值
+        # 表示跨表公式的所有引用都缺失，需要真正清空已有单元格。
+        try:
+            cell.Value = None
+        except Exception:
+            try:
+                cell.PutValue("")
+            except Exception:
+                logger.warning("[integrate] 清空单元格失败，跳过")
+        return
     if value is None:
         return
     # 长数字文本（身份证/银行卡/手机号）→ 文本格式
