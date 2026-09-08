@@ -50,6 +50,9 @@ bcrypt==4.0.1
 # Aspose.Cells .NET 桥接
 pythonnet==3.0.5
 
+# 运行时：生成代码作用域检查（不能随开发工具跳过）
+pyflakes==3.1.0
+
 # 开发工具（Docker构建时可跳过）
 pytest==7.4.3
 pytest-asyncio==0.21.1

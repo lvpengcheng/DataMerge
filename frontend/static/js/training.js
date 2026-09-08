@@ -37,6 +37,8 @@ function _resetHistoryPaging() {
 // 在切租户/切会话/新建/删除/提交完成等"开始下一轮操作"前调用
 function _resetUploadState() {
     _filePasswordsMap = {};
+    const updateMode = document.getElementById('source-update-mode');
+    if (updateMode) updateMode.value = 'merge';
     ['source-files', 'target-file', 'rule-files'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.value = '';
@@ -156,8 +158,8 @@ function _applyTenantPermission() {
     // 故前端不做灰化,避免误把"全新租户名"判定为无权。
     const sendBtn = document.getElementById('send-btn');
     const genBtn = document.getElementById('generate-btn');
-    if (sendBtn && !_isStreaming) { sendBtn.disabled = false; sendBtn.title = ''; }
-    if (genBtn && !_isStreaming) { genBtn.disabled = false; genBtn.title = ''; }
+    if (sendBtn && !_isStreaming && !_savingAssets) { sendBtn.disabled = false; sendBtn.title = ''; }
+    if (genBtn && !_isStreaming && !_savingAssets) { genBtn.disabled = false; genBtn.title = ''; }
 }
 
 function _showTenantDropdown() {
@@ -218,7 +220,9 @@ async function loadAiProviderOptions() {
         const data = await resp.json();
         const items = (data.items || []).filter(p => p.enabled);
         if (!items.length) return;   // 未配置时保持默认
-        sel.innerHTML = items.map(p => `<option value="${p.key}">${p.label}${p.key === 'claude' ? ' (推荐)' : ''}</option>`).join('');
+        const previous = sel.value;
+        sel.replaceChildren(...items.map(p => new Option(p.label, p.key)));
+        if (Array.from(sel.options).some(o => o.value === previous)) sel.value = previous;
     } catch (e) {
         console.warn('加载AI模型列表失败:', e);
     }
@@ -320,6 +324,8 @@ function _statusText(status) {
 }
 
 function createNewSession() {
+    if (_savingAssets) return;
+    _sessionSettings = null;
     // 允许手动输入租户名称
     if (!_currentTenantId) {
         const typed = document.getElementById('tenant-input').value.trim();
@@ -411,7 +417,7 @@ async function _promptScriptName(tenantId) {
 }
 
 async function selectSession(sessionId) {
-    if (_isStreaming) return;
+    if (_isStreaming || _savingAssets) return;
     _pendingScriptName = null;  // 切换到已存在会话，不再需要新建命名
     _resetUploadState();
     _resetHistoryPaging();
@@ -432,6 +438,7 @@ async function selectSession(sessionId) {
 
         // 显示原始训练文件信息
         _showSessionFilesInfo(data);
+        _restoreSessionSettings(data.settings);
 
         // 合并消息 + 迭代记录，构建完整时间线（首屏最近 5 轮）
         _renderFullHistory(data.messages || [], data.iterations || []);
@@ -455,7 +462,7 @@ async function selectSession(sessionId) {
         }
         // 如果训练文件已丢失，提示用户
         if (!canRetrain && data.session.total_iterations > 0) {
-            _addSystemMessage('训练源文件已丢失，如需继续训练请创建新会话并重新上传文件。', 'status', { error: true });
+            _addSystemMessage('部分训练文件未找到，可在“文件与配置”中补充上传后继续本会话。', 'status', { error: true });
         }
 
         // 更新头部
@@ -852,6 +859,8 @@ function _finishCodeStream() {
 }
 
 function _clearChatUI() {
+    document.getElementById('session-assets').style.display = 'none';
+    document.getElementById('session-asset-actions').style.display = 'none';
     const container = document.getElementById('chat-messages');
     container.innerHTML = `
         <div class="chat-placeholder" id="chat-placeholder">
@@ -900,6 +909,7 @@ function _hideActionButtons() {
 
 // ==================== 发送消息 ====================
 function sendMessage(action) {
+    if (_savingAssets) return;
     const input = document.getElementById('chat-input');
     const text = input.value.trim();
     if (_isStreaming) return;
@@ -1002,7 +1012,6 @@ function _submitStartTraining(userText, sourceFiles, targetFile, ruleFiles,
     if (_currentSessionId) formData.append('session_id', _currentSessionId);
     if (Object.keys(_filePasswordsMap).length > 0) {
         formData.append('file_passwords', JSON.stringify(_filePasswordsMap));
-        console.log('[训练] file_passwords:', JSON.stringify(_filePasswordsMap));
     }
     if (selectedSheets && selectedSheets.length > 0) {
         formData.append('target_sheets', JSON.stringify(selectedSheets));
@@ -1130,7 +1139,8 @@ function closeSheetPicker(cancelled) {
     }
 }
 
-function _sendChatMessage(text, action) {
+async function _sendChatMessage(text, action) {
+    if (!await saveSessionAssets()) return;
     const ruleFiles = document.getElementById('rule-files').files;
 
     const formData = new FormData();
@@ -1149,16 +1159,13 @@ function _sendChatMessage(text, action) {
     });
 }
 
-function _sendRegenerateMessage(text) {
+async function _sendRegenerateMessage(text) {
+    if (!await saveSessionAssets()) return;
     const sourceFiles = document.getElementById('source-files').files;
     const targetFile = document.getElementById('target-file').files[0];
     const ruleFiles = document.getElementById('rule-files').files;
 
     const hasAny = (sourceFiles && sourceFiles.length > 0) || !!targetFile || (ruleFiles && ruleFiles.length > 0);
-    if (!hasAny) {
-        const ok = confirm('未选择新文件。继续将使用原有文件重新生成代码（追加为新一轮迭代）。是否继续？');
-        if (!ok) return;
-    }
 
     const formData = new FormData();
     formData.append('message', text || '使用新文件重新生成');
@@ -1246,6 +1253,7 @@ async function _fetchTrainingSSE(url, options) {
         }
     } finally {
         _setUIStreaming(false);
+        refreshSessionAssets();
     }
 }
 
@@ -1263,6 +1271,7 @@ function _handleSSEEvent(event) {
 
         case 'session_created':
             _currentSessionId = event.session_id;
+            refreshSessionAssets();
             document.getElementById('chat-title').textContent = `训练 #${event.session_id}`;
             // 刷新租户列表（新租户目录可能刚被创建）
             _loadTenants();
@@ -1552,64 +1561,7 @@ function _showAnalyzeDiffButton() {
 }
 
 function _showSessionFilesInfo(data) {
-    const container = document.getElementById('chat-messages');
-    const placeholder = document.getElementById('chat-placeholder');
-    if (placeholder) placeholder.style.display = 'none';
-
-    const sourceNames = data.source_file_names || [];
-    const expectedName = data.expected_file_name;
-    if (sourceNames.length === 0 && !expectedName) return;
-
-    const msgDiv = document.createElement('div');
-    msgDiv.className = 'message system files-info';
-
-    const label = document.createElement('div');
-    label.className = 'message-label';
-    label.textContent = '训练文件';
-
-    const contentDiv = document.createElement('div');
-    contentDiv.className = 'message-content session-files-content';
-
-    // 源文件列表 + 下载
-    if (sourceNames.length > 0) {
-        const srcSection = document.createElement('div');
-        srcSection.className = 'files-section';
-        srcSection.innerHTML = '<strong>源文件:</strong> ';
-        sourceNames.forEach(fn => {
-            const link = document.createElement('a');
-            link.className = 'file-download-link';
-            link.textContent = fn;
-            link.href = '#';
-            link.onclick = (e) => {
-                e.preventDefault();
-                _downloadOriginalFile(_currentSessionId, 'source', fn);
-            };
-            srcSection.appendChild(link);
-            srcSection.appendChild(document.createTextNode(' '));
-        });
-        contentDiv.appendChild(srcSection);
-    }
-
-    // 预期文件 + 下载
-    if (expectedName) {
-        const expSection = document.createElement('div');
-        expSection.className = 'files-section';
-        expSection.innerHTML = '<strong>预期文件:</strong> ';
-        const link = document.createElement('a');
-        link.className = 'file-download-link';
-        link.textContent = expectedName;
-        link.href = '#';
-        link.onclick = (e) => {
-            e.preventDefault();
-            _downloadOriginalFile(_currentSessionId, 'expected');
-        };
-        expSection.appendChild(link);
-        contentDiv.appendChild(expSection);
-    }
-
-    msgDiv.appendChild(label);
-    msgDiv.appendChild(contentDiv);
-    container.appendChild(msgDiv);
+    _renderSessionAssets(data);
 }
 
 /**
@@ -1951,9 +1903,9 @@ function _setUIStreaming(streaming) {
     const sendBtn = document.getElementById('send-btn');
     const genBtn = document.getElementById('generate-btn');
     const regenBtn = document.getElementById('regenerate-btn');
-    sendBtn.disabled = streaming;
-    if (genBtn) genBtn.disabled = streaming;
-    if (regenBtn) regenBtn.disabled = streaming;
+    sendBtn.disabled = streaming || _savingAssets;
+    if (genBtn) genBtn.disabled = streaming || _savingAssets;
+    if (regenBtn) regenBtn.disabled = streaming || _savingAssets;
     if (streaming) {
         sendBtn.textContent = '处理中...';
     } else {
@@ -1986,7 +1938,7 @@ async function setBestCode() {
         }
         const data = await resp.json();
         _addSystemMessage(
-            `已设为最佳脚本 (v${data.version}，准确率 ${(data.accuracy * 100).toFixed(1)}%)`,
+            `已人工选定最佳脚本 (v${data.version}，实测准确率 ${(data.accuracy * 100).toFixed(1)}%)`,
             'status', { accuracy: data.accuracy }
         );
         _updateChatStatus('completed');

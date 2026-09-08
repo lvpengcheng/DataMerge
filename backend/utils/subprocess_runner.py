@@ -28,6 +28,10 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional
+from backend.utils.resource_guard import (
+    kill_tree as _kill_tree, terminate_process, process_group_options,
+    memory_limit_mb, wait_for_memory, ensure_healthy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,19 +40,19 @@ _PROJ_ROOT = str(Path(__file__).resolve().parent.parent.parent)
 
 # 并发上限：最多同时跑 N 个子进程，防止多任务并发时子进程内存叠加（N × 1GB 以内可控）。
 # 其余调用排队等待（排队有上限 SUBPROCESS_QUEUE_TIMEOUT，满负载返回"系统繁忙"而非无限等）。
-# N 用 lazy 信号量：首次使用时才从 .env SUBPROCESS_CONCURRENCY 读取（默认 3），
+# N 用 lazy 信号量：首次使用时才从 .env SUBPROCESS_CONCURRENCY 读取（默认 1），
 # 避免模块 import 时 .env 尚未加载（load_dotenv 在应用启动早期执行）导致配置读不到。
 _semaphore = None
 _semaphore_lock = threading.Lock()
 
 
 def _get_semaphore() -> threading.Semaphore:
-    """lazy 创建并发信号量：读 .env SUBPROCESS_CONCURRENCY（默认 3）。"""
+    """lazy 创建并发信号量：读 .env SUBPROCESS_CONCURRENCY（默认 1）。"""
     global _semaphore
     if _semaphore is None:
         with _semaphore_lock:
             if _semaphore is None:
-                _semaphore = threading.Semaphore(env_int("SUBPROCESS_CONCURRENCY", 3))
+                _semaphore = threading.Semaphore(max(1, env_int("SUBPROCESS_CONCURRENCY", 1)))
     return _semaphore
 
 
@@ -67,8 +71,8 @@ def env_int(name: str, default: int) -> int:
 
 
 def default_max_memory_mb() -> int:
-    """默认子进程内存上限（MB），由 .env SUBPROCESS_MAX_MEMORY_MB 控制，默认 4096。"""
-    return env_int("SUBPROCESS_MAX_MEMORY_MB", 4096)
+    """默认子进程内存上限（MB），由 .env SUBPROCESS_MAX_MEMORY_MB 控制，默认 0 表示自动预算。"""
+    return env_int("SUBPROCESS_MAX_MEMORY_MB", 0)
 
 
 def default_timeout(kind: str) -> int:
@@ -142,32 +146,6 @@ def _process_rss_mb(pid: int) -> float:
         k32.CloseHandle(handle)
 
 
-def _kill_tree(pid: int) -> None:
-    """强杀进程树。Windows 用 taskkill /F /T（连子进程一起杀）；其他平台 SIGKILL。"""
-    if sys.platform == "win32":
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                capture_output=True, timeout=10,
-            )
-            return
-        except Exception as e:
-            logger.warning(f"[subproc] taskkill 失败（回退 TerminateProcess）: {e}")
-            import ctypes
-            try:
-                handle = ctypes.windll.kernel32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
-                if handle:
-                    ctypes.windll.kernel32.TerminateProcess(handle, 1)
-                    ctypes.windll.kernel32.CloseHandle(handle)
-            except Exception:
-                pass
-            return
-    try:
-        os.kill(pid, 9)
-    except Exception:
-        pass
-
-
 @dataclass
 class SubprocessResult:
     """子进程执行结果。success=False 时 result=None，error 含明确原因。"""
@@ -176,6 +154,8 @@ class SubprocessResult:
     error: str = ""
     timed_out: bool = False          # 超时被杀
     killed_by_memory: bool = False   # 内存超限被杀
+    termination_failed: bool = False
+    peak_memory_mb: float = 0.0
     duration: float = 0.0
     log_lines: list = field(default_factory=list)
 
@@ -184,177 +164,108 @@ class SubprocessResult:
         return self.timed_out or self.killed_by_memory
 
 
-def _run_single(
-    entry: str,
-    args: tuple,
-    kwargs: dict,
-    timeout: float,
-    max_memory_mb: int,
-    progress_cb,
-) -> SubprocessResult:
-    """单任务模式：每次调用起全新子进程（WorkerPool 不可用时的回退路径）。"""
-    max_memory_mb = default_max_memory_mb() if max_memory_mb is None else max_memory_mb
-    kwargs = dict(kwargs or {})
-    if progress_cb is not None:
-        kwargs[_PROGRESS_MARK] = True   # 移除真函数（不可 pickle），子进程侧替换为 stdout 包装
-    else:
-        kwargs.pop("progress_cb", None)
-
+def _run_single(entry, args, kwargs, timeout, max_memory_mb, progress_cb,
+                cancel_event=None) -> SubprocessResult:
+    """Isolated process with finite queue, execution, pipe drain and kill deadlines."""
     res = SubprocessResult()
-    t0 = time.time()
-    state = {"result_path": None, "error_b64": None, "start_error": None,
-             "killed_by_memory": False}
-    done = threading.Event()
-
-    # 并发上限排队：等待空位（最多 queue_timeout 秒，满了返回"系统繁忙"而非无限等）。
-    # 注意：本函数是同步阻塞的——async 端点请用 run_in_subprocess_async，否则会冻结事件循环。
-    _sem = _get_semaphore()
-    if not _sem.acquire(timeout=queue_timeout()):
-        res.error = (f"系统繁忙：并发计算任务已满（上限 "
-                     f"{env_int('SUBPROCESS_CONCURRENCY', 3)}），排队超过 "
-                     f"{queue_timeout()}s，请稍后重试")
-        logger.warning(f"[subproc/{entry}] {res.error}")
+    started = time.monotonic()
+    sem = _get_semaphore()
+    if not sem.acquire(timeout=queue_timeout()):
+        res.error = "Excel 执行槽排队超时，请稍后重试"
         return res
     proc = None
     params_file = None
-    mem_thread = None
+    done = threading.Event()
+    state = {"result_path": None, "error_b64": None}
     try:
-        # 1) 参数 pickle 到临时文件
-        fd, params_file = tempfile.mkstemp(suffix=".json", prefix="subproc_params_")
+        wait_for_memory(queue_timeout(), cancel_event)
+        if cancel_event and cancel_event.is_set():
+            raise RuntimeError("任务已取消")
+        cap = memory_limit_mb(default_max_memory_mb() if max_memory_mb is None else max_memory_mb)
+        kwargs = dict(kwargs or {})
+        if progress_cb:
+            kwargs[_PROGRESS_MARK] = True
+        else:
+            kwargs.pop("progress_cb", None)
+        fd, params_file = tempfile.mkstemp(suffix=".pkl", prefix="subproc_params_")
         with os.fdopen(fd, "wb") as f:
-            pickle.dump({"entry": entry, "args": args, "kwargs": kwargs}, f,
-                        protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump({"entry": entry, "args": args, "kwargs": kwargs}, f, protocol=pickle.HIGHEST_PROTOCOL)
+        env = os.environ.copy()
+        env.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+        proc = subprocess.Popen(
+            [sys.executable, "-u", "-m", "backend.utils.subprocess_worker", params_file],
+            cwd=_PROJ_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=env, **process_group_options())
 
-        # 2) 主线程启动子进程（reader 线程只读管道，避免 proc 就绪竞态）
-        try:
-            env = os.environ.copy()
-            env["PYTHONIOENCODING"] = "utf-8"   # 与智算子进程一致，避免 Windows GBK 乱码
-            env["PYTHONUTF8"] = "1"
-            proc = subprocess.Popen(
-                [sys.executable, "-u", "-m", "backend.utils.subprocess_worker", params_file],
-                cwd=_PROJ_ROOT,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                env=env,
-            )
-        except Exception as e:
-            state["start_error"] = e
-
-        def _reader():
+        def read_output():
             try:
                 for raw in proc.stdout:
                     line = raw.decode("utf-8", "replace").rstrip("\r\n")
-                    if line.startswith("@@PROG@@"):
-                        msg = line[len("@@PROG@@"):]
-                        if progress_cb:
-                            try:
-                                progress_cb(msg)
-                            except Exception:
-                                pass
-                    elif line.startswith("@@RESULT@@"):
+                    if line.startswith("@@RESULT@@"):
                         state["result_path"] = line[len("@@RESULT@@"):]
                     elif line.startswith("@@ERROR@@"):
                         state["error_b64"] = line[len("@@ERROR@@"):]
+                    elif line.startswith("@@PROG@@"):
+                        if progress_cb:
+                            try:
+                                progress_cb(line[len("@@PROG@@"):])
+                            except Exception:
+                                pass
                     elif line.strip():
                         res.log_lines.append(line)
-                        logger.debug(f"[subproc/{entry}] {line}")
-                proc.wait()
-            except Exception as e:
-                state["start_error"] = e
+                        if len(res.log_lines) > 2000:
+                            del res.log_lines[:1000]
             finally:
                 done.set()
 
-        _t = threading.Thread(target=_reader, name=f"subproc-{entry.rsplit(':', 1)[-1]}", daemon=True)
-        _t.start()
-
-        if state["start_error"] is not None:
-            done.set()   # 启动失败：让监控线程退出，走错误分支
-
-        # 3) 内存监控线程：每秒轮询 RSS，超限强杀
-        def _mem_watchdog():
-            while not done.is_set():
-                if proc is None or proc.poll() is not None:
-                    return
-                try:
-                    rss = _process_rss_mb(proc.pid)
-                    if rss > max_memory_mb:
-                        logger.error(
-                            f"[subproc/{entry}] 内存超限 {rss:.0f}MB > {max_memory_mb}MB，强杀")
-                        state["killed_by_memory"] = True
-                        _kill_tree(proc.pid)
-                        return
-                except Exception:
-                    pass
-                time.sleep(0.5)
-
-        if max_memory_mb and max_memory_mb > 0:
-            mem_thread = threading.Thread(target=_mem_watchdog,
-                                          name=f"subproc-mem-{entry.rsplit(':', 1)[-1]}",
-                                          daemon=True)
-            mem_thread.start()
-
-        # 4) 等待完成（真超时）
-        timed_out = False
-        if state["start_error"] is None:
-            if timeout and timeout > 0:
-                try:
-                    proc.wait(timeout=timeout)
-                except subprocess.TimeoutExpired:
-                    timed_out = True
-                    logger.error(f"[subproc/{entry}] 执行超时（{timeout}s），强杀")
-                    _kill_tree(proc.pid)
-                    proc.wait()   # 收尸；reader 线程随后因 stdout EOF 自然结束
-            else:
-                proc.wait()
-
-        done.wait()
-
-        res.duration = time.time() - t0
-
-        # 4) 结果/错误
-        if state["start_error"] is not None:
-            res.error = f"子进程启动/读取失败: {state['start_error']}"
-            logger.error(f"[subproc/{entry}] {res.error}")
-        elif state["killed_by_memory"]:
-            res.killed_by_memory = True
-            res.error = f"内存超限被杀（上限 {max_memory_mb}MB）"
-        elif timed_out:
-            res.timed_out = True
-            res.error = f"执行超时（{timeout}s），已强杀"
-        elif state["error_b64"]:
-            try:
-                tb = base64.b64decode(state["error_b64"]).decode("utf-8", "replace")
-            except Exception:
-                tb = state["error_b64"]
-            res.error = tb.strip()
-            logger.error(f"[subproc/{entry}] 子进程异常: {tb.strip().splitlines()[-1] if tb.strip() else '未知'}")
-        elif state["result_path"] and os.path.exists(state["result_path"]):
-            try:
-                with open(state["result_path"], "rb") as f:
-                    res.result = pickle.load(f)
-                res.success = True
-            except Exception as e:
-                res.error = f"结果反序列化失败: {e}"
-                logger.error(f"[subproc/{entry}] {res.error}")
-            finally:
-                try:
-                    os.remove(state["result_path"])
-                except Exception:
-                    pass
-        else:
-            rc = proc.returncode if proc is not None else None
-            res.error = f"子进程退出(code={rc})，无结果"
-            logger.error(f"[subproc/{entry}] {res.error}")
-    finally:
-        _get_semaphore().release()
-        try:
-            if params_file and os.path.exists(params_file):
-                os.remove(params_file)
-        except Exception:
-            pass
-        if proc is not None and proc.poll() is None:
+        threading.Thread(target=read_output, daemon=True, name="excel-output").start()
+        deadline = time.monotonic() + (timeout if timeout and timeout > 0 else 3600)
+        while proc.poll() is None:
+            rss = _process_rss_mb(proc.pid)
+            current_cap = memory_limit_mb(cap, rss)
+            res.peak_memory_mb = max(res.peak_memory_mb, rss)
+            if cancel_event and cancel_event.is_set():
+                res.error = "任务已取消"
+                break
+            if rss > current_cap:
+                res.killed_by_memory = True
+                res.error = f"任务内存超过安全预算 {current_cap}MB（峰值 {rss:.0f}MB）"
+                break
+            if time.monotonic() >= deadline:
+                res.timed_out = True
+                res.error = f"执行超时（{timeout}s）"
+                break
+            time.sleep(0.2)
+        if res.error:
+            res.termination_failed = not terminate_process(proc)
+            res.error += "；进程未退出，已暂停派发新任务，请检查存储 I/O" if res.termination_failed else "；进程已终止"
+        elif not done.wait(timeout=2):
+            res.error = "进程退出后输出管道未关闭，结果不完整"
             _kill_tree(proc.pid)
-
+        elif proc.returncode != 0:
+            res.error = f"子进程异常退出(code={proc.returncode})"
+        elif state["error_b64"]:
+            res.error = base64.b64decode(state["error_b64"]).decode("utf-8", "replace").strip()
+        elif state["result_path"]:
+            with open(state["result_path"], "rb") as f:
+                res.result = pickle.load(f)
+            res.success = True
+        else:
+            res.error = "子进程未返回结果"
+    except Exception as exc:
+        res.error = f"子进程执行失败: {exc}"
+    finally:
+        if proc is not None and proc.poll() is None and not res.termination_failed:
+            res.termination_failed = not terminate_process(proc)
+        if not res.termination_failed:
+            for path in (params_file, state["result_path"]):
+                if path:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+        res.duration = time.monotonic() - started
+        sem.release()
     return res
 
 
@@ -384,23 +295,27 @@ class _WorkerSlot:
         self.proc = subprocess.Popen(
             [sys.executable, "-u", "-m", "backend.utils.subprocess_worker", "--daemon"],
             cwd=_PROJ_ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, env=env, bufsize=0)
+            stderr=subprocess.STDOUT, env=env, bufsize=0, **process_group_options())
         self.dead = False
-        self.reader = threading.Thread(target=self._read_loop, daemon=True,
+        self.reader = threading.Thread(target=self._read_loop, args=(self.proc,), daemon=True,
                                        name=f"pool-reader-{self.idx}")
         self.reader.start()
 
     def restart(self):
         """崩溃/被杀后重启补位（pending 任务已由 kill/EOF 置完成）。"""
+        ensure_healthy()
+        if self.proc is not None and self.proc.poll() is None:
+            if not terminate_process(self.proc):
+                ensure_healthy()
         try:
             self.start()
         except Exception as e:
             logger.error(f"[subproc-pool/{self.idx}] worker 重启失败: {e}")
             self.dead = True
 
-    def _read_loop(self):
+    def _read_loop(self, proc):
         try:
-            for raw in self.proc.stdout:
+            for raw in proc.stdout:
                 line = raw.decode("utf-8", "replace").rstrip("\r\n")
                 if line.startswith("@@READY@@"):
                     continue
@@ -430,6 +345,8 @@ class _WorkerSlot:
         finally:
             # EOF = worker 退出：pending 任务全部置失败（父进程 wait 返回）
             with self.lock:
+                if self.proc is not proc:
+                    return  # An old reader must never invalidate its replacement.
                 self.dead = True
                 for tid, ctx in self.pending.items():
                     if not ctx["event"].is_set():
@@ -459,11 +376,9 @@ class _WorkerSlot:
                     ctx["error_b64"] = base64.b64encode("worker 被强杀（超时/内存超限）".encode("utf-8"))
                     ctx["event"].set()
             self.pending.clear()
-        try:
-            _kill_tree(self.proc.pid)
-        except Exception:
-            pass
-        self.restart()
+        # Reap first; defer replacement until the next admitted task needs it.
+        return terminate_process(self.proc)
+
 
 
 class _WorkerPool:
@@ -476,18 +391,21 @@ class _WorkerPool:
 
     def _acquire_slot(self) -> "_WorkerSlot":
         """等一个空闲 slot（死亡的自动重启）。"""
-        while True:
+        deadline = time.monotonic() + queue_timeout()
+        while time.monotonic() < deadline:
+            ensure_healthy()
             for slot in self.slots:
                 with slot.lock:
-                    if slot.dead or slot.proc is None or slot.proc.poll() is not None:
+                    if slot.idle and (slot.dead or slot.proc is None or slot.proc.poll() is not None):
                         slot.restart()
-                    if slot.idle:
+                    if slot.idle and not slot.dead:
                         slot.idle = False
                         return slot
             time.sleep(0.05)
+        raise RuntimeError("工作进程等待超时")
 
     def run(self, entry: str, args: tuple, kwargs: dict,
-            timeout: float, max_memory_mb: int, progress_cb) -> SubprocessResult:
+            timeout: float, max_memory_mb: int, progress_cb, cancel_event=None) -> SubprocessResult:
         res = SubprocessResult()
         t0 = time.time()
         kwargs = dict(kwargs or {})
@@ -501,16 +419,24 @@ class _WorkerPool:
                          f"排队超过 {queue_timeout()}s，请稍后重试")
             return res
 
+        shared = _get_semaphore()
+        if not shared.acquire(timeout=queue_timeout()):
+            self._sem.release()
+            res.error = "Excel 执行槽排队超时"
+            return res
         slot = None
         params_file = None
-        task_id = f"t{int(time.time() * 1000)}"
+        import uuid
+        task_id = uuid.uuid4().hex
         try:
+            wait_for_memory(queue_timeout(), cancel_event)
             fd, params_file = tempfile.mkstemp(suffix=".pkl", prefix="subproc_params_")
             with os.fdopen(fd, "wb") as f:
                 pickle.dump({"entry": entry, "args": args, "kwargs": kwargs,
                              "task_id": task_id}, f, protocol=pickle.HIGHEST_PROTOCOL)
 
             slot = self._acquire_slot()
+            max_memory_mb = memory_limit_mb(max_memory_mb, _process_rss_mb(slot.proc.pid))
             ctx = {"event": threading.Event(), "result_path": None,
                    "error_b64": None, "progress_cb": progress_cb}
             if not slot.submit(task_id, params_file, ctx):
@@ -519,18 +445,22 @@ class _WorkerPool:
             # 等待 + 超时/内存监控（0.5s 粒度轮询）
             timed_out = False
             killed_mem = False
-            deadline = time.time() + (timeout if (timeout and timeout > 0) else 3600 * 24)
+            deadline = time.monotonic() + (timeout if (timeout and timeout > 0) else 3600)
             while not ctx["event"].is_set():
-                if time.time() > deadline:
+                if cancel_event and cancel_event.is_set():
+                    res.termination_failed = not slot.kill_and_restart()
+                    raise RuntimeError("任务已取消")
+                if time.monotonic() > deadline:
                     timed_out = True
-                    slot.kill_and_restart()
+                    res.termination_failed = not slot.kill_and_restart()
                     break
                 if max_memory_mb and max_memory_mb > 0:
                     try:
                         rss = _process_rss_mb(slot.proc.pid)
-                        if rss > max_memory_mb:
+                        res.peak_memory_mb = max(res.peak_memory_mb, rss)
+                        if rss > memory_limit_mb(max_memory_mb, rss):
                             killed_mem = True
-                            slot.kill_and_restart()
+                            res.termination_failed = not slot.kill_and_restart()
                             break
                     except Exception:
                         pass
@@ -569,16 +499,20 @@ class _WorkerPool:
             res.error = f"子进程池执行异常: {e}"
             logger.error(f"[subproc-pool/{entry}] {res.error}", exc_info=True)
         finally:
+            shared.release()
             self._sem.release()
             if slot is not None:
                 with slot.lock:
                     slot.pending.pop(task_id, None)
                     slot.idle = True
             try:
-                if params_file and os.path.exists(params_file):
+                if not res.termination_failed and params_file and os.path.exists(params_file):
                     os.remove(params_file)
             except Exception:
                 pass
+        if res.termination_failed:
+            res.success = False
+            res.error = "进程在强杀后仍未退出，已暂停派发新任务，请检查存储 I/O"
         return res
 
 
@@ -596,9 +530,11 @@ def _get_pool() -> Optional[_WorkerPool]:
         if _pool is not None or _pool_failed:
             return _pool
         try:
-            # 常驻池与一次性子进程并发分开配置：计算可并发 3 个，但常驻 Aspose
-            # worker 默认只保留 1 个，避免空闲时也常驻多份 .NET 堆内存。
-            size = max(1, env_int("SUBPROCESS_POOL_SIZE", 1))
+            # 低内存环境默认无常驻池；显式开启后仍与一次性进程共享执行槽。
+            size = max(0, env_int("SUBPROCESS_POOL_SIZE", 0))
+            if size == 0:
+                return None
+            wait_for_memory(queue_timeout())
             _pool = _WorkerPool(size)
             logger.info(f"[subproc-pool] 常驻 worker 池已启动（{size} 个，预加载 Aspose）")
             return _pool
@@ -644,6 +580,7 @@ def run_in_subprocess(
     timeout: float = 300,
     max_memory_mb: int = None,
     progress_cb=None,
+    cancel_event=None,
 ) -> SubprocessResult:
     """在独立子进程执行 entry 指向的模块级函数，超时/超内存强杀。
 
@@ -655,48 +592,49 @@ def run_in_subprocess(
     max_memory_mb = default_max_memory_mb() if max_memory_mb is None else max_memory_mb
     if os.environ.get("_IN_SUBPROCESS_WORKER") == "1":
         return _run_entry_sync(entry, args, kwargs, progress_cb)
+    try:
+        ensure_healthy()
+    except RuntimeError as exc:
+        return SubprocessResult(error=str(exc))
     pool = _get_pool()
     if pool is not None:
-        return pool.run(entry, args, kwargs, timeout, max_memory_mb, progress_cb)
-    return _run_single(entry, args, kwargs, timeout, max_memory_mb, progress_cb)
+        return pool.run(entry, args, kwargs, timeout, max_memory_mb, progress_cb, cancel_event)
+    return _run_single(entry, args, kwargs, timeout, max_memory_mb, progress_cb, cancel_event)
 
 
-async def run_in_subprocess_async(entry: str, args: tuple = (), kwargs: dict = None,
-                                  timeout: float = 300, max_memory_mb: int = None,
-                                  progress_cb=None) -> SubprocessResult:
-    """async 版 run_in_subprocess：在后台线程执行，不冻结事件循环。
-
-    用于 async 端点（整合对比/合并/智算等）。事件循环内直接调同步版会在
-    Popen 等待/排队期间冻结所有用户的请求——多客户并发时表现为整体卡死。
-    """
+async def _async_run(runner, entry, args, kwargs, timeout, max_memory_mb, progress_cb):
     import asyncio
-    return await asyncio.to_thread(
-        run_in_subprocess, entry, args, kwargs or {},
-        timeout=timeout, max_memory_mb=max_memory_mb, progress_cb=progress_cb,
-    )
+    cancelled = threading.Event()
+    future = asyncio.create_task(asyncio.to_thread(
+        runner, entry, args, kwargs or {}, timeout, max_memory_mb, progress_cb,
+        cancel_event=cancelled))
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        cancelled.set()
+        # The executor owns the reservation until the child has actually exited.
+        def consume_result(task):
+            if not task.cancelled():
+                task.exception()
+        future.add_done_callback(consume_result)
+        raise
 
 
-async def run_in_fresh_subprocess_async(entry: str, args: tuple = (), kwargs: dict = None,
-                                        timeout: float = 300, max_memory_mb: int = None,
-                                        progress_cb=None) -> SubprocessResult:
-    """每次启动一个全新子进程的 async 执行器。
-
-    适用于上传解析：Aspose/.NET 的非托管内存即使 Dispose 后也可能
-    暂留在进程堆中。文件处理完后让进程退出，操作系统可确定回收全部内存。
-    """
-    import asyncio
-    return await asyncio.to_thread(
-        run_in_fresh_subprocess, entry, args, kwargs or {}, timeout,
-        max_memory_mb, progress_cb,
-    )
+async def run_in_subprocess_async(entry, args=(), kwargs=None, timeout=300,
+                                  max_memory_mb=None, progress_cb=None):
+    return await _async_run(run_in_subprocess, entry, args, kwargs, timeout,
+                            max_memory_mb, progress_cb)
 
 
-def run_in_fresh_subprocess(entry: str, args: tuple = (), kwargs: dict = None,
-                            timeout: float = 300, max_memory_mb: int = None,
-                            progress_cb=None) -> SubprocessResult:
-    """同步版全新子进程执行器，供已在后台线程中的流程使用。"""
-    return _run_single(
-        entry, args, kwargs or {}, timeout,
-        default_max_memory_mb() if max_memory_mb is None else max_memory_mb,
-        progress_cb,
-    )
+async def run_in_fresh_subprocess_async(entry, args=(), kwargs=None, timeout=300,
+                                        max_memory_mb=None, progress_cb=None):
+    return await _async_run(run_in_fresh_subprocess, entry, args, kwargs, timeout,
+                            max_memory_mb, progress_cb)
+
+
+def run_in_fresh_subprocess(entry, args=(), kwargs=None, timeout=300,
+                            max_memory_mb=None, progress_cb=None, cancel_event=None):
+    if os.environ.get("_IN_SUBPROCESS_WORKER") == "1":
+        return _run_entry_sync(entry, args, kwargs, progress_cb)
+    return _run_single(entry, args, kwargs or {}, timeout, max_memory_mb,
+                       progress_cb, cancel_event)

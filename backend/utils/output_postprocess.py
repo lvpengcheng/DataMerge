@@ -11,6 +11,7 @@ import os
 import re
 import time
 import logging
+from contextvars import ContextVar
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -18,6 +19,102 @@ logger = logging.getLogger(__name__)
 _ILLEGAL = re.compile(r'[\\/:*?"<>|]+')
 
 _ADDR_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
+_workbook_session = ContextVar("output_workbook_session", default=None)
+
+
+def apply_expected_column_schemas(output_path, expected_structure) -> int:
+    """非模板结果按训练时解析出的目标列 schema 统一值类型和 number_format。
+
+    模板填充不调用本函数，模板自身样式仍是唯一权威来源。公式单元格只设置显示格式，
+    不改公式；直接写入的文本主键会转成字符串，从而与源表主键保持同型。
+    """
+    import json
+    import openpyxl
+    from openpyxl.utils import column_index_from_string
+    from backend.utils.data_helpers import _schema_text_value
+    from backend.utils.source_sheet_writer import coerce_source_date
+
+    if isinstance(expected_structure, str):
+        try:
+            expected_structure = json.loads(expected_structure)
+        except Exception:
+            return 0
+    sheets = (expected_structure or {}).get("sheets", {}) if isinstance(expected_structure, dict) else {}
+    if not sheets:
+        return 0
+
+    wb = openpyxl.load_workbook(str(output_path), data_only=False)
+    changed = 0
+    try:
+        for sheet_name, sheet_info in sheets.items():
+            if sheet_name not in wb.sheetnames or not isinstance(sheet_info, dict):
+                continue
+            schemas = sheet_info.get("column_schemas") or {}
+            headers = sheet_info.get("headers") or {}
+            if not schemas:
+                continue
+            ws = wb[sheet_name]
+            for name, schema in schemas.items():
+                letter = headers.get(name)
+                try:
+                    ci = column_index_from_string(str(letter)) if letter else None
+                except Exception:
+                    ci = None
+                # 兼容生成脚本改变列次序：找不到权威列字母时扫描前 30 行表头。
+                header_row = 1
+                matched_at_expected_col = False
+                if ci:
+                    for ri in range(1, min(30, ws.max_row) + 1):
+                        if str(ws.cell(ri, ci).value or "").strip() == str(name).strip():
+                            header_row = ri
+                            matched_at_expected_col = True
+                            break
+                if not matched_at_expected_col:
+                    ci = None
+                    for row in ws.iter_rows(min_row=1, max_row=min(30, ws.max_row)):
+                        hit = next((c for c in row if str(c.value or "").strip() == str(name).strip()), None)
+                        if hit:
+                            ci, header_row = hit.column, hit.row
+                            break
+                if not ci:
+                    continue
+                field_type = (schema or {}).get("field_type")
+                number_format = (schema or {}).get("number_format") or "General"
+                for ri in range(header_row + 1, ws.max_row + 1):
+                    cell = ws.cell(ri, ci)
+                    value = cell.value
+                    is_formula = isinstance(value, str) and value.startswith("=")
+                    if value is not None and not is_formula:
+                        if field_type == "text":
+                            converted = _schema_text_value(value)
+                            if converted != value or cell.data_type != 's':
+                                cell.value = converted
+                                cell.data_type = "s"
+                                changed += 1
+                        elif field_type in ("date", "datetime"):
+                            converted = coerce_source_date(value)
+                            if converted != value:
+                                cell.value = converted
+                                changed += 1
+                        elif field_type in ("integer", "decimal") and isinstance(value, str):
+                            raw = value.strip().replace(",", "")
+                            pct = raw.endswith("%")
+                            try:
+                                n = float(raw.rstrip("%"))
+                                if pct:
+                                    n /= 100
+                                cell.value = int(n) if field_type == "integer" and n.is_integer() else n
+                                changed += 1
+                            except Exception:
+                                pass
+                    if cell.number_format != number_format:
+                        cell.number_format = number_format
+                        changed += 1
+        if changed:
+            wb.save(str(output_path))
+    finally:
+        wb.close()
+    return changed
 
 
 def _addr_to_rc0(addr):
@@ -67,9 +164,157 @@ def _silent_load_options():
 
 def _open_workbook(path):
     """打开工作簿，绕过 Aspose 载入警告触发的空引用崩溃（见 _silent_load_options）。"""
+    session = _workbook_session.get()
+    if session is not None:
+        return session.open(path)
     from Aspose.Cells import Workbook
     lo = _silent_load_options()
     return Workbook(str(path), lo) if lo is not None else Workbook(str(path))
+
+
+class _BorrowedWorkbook:
+    """Existing repair helpers borrow a session workbook without saving/disposing it."""
+    def __init__(self, workbook, path):
+        self.workbook, self.path = workbook, path
+
+    def __getattr__(self, name):
+        return getattr(self.workbook, name)
+
+    def Save(self, path):
+        if os.path.normcase(os.path.abspath(str(path))) != self.path:
+            raise ValueError("后处理会话不能写入其他工作簿")
+
+    def Dispose(self):
+        pass
+
+
+class _OutputSession:
+    def __init__(self):
+        self.books = {}
+
+    def open(self, path):
+        key = os.path.normcase(os.path.abspath(str(path)))
+        if key not in self.books:
+            from Aspose.Cells import Workbook
+            options = _silent_load_options()
+            book = Workbook(str(path), options) if options is not None else Workbook(str(path))
+            self.books[key] = _BorrowedWorkbook(book, key)
+        return self.books[key]
+
+    def close(self):
+        for handle in self.books.values():
+            handle.workbook.Dispose()
+
+
+def _apply_expected_schemas_in_workbook(wb, structure):
+    """Apply target types in Aspose, keeping formula caches and numeric date serials."""
+    import json
+    import math
+    from backend.utils.data_helpers import _schema_text_value
+    from backend.utils.source_sheet_writer import coerce_source_date, dt_to_excel_serial
+    if isinstance(structure, str):
+        structure = json.loads(structure)
+    sheets = (structure or {}).get("sheets", {})
+    for si in range(wb.Worksheets.Count):
+        ws = wb.Worksheets[si]
+        info = sheets.get(str(ws.Name), {})
+        schemas = info.get("column_schemas") or {}
+        if not schemas:
+            continue
+        cells = ws.Cells
+        headers = {}
+        for ri in range(min(30, cells.MaxDataRow + 1)):
+            for ci in range(cells.MaxDataColumn + 1):
+                text = str(cells[ri, ci].Value or "").strip()
+                if text in schemas and text not in headers:
+                    headers[text] = (ri, ci)
+        for name, (header_row, ci) in headers.items():
+            schema = schemas[name] or {}
+            kind = schema.get("field_type")
+            for ri in range(header_row + 1, cells.MaxDataRow + 1):
+                cell = cells[ri, ci]
+                value = cell.Value
+                if value is None and not cell.IsFormula:
+                    continue
+                if not cell.IsFormula:
+                    if kind == "text":
+                        cell.PutValue(_schema_text_value(value))
+                    elif kind in ("date", "datetime"):
+                        converted = coerce_source_date(value, epoch=datetime(1904, 1, 1) if wb.Settings.Date1904 else datetime(1899, 12, 30))
+                        if isinstance(converted, datetime):
+                            serial = dt_to_excel_serial(converted)
+                            if wb.Settings.Date1904:
+                                serial -= 1462
+                            cell.PutValue(serial)
+                    elif kind in ("integer", "decimal") and isinstance(value, str):
+                        try:
+                            raw = value.strip().replace(",", "")
+                            number = float(raw.rstrip("%")) / (100 if raw.endswith("%") else 1)
+                            if math.isfinite(number):
+                                cell.PutValue(number)
+                        except ValueError:
+                            pass
+                style = cell.GetStyle()
+                style.Custom = schema.get("number_format") or "General"
+                cell.SetStyle(style)
+
+
+def finalize_output_workbook(output_path, template_path=None, expected_structure=None,
+                             script_code=None, sheet_name_map=None):
+    """One output open, repairs in memory, one calculation and one atomic final save.
+
+    The script's initial workbook creation is separate. Existing public repair
+    functions retain their standalone behavior outside this session.
+    """
+    import tempfile
+    import aspose_init
+    aspose_init.ensure_license()
+    session = _OutputSession()
+    token = _workbook_session.set(session)
+    staged = None
+    try:
+        handle = session.open(output_path)
+        wb = handle.workbook
+        normalize_key_columns_to_text(output_path)
+        template_ok = bool(template_path and os.path.exists(template_path))
+        if template_ok:
+            restore_formats_from_template(output_path, template_path)
+        _normalize_source_sheet_formats_impl(output_path, template_path if template_ok else None)
+        if not template_ok and expected_structure:
+            _apply_expected_schemas_in_workbook(wb, expected_structure)
+        if template_ok and restore_summary_format_enabled():
+            restore_template_region_format(output_path, template_path, script_code)
+        # Rename via Aspose so cross-sheet formula references follow the names.
+        if sheet_name_map:
+            import uuid
+            pending = []
+            for si in range(wb.Worksheets.Count):
+                ws = wb.Worksheets[si]
+                replacement = sheet_name_map.get(str(ws.Name))
+                if replacement and replacement != str(ws.Name):
+                    ws.Name = "tmp_" + uuid.uuid4().hex[:20]
+                    pending.append((ws, replacement))
+            for ws, replacement in pending:
+                ws.Name = replacement
+        wb.Settings.ForceFullCalculate = True
+        wb.Settings.ReCalculateOnOpen = True
+        wb.CalculateFormula()  # failure propagates; never publish a partial calculation
+        rows = sum(wb.Worksheets[i].Cells.MaxDataRow + 1 for i in range(wb.Worksheets.Count))
+        fd, staged = tempfile.mkstemp(prefix=".final_", suffix=os.path.splitext(str(output_path))[1],
+                                      dir=os.path.dirname(os.path.abspath(str(output_path))))
+        os.close(fd)
+        wb.Save(staged)
+        os.replace(staged, output_path)
+        staged = None
+        return {"calculated": True, "rows_processed": rows}
+    finally:
+        _workbook_session.reset(token)
+        session.close()
+        if staged:
+            try:
+                os.remove(staged)
+            except OSError:
+                pass
 
 
 def _safe_name(s, fallback="result", max_bytes=120):
@@ -779,8 +1024,10 @@ def _canon_key_text(v):
         return None
     if isinstance(v, bool):
         return None
-    if isinstance(v, (int, float)):
-        f = float(v)
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        f = v
         if f != f or f in (float("inf"), float("-inf")):  # NaN/Inf
             return None
         return str(int(f)) if f == int(f) else repr(v)
@@ -837,12 +1084,15 @@ def normalize_key_columns_to_text(output_path, source_sheet_prefix="源_") -> in
             for ci in key_cols:
                 for ri in range(1, mr + 1):  # 跳过表头
                     cell = cells[ri, ci]
+                    if cell.IsFormula:
+                        # PutValue 会删除原公式；主键归一仅处理源值，保留结果公式及依赖。
+                        continue
                     canon = _canon_key_text(cell.Value)
                     if canon is None:
                         continue
                     # 已是规范文本则跳过（幂等，避免无谓写入）
                     try:
-                        if cell.Type == 1 and str(cell.Value) == canon:  # 1=IsString
+                        if isinstance(cell.Value, str) and cell.Value == canon and cell.GetStyle().Custom == '@':
                             continue
                     except Exception:
                         pass
@@ -872,7 +1122,7 @@ def normalize_key_columns_to_text(output_path, source_sheet_prefix="源_") -> in
 
 def make_values_only_copy(src_xlsx, dst_xlsx, source_sheet_prefix="源_",
                           keep_sheets=None, template_path=None, sheet_name_map=None,
-                          fill_report_path=None):
+                          fill_report_path=None, recalculate=True):
     """生成纯值副本：新填列公式→值，模版原有公式保留。
 
     公式取舍（选择性拍平），按优先级两条路径：
@@ -932,7 +1182,8 @@ def make_values_only_copy(src_xlsx, dst_xlsx, source_sheet_prefix="源_",
         wb = _open_workbook(src_xlsx)
         try:
             try:
-                wb.CalculateFormula()
+                if recalculate:
+                    wb.CalculateFormula()
             except Exception as _ce:
                 logger.warning(f"[纯值版] CalculateFormula 跳过: {_ce}")
 
@@ -1039,6 +1290,10 @@ def make_values_only_copy(src_xlsx, dst_xlsx, source_sheet_prefix="源_",
     for _try in range(3):
         try:
             return _attempt()
+        except (OSError, MemoryError) as e:
+            last_err = e
+            logger.error("[纯值版] 存储或内存故障，停止重试: %s", e)
+            break
         except Exception as e:
             last_err = e
             logger.warning(f"[纯值版] 第{_try + 1}/3 次生成失败，准备重试: {src_xlsx} -> {dst_xlsx}: {e}")
@@ -1046,5 +1301,5 @@ def make_values_only_copy(src_xlsx, dst_xlsx, source_sheet_prefix="源_",
                 time.sleep(0.4)
             except Exception:
                 pass
-    logger.exception(f"[纯值版] 生成失败（重试 3 次后返回 None）: {src_xlsx} -> {dst_xlsx}: {last_err}")
+    logger.error(f"[纯值版] 生成失败: {src_xlsx} -> {dst_xlsx}: {last_err}")
     return None

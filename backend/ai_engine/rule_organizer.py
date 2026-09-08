@@ -6,13 +6,14 @@
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 
 logger = logging.getLogger(__name__)
 
 # 文档最大字符数（防止超出 AI 上下文窗口），可通过 .env 配置
-MAX_DOC_CHARS = int(os.getenv("RULE_ORGANIZE_MAX_DOC_CHARS", "30000"))
+MAX_DOC_CHARS = max(1000, int(os.getenv("RULE_ORGANIZE_MAX_DOC_CHARS", "30000")))
 
 # 源数据格式段落标题（用于检测和替换）
 SOURCE_DATA_FORMAT_HEADER = "## 源数据格式"
@@ -53,6 +54,18 @@ SYSTEM_PROMPT = """\
    - L3（计算层）：依赖L1/L2列进行公式计算的列（如 应发合计=基本工资+绩效+加班费）\
    - L4（复合层）：依赖L3列结果的列（如 实发工资=应发合计-社保-公积金-个税）\
    确定每列的层级，在列级规则的"类型"中标注层级，并在最后的"列处理分层"章节汇总。
+9. **字段类型必须落入规则**：excel_parser 已根据列头含义、样例值和单元格格式给出每列的
+   `字段类型/格式类型/number_format`。源列参与筛选、计算、排序和主键关联时必须先按字段类型读取；
+   非模板输出写入时必须应用对应 number_format。主键两侧类型必须一致，文本主键不得转数字。
+10. **证据与冲突检查**：原始公式、SOP 条款、样本推断必须明确区分；每条规则注明依据的
+    文件/Sheet/单元格或章节。除用户明确要求覆盖外，样例 Excel 中已经明确的公式逻辑
+    优先于 SOP、其他规则文档和样本数值推断；保留条件分支、舍入顺序、绝对引用和例外。
+    与 SOP 或其他文档冲突时按样例明确公式整理，并单独列出冲突及采用依据，
+    不得擅自补造常量或条件；没有明确公式的部分再依据 SOP 和规则文档补充。
+11. **主键与依赖检查**：只凭少量样本不能断定主键全量唯一；说明记录粒度、空键/重复键策略，
+    必要时采用工号+月份等复合键。跨表查找遇到一对多必须明确汇总或展开规则。
+    输出前检查列引用是否存在、公式是否循环依赖、日期空值/边界、同源与跨表引用是否一致。
+    不确定或图片中尚未提取的内容列入待确认事项，不要猜测。
 
 ## 中间计算项处理规则
 当目标列的计算需要依赖不在源文件/目标文件中的中间值时：
@@ -102,6 +115,9 @@ SYSTEM_PROMPT = """\
 - 关联键: [如果涉及跨表查找，说明用什么字段关联]
 - 精度: [小数位数要求，如有]
 - 特殊处理: [边界条件、空值处理等]
+- 字段类型: [text/integer/decimal/date/datetime/time/boolean]
+- 格式类型: [general/text/integer/decimal/percentage/currency/date/datetime/time/custom]
+- number_format: [Excel格式码，如 @、0、0.00、yyyy-mm-dd]
 
 （先按目标文件的列字母顺序逐列输出原始列，然后紧接着输出中间计算项列）
 
@@ -182,6 +198,7 @@ class RuleOrganizer:
         source_info = self._extract_source_structures(source_files, file_passwords)
         target_info = self._extract_target_structure(target_file, file_passwords)
         design_info = self._extract_design_docs(design_doc_files or [])
+        design_info = self._prepare_design_context(design_info, user_message)
 
         messages = self._build_messages(source_info, target_info, design_info, user_message)
         total_len = sum(len(m["content"]) for m in messages)
@@ -212,6 +229,7 @@ class RuleOrganizer:
         source_info = self._extract_source_structures(source_files, file_passwords)
         target_info = self._extract_target_structure(target_file, file_passwords)
         design_info = self._extract_design_docs(design_doc_files or [])
+        design_info = self._prepare_design_context(design_info, user_message, thinking_callback)
 
         messages = self._build_messages(source_info, target_info, design_info, user_message)
         total_len = sum(len(m["content"]) for m in messages)
@@ -250,7 +268,7 @@ class RuleOrganizer:
         source_files: List[str],
         file_passwords: Optional[Dict[str, str]] = None,
     ) -> str:
-        """解析源文件，提取表头 + 1 行数据样本"""
+        """解析源文件结构与多行样例，并独立扫描全表公式。"""
         passwords = file_passwords or {}
         parts: List[str] = []
 
@@ -259,11 +277,11 @@ class RuleOrganizer:
             try:
                 parsed_data = self.excel_parser.parse_excel_file(
                     file_path,
-                    max_data_rows=1,
+                    max_data_rows=5,
                     active_sheet_only=False,
                     best_region_only=False,
                     password=passwords.get(file_name),
-                    read_formulas=False,
+                    read_formulas=True,
                 )
                 part = f"=== 源文件: {file_name} ===\n"
                 for sheet_data in parsed_data:
@@ -273,11 +291,15 @@ class RuleOrganizer:
                             f"{name}={col}" for name, col in region.head_data.items()
                         )
                         part += f"  表头: {headers_str}\n"
-                        if region.data:
+                        part += self._format_region_schemas(region)
+                        for sample_index, sample in enumerate(region.data, 1):
                             sample_str = ", ".join(
-                                f"{col}={val}" for col, val in region.data[0].items()
+                                f"{col}={val}" for col, val in sample.items()
                             )
-                            part += f"  数据样本(第1行): {sample_str}\n"
+                            part += f"  数据样本({sample_index}): {sample_str}\n"
+                        for address, formula in region.formula.items():
+                            part += f"  样本公式 {address}: {formula}\n"
+                part += self._formula_context(file_path)
                 parts.append(part)
             except Exception as e:
                 logger.warning(f"[规则整理] 解析源文件失败 {file_name}: {e}")
@@ -303,7 +325,7 @@ class RuleOrganizer:
         try:
             parsed_data = self.excel_parser.parse_excel_file(
                 target_file,
-                max_data_rows=1,
+                max_data_rows=5,
                 active_sheet_only=False,
                 best_region_only=False,
                 password=passwords.get(file_name),
@@ -317,21 +339,38 @@ class RuleOrganizer:
                         f"{name}={col}" for name, col in region.head_data.items()
                     )
                     result += f"  表头: {headers_str}\n"
+                    result += self._format_region_schemas(region)
                     # 数据样本
-                    if region.data:
+                    for sample_index, sample in enumerate(region.data, 1):
                         sample_str = ", ".join(
-                            f"{col}={val}" for col, val in region.data[0].items()
+                            f"{col}={val}" for col, val in sample.items()
                         )
-                        result += f"  数据样本(第1行): {sample_str}\n"
+                        result += f"  数据样本({sample_index}): {sample_str}\n"
                     # 公式（关键：目标文件的公式能帮助 AI 推断计算逻辑）
                     if region.formula:
                         result += "  公式:\n"
                         for cell_addr, formula in sorted(region.formula.items()):
                             result += f"    {cell_addr}: {formula}\n"
-            return result
+            return result + self._formula_context(target_file)
         except Exception as e:
             logger.warning(f"[规则整理] 解析目标文件失败 {file_name}: {e}")
             return f"=== 目标文件: {file_name} (解析失败: {e}) ===\n"
+
+    @staticmethod
+    def _format_region_schemas(region) -> str:
+        """把解析器字段定义写进 AI 可读结构；列名而非样例值决定引用身份。"""
+        schemas = getattr(region, "column_schemas", None) or {}
+        if not schemas:
+            return ""
+        rows = []
+        for name, letter in region.head_data.items():
+            schema = schemas.get(letter) or {}
+            rows.append(
+                f"{name}({letter}):字段类型={schema.get('field_type', 'text')},"
+                f"格式类型={schema.get('format_type', 'general')},"
+                f"number_format={schema.get('number_format', 'General')}"
+            )
+        return "  字段定义: " + "; ".join(rows) + "\n"
 
     def _extract_design_docs(self, design_doc_files: List[str]) -> str:
         """用 DocumentParser 提取设计文档文本"""
@@ -343,17 +382,60 @@ class RuleOrganizer:
             file_name = Path(file_path).name
             try:
                 content = self.doc_parser.parse_document(file_path)
-                if len(content) > MAX_DOC_CHARS:
-                    logger.warning(
-                        f"[规则整理] 设计文档 {file_name} 过长 ({len(content)} 字符)，截断至 {MAX_DOC_CHARS}"
-                    )
-                    content = content[:MAX_DOC_CHARS] + "\n... (文档过长，已截断)"
+                if not content.strip() or re.match(r'^\[.*(?:失败|未提取到文本)', content):
+                    raise ValueError(f'设计文档未能完整读取: {file_name}: {content}')
                 parts.append(f"=== 设计文档: {file_name} ===\n{content}\n")
             except Exception as e:
                 logger.warning(f"[规则整理] 读取设计文档失败 {file_name}: {e}")
-                parts.append(f"=== 设计文档: {file_name} (读取失败: {e}) ===\n")
+                raise ValueError(f'读取设计文档失败 {file_name}: {e}') from e
 
         return "\n".join(parts)
+
+    @staticmethod
+    def _formula_context(file_path):
+        from backend.utils.formula_evidence import collect_formula_evidence, format_formula_evidence
+        try:
+            return format_formula_evidence(collect_formula_evidence(file_path))
+        except Exception as exc:
+            # 加密 xlsx / 旧 xls 的公式仍来自带密码的解析器；必须标明扫描范围限制。
+            logger.warning('完整公式扫描失败 %s: %s', Path(file_path).name, exc)
+            return '注意：全表公式扫描未完成，只提供了解析样本中的公式，不得推断其他区域没有公式。\n'
+
+    def _prepare_design_context(self, content, user_message=None, progress=None):
+        """长文档逐段阅读后整合；每段有全局目录及相邻上下文，绝不截掉原文尾部。"""
+        if len(content) <= MAX_DOC_CHARS:
+            return content
+        outline = '\n'.join(line for line in content.splitlines()
+                            if re.match(r'^(#{1,6}\s|===|\d+[.、]\s*)', line))
+        chunks, start = [], 0
+        while start < len(content):
+            end = min(start + MAX_DOC_CHARS, len(content))
+            if end < len(content):
+                boundary = content.rfind('\n', start + MAX_DOC_CHARS // 2, end)
+                if boundary > start:
+                    end = boundary + 1
+            chunks.append((start, end))
+            start = end
+        notes = []
+        for index, (start, end) in enumerate(chunks, 1):
+            message = f'正在分析 SOP 第 {index}/{len(chunks)} 段（全文 {len(content)} 字符）'
+            logger.info(message)
+            if progress:
+                progress(message + '\n')
+            prompt = (f'用户需求：{user_message or "整理业务规则"}\n全文目录：\n{outline}\n'
+                      f'本段 {index}/{len(chunks)}，原文字符范围 [{start}, {end})：\n{content[start:end]}\n'
+                      f'前文衔接：{content[max(0, start-500):start]}\n后文衔接：{content[end:end+500]}\n'
+                      '逐条提取本段规则，保留原章节、表格对应关系、公式、参数、条件、例外、跨章节引用；'
+                      '不要猜测未定义项，列出歧义和图片内容缺失。用于后续全局整合，不能只写概括性摘要。')
+            result = self.ai_provider.chat([
+                {'role': 'system', 'content': '你负责阅读 SOP 分段并提取可追溯的完整规则条目。'},
+                {'role': 'user', 'content': prompt},
+            ])
+            if not result or not result.strip():
+                raise ValueError(f'SOP 第 {index} 段分析结果为空，已停止以避免遗漏规则')
+            notes.append(f'### 分段 {index} [{start}, {end})\n{result}')
+        return ('全文已逐段送交 AI 阅读；以下为分段提取结果，整合时必须检查跨段依赖和冲突。\n'
+                f'## 原文目录\n{outline}\n' + '\n\n'.join(notes))
 
     def _build_messages(
         self, source_info: str, target_info: str, design_info: str,

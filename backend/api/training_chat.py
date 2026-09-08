@@ -43,9 +43,9 @@ def _bounded_env_int(name: str, default: int, upper: int) -> int:
 
 # 智训主流程和内部全量解析分别使用有界线程池；真正的 Excel 重活还受共享槽位限制。
 _training_executor = ThreadPoolExecutor(
-    max_workers=_bounded_env_int("TRAINING_WORK_CONCURRENCY", 3, 5))
+    max_workers=_bounded_env_int("TRAINING_WORK_CONCURRENCY", 1, 5))
 _training_parse_executor = ThreadPoolExecutor(
-    max_workers=_bounded_env_int("TRAINING_PARSE_CONCURRENCY", 2, 3))
+    max_workers=_bounded_env_int("TRAINING_PARSE_CONCURRENCY", 1, 3))
 
 # SSE 心跳间隔（秒），防止大文件解析时连接超时
 _SSE_HEARTBEAT_INTERVAL = 15
@@ -94,11 +94,22 @@ async def _acquire_excel_slot_with_updates(emit=None, stage: str = "Excel 任务
 async def _run_training_serialized(func, emit=None):
     """智训主流程与基础资料/智算共享 Excel 有界并发闸门。"""
     semaphore = await _acquire_excel_slot_with_updates(emit, "智训执行")
+    future = None
     try:
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(_training_executor, func)
+        future = loop.run_in_executor(_training_executor, func)
+        return await asyncio.shield(future)
     finally:
-        semaphore.release()
+        if future is not None and not future.done():
+            # Cancelling an HTTP task cannot stop its Python executor thread.
+            # Keep its reservation until that thread really finishes.
+            def release_when_finished(completed):
+                if not completed.cancelled():
+                    completed.exception()
+                semaphore.release()
+            future.add_done_callback(release_when_finished)
+        else:
+            semaphore.release()
 
 
 def _prepare_training_uploads_subprocess(payload: dict) -> dict:
@@ -233,18 +244,7 @@ def _create_formula_generator(ai_provider_name: str, stream_callback=None):
     from ..ai_engine.formula_code_generator import FormulaCodeGenerator
     from ..ai_engine.training_logger import TrainingLogger
 
-    # 设置 AI provider
-    original = os.environ.get("AI_PROVIDER")
-    if ai_provider_name:
-        os.environ["AI_PROVIDER"] = ai_provider_name
-
-    try:
-        provider = AIProviderFactory.create_provider(ai_provider_name)
-    finally:
-        if original is not None:
-            os.environ["AI_PROVIDER"] = original
-        elif ai_provider_name:
-            os.environ.pop("AI_PROVIDER", None)
+    provider = AIProviderFactory.create_provider(ai_provider_name)
 
     # 创建简单 logger（不写文件）
     tl = TrainingLogger("chat_training")
@@ -345,27 +345,37 @@ def _build_source_structure_from_dir_impl(source_dir: str, manual_headers: Dict 
     parser = IntelligentExcelParser()
 
     for filename in sorted(os.listdir(source_dir)):
-        if not filename.endswith(('.xlsx', '.xls')) or filename.startswith('~'):
+        if not filename.lower().endswith((".xlsx", ".xls", ".xlsm")) or filename.startswith('~'):
             continue
         file_path = os.path.join(source_dir, filename)
         try:
             results = parser.parse_excel_file(
                 file_path, manual_headers=manual_headers,
                 active_sheet_only=not multi_sheet_source, best_region_only=True,
-                max_data_rows=3, headers_only=True,
-                read_formulas=False,
+                max_data_rows=3, headers_only=False,
+                read_formulas=True,
             )
             file_struct = {"file_name": filename, "sheets": {}, "total_regions": 0}
             for sheet_data in results:
                 headers = {}
+                column_schemas = {}
+                samples, formulas = [], {}
                 for region in sheet_data.regions:
                     headers.update(region.head_data)
+                    samples.extend((region.data or [])[:3 - len(samples)])
+                    formulas.update(region.formula or {})
+                    for name, letter in region.head_data.items():
+                        schema = (getattr(region, "column_schemas", None) or {}).get(letter)
+                        if schema:
+                            column_schemas[name] = dict(schema)
                 if headers:
                     file_struct["sheets"][sheet_data.sheet_name] = {
                         "sheet_name": sheet_data.sheet_name,
                         "regions": len(sheet_data.regions),
                         "headers": headers,
-                        "data_sample": [],
+                        "data_sample": samples,
+                        "formulas": formulas,
+                        "column_schemas": column_schemas,
                     }
                     file_struct["total_regions"] += len(sheet_data.regions)
             structure["files"][filename] = file_struct
@@ -425,15 +435,32 @@ def _analyze_expected_structure_impl(expected_file: str) -> Dict[str, Any]:
             "regions": len(sheet_data.regions),
             "headers": {},
             "data_sample": [],
+            "column_schemas": {},
+            "formulas": {},
         }
         for region in sheet_data.regions:
             sheet_structure["headers"].update(region.head_data)
+            sheet_structure["formulas"].update(region.formula or {})
+            for name, letter in region.head_data.items():
+                schema = (getattr(region, "column_schemas", None) or {}).get(letter)
+                if schema:
+                    sheet_structure["column_schemas"][name] = dict(schema)
             if region.data and len(sheet_structure["data_sample"]) < 3:
-                sheet_structure["data_sample"].append(region.data[0])
+                sheet_structure["data_sample"].extend(region.data[:3 - len(sheet_structure["data_sample"])])
 
         structure["sheets"][sheet_data.sheet_name] = sheet_structure
         structure["total_regions"] += len(sheet_data.regions)
 
+    from backend.utils.formula_evidence import collect_formula_evidence
+    try:
+        evidence = collect_formula_evidence(expected_file)
+        for name, info in (evidence or {}).items():
+            sheet = structure["sheets"].setdefault(name, {"headers": {}, "data_sample": []})
+            sheet.setdefault("formulas", {}).update(info["formulas"])
+            sheet["formula_count"] = info["formula_count"]
+    except Exception as exc:
+        structure["formula_evidence_warning"] = f"全表公式扫描未完成: {exc}"
+        logger.warning("%s", structure["formula_evidence_warning"])
     return structure
 
 
@@ -477,10 +504,10 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None,
     _collected: list = []  # [(file_base, sheet_name, merged_df, columns)]
 
     for filename in sorted(os.listdir(source_dir)):
-        if not filename.endswith(('.xlsx', '.xls')) or filename.startswith('~'):
+        if not filename.lower().endswith((".xlsx", ".xls", ".xlsm")) or filename.startswith('~'):
             continue
         file_path = os.path.join(source_dir, filename)
-        file_base = filename.replace('.xlsx', '').replace('.xls', '')
+        file_base = os.path.splitext(filename)[0]
 
         # 兜底解密：如果文件仍然加密（旧会话迁移场景），用密码解密后再解析
         if _passwords.get(filename):
@@ -500,33 +527,32 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None,
                 manual_headers=manual_headers,
                 active_sheet_only=not multi_sheet_source,
                 best_region_only=True,
+                normalize_source=True, raise_errors=True,
                 read_formulas=False,  # 脚本执行阶段不需要公式文本，使用批量读取提升性能
                 calculate_formulas=True,  # 但要先算公式：含公式无缓存值的源（如模板产出）否则读到空
                 # 不传 max_data_rows → 加载全量数据
             )
             if not results:
-                continue
+                raise ValueError(f"源文件没有可用结构: {filename}")
 
             for sheet_data in results:
                 dfs = []
                 columns = None
+                column_schemas = None
+                column_formats = None
                 for region in sheet_data.regions:
-                    # 将 ExcelRegion 转换为 DataFrame（与模板代码逻辑一致）
-                    col_letter_to_name = {v: k for k, v in region.head_data.items()}
-                    cols = list(region.head_data.keys())
-                    if not region.data:
-                        df = pd.DataFrame(columns=cols)
-                    else:
-                        converted = []
-                        for row in region.data:
-                            new_row = {col_letter_to_name.get(cl, cl): val for cl, val in row.items()}
-                            converted.append(new_row)
-                        df = pd.DataFrame(converted, columns=cols)
+                    from backend.utils.data_helpers import convert_region_to_dataframe
+                    df = convert_region_to_dataframe(region)
 
                     if df.empty and len(df.columns) == 0:
                         continue
                     if columns is None:
                         columns = list(df.columns)
+                        from backend.utils.data_helpers import region_schemas_by_name, region_formats_by_name
+                        column_schemas = region_schemas_by_name(
+                            region.head_data, getattr(region, "column_schemas", None) or {})
+                        column_formats = region_formats_by_name(
+                            region.head_data, getattr(region, "column_formats", None) or {})
                     dfs.append(df)
 
                 if not dfs:
@@ -543,10 +569,11 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None,
                         merged_df[_sn_col] = range(1, len(merged_df) + 1)
                         logger.info(f"[序号补全] {file_base}: 列'{_sn_col}'全空, 已填充1~{len(merged_df)}")
 
-                _collected.append((file_base, sheet_data.sheet_name, merged_df, columns))
+                _collected.append((file_base, sheet_data.sheet_name, merged_df, columns,
+                                   column_schemas or {}, column_formats or {}))
 
         except Exception as e:
-            logger.warning(f"[后台全量加载] 解析 {filename} 失败: {e}")
+            raise ValueError(f"后台全量加载失败，不能使用不完整源数据: {filename}: {e}") from e
 
     # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 / 撞结果 sheet → 加文件名前缀
     # 按 (file_base, sheet) 排序，使字典顺序确定，并与智算侧 _build_pre_loaded_from_memory 完全一致
@@ -554,12 +581,17 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None,
     from backend.utils.data_helpers import assign_sheet_keys
     _collected.sort(key=lambda x: (str(x[0]), str(x[1])))
     key_map = assign_sheet_keys(
-        ((fb, sn) for fb, sn, _, _ in _collected),
+        ((fb, sn) for fb, sn, _, _, _, _ in _collected),
         reserved_names=reserved_sheet_names,
     )
-    for file_base, sheet_name, merged_df, columns in _collected:
+    for file_base, sheet_name, merged_df, columns, column_schemas, column_formats in _collected:
         final_key = key_map[(file_base, sheet_name)]
-        entry = {"df": merged_df, "columns": columns}
+        entry = {
+            "df": merged_df,
+            "columns": columns,
+            "column_schemas": column_schemas,
+            "column_formats": column_formats,
+        }
         source_data[final_key] = entry
         logger.info(f"[后台全量加载] {final_key}: {len(merged_df)} 行")
 
@@ -572,7 +604,7 @@ def _load_full_source_data_subproc(src_dir, manual_headers=None, multi_sheet_sou
 
     背景: 某些文件（公式密集/超大）会让 Aspose 解析在 ThreadPoolExecutor 线程里长时间
     计算、内存暴涨 → VM swap 风暴 → 假死。线程无法强杀，必须子进程隔离。
-    失败时返回 None，调用方现有逻辑（脚本自行解析）兜底，行为与改造前一致。
+    失败直接终止本次训练，避免重新读取同一个超大或损坏的文件。
     """
     from backend.utils.subprocess_runner import run_in_subprocess, default_max_memory_mb, default_timeout
 
@@ -587,11 +619,13 @@ def _load_full_source_data_subproc(src_dir, manual_headers=None, multi_sheet_sou
         timeout=default_timeout("parse"),  # .env SUBPROCESS_PARSE_TIMEOUT，默认 300
         max_memory_mb=default_max_memory_mb(),
     )
-    if r.success:
+    if r.success and r.result:
         return r.result
     reason = "超时" if r.timed_out else ("内存超限" if r.killed_by_memory else r.error)
-    logger.warning(f"[后台全量加载] 子进程解析失败（{reason}），脚本将自行解析")
-    return None
+    if r.killed or r.termination_failed:
+        from backend.utils.training_validation import TrainingResourceFailure
+        raise TrainingResourceFailure(f"全量源数据加载失败: {reason}")
+    raise ValueError(f"全量源数据加载失败: {reason or '没有可读取的数据区域'}")
 
 
 # ==================== 辅助函数 ====================
@@ -651,6 +685,7 @@ def _get_session_context(db: Session, session_id: int) -> Dict[str, Any]:
         "tenant_id": session.tenant_id,
         "mode": session.mode,
         "config": session.config or {},
+        "source_structure": session.source_structure or {},
         "best_code": best_iteration.generated_code if best_iteration else None,
         "best_accuracy": best_iteration.accuracy if best_iteration else None,
         "latest_code": latest_iteration.generated_code if latest_iteration else None,
@@ -664,6 +699,9 @@ def _get_session_context(db: Session, session_id: int) -> Dict[str, Any]:
             {"role": m.role, "content": m.content} for m in recent_messages
         ],
     }
+    if (session.config or {}).get('validation_stale'):
+        for key in ('latest_diff', 'latest_accuracy', 'best_accuracy', 'latest_execution_result'):
+            context[key] = None
     return context
 
 
@@ -686,6 +724,10 @@ def _build_chat_system_prompt(context: Dict, config: Dict, rules: str) -> str:
         "**可以修改脚本里的任意位置**——包括填充逻辑 fill_template、源数据读取与写值逻辑"
         "（如 _append_source_sheets、load_source_data）、辅助函数等，不限于某个函数。",
         "因此：",
+        "- 用户更新源文件或目标文件后，先结合当前结构说明受影响的读取、清洗、关联、汇总、组装或公式步骤；"
+        "上传文件本身不会自动改写脚本。",
+        "- 讨论清洗或组装时，请明确输入 sheet、主键、去重规则、关联方式、缺失值处理、汇总粒度及目标字段，"
+        "并将确认后的必要改动整理成可供【执行修正】使用的指示，不限于列公式。",
         "- **严禁**告诉用户\"这段在 fill_template 之外 / 执行修正够不到 / 只能改 fill_template\"——这是过时的错误说法；",
         "- **严禁**建议用户手动去改 .py 文件；只要能说清改哪里、怎么改，就让用户点【执行修正】，由系统精确改；",
         "- 唯一真正改不了的：模板单元格的样式/背景色/字体（模板模式按设计不动这些）。除此之外都可以经【执行修正】落地。",
@@ -728,9 +770,13 @@ def _build_chat_system_prompt(context: Dict, config: Dict, rules: str) -> str:
         parts.append(f"\n计算规则（参考）:\n{rules[:70000]}")
 
     # 源数据结构
-    src_desc = config.get("source_structure_desc", "")
+    src_desc = config.get("source_structure_desc", "") or json.dumps(context.get('source_structure', {}), ensure_ascii=False)
     if src_desc:
-        parts.append(f"\n源数据结构:\n{src_desc[:3000]}")
+        parts.append(f"\n当前源数据结构:\n{src_desc}")
+    if config.get('expected_structure'):
+        parts.append('\n当前目标结构与公式:\n' + json.dumps(config['expected_structure'], ensure_ascii=False))
+    if config.get('validation_stale'):
+        parts.append('源/目标或规则已更新。历史评分和差异不适用于当前输入，须重新验证；以当前文件结构和公式为准。')
 
     return "\n".join(parts)
 
@@ -765,7 +811,7 @@ def _persist_iteration_files(tenant_id: str, session_id: int, iteration_num: int
         output_dir = run_result.get("output_dir", "")
         if output_dir and os.path.isdir(output_dir):
             for fn in os.listdir(output_dir):
-                if fn.endswith((".xlsx", ".xls")) and not fn.startswith("~"):
+                if fn.lower().endswith((".xlsx", ".xls", ".xlsm")) and not fn.startswith("~"):
                     src = os.path.join(output_dir, fn)
                     if "diff" in fn.lower() or "_diff" in fn or "差异对比" in fn:
                         dst = iter_dir / f"diff_{fn}"
@@ -818,7 +864,7 @@ def _run_single_iteration(
         # 复制源文件到临时输入目录
         source_file_names = []
         for fn in os.listdir(source_dir):
-            if fn.endswith((".xlsx", ".xls")) and not fn.startswith("~"):
+            if fn.lower().endswith((".xlsx", ".xls", ".xlsm")) and not fn.startswith("~"):
                 shutil.copy(os.path.join(source_dir, fn), input_dir / fn)
                 source_file_names.append(fn)
 
@@ -874,6 +920,9 @@ def _run_single_iteration(
             return {
                 "success": False,
                 "error": exec_result.get("error", "执行失败"),
+                "resource_failure": exec_result.get("resource_failure", False),
+                "detailed_diff": exec_result.get("error", "执行失败"),
+                "code_issues": exec_result.get("code_issues", []),
                 "accuracy": 0,
                 "diff_details": None,
                 "output_dir": str(output_dir),
@@ -895,29 +944,36 @@ def _run_single_iteration(
                 "output_dir": str(output_dir),
                 "execution_time": execution_time,
             }
-        result_file = str(output_files[0])
+        from backend.utils.result_selection import pick_result_output
+        selected_output = pick_result_output(output_files, execution_env.get('_template_override_path'))
+        if selected_output is None:
+            raise ValueError('未生成有效结果工作簿')
+        result_file = str(selected_output)
 
-        # 源_ sheet 格式兜底（与智算 compute.py / 下载 main.py 同一处理，训练路径此前遗漏）：
-        # 模板 Normal 默认样式常被设成时间/日期格式（如 [$-F400]h:mm:ss AM/PM），openpyxl
-        # 追加 源_ sheet 时，走 "General" 兜底分支的列（序号等无显式数字格式的列）设 General
-        # 并不能覆盖继承来的默认样式，数值会显示成时间——即用户看到的"数值列变时间格式"。
-        # 这里用 Aspose 把 源_ sheet 里格式恰好等于默认样式的单元格拉回 General（日期关键词
-        # 列→yyyy-mm-dd），只改样式保值。template_path 传 None → 内部回退用输出文件自身
-        # 读默认格式（输出基于模板、继承同一 Normal 样式），故无需定位模板文件。
-        try:
-            from backend.utils.output_postprocess import normalize_source_sheet_formats
-            _fixed = normalize_source_sheet_formats(result_file, None)
-            if _fixed:
-                logger.info(f"[源_格式兜底] 训练输出已规范 {_fixed} 个继承默认样式的单元格: {result_file}")
-        except Exception as _fe:
-            logger.warning(f"[源_格式兜底] 训练路径跳过: {_fe}")
+        from backend.utils.training_validation import finalize_training_output
+        finalization = finalize_training_output(
+            result_file, code, expected_structure,
+            execution_env.get("_template_override_path"))
+        formula_report = finalization.get("formula_report") or {}
+        formula_warning = bool(finalization.get("formula_warning"))
+        if formula_warning:
+            logger.warning(
+                "[公式质量] 结果已生成，继续对比："
+                "empty=%s, errors=%s, invalid_refs=%s, external=%s",
+                formula_report.get("empty_cache_count", 0),
+                formula_report.get("error_cache_count", 0),
+                formula_report.get("invalid_ref_formula_count", 0),
+                formula_report.get("external_formula_count", 0),
+            )
 
         # 对比 — 统一使用多sheet对比（自动处理单sheet情况，避免预先打开文件数sheet数）
         diff_output = str(output_dir / "_diff.xlsx")
         comparison_primary_keys = extract_primary_keys_from_rules(rules_content) if rules_content else None
         logger.info(f"[对比] rules_content长度={len(rules_content) if rules_content else 0}, 提取到主键={comparison_primary_keys}")
 
-        comparison = compare_excel_files_multi_sheet(result_file, expected_file, diff_output, primary_keys=comparison_primary_keys)
+        comparison = compare_excel_files_multi_sheet(result_file, expected_file, diff_output, primary_keys=comparison_primary_keys, result_calculated=True)
+        from backend.utils.excel_comparator import require_complete_comparison
+        require_complete_comparison(comparison)
 
         total = comparison.get("total_cells", 1)
         matched = comparison.get("matched_cells", 0)
@@ -968,6 +1024,28 @@ def _run_single_iteration(
                     lines.append(f"列 '{col}': {info['count']}处差异, 示例: {info.get('sample', '')}")
             detailed_diff = "\n".join(lines)
 
+        # 对比完成不代表公式质量告警应被丢掉。把根因单元格加入下一轮
+        # AI 修正上下文，但不再因 #N/A 中断本轮或丢失可下载的结果。
+        if formula_warning:
+            warning_lines = [
+                "### 公式质量告警（结果已生成，需继续修正）",
+                f"- 错误值: {formula_report.get('error_cache_count', 0)}",
+                f"- 空公式缓存: {formula_report.get('empty_cache_count', 0)}",
+                f"- #REF!: {formula_report.get('invalid_ref_formula_count', 0)}",
+                f"- 外部工作簿引用: {formula_report.get('external_formula_count', 0)}",
+            ]
+            samples = (
+                formula_report.get("error_cache_samples", [])
+                + formula_report.get("empty_cache_samples", [])
+                + formula_report.get("invalid_ref_samples", [])
+            )
+            for sample in samples[:10]:
+                warning_lines.append(
+                    f"- {sample.get('sheet', '')}!{sample.get('cell', '')}: "
+                    f"{sample.get('formula', '')} => {sample.get('value', '空缓存')}")
+            warning_text = "\n".join(warning_lines)
+            detailed_diff = f"{detailed_diff}\n\n{warning_text}" if detailed_diff else warning_text
+
         return {
             "success": True,
             "accuracy": accuracy,
@@ -982,13 +1060,17 @@ def _run_single_iteration(
             "diff_file": diff_output if os.path.exists(diff_output) else None,
             "output_dir": str(output_dir),
             "execution_time": execution_time,
+            "formula_warning": formula_warning,
+            "formula_report": formula_report,
         }
 
     except Exception as e:
         logger.error(f"单轮执行失败: {e}", exc_info=True)
+        from backend.utils.training_validation import TrainingResourceFailure
         return {
             "success": False,
             "error": str(e),
+            "resource_failure": isinstance(e, TrainingResourceFailure),
             "accuracy": 0,
             "diff_details": None,
             "output_dir": str(output_dir),
@@ -1097,6 +1179,7 @@ def get_session_messages(
     before_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible_tenants: list = Depends(get_operable_tenants),
 ):
     """获取会话消息（游标分页）。
 
@@ -1110,6 +1193,8 @@ def get_session_messages(
         raise HTTPException(status_code=404, detail="会话不存在")
 
     is_first_page = before_id is None
+    if session.tenant_id not in accessible_tenants:
+        raise HTTPException(403, '无权查看该会话')
 
     # 过滤集：本会话 且（若上划）id < before_id
     base = db.query(TrainingMessage).filter(TrainingMessage.session_id == session_id)
@@ -1223,6 +1308,16 @@ def get_session_messages(
 
     cfg = session.config or {}
     latest_files = cfg.get("latest_files", {})
+    from ..utils.training_assets import resolve_asset_config, asset_manifest
+    resolved = resolve_asset_config(cfg, _session_asset_root(session))
+    if resolved != cfg:
+        session.config = resolved
+        flag_modified(session, 'config')
+        db.commit()
+    cfg = resolved
+    cfg.setdefault('ai_provider', session.ai_provider)
+    cfg.setdefault('mode', session.mode)
+    manifest = asset_manifest(cfg, _session_asset_root(session))
     src_dir = cfg.get("source_dir", "")
     exp_file = cfg.get("expected_file", "")
 
@@ -1246,11 +1341,11 @@ def get_session_messages(
             "best_accuracy": session.best_accuracy,
             "total_iterations": session.total_iterations or 0,
             "has_script": session.final_script_id is not None,
-            "has_source_files": bool(src_dir and os.path.isdir(src_dir)),
+            "has_source_files": bool(manifest['source_file_names']),
             "has_expected_file": bool(exp_file and os.path.exists(exp_file)),
         },
         "current_code": latest_iteration.generated_code if latest_iteration else None,
-        "current_accuracy": latest_iteration.accuracy if latest_iteration else None,
+        "current_accuracy": latest_iteration.accuracy if latest_iteration and not cfg.get('validation_stale') else None,
         "latest_files": {
             "script_file": bool(latest_files.get("script_file")),
             "output_file": bool(latest_files.get("output_file")),
@@ -1260,7 +1355,149 @@ def get_session_messages(
         "expected_file_name": expected_file_name,
         "has_rules": bool(cfg.get("rules_content")),
     })
+    result.update(manifest)
     return result
+
+
+def _session_asset_root(session):
+    from ..storage.storage_manager import StorageManager
+    return Path(StorageManager().get_tenant_dir(session.tenant_id)) / 'training_chat' / str(session.id)
+
+
+def _apply_session_asset_update(session_id, uploads, settings, source_mode, passwords):
+    from ..utils.training_assets import stage_revision, asset_manifest
+    from ..utils.subprocess_runner import run_in_subprocess, default_timeout, default_max_memory_mb
+    db = SessionLocal()
+    revision = None
+    committed = False
+    try:
+        session = db.query(TrainingSession).filter_by(id=session_id).first()
+        if not session:
+            raise ValueError('会话不存在')
+        root = _session_asset_root(session)
+        current = dict(session.config or {})
+        current.setdefault('mode', session.mode or 'formula')
+        cfg, revision, changed = stage_revision(current, root, uploads, settings, source_mode)
+        cfg['file_passwords'] = {**(cfg.get('file_passwords') or {}), **passwords}
+        if changed:
+            result = run_in_subprocess('backend.utils.training_assets:prepare_revision',
+                (cfg, str(revision) if revision else None, [k for k, v in uploads.items() if v]),
+                timeout=default_timeout('parse'), max_memory_mb=default_max_memory_mb())
+            if not result.success:
+                raise ValueError(result.error or '文件验证失败，已保留原会话文件')
+            cfg = result.result['config']
+            session.source_structure = result.result['source_structure']
+            import uuid
+            cfg['input_revision'] = revision.name if revision else uuid.uuid4().hex
+            cfg['validation_stale'] = True
+            cfg.pop('latest_detailed_diff', None)
+            cfg.pop('source_structure_desc', None)
+            cfg.pop('latest_files', None)
+            session.best_accuracy = None
+            session.final_script_id = None
+        session.config = cfg
+        session.ai_provider = cfg.get('ai_provider')
+        session.mode = cfg.get('mode', session.mode)
+        session.salary_year = cfg.get('salary_year')
+        session.salary_month = cfg.get('salary_month')
+        session.manual_headers = cfg.get('manual_headers')
+        session.expected_structure = cfg.get('expected_structure')
+        session.rules_content = cfg.get('rules_content')
+        flag_modified(session, 'config')
+        db.commit()
+        committed = True
+        try:
+            names = [Path(path).name for paths in uploads.values() for path in paths]
+            _add_message(db, session_id, 'system',
+                ('文件与配置已保存：' + '、'.join(names) + '；后续训练使用更新后的输入。') if changed
+                else 'AI 配置已保存，下一条消息开始使用。',
+                'status', {'input_revision': cfg.get('input_revision'), 'ai_provider': cfg.get('ai_provider')})
+        except Exception:
+            logger.warning('文件已保存，追加会话通知失败', exc_info=True)
+        return asset_manifest(cfg, root)
+    except Exception:
+        db.rollback()
+        if revision is not None and not committed:
+            from ..utils.training_validation import cleanup_training_directory
+            cleanup_training_directory(str(revision))
+        raise
+    finally:
+        db.close()
+
+
+@router.get('/sessions/{session_id}/assets')
+def get_session_assets(session_id: int, db: Session = Depends(get_db),
+    current_user=Depends(get_current_user), accessible_tenants: list = Depends(get_operable_tenants)):
+    session = db.query(TrainingSession).filter_by(id=session_id).first()
+    if not session:
+        raise HTTPException(404, '会话不存在')
+    if session.tenant_id not in accessible_tenants:
+        raise HTTPException(403, '无权查看该会话')
+    from ..utils.training_assets import asset_manifest
+    cfg = dict(session.config or {})
+    cfg.setdefault('ai_provider', session.ai_provider)
+    cfg.setdefault('mode', session.mode)
+    return asset_manifest(cfg, _session_asset_root(session))
+
+
+@router.post('/sessions/{session_id}/assets')
+async def update_session_assets(
+    session_id: int, settings: str = Form('{}'), source_mode: str = Form('merge'),
+    source_files: List[UploadFile] = File(default=[]), expected_result: UploadFile = File(None),
+    rule_files: List[UploadFile] = File(default=[]), file_passwords: str = Form('{}'),
+    db: Session = Depends(get_db), current_user=Depends(get_current_user),
+    accessible_tenants: list = Depends(get_operable_tenants),
+):
+    from ..utils.training_assets import validate_settings, EXCEL_SUFFIXES, RULE_SUFFIXES
+    from ..utils.upload_stream import save_upload_file, safe_upload_name
+    session = db.query(TrainingSession).filter_by(id=session_id).first()
+    if not session:
+        raise HTTPException(404, '会话不存在')
+    if session.tenant_id not in accessible_tenants:
+        raise HTTPException(403, '无权修改该会话')
+    try:
+        parsed_settings = validate_settings(json.loads(settings))
+        passwords = json.loads(file_passwords)
+        if not isinstance(passwords, dict) or any(not isinstance(v, str) for v in passwords.values()):
+            raise ValueError('密码配置格式错误')
+    except (ValueError, TypeError) as error:
+        raise HTTPException(422, str(error)) from error
+    # Staging does not touch active inputs. Shared FIFO gate waits for the running iteration to finish.
+    staging = Path(tempfile.mkdtemp(prefix='training_edit_'))
+    uploads = {'source': [], 'expected': [], 'rules': []}
+    update_task = None
+    try:
+        for category, files in [('source', source_files), ('expected', [expected_result] if expected_result else []), ('rules', rule_files)]:
+            folder = staging / category
+            folder.mkdir()
+            names = set()
+            for upload in files:
+                name = safe_upload_name(upload.filename, 'upload.xlsx')
+                if Path(name).suffix.lower() not in (RULE_SUFFIXES if category == 'rules' else EXCEL_SUFFIXES):
+                    raise ValueError(f'不支持的文件类型: {name}')
+                if name.casefold() in names:
+                    raise ValueError(f'本次上传文件重名: {name}')
+                names.add(name.casefold())
+                path = folder / name
+                await save_upload_file(upload, str(path))
+                uploads[category].append(str(path))
+        # Own task retains uploaded staging until the real thread finishes even if the browser disconnects.
+        async def apply_and_cleanup():
+            try:
+                return await _run_training_serialized(lambda: _apply_session_asset_update(
+                    session_id, uploads, parsed_settings, source_mode, passwords))
+            finally:
+                from ..utils.training_validation import cleanup_training_directory
+                await run_in_threadpool(cleanup_training_directory, str(staging))
+        update_task = asyncio.create_task(apply_and_cleanup())
+        return await asyncio.shield(update_task)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    except (RuntimeError, TimeoutError) as error:
+        raise HTTPException(503, f'保存任务暂时无法执行: {error}') from error
+    finally:
+        if update_task is None:
+            await run_in_threadpool(shutil.rmtree, str(staging), True)
 
 
 # ==================== 模板 sheet 预览（智训前弹出选择） ====================
@@ -1361,7 +1598,7 @@ async def start_training(
 
     # 解析密码并解密加密文件
     passwords = {}
-    logger.info(f"[chat训练] file_passwords参数(Form): {repr(file_passwords)}")
+    logger.info(f"[chat训练] file_passwords参数(Form): {bool(file_passwords)}")
 
     # FastAPI Form() 参数绑定在 File+Form 混合场景下可能丢失，从 Request 兜底读取
     _fp_raw = file_passwords
@@ -1369,7 +1606,7 @@ async def start_training(
         try:
             form_data = await request.form()
             _fp_raw = form_data.get("file_passwords")
-            logger.info(f"[chat训练] file_passwords参数(Request fallback): {repr(_fp_raw)}")
+            logger.info(f"[chat训练] file_passwords参数(Request fallback): {bool(_fp_raw)}")
         except Exception as e:
             logger.warning(f"[chat训练] 读取 request.form() 失败: {e}")
 
@@ -1572,6 +1809,12 @@ async def start_training(
                 # 必须创建新 dict，否则 SQLAlchemy JSON 列不检测 in-place 变异
                 _cfg = dict(ts.config) if ts.config else {}
                 _cfg["source_dir"] = str(p_source)
+                if saved_rule_paths:
+                    persisted_rules = session_persist_dir / 'rule_files'
+                    persisted_rules.mkdir(exist_ok=True)
+                    for rule_path in saved_rule_paths:
+                        shutil.copy2(rule_path, persisted_rules / Path(rule_path).name)
+                    _cfg['rule_files_dir'] = str(persisted_rules)
                 if p_expected:
                     _cfg["expected_file"] = p_expected
                 if p_template:
@@ -1582,6 +1825,7 @@ async def start_training(
                 flag_modified(ts, "config")
                 db.commit()
                 logger.info(f"训练文件已持久化到: {session_persist_dir}")
+                config = dict(_cfg)  # 后续迭代提交不能把持久化路径覆盖回即将清理的临时目录。
             except Exception as e:
                 logger.warning(f"持久化训练文件失败: {e}")
 
@@ -1696,6 +1940,7 @@ def main(source_dir, output_dir, **kwargs):
                 if saved_files:
                     saved_files["has_rules"] = bool(config.get("rules_content"))
                     config["latest_files"] = saved_files
+                    config["validation_stale"] = False
                     ts.config = config
                     flag_modified(ts, "config")
                     db.commit()
@@ -1769,7 +2014,7 @@ def main(source_dir, output_dir, **kwargs):
                     from ..utils.aspose_helper import is_encrypted, decrypt_excel
                     import shutil as _dec_shutil
                     for _fn in os.listdir(src_dir):
-                        if not _fn.endswith((".xlsx", ".xls")) or _fn.startswith("~"):
+                        if not _fn.lower().endswith((".xlsx", ".xls", ".xlsm")) or _fn.startswith("~"):
                             continue
                         _fp = os.path.join(src_dir, _fn)
                         if is_encrypted(_fp) and _cfg_passwords.get(_fn):
@@ -1869,12 +2114,12 @@ def main(source_dir, output_dir, **kwargs):
             # 【后台全量加载】等待全量数据就绪（通常 AI 生成代码耗时更长，此时已完成）
             _full_source_data = None
             try:
-                _full_source_data = _full_data_future.result(timeout=300)
+                _full_source_data = _full_data_future.result()  # 子进程负责排队和运行期限；等待其真实结束。
                 if _full_source_data:
                     logger.info(f"[后台全量加载] 完成，共 {len(_full_source_data)} 个sheet")
                     _emit({"type": "log", "message": f"全量源数据加载完成（{len(_full_source_data)} 个sheet）"})
             except Exception as e:
-                logger.warning(f"[后台全量加载] 失败，脚本将自行解析: {e}")
+                raise RuntimeError(f"全量源数据加载失败，已停止验证: {e}") from e
 
             # 执行并验证
             iteration_num = (ts.total_iterations or 0) + 1
@@ -1965,6 +2210,7 @@ def main(source_dir, output_dir, **kwargs):
             saved_files["has_rules"] = bool(config.get("rules_content"))
             if saved_files:
                 config["latest_files"] = saved_files
+                config["validation_stale"] = not bool(run_result.get("success"))
                 ts.config = config
                 flag_modified(ts, "config")  # 关键：首轮 latest_files 就地更新须标记，否则下载指向错文件
                 db.commit()
@@ -2001,6 +2247,8 @@ def main(source_dir, output_dir, **kwargs):
                 "success": run_result.get("success", False),
                 "diff_details": run_result.get("diff_details"),
                 "error": run_result.get("error"),
+                "formula_warning": run_result.get("formula_warning", False),
+                "formula_report": run_result.get("formula_report"),
                 "files": saved_files,
             })
 
@@ -2273,8 +2521,8 @@ async def send_message(
                 return
 
             # 获取结构化差异（dict格式）和文本差异
-            diff_dict = context.get("latest_diff")  # {"列名": {"count": N, ...}}
-            detailed_diff_text = config.get("latest_detailed_diff", "")
+            diff_dict = None if config.get("validation_stale") else context.get("latest_diff")
+            detailed_diff_text = "" if config.get("validation_stale") else config.get("latest_detailed_diff", "")
 
             # 【关键】分析用户消息中提到了哪些列名，只修正这些列
             user_mentioned_columns = {}
@@ -2304,7 +2552,9 @@ async def send_message(
                 logger.info(f"[chat修正] 用户未指定列名，自动使用差异列: {list(user_mentioned_columns.keys())}")
 
             # 获取源数据结构描述
-            source_structure_desc = config.get("source_structure_desc", "")
+            source_structure_desc = json.dumps(context.get("source_structure"), ensure_ascii=False) if context.get("source_structure") else config.get("source_structure_desc", "")
+            from backend.utils.training_edit_context import build_training_edit_context
+            _input_context = build_training_edit_context(config, context)
 
             _cur_mode = (config.get("mode") or session.mode or "").lower()
 
@@ -2344,7 +2594,7 @@ async def send_message(
 
             # 所有模式统一：优先"外科手术式"精确编辑（只改用户点名的内容，未点名代码零改动），
             # 只喂"最新代码 + 用户这轮的话"（不灌对话历史）；失败再走各模式兜底。
-            _emit({"type": "status", "message": "AI 正在精确修改（只改你点名的内容，其余原样）..."})
+            _emit({"type": "status", "message": "AI 正在基于最新文件精确修改读取、清洗、组装或公式及必要调用点..."})
             logger.info(f"[chat修正] {_cur_mode} 模式：尝试精确编辑（结构化替换）")
             try:
                 if _cur_mode == "template":
@@ -2357,7 +2607,7 @@ async def send_message(
                         stream_callback=stream_cb,
                         thinking_callback=thinking_cb,
                         iteration_num=(session.total_iterations or 0) + 1,
-                        history_context=_history_context,  # 对话背景（仅理解指代）
+                        history_context=_history_context + _input_context,
                         reason_sink=_edit_reasons,
                     )
                 else:
@@ -2368,7 +2618,7 @@ async def send_message(
                         provider,
                         original_code,
                         message,   # 当前指示为唯一修改依据
-                        extra_context=_history_context + _rules_extra,  # 对话背景（仅理解指代）+ 规则
+                        extra_context=_history_context + _rules_extra + _input_context,
                         stream_callback=stream_cb,
                         thinking_callback=thinking_cb,
                         reason_sink=_edit_reasons,
@@ -2380,33 +2630,8 @@ async def send_message(
             if code:
                 _emit({"type": "status", "message": "精确修改已套用"})
 
-            # 公式模式：精确编辑没搞定且用户点到具体列 → 再试列级修正（同样只编辑最新代码、不回退）。
-            # 模板/自动模式无此路径。列级修正只喂用户这轮消息，不灌历史。
-            if not code and user_mentioned_columns and _cur_mode == "formula":
-                _emit({"type": "status",
-                       "message": f"AI 正在精准修正 {len(user_mentioned_columns)} 列: {', '.join(user_mentioned_columns.keys())}..."})
-                logger.info(f"[chat修正] 用户指定列级修正: {list(user_mentioned_columns.keys())}")
-                try:
-                    code, _ = generator.generate_column_level_correction(
-                        full_code=original_code,
-                        field_diff_samples=user_mentioned_columns,
-                        rules_content=rules,
-                        source_structure=source_structure_desc,
-                        expected_structure=config.get("expected_structure", {}),
-                        stream_callback=stream_cb,
-                        thinking_callback=thinking_cb,
-                        user_feedback=message,
-                        history_context=_history_context,  # 对话背景（仅理解指代）
-                    )
-                    if not code:
-                        _edit_reasons.append(
-                            f"针对 {', '.join(user_mentioned_columns.keys())} 的列级修正也未能生成有效改动")
-                except Exception as col_err:
-                    logger.warning(f"[chat修正] 列级修正失败: {col_err}")
-                    _edit_reasons.append(f"列级修正出错：{col_err}")
-                    code = None
-
-            # 精确编辑（公式模式再加列级修正）都兜不住时：**不再做全量重写**。
+            # 精确编辑内部会携带定位/依赖诊断重试；仍失败就保留原脚本，
+            # 不降级为只修改差异列，避免丢失清洗、关联或组装等必要变更。
             # 原则（rex）：能改就精确改、其余不动；改不了就直说、代码保持原样，绝不回退。
             # 全量重写会从规则文档重新生成整段函数、覆盖用户之前的手动修改（表现为"把上一轮删的列又长回来"），
             # 这是错误行为——真需要整体重出请用『重新生成』。
@@ -2421,13 +2646,13 @@ async def send_message(
                 else:
                     _reason_block = (
                         "可能原因：\n"
-                        "1. 没能精确定位到要改的位置——请更具体地说明改哪个 sheet / 哪一列 / 怎么改；\n"
+                        "1. 没能精确定位到要改的位置——请说明源文件 / sheet、清洗规则、关联键、汇总粒度或目标字段；\n"
                         f"2. 该改动超出当前能力，或与现有逻辑冲突{_reason_style}。\n"
                     )
                 ai_msg = (
                     "这次修改没能完成，已**保持代码原样、未做任何改动**（不会回退你之前的修改）。\n"
                     f"{_reason_block}"
-                    "建议：把要改的 sheet / 列名 / 期望结果说得更具体些再点【执行修正】；"
+                    "建议：说明输入文件、处理步骤和期望输出后再点【执行修正】；"
                     "若确需大范围改动，请使用『重新生成』（会依据规则文档整体重出，注意这会覆盖手动微调）。"
                 )
                 _add_message(db, session_id, "assistant", ai_msg, "chat")
@@ -2473,9 +2698,9 @@ async def send_message(
             _full_source_data = None
             if _full_data_future:
                 try:
-                    _full_source_data = _full_data_future.result(timeout=300)
+                    _full_source_data = _full_data_future.result()
                 except Exception as e:
-                    logger.warning(f"[后台全量加载] 修正轮次失败: {e}")
+                    raise RuntimeError(f"全量源数据加载失败，已停止修正: {e}") from e
 
             # 执行并验证
             iteration_num = (session.total_iterations or 0) + 1
@@ -2574,6 +2799,7 @@ async def send_message(
             saved_files["has_rules"] = bool(config.get("rules_content"))
             if saved_files:
                 config["latest_files"] = saved_files
+                config["validation_stale"] = not bool(run_result.get("success"))
                 session.config = config
                 flag_modified(session, "config")  # 关键：latest_files 就地更新须标记，否则下载仍指向旧输出
                 db.commit()
@@ -2606,6 +2832,8 @@ async def send_message(
                 "success": run_result.get("success", False),
                 "diff_details": run_result.get("diff_details"),
                 "error": run_result.get("error"),
+                "formula_warning": run_result.get("formula_warning", False),
+                "formula_report": run_result.get("formula_report"),
                 "files": saved_files,
             })
 
@@ -2877,9 +3105,9 @@ async def send_message(
 
             _full_source_data = None
             try:
-                _full_source_data = _full_data_future.result(timeout=300)
+                _full_source_data = _full_data_future.result()
             except Exception as e:
-                logger.warning(f"[regenerate] 后台全量加载失败: {e}")
+                raise RuntimeError(f"全量源数据加载失败，已停止验证: {e}") from e
 
             iteration_num = (session.total_iterations or 0) + 1
             run_result = _run_single_iteration(
@@ -2963,6 +3191,7 @@ async def send_message(
             saved_files["has_rules"] = bool(config.get("rules_content"))
             if saved_files:
                 config["latest_files"] = saved_files
+                config["validation_stale"] = not bool(run_result.get("success"))
                 session.config = config
                 flag_modified(session, "config")
                 db.commit()
@@ -2997,6 +3226,8 @@ async def send_message(
                 "success": run_result.get("success", False),
                 "diff_details": run_result.get("diff_details"),
                 "error": run_result.get("error"),
+                "formula_warning": run_result.get("formula_warning", False),
+                "formula_report": run_result.get("formula_report"),
                 "files": saved_files,
                 "regenerate": True,
             })
@@ -3052,7 +3283,7 @@ def set_as_best(
 
     # 找到最佳迭代
     if body and body.iteration_id:
-        iteration = db.query(TrainingIteration).filter_by(id=body.iteration_id).first()
+        iteration = db.query(TrainingIteration).filter_by(id=body.iteration_id, session_id=session_id).first()
     else:
         # 未显式指定：取「最新一轮有代码」的迭代，即用户当前看到/刚上传的这版。
         # （按钮语义是"将当前代码设为最佳"；手动上传的代码永远是最新一轮，
@@ -3070,21 +3301,16 @@ def set_as_best(
 
     config = session.config or {}
 
-    # 设为最佳 → 强制评分 100%（用户认可即为正确）
-    forced_accuracy = 1.0
-    try:
-        iteration.accuracy = forced_accuracy
-        db.commit()
-    except Exception as _acc_e:
-        logger.warning(f"[set-best] 更新迭代 accuracy 失败: {_acc_e}")
-        db.rollback()
+    # 人工选定版本保留本轮实测分数，不能把认可操作伪装成重新验证通过。
+    measured_accuracy = float(iteration.accuracy or 0.0)
 
     # 先保存到磁盘，获取基于内容哈希的 script_id
     from ..storage.storage_manager import StorageManager
     _sm = StorageManager()
     training_result = {
         "success": True,
-        "best_score": forced_accuracy,
+        "best_score": measured_accuracy,
+        "manual_approved": True,
         "total_iterations": iteration.iteration_num,
         "best_code": iteration.generated_code,
         "mode": session.mode or "formula",
@@ -3116,9 +3342,9 @@ def set_as_best(
         code=iteration.generated_code,
         mode=session.mode,
         source_session_id=session_id,
-        accuracy=forced_accuracy,
+        accuracy=measured_accuracy,
         created_by=current_user.id,
-        config={"use_history": bool(config.get("use_history", False))},
+        config={"use_history": bool(config.get("use_history", False)), "manual_approved": True},
         manual_headers=config.get("manual_headers"),
         source_structure=session.source_structure,
         rules_content=config.get("rules_content", ""),
@@ -3132,14 +3358,15 @@ def set_as_best(
     db.commit()
 
     _add_message(db, session_id, "system",
-                 f"已设为最佳脚本 (v{script.version}，评分 100%)",
+                 f"已人工选定最佳脚本 (v{script.version}，实测准确率 {measured_accuracy:.1%})",
                  "status", {"script_id": script.id, "version": script.version})
 
     return {
         "ok": True,
         "script_id": script.id,
         "version": script.version,
-        "accuracy": forced_accuracy,
+        "accuracy": measured_accuracy,
+        "manual_approved": True,
     }
 
 
@@ -3248,7 +3475,7 @@ async def upload_code(
             if _full_source_data:
                 logger.info(f"[upload-code] 全量源数据加载完成，共 {len(_full_source_data)} 个 sheet")
         except Exception as _le:
-            logger.warning(f"[upload-code] 全量源数据加载失败，脚本将自行解析: {_le}")
+            raise HTTPException(status_code=422, detail=f"全量源数据加载失败，未执行脚本: {_le}") from _le
 
     # 执行验证（放入线程池，避免阻塞事件循环导致 Windows 反向代理 502）
     iteration_num = (session.total_iterations or 0) + 1
@@ -3295,6 +3522,7 @@ async def upload_code(
     config["latest_detailed_diff"] = (run_result.get("detailed_diff") or "")[:70000]
     if iter_files:
         config["latest_files"] = iter_files
+        config["validation_stale"] = not bool(run_result.get("success"))
     session.config = dict(config)  # 触发 SQLAlchemy 变更检测
     db.commit()
 
@@ -3635,6 +3863,7 @@ def download_original_file(
     filename: str = Query(None),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    accessible_tenants: list = Depends(get_operable_tenants),
 ):
     """下载训练会话的原始文件（源文件/预期文件/规则）"""
     from fastapi.responses import FileResponse
@@ -3643,7 +3872,10 @@ def download_original_file(
     if not session:
         raise HTTPException(status_code=404, detail="会话不存在")
 
-    config = session.config or {}
+    if session.tenant_id not in accessible_tenants:
+        raise HTTPException(403, '无权下载该会话文件')
+    from ..utils.training_assets import resolve_asset_config, excel_files
+    config = resolve_asset_config(session.config or {}, _session_asset_root(session))
 
     if file_category == "source":
         src_dir = config.get("source_dir", "")
@@ -3652,7 +3884,7 @@ def download_original_file(
         if filename:
             file_path = os.path.join(src_dir, os.path.basename(filename))
         else:
-            files = [f for f in os.listdir(src_dir) if not f.startswith("~") and os.path.isfile(os.path.join(src_dir, f))]
+            files = [p.name for p in excel_files(src_dir)]
             if not files:
                 raise HTTPException(status_code=404, detail="无源文件")
             file_path = os.path.join(src_dir, files[0])
@@ -3667,6 +3899,15 @@ def download_original_file(
             raise HTTPException(status_code=404, detail="预期文件不存在")
         return FileResponse(file_path, filename=os.path.basename(file_path), headers=_NO_STORE_HEADERS)
 
+    elif file_category == "rule-file":
+        folder = config.get('rule_files_dir')
+        if not folder or not filename or filename != os.path.basename(filename):
+            raise HTTPException(404, '规则附件不存在')
+        path = Path(folder) / filename
+        if not path.is_file():
+            raise HTTPException(404, '规则附件不存在')
+        return FileResponse(str(path), filename=path.name, headers=_NO_STORE_HEADERS)
+
     elif file_category == "rules":
         # 检查持久化的规则文件
         try:
@@ -3674,7 +3915,7 @@ def download_original_file(
             sm = StorageManager()
             td = sm.get_tenant_dir(session.tenant_id)
             rules_file = td / "training_chat" / str(session_id) / "rules.txt"
-            if rules_file.exists():
+            if rules_file.exists() and not config.get('rules_content'):
                 return FileResponse(str(rules_file), media_type="text/plain", filename="rules.txt", headers=_NO_STORE_HEADERS)
         except Exception:
             pass
@@ -3759,12 +4000,12 @@ async def generate_final_rules(
     config = session.config or {}
 
     # 1) 原始规则：优先持久化 rules.txt，回退 config / session 字段
-    original_rules = ""
+    original_rules = config.get('rules_content', '') or session.rules_content or ''
     try:
         from ..storage.storage_manager import StorageManager
         sm = StorageManager()
         rules_file = sm.get_tenant_dir(session.tenant_id) / "training_chat" / str(session_id) / "rules.txt"
-        if rules_file.exists():
+        if rules_file.exists() and not original_rules:
             original_rules = rules_file.read_text(encoding="utf-8")
     except Exception:
         pass

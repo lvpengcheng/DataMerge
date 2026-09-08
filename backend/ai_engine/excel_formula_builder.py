@@ -82,8 +82,10 @@ class ExcelFormulaBuilder:
         # 先采集所有 (file_base, sheet_name, merged_df, columns, filename)，最后统一分配 key
         _collected = []
 
-        for filename in os.listdir(input_folder):
-            if not filename.endswith(('.xlsx', '.xls')) or filename.startswith('~'):
+        self.source_sheets.clear()
+        self._used_sheet_keys.clear()
+        for filename in sorted(os.listdir(input_folder)):
+            if not filename.lower().endswith((".xlsx", ".xls", ".xlsm")) or filename.startswith('~'):
                 continue
 
             file_path = os.path.join(input_folder, filename)
@@ -102,12 +104,19 @@ class ExcelFormulaBuilder:
                     # 收集同sheet下所有region并合并（处理同列头多区域合并场景）
                     dfs = []
                     first_columns = None
+                    first_schemas = None
+                    first_formats = None
                     for region in sheet_data.regions:
                         df = self._convert_region_to_dataframe(region)
                         if df.empty and len(df.columns) == 0:
                             continue
                         if first_columns is None:
                             first_columns = list(df.columns)
+                            from backend.utils.data_helpers import region_schemas_by_name, region_formats_by_name
+                            first_schemas = region_schemas_by_name(
+                                region.head_data, getattr(region, "column_schemas", None) or {})
+                            first_formats = region_formats_by_name(
+                                region.head_data, getattr(region, "column_formats", None) or {})
                         dfs.append(df)
 
                     if not dfs or first_columns is None:
@@ -119,33 +128,37 @@ class ExcelFormulaBuilder:
                     else:
                         merged_df = pd.concat(dfs, ignore_index=True)
 
-                    _collected.append((file_base, sheet_data.sheet_name, merged_df, first_columns, filename))
+                    _collected.append((file_base, sheet_data.sheet_name, merged_df, first_columns,
+                                       filename, first_schemas or {}, first_formats or {}))
 
             except Exception as e:
                 logger.error(f"加载文件失败 {filename}: {e}")
 
         # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 / 撞目标 sheet → 加文件名前缀
         key_map = assign_sheet_keys(
-            ((fb, sn) for fb, sn, _, _, _ in _collected),
+            ((fb, sn) for fb, sn, _, _, _, _, _ in _collected),
             reserved_names=reserved_sheet_names,
         )
         # 已分配的 key 同步给实例集合，便于后续可能的扩展
         self._used_sheet_keys.update(key_map.values())
 
-        for file_base, sheet_name, merged_df, first_columns, filename in _collected:
+        for file_base, sheet_name, merged_df, first_columns, filename, column_schemas, column_formats in _collected:
             final_key = key_map[(file_base, sheet_name)]
 
             self.source_sheets[final_key] = {
                 "df": merged_df,
                 "columns": first_columns,
                 "source_file": filename,
-                "source_sheet": sheet_name
+                "source_sheet": sheet_name,
+                "column_schemas": column_schemas,
+                "column_formats": column_formats,
             }
 
             source_info["sheets"][final_key] = {
                 "columns": first_columns,
                 "row_count": len(merged_df),
-                "source_file": filename
+                "source_file": filename,
+                "column_schemas": column_schemas,
             }
             source_info["all_columns"][final_key] = first_columns
 
@@ -159,24 +172,11 @@ class ExcelFormulaBuilder:
         即使没有数据行，也会返回带列名的空DataFrame，
         这样可以避免在引用只有表头的sheet时出现KeyError
         """
-        # 获取列名映射
-        col_letter_to_name = {v: k for k, v in region.head_data.items()}
-        columns = list(region.head_data.keys())
-
-        # 如果没有数据，返回带列名的空DataFrame
-        if not region.data:
-            return pd.DataFrame(columns=columns)
-
-        # 转换数据行
-        converted_data = []
-        for row in region.data:
-            new_row = {}
-            for col_letter, value in row.items():
-                col_name = col_letter_to_name.get(col_letter, col_letter)
-                new_row[col_name] = value
-            converted_data.append(new_row)
-
-        return pd.DataFrame(converted_data, columns=columns)
+        from backend.utils.data_helpers import convert_region_to_dataframe
+        df = convert_region_to_dataframe(region)
+        if df.empty and len(df.columns) == 0:
+            return pd.DataFrame(columns=list(region.head_data.keys()))
+        return df
 
     def build_excel_with_formulas(
         self,
@@ -219,7 +219,8 @@ class ExcelFormulaBuilder:
             else:
                 ws = self.workbook.create_sheet(title=sheet_name)
 
-            self._write_source_sheet(ws, sheet_info["df"])
+            self._write_source_sheet(
+                ws, sheet_info["df"], sheet_info.get("column_schemas") or {})
 
         # 2. 创建结果sheet
         result_sheet_name = formula_config.get("result_sheet_name", "结果")
@@ -233,6 +234,9 @@ class ExcelFormulaBuilder:
         row_count = 0
         primary_key_values = []
 
+        if primary_key_sheet and primary_key_sheet not in self.source_sheets:
+            raise ValueError(f'配置指定的主键来源表不存在: {primary_key_sheet}')
+
         if primary_key_sheet and primary_key_sheet in self.source_sheets:
             pk_df = self.source_sheets[primary_key_sheet]["df"]
             row_count = len(pk_df)
@@ -240,8 +244,10 @@ class ExcelFormulaBuilder:
             if pk_col in pk_df.columns:
                 primary_key_values = pk_df[pk_col].tolist()
 
-        if row_count == 0:
-            # 使用第一个源sheet的行数
+        if not primary_key_sheet:
+            if len(self.source_sheets) != 1:
+                raise ValueError('多源表必须明确 primary_key_source_sheet，不能默认采用第一张表')
+            # 只有一个源表时，行来源无歧义。
             for sheet_name, sheet_info in self.source_sheets.items():
                 row_count = len(sheet_info["df"])
                 break
@@ -322,7 +328,7 @@ class ExcelFormulaBuilder:
 
         return output_path
 
-    def _write_source_sheet(self, ws, df: pd.DataFrame):
+    def _write_source_sheet(self, ws, df: pd.DataFrame, column_schemas: Dict[str, Any] = None):
         """将DataFrame写入源数据sheet"""
         # 写入表头
         for col_idx, col_name in enumerate(df.columns, 1):
@@ -340,6 +346,11 @@ class ExcelFormulaBuilder:
                     cell.value = ""
                 else:
                     cell.value = value
+                schema = (column_schemas or {}).get(df.columns[col_idx - 1]) or {}
+                if schema.get("field_type") == "text" and cell.value not in (None, ""):
+                    cell.value = str(cell.value)
+                    cell.data_type = "s"
+                cell.number_format = schema.get("number_format") or "General"
 
     def _identify_key_columns(self, df: pd.DataFrame) -> List[str]:
         """识别DataFrame中可能的主键列
@@ -351,7 +362,7 @@ class ExcelFormulaBuilder:
             可能的主键列名列表
         """
         key_columns = []
-        columns_lower = {col.lower().strip(): col for col in df.columns}
+        columns_lower = {str(col).lower().strip(): col for col in df.columns}
 
         for key_pattern in self.COMMON_KEY_COLUMNS:
             key_lower = key_pattern.lower()
@@ -445,12 +456,19 @@ class ExcelFormulaBuilder:
 
             lines.append(f"- 列 (按顺序):")
 
+            schemas = sheet_info.get("column_schemas") or {}
             for col_idx, col_name in enumerate(columns, 1):
                 col_letter = get_column_letter(col_idx)
                 # 标记主键列
                 key_marker = " 🔑" if col_name in key_columns else ""
                 copy_marker = " → 直接复制" if (is_main or is_candidate) and col_name not in key_columns else ""
-                lines.append(f"  - {col_letter}列: {col_name}{key_marker}{copy_marker}")
+                schema = schemas.get(col_name) or {}
+                type_note = ""
+                if schema:
+                    type_note = (f" [字段类型={schema.get('field_type', 'text')}, "
+                                 f"格式类型={schema.get('format_type', 'general')}, "
+                                 f"number_format={schema.get('number_format', 'General')}]")
+                lines.append(f"  - {col_letter}列: {col_name}{key_marker}{copy_marker}{type_note}")
 
             lines.append("")
 

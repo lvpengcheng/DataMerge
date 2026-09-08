@@ -3,6 +3,7 @@ Excel差异对比组件 - 用于对比生成结果和预期结果
 """
 
 import logging
+from contextlib import contextmanager
 import os
 import re
 import pandas as pd
@@ -18,6 +19,27 @@ logger = logging.getLogger(__name__)
 _OOXML_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _OOXML_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _OOXML_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+
+@contextmanager
+def _open_comparison_workbooks(result_file, expected_file):
+    """Release native allocations even when opening/calculating the sample fails."""
+    from Aspose.Cells import Workbook
+    books = []
+    try:
+        result = Workbook(str(result_file))
+        books.append(result)
+        expected = Workbook(str(expected_file))
+        books.append(expected)
+        # 原始结果文件是对比基准，读取其已保存的公式缓存。
+        # 重算可能使外链/历史公式变成错误值，从而改变参考答案。
+        yield result, expected
+    finally:
+        for book in reversed(books):
+            try:
+                book.Dispose()
+            except Exception:
+                logger.warning("释放对比工作簿失败", exc_info=True)
 
 
 def inspect_formula_cache(file_path: str, sample_limit: int = 20) -> Dict[str, Any]:
@@ -672,45 +694,32 @@ def _standardize_column_name(col_name) -> str:
     return col_str
 
 
-def _standardize_key_value(value) -> str:
-    """标准化主键值（去空格、统一格式）
+def _standardize_unique_columns(columns) -> List[str]:
+    """标准化后再按位置去重。
 
-    Args:
-        value: 原始主键值
-
-    Returns:
-        标准化后的字符串
+    Excel 原表头可能不完全相同，但去换行/合并空格后变成同名。如果直接
+    交给 pandas，df['列名'] 会返回 DataFrame，主键检测便会触发
+    ``The truth value of a Series is ambiguous``。预期和结果使用同一个
+    确定性规则，保留每个物理列，同名列依次加 _2/_3。
     """
-    if pd.isna(value):
-        return ""
+    return _dedupe_headers([_standardize_column_name(col) for col in columns])
 
-    # 对 float 类型直接处理，避免 str(float) 产生科学记号或精度问题
-    if isinstance(value, float):
-        if value == int(value):
-            # 用 format 避免科学记号，保持 float→int 的一致性
-            return format(value, '.0f').strip().lower().replace(" ", "")
-        else:
-            return str(value).strip().lower().replace(" ", "")
 
-    value_str = str(value).strip()
+def _standardize_key_value(value) -> str:
+    """Use the same identifier representation as source writing and joins."""
+    from backend.utils.data_helpers import _schema_text_value
+    return _schema_text_value(value) or ""
 
-    # 纯数字字符串（含可选符号、前导零、小数点）→ 归一化为不含前导零的整数串
-    # 覆盖两种常见错配：
-    #   - Excel "数字存为文本"：expected="00012345"  vs  result=12345（int/float）
-    #   - float→string 尾巴：  expected="1001.0"     vs  result="1001"
-    # 限制有效位数 ≤ 15 防止超大数字精度丢失
-    try:
-        if re.fullmatch(r'-?0*\d+(\.\d+)?', value_str):
-            digits = value_str.replace('.', '').replace('-', '').lstrip('0') or '0'
-            if len(digits) <= 15:
-                f = float(value_str)
-                if f == int(f):
-                    value_str = str(int(f))
-    except (ValueError, OverflowError):
-        pass
 
-    # 去空格、转小写（统一格式）
-    return value_str.lower().replace(" ", "")
+def require_complete_comparison(result):
+    """Infrastructure/read failures are never interpreted as zero differences."""
+    if result.get("resource_failure"):
+        from backend.utils.training_validation import TrainingResourceFailure
+        raise TrainingResourceFailure(result.get("error") or "对比资源不足")
+    if (result.get("comparison_complete") is False or result.get("error")
+            or int(result.get("total_cells", 0)) <= 0):
+        raise ValueError(result.get("error") or result.get("warning") or "对比未完成或没有可校验单元格")
+    return result
 
 
 def extract_primary_keys_from_rules(rules_content: str, result_columns: Optional[List[str]] = None) -> Optional[List[str]]:
@@ -739,70 +748,49 @@ def extract_primary_keys_from_rules(rules_content: str, result_columns: Optional
     )
     if relation_section:
         section_text = relation_section.group(1)
-        m = re.search(r'主键[：:\s]+([^\n,，;；]+)', section_text)
+        m = re.search(r'主键[：:\s]+([^\n]+)', section_text)
         if m:
             key_name = m.group(1).strip().strip('"\'')
             candidates.append(key_name)
 
     # 模式2: 顶层主键声明 "- 主键：xxx" 或 "**主键**: xxx"
-    for m in re.finditer(r'(?:^|\n)\s*[-*]*\s*\**主键\**[：:\s]+([^\n,，;；(（]+)', rules_content):
+    for m in re.finditer(r'(?:^|\n)\s*[-*]*\s*\**主键\**[：:\s]+([^\n]+)', rules_content):
         key_name = m.group(1).strip().strip('"\'*')
         if key_name and key_name not in candidates:
             candidates.append(key_name)
 
+    # Preserve every component of a declared composite key (including English names with spaces).
+    parsed_keys = []
+    for declaration in candidates:
+        declaration = re.split(r'[（(]', declaration, maxsplit=1)[0]
+        for key in re.split(r'[,，、+＋;；]', declaration):
+            key = key.strip().strip('[]【】\"\'`* ').strip()
+            if key and key not in parsed_keys:
+                parsed_keys.append(key)
+    candidates = parsed_keys
     if not candidates:
         return None
 
-    # 如果提供了结果表列名，验证主键是否存在于结果表中
     if result_columns:
-        normalized_cols = {col.strip().lower(): col for col in result_columns}
-        # 语义别名组：同一组内的关键词表示相同语义
-        _ALIAS_GROUPS = [
-            {"工号", "员工编号", "员工号", "职工号", "人员编号", "编号", "雇员工号", "partner number", "employee id", "emp id", "staff id"},
+        alias_groups = [
+            {"工号", "员工编号", "员工号", "职工号", "人员编号", "雇员工号", "partner number", "employee id", "emp id", "staff id"},
             {"姓名", "中文姓名", "员工姓名", "雇员姓名", "name"},
             {"身份证", "身份证号", "证件号", "身份证号码"},
         ]
         validated = []
         for key in candidates:
-            key_lower = key.strip().lower()
-            # 精确匹配
-            if key_lower in normalized_cols:
-                validated.append(normalized_cols[key_lower])
-                continue
-            # 子串匹配：结果表列名包含主键名，或主键名包含结果表列名
-            found = False
-            for col_lower, col_original in normalized_cols.items():
-                if key_lower in col_lower or col_lower in key_lower:
-                    validated.append(col_original)
-                    found = True
-                    break
-            if found:
-                continue
-            # 语义别名匹配：主键和列名属于同一语义组
-            key_group = None
-            for group in _ALIAS_GROUPS:
-                if any(alias in key_lower or key_lower in alias for alias in group):
-                    key_group = group
-                    break
-            if key_group:
-                for col_lower, col_original in normalized_cols.items():
-                    if any(alias in col_lower or col_lower in alias for alias in key_group):
-                        validated.append(col_original)
-                        found = True
-                        break
-        if validated:
-            # 去重保持顺序
-            seen = set()
-            result = []
-            for v in validated:
-                if v not in seen:
-                    seen.add(v)
-                    result.append(v)
-            logger.info(f"从规则中提取到主键列: {result}")
-            return result
-        else:
-            logger.warning(f"规则中声明的主键 {candidates} 在结果表列 {result_columns[:10]} 中未找到匹配")
-            return None
+            normalized = _standardize_column_name(key).casefold()
+            matches = [c for c in result_columns if _standardize_column_name(c).casefold() == normalized]
+            if not matches:
+                matches = [c for c in result_columns if normalized in str(c).casefold() or str(c).casefold() in normalized]
+            if not matches:
+                group = next((g for g in alias_groups if normalized in g), set())
+                matches = [c for c in result_columns if str(c).strip().casefold() in group]
+            if len(matches) != 1 or matches[0] in validated:
+                raise ValueError(f"规则指定主键 {key!r} 在结果列中缺失或不唯一: {matches}")
+            validated.append(matches[0])
+        logger.info(f"从规则中提取到主键列: {validated}")
+        return validated
 
     # 没有列名用于验证时，直接返回候选
     logger.info(f"从规则中提取到主键列（未验证）: {candidates}")
@@ -921,7 +909,8 @@ def compare_excel_files(
     result_file: str,
     expected_file: str,
     output_file: Optional[str] = None,
-    primary_keys: Optional[List[str]] = None
+    primary_keys: Optional[List[str]] = None,
+    result_calculated: bool = False,
 ) -> Dict[str, Any]:
     """对比两个Excel文件的差异
 
@@ -946,16 +935,11 @@ def compare_excel_files(
     logger.info("开始差异对比...")
 
     # 【第1次打开 result】Aspose 计算公式并保存（expected 不需要，外部已计算）
-    result_calc_ok = calculate_excel_formulas(result_file)
+    result_calc_ok = result_calculated or calculate_excel_formulas(result_file)
     if not result_calc_ok:
-        logger.error(f"[对比] 结果文件公式计算失败，对比结果可能不准确: {result_file}")
+        raise ValueError(f"结果文件公式计算失败，不能确认对比结果: {result_file}")
 
-    # 【第2次打开 result】Aspose 直读：值 + 公式，一次全部拿到
-    res_wb = AsposeWorkbook(str(result_file))
-    # 【第3次打开 expected】Aspose 直读：值
-    exp_wb = AsposeWorkbook(str(expected_file))
-
-    try:
+    with _open_comparison_workbooks(result_file, expected_file) as (res_wb, exp_wb):
         # 过滤掉 Aspose 评估版水印 sheet 和隐藏 sheet（默认跳过隐藏）
         _skip_hidden = _should_skip_hidden_sheets()
         def _first_real_ws(wb):
@@ -976,19 +960,17 @@ def compare_excel_files(
         logger.info(f"对比: expected['{exp_ws.Name}'] vs result['{res_ws.Name}']")
 
         # 智能识别表头起始行（处理顶部 banner / 数字索引行场景）
-        res_header_row = _detect_header_row(result_file, sheet_name=res_ws.Name)
-        exp_header_row = _detect_header_row(expected_file, sheet_name=exp_ws.Name)
+        res_header_row = _detect_header_row(result_file, sheet_name=res_ws.Name, worksheet=res_ws)
+        exp_header_row = _detect_header_row(expected_file, sheet_name=exp_ws.Name, worksheet=exp_ws)
         logger.info(f"表头行: expected@row{exp_header_row}, result@row{res_header_row}")
 
         # Aspose 一次读取：值 + 公式（result），仅值（expected）
         result_df, result_formulas = _aspose_read_sheet_df_and_formulas(res_ws, header_row=res_header_row)
         expected_df = _aspose_read_sheet_df(exp_ws, header_row=exp_header_row)
-    finally:
-        del res_wb, exp_wb
 
     # 标准化列名
-    result_df.columns = [_standardize_column_name(col) for col in result_df.columns]
-    expected_df.columns = [_standardize_column_name(col) for col in expected_df.columns]
+    result_df.columns = _standardize_unique_columns(result_df.columns)
+    expected_df.columns = _standardize_unique_columns(expected_df.columns)
 
     logger.info(f"生成结果: {len(result_df)} 行")
     logger.info(f"预期结果: {len(expected_df)} 行")
@@ -1033,7 +1015,7 @@ def _read_sheet_df_data_only(ws_data) -> pd.DataFrame:
 
 # ==================== Aspose 直读辅助函数 ====================
 
-def _detect_header_row(file_path: str, sheet_name: Optional[str] = None) -> int:
+def _detect_header_row(file_path: str, sheet_name: Optional[str] = None, worksheet=None) -> int:
     """用 IntelligentExcelParser 智能识别表头所在行（1-indexed）。
 
     用途：当 Excel 顶部有 banner / 数字索引行时，第 1 行不是真正的表头。
@@ -1047,14 +1029,19 @@ def _detect_header_row(file_path: str, sheet_name: Optional[str] = None) -> int:
         表头行号（1-indexed），找不到时返回 1
     """
     try:
-        from excel_parser import IntelligentExcelParser
+        from excel_parser import IntelligentExcelParser, _AsposeWorksheet
         parser = IntelligentExcelParser()
-        parsed = parser.parse_excel_file(
-            file_path,
-            max_data_rows=1,
-            active_sheet_only=False,
-            best_region_only=True,
-        )
+        if worksheet is not None:
+            sheet = parser._parse_sheet(_AsposeWorksheet(worksheet), 1, 0, None,
+                                        headers_only=True, read_formulas=False)
+            parsed = [sheet] if sheet else []
+            if sheet and sheet.regions:
+                _, best = parser._find_valid_region(parsed)
+                if best:
+                    sheet.regions = best
+        else:
+            parsed = parser.parse_excel_file(
+                file_path, max_data_rows=1, active_sheet_only=False, best_region_only=True)
         for sd in parsed:
             if sheet_name and sd.sheet_name != sheet_name:
                 continue
@@ -1068,6 +1055,8 @@ def _detect_header_row(file_path: str, sheet_name: Optional[str] = None) -> int:
             return 1
         return 1
     except Exception as e:
+        if worksheet is not None:
+            raise ValueError(f"无法确认 {sheet_name} 的表头，停止对比") from e
         logger.warning(f"[表头侦测] 识别 {file_path} 的表头行失败，回退第1行: {e}")
         return 1
 
@@ -1215,25 +1204,25 @@ def _aspose_read_sheet_df_and_formulas(aspose_ws, header_row: int = 1) -> tuple:
     return pd.DataFrame(rows, columns=final_headers), formulas
 
 
-def _match_sheet_name(target: str, available: List[str]) -> Optional[str]:
-    """在 available 中查找与 target 匹配的 sheet 名称。
-
-    匹配策略：精确 → 忽略大小写/空格 → 包含关系。
-    """
-    # 精确匹配
+def _match_comparison_sheet(target, available):
+    """对比只允许同名或唯一的大小写/首尾空格归一化同名。"""
     if target in available:
         return target
-    # 忽略大小写/空格
-    target_norm = target.strip().lower()
-    for name in available:
-        if name.strip().lower() == target_norm:
-            return name
-    # 包含关系
-    for name in available:
-        n_lower = name.strip().lower()
-        if target_norm in n_lower or n_lower in target_norm:
-            return name
-    return None
+    normalized = str(target).strip().casefold()
+    matches = [name for name in available if str(name).strip().casefold() == normalized]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _match_sheet_name(target, available):
+    if target in available:
+        return target
+    normalized = str(target).strip().casefold()
+    exact = [n for n in available if str(n).strip().casefold() == normalized]
+    if len(exact) == 1:
+        return exact[0]
+    matching = [n for n in available if normalized in str(n).strip().casefold()
+                or str(n).strip().casefold() in normalized]
+    return matching[0] if len(matching) == 1 else None
 
 
 def _match_sheet_with_strategy(
@@ -1273,6 +1262,7 @@ def _compare_excel_files_multi_sheet_impl(
     output_file: Optional[str] = None,
     primary_keys: Optional[List[str]] = None,
     skip_source_filter: bool = False,
+    result_calculated: bool = False,
 ) -> Dict[str, Any]:
     """（子进程执行体）对比两个 Excel 文件的所有 Sheet 差异（多Sheet版本）。
 
@@ -1292,152 +1282,143 @@ def _compare_excel_files_multi_sheet_impl(
     # 外层护栏（超时/内存）已保护本进程，再开嵌套子进程会占双倍并发槽、并发=1 时互相等待。
     formula_warning = ""
     try:
-        _aspose_calc_impl(str(result_file))
+        if not result_calculated:
+            _aspose_calc_impl(str(result_file))
         result_calc_ok = True
     except Exception as _calc_e:
         result_calc_ok = False
         logger.error(f"[多Sheet对比] 结果文件公式计算失败: {result_file} - {_calc_e}")
-        formula_warning += "结果文件公式未计算; "
+        raise ValueError("结果文件公式计算失败，不能确认对比结果") from _calc_e
 
-    # 【第2次打开 result】Aspose 直读（值 + 公式）
-    res_wb = AsposeWorkbook(str(result_file))
-    # 【第3次打开 expected】Aspose 直读（仅值）
-    exp_wb = AsposeWorkbook(str(expected_file))
+    with _open_comparison_workbooks(result_file, expected_file) as (res_wb, exp_wb):
+        # 构建 sheet 名称列表和索引映射（过滤 Aspose 评估版水印 sheet 和隐藏 sheet）
+        _skip_hidden = _should_skip_hidden_sheets()
+        def _real_sheet_info(wb):
+            """返回 (名称列表, {名称: worksheet对象})"""
+            names = []
+            ws_map = {}
+            for i in range(wb.Worksheets.Count):
+                ws = wb.Worksheets[i]
+                if "Evaluation" in ws.Name:
+                    continue
+                if _skip_hidden and not _is_visible_sheet(ws):
+                    logger.info(f"[多Sheet对比] 跳过隐藏sheet: '{ws.Name}'")
+                    continue
+                names.append(ws.Name)
+                ws_map[ws.Name] = ws
+            return names, ws_map
 
-    # 构建 sheet 名称列表和索引映射（过滤 Aspose 评估版水印 sheet 和隐藏 sheet）
-    _skip_hidden = _should_skip_hidden_sheets()
-    def _real_sheet_info(wb):
-        """返回 (名称列表, {名称: worksheet对象})"""
-        names = []
-        ws_map = {}
-        for i in range(wb.Worksheets.Count):
-            ws = wb.Worksheets[i]
-            if "Evaluation" in ws.Name:
+        exp_sheets, exp_ws_map = _real_sheet_info(exp_wb)
+        res_sheets, res_ws_map = _real_sheet_info(res_wb)
+
+        # 只排除明确的源数据/参数 Sheet，数字前缀仍可能是业务结果。
+        def _is_source_or_param(name: str) -> bool:
+            clean = str(name).strip().casefold()
+            return clean.startswith(("源_", "source_")) or clean in ("参数", "历史数据", "param", "config")
+
+        exp_compare_sheets = exp_sheets  # 独立对比场景不过滤
+        if not skip_source_filter:
+            exp_compare_sheets = [n for n in exp_sheets if not _is_source_or_param(n)]
+        if not exp_compare_sheets:
+            exp_compare_sheets = exp_sheets  # 全部都像源数据时回退
+
+        logger.info(f"[多Sheet对比] 预期文件sheets: {exp_sheets}, 对比sheets: {exp_compare_sheets}")
+        logger.info(f"[多Sheet对比] 结果文件sheets: {res_sheets}")
+
+        # 3. 逐 sheet 对比
+        per_sheet = {}
+        missing_sheets = []
+        matched_result_sheets = set()
+
+        agg_total_diff = 0
+        agg_total_cells = 0
+        agg_matched_cells = 0
+        agg_unmatched_expected = 0
+        agg_unmatched_result = 0
+        agg_field_diff_samples = {}
+
+        if output_file is None:
+            output_dir = Path(result_file).parent
+            output_file = str(output_dir / "差异对比.xlsx")
+
+        # 创建共享workbook，多sheet差异写入同一个文件
+        import openpyxl as _openpyxl_multi
+        combined_wb = _openpyxl_multi.Workbook()
+        combined_wb.remove(combined_wb.active)
+
+        for idx, exp_sheet_name in enumerate(exp_compare_sheets):
+            # 以原始结果文件的同名 sheet 为基准，不将缺失结果表模糊配到源表或备份表。
+            available = [n for n in res_sheets if n not in matched_result_sheets]
+            res_sheet_name = _match_comparison_sheet(exp_sheet_name, available)
+
+            if res_sheet_name is None:
+                # 结果中缺失此 sheet
+                missing_sheets.append(exp_sheet_name)
+                try:
+                    exp_hdr_row = _detect_header_row(expected_file, sheet_name=exp_sheet_name, worksheet=exp_ws_map[exp_sheet_name])
+                    exp_df = _aspose_read_sheet_df(exp_ws_map[exp_sheet_name], header_row=exp_hdr_row)
+                    miss_cells = max(1, len(exp_df) * max(len(exp_df.columns) - 1, 1))
+                except Exception:
+                    miss_cells = 100
+                per_sheet[exp_sheet_name] = {
+                    "total_differences": miss_cells,
+                    "total_cells": miss_cells,
+                    "matched_cells": 0,
+                    "match_rate": 0.0,
+                    "success": False,
+                    "missing": True,
+                    "field_diff_samples": {},
+                }
+                agg_total_diff += miss_cells
+                agg_total_cells += miss_cells
+                logger.warning(f"[多Sheet对比] 结果文件中缺失sheet: '{exp_sheet_name}'")
                 continue
-            if _skip_hidden and not _is_visible_sheet(ws):
-                logger.info(f"[多Sheet对比] 跳过隐藏sheet: '{ws.Name}'")
-                continue
-            names.append(ws.Name)
-            ws_map[ws.Name] = ws
-        return names, ws_map
 
-    exp_sheets, exp_ws_map = _real_sheet_info(exp_wb)
-    res_sheets, res_ws_map = _real_sheet_info(res_wb)
+            matched_result_sheets.add(res_sheet_name)
+            logger.info(f"[多Sheet对比] 按名称匹配对比: '{exp_sheet_name}' ↔ '{res_sheet_name}'")
 
-    # 过滤掉明显的源数据 sheet（数字前缀如 "01_xxx"）和参数 sheet
-    import re as _re_ms
-    skip_keywords = ["参数", "历史数据", "source", "param", "config"]
-    def _is_source_or_param(name: str) -> bool:
-        if _re_ms.match(r'^\d{1,3}_', name):
-            return True
-        return any(kw in name.lower() for kw in skip_keywords)
-
-    exp_compare_sheets = exp_sheets  # 独立对比场景不过滤
-    if not skip_source_filter:
-        exp_compare_sheets = [n for n in exp_sheets if not _is_source_or_param(n)]
-    if not exp_compare_sheets:
-        exp_compare_sheets = exp_sheets  # 全部都像源数据时回退
-
-    logger.info(f"[多Sheet对比] 预期文件sheets: {exp_sheets}, 对比sheets: {exp_compare_sheets}")
-    logger.info(f"[多Sheet对比] 结果文件sheets: {res_sheets}")
-
-    # 3. 逐 sheet 对比
-    per_sheet = {}
-    missing_sheets = []
-    matched_result_sheets = set()
-
-    agg_total_diff = 0
-    agg_total_cells = 0
-    agg_matched_cells = 0
-    agg_unmatched_expected = 0
-    agg_unmatched_result = 0
-    agg_field_diff_samples = {}
-
-    if output_file is None:
-        output_dir = Path(result_file).parent
-        output_file = str(output_dir / "差异对比.xlsx")
-
-    # 创建共享workbook，多sheet差异写入同一个文件
-    import openpyxl as _openpyxl_multi
-    combined_wb = _openpyxl_multi.Workbook()
-    combined_wb.remove(combined_wb.active)
-
-    for idx, exp_sheet_name in enumerate(exp_compare_sheets):
-        # 按sheet名称匹配（精确→忽略大小写→包含关系→索引回退）
-        res_sheet_name = _match_sheet_name(exp_sheet_name, [n for n in res_sheets if n not in matched_result_sheets])
-        if res_sheet_name is None and idx < len(res_sheets):
-            res_sheet_name = res_sheets[idx] if res_sheets[idx] not in matched_result_sheets else None
-
-        if res_sheet_name is None:
-            # 结果中缺失此 sheet
-            missing_sheets.append(exp_sheet_name)
             try:
-                exp_hdr_row = _detect_header_row(expected_file, sheet_name=exp_sheet_name)
+                # Aspose 直读：expected 仅值，result 值+公式（智能识别表头行）
+                exp_hdr_row = _detect_header_row(expected_file, sheet_name=exp_sheet_name, worksheet=exp_ws_map[exp_sheet_name])
+                res_hdr_row = _detect_header_row(result_file, sheet_name=res_sheet_name, worksheet=res_ws_map[res_sheet_name])
+                logger.info(f"[多Sheet对比] '{exp_sheet_name}' 表头行: expected@row{exp_hdr_row}, result@row{res_hdr_row}")
                 exp_df = _aspose_read_sheet_df(exp_ws_map[exp_sheet_name], header_row=exp_hdr_row)
-                miss_cells = len(exp_df) * max(len(exp_df.columns) - 1, 1)
-            except Exception:
-                miss_cells = 100
-            per_sheet[exp_sheet_name] = {
-                "total_differences": miss_cells,
-                "total_cells": miss_cells,
-                "matched_cells": 0,
-                "match_rate": 0.0,
-                "success": False,
-                "missing": True,
-                "field_diff_samples": {},
-            }
-            agg_total_diff += miss_cells
-            agg_total_cells += miss_cells
-            logger.warning(f"[多Sheet对比] 结果文件中缺失sheet: '{exp_sheet_name}'")
-            continue
+                res_df, res_formulas = _aspose_read_sheet_df_and_formulas(res_ws_map[res_sheet_name], header_row=res_hdr_row)
 
-        matched_result_sheets.add(res_sheet_name)
-        logger.info(f"[多Sheet对比] 按名称匹配对比: '{exp_sheet_name}' ↔ '{res_sheet_name}'")
+                # 标准化列名
+                exp_df.columns = _standardize_unique_columns(exp_df.columns)
+                res_df.columns = _standardize_unique_columns(res_df.columns)
 
-        try:
-            # Aspose 直读：expected 仅值，result 值+公式（智能识别表头行）
-            exp_hdr_row = _detect_header_row(expected_file, sheet_name=exp_sheet_name)
-            res_hdr_row = _detect_header_row(result_file, sheet_name=res_sheet_name)
-            logger.info(f"[多Sheet对比] '{exp_sheet_name}' 表头行: expected@row{exp_hdr_row}, result@row{res_hdr_row}")
-            exp_df = _aspose_read_sheet_df(exp_ws_map[exp_sheet_name], header_row=exp_hdr_row)
-            res_df, res_formulas = _aspose_read_sheet_df_and_formulas(res_ws_map[res_sheet_name], header_row=res_hdr_row)
+                resolved_keys = _resolve_primary_keys(exp_df, res_df, primary_keys)
 
-            # 标准化列名
-            exp_df.columns = [_standardize_column_name(c) for c in exp_df.columns]
-            res_df.columns = [_standardize_column_name(c) for c in res_df.columns]
+                # 写入共享workbook的对应sheet
+                sheet_result = _compare_dataframes_core(
+                    res_df, exp_df, resolved_keys, output_file, res_formulas,
+                    wb_shared=combined_wb, sheet_title=exp_sheet_name
+                )
+                per_sheet[exp_sheet_name] = sheet_result
+            except Exception as e:
+                logger.error(f"[多Sheet对比] 对比sheet '{exp_sheet_name}' 失败: {e}")
+                per_sheet[exp_sheet_name] = {
+                    "total_differences": 0, "total_cells": 0, "matched_cells": 0,
+                    "match_rate": 0.0, "success": False, "error": str(e),
+                    "field_diff_samples": {},
+                }
+                continue
 
-            resolved_keys = _resolve_primary_keys(exp_df, res_df, primary_keys)
+            # 汇总
+            agg_total_diff += sheet_result.get("total_differences", 0)
+            agg_total_cells += sheet_result.get("total_cells", 0)
+            agg_matched_cells += sheet_result.get("matched_cells", 0)
+            agg_unmatched_expected += sheet_result.get("unmatched_expected", 0)
+            agg_unmatched_result += sheet_result.get("unmatched_result", 0)
 
-            # 写入共享workbook的对应sheet
-            sheet_result = _compare_dataframes_core(
-                res_df, exp_df, resolved_keys, output_file, res_formulas,
-                wb_shared=combined_wb, sheet_title=exp_sheet_name
-            )
-            per_sheet[exp_sheet_name] = sheet_result
-        except Exception as e:
-            logger.error(f"[多Sheet对比] 对比sheet '{exp_sheet_name}' 失败: {e}")
-            per_sheet[exp_sheet_name] = {
-                "total_differences": 0, "total_cells": 0, "matched_cells": 0,
-                "match_rate": 0.0, "success": False, "error": str(e),
-                "field_diff_samples": {},
-            }
-            continue
+            # field_diff_samples 带 sheet 前缀合并
+            is_multi = len(exp_compare_sheets) > 1
+            for field_name, info in sheet_result.get("field_diff_samples", {}).items():
+                key = f"[{exp_sheet_name}].{field_name}" if is_multi else field_name
+                agg_field_diff_samples[key] = info
 
-        # 汇总
-        agg_total_diff += sheet_result.get("total_differences", 0)
-        agg_total_cells += sheet_result.get("total_cells", 0)
-        agg_matched_cells += sheet_result.get("matched_cells", 0)
-        agg_unmatched_expected += sheet_result.get("unmatched_expected", 0)
-        agg_unmatched_result += sheet_result.get("unmatched_result", 0)
-
-        # field_diff_samples 带 sheet 前缀合并
-        is_multi = len(exp_compare_sheets) > 1
-        for field_name, info in sheet_result.get("field_diff_samples", {}).items():
-            key = f"[{exp_sheet_name}].{field_name}" if is_multi else field_name
-            agg_field_diff_samples[key] = info
-
-    # 释放 Aspose workbook
-    del res_wb, exp_wb
 
     # 多余的 result sheets（不计入差异，仅提示）
     extra_sheets = [n for n in res_sheets if n not in matched_result_sheets and not _is_source_or_param(n)]
@@ -1456,12 +1437,16 @@ def _compare_excel_files_multi_sheet_impl(
     except Exception as e:
         logger.warning(f"[多Sheet对比] 保存diff文件失败: {e}")
 
+    comparison_errors = {name: info["error"] for name, info in per_sheet.items() if info.get("error")}
+    complete = not comparison_errors and agg_total_cells > 0
     return {
+        "comparison_complete": complete,
+        "error": f"部分 Sheet 对比失败: {comparison_errors}" if comparison_errors else None,
         "total_differences": agg_total_diff,
         "unmatched_expected": agg_unmatched_expected,
         "unmatched_result": agg_unmatched_result,
         "output_file": output_file,
-        "success": agg_total_diff == 0 and len(missing_sheets) == 0,
+        "success": complete and agg_total_diff == 0 and len(missing_sheets) == 0,
         "total_cells": agg_total_cells,
         "matched_cells": agg_matched_cells,
         "match_rate": agg_match_rate,
@@ -1480,6 +1465,7 @@ def compare_excel_files_multi_sheet(
     output_file: Optional[str] = None,
     primary_keys: Optional[List[str]] = None,
     skip_source_filter: bool = False,
+    result_calculated: bool = False,
 ) -> Dict[str, Any]:
     """对比两个 Excel 文件的所有 Sheet 差异（多Sheet版本）。
 
@@ -1505,6 +1491,7 @@ def compare_excel_files_multi_sheet(
             "output_file": output_file,
             "primary_keys": primary_keys,
             "skip_source_filter": skip_source_filter,
+            "result_calculated": result_calculated,
         },
         timeout=default_timeout("write"),   # 对比+生成差异文件，给足 600s
         max_memory_mb=default_max_memory_mb(),
@@ -1515,7 +1502,9 @@ def compare_excel_files_multi_sheet(
     logger.error(f"[多Sheet对比] 子进程对比失败（{reason}）: {result_file}")
     return {
         "total_differences": 0, "total_cells": 0, "matched_cells": 0,
-        "match_rate": 0.0, "success": False,
+        "match_rate": 0.0, "success": False, "comparison_complete": False,
+        "error": r.error or f"对比执行失败（{reason}）",
+        "resource_failure": r.killed,
         "warning": f"对比执行失败（{reason}）",
         "per_sheet": {}, "missing_sheets": [], "extra_sheets": [],
         "field_diff_samples": {}, "unmatched_expected": 0, "unmatched_result": 0,
@@ -1552,6 +1541,18 @@ def _compare_dataframes_core(
     if result_formulas is None:
         result_formulas = {}
 
+    from decimal import Decimal, InvalidOperation
+    try:
+        numeric_tolerance = Decimal(os.getenv("COMPARISON_NUMERIC_TOLERANCE", "0.000000001"))
+        if not numeric_tolerance.is_finite() or numeric_tolerance < 0:
+            raise ValueError('invalid tolerance')
+    except (InvalidOperation, ValueError) as error:
+        raise ValueError('COMPARISON_NUMERIC_TOLERANCE 必须是非负有限数字') from error
+    if not primary_keys:
+        raise ValueError("未提供可用对比主键")
+    if not expected_df.columns.is_unique or not result_df.columns.is_unique:
+        raise ValueError("对比列名不唯一，不能确认列对应关系")
+    expected_df, result_df = expected_df.copy(), result_df.copy()
     # 标准化主键列
     for key_col in primary_keys:
         expected_df[f"标准化_{key_col}"] = expected_df[key_col].apply(_standardize_key_value)
@@ -1618,9 +1619,14 @@ def _compare_dataframes_core(
     standardized_key_cols = [f"标准化_{k}" for k in primary_keys]
     for df, label in [(expected_df, "预期"), (result_df, "生成")]:
         if all(col in df.columns for col in standardized_key_cols):
-            df["匹配键"] = df[standardized_key_cols].astype(str).agg("_".join, axis=1)
+            df["匹配键"] = pd.Series(list(df[standardized_key_cols].itertuples(index=False, name=None)), index=df.index, dtype=object)
         else:
-            df["匹配键"] = df[primary_keys].astype(str).agg("_".join, axis=1)
+            df["匹配键"] = pd.Series(list(df[primary_keys].itertuples(index=False, name=None)), index=df.index, dtype=object)
+
+    for df, side in ((expected_df, "expected"), (result_df, "result")):
+        df["匹配键"] = pd.Series([
+            (side, index) if any(value == "" for value in key) else ("key", key)
+            for index, key in enumerate(df["匹配键"])], index=df.index, dtype=object)
 
     # P0: 检查匹配键是否有重复，防止 merge 产生笛卡尔积膨胀
     exp_has_dup = expected_df["匹配键"].duplicated().any()
@@ -1628,18 +1634,9 @@ def _compare_dataframes_core(
     if exp_has_dup or res_has_dup:
         logger.warning(f"[对比] 主键存在重复值（预期重复={exp_has_dup}, 生成重复={res_has_dup}），"
                        "添加组内序号避免 merge 膨胀")
-        # 按匹配键排序，使同key的行相邻且顺序一致
-        expected_df = expected_df.sort_values("匹配键").reset_index(drop=True)
-        result_df = result_df.sort_values("匹配键").reset_index(drop=True)
-        # 同key内按出现顺序编号：001_#0, 001_#1, ...
-        expected_df["匹配键"] = (
-            expected_df["匹配键"] + "_#" +
-            expected_df.groupby("匹配键").cumcount().astype(str)
-        )
-        result_df["匹配键"] = (
-            result_df["匹配键"] + "_#" +
-            result_df.groupby("匹配键").cumcount().astype(str)
-        )
+        for df in (expected_df, result_df):
+            occurrences = df.groupby("匹配键", sort=False).cumcount()
+            df["匹配键"] = pd.Series(list(zip(df["匹配键"], occurrences)), index=df.index, dtype=object)
 
     merged_df = pd.merge(
         expected_df, result_df,
@@ -1677,7 +1674,7 @@ def _compare_dataframes_core(
                 ws.cell(row=row_idx, column=c_idx).fill = PatternFill(
                     start_color="FFFF99", end_color="FFFF99", fill_type="solid")
             row_idx += 1
-            total_differences += len(compare_data_columns)
+            total_differences += max(1, len(compare_data_columns))
             continue
         elif merge_status == "right_only":
             unmatched_result += 1
@@ -1688,11 +1685,13 @@ def _compare_dataframes_core(
                 ws.cell(row=row_idx, column=c_idx).fill = PatternFill(
                     start_color="FFCC99", end_color="FFCC99", fill_type="solid")
             row_idx += 1
-            total_differences += 1
+            penalty = max(1, len(compare_data_columns))
+            total_differences += penalty
+            total_cells += penalty
             continue
 
         # 逐字段对比
-        for col in common_columns:
+        for col in sorted(common_columns, key=str):
             if col in primary_keys or col == "匹配键":
                 continue
             if any(col == f"标准化_{k}" for k in primary_keys):
@@ -1705,16 +1704,20 @@ def _compare_dataframes_core(
             result_value = row.get(result_col, 0)
 
             if pd.isna(expected_value):
-                expected_value = 0
+                expected_value = ""
             if pd.isna(result_value):
-                result_value = 0
+                result_value = ""
 
             try:
-                expected_num = float(expected_value) if expected_value != "" else 0
-                result_num = float(result_value) if result_value != "" else 0
+                if expected_value == "" or result_value == "":
+                    raise ValueError("空值按文本对比，不等同零")
+                expected_num = Decimal(str(expected_value))
+                result_num = Decimal(str(result_value))
+                if not expected_num.is_finite() or not result_num.is_finite():
+                    raise ValueError("非有限数字")
                 difference = result_num - expected_num
 
-                if abs(difference) > 0.01:
+                if abs(difference) > numeric_tolerance:
                     total_differences += 1
                     diff_rate_str = f"{(difference / expected_num * 100):.2f}%" if expected_num != 0 else "N/A"
 
@@ -1724,7 +1727,7 @@ def _compare_dataframes_core(
                         field_diff_samples[col]["count"] += 1
                     # 保存前3个差异样本（供根因分类使用）
                     if len(field_diff_samples[col]["samples"]) < 3:
-                        field_diff_samples[col]["samples"].append({"actual": result_num, "expected": expected_num})
+                        field_diff_samples[col]["samples"].append({"actual": str(result_num), "expected": str(expected_num)})
 
                     for c, v in [(1, key_values[0]), (2, key_values[1]), (3, key_values[2]),
                                  (4, col), (5, expected_num), (6, result_num),
@@ -1738,7 +1741,7 @@ def _compare_dataframes_core(
                     row_idx += 1
                 else:
                     matched_cells += 1
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, InvalidOperation):
                 # 文本对比：去除首尾空格后比较
                 expected_str = str(expected_value).strip()
                 result_str = str(result_value).strip()
@@ -1780,7 +1783,8 @@ def _compare_dataframes_core(
         "unmatched_expected": unmatched_expected,
         "unmatched_result": unmatched_result,
         "output_file": output_file,
-        "success": total_differences == 0,
+        "success": total_differences == 0 and total_cells > 0,
+        "comparison_complete": total_cells > 0,
         "total_cells": total_cells,
         "matched_cells": matched_cells,
         "match_rate": match_rate,
@@ -1794,6 +1798,7 @@ def _resolve_primary_keys(
     primary_keys: Optional[List[str]] = None
 ) -> List[str]:
     """解析并验证主键列，返回可用的主键列名列表"""
+    explicitly_declared = bool(primary_keys)
     if primary_keys is not None:
         logger.info(f"使用指定主键: {primary_keys}")
     else:
@@ -1833,21 +1838,20 @@ def _resolve_primary_keys(
             # 再试包含关系匹配（用户输入 "身份证号码"，列名可能是 "ID NO. 身份证号码"）
             if not matched_col:
                 key_lower = std_key.lower()
-                for col in expected_df.columns:
-                    if key_lower in col.lower() or col.lower() in key_lower:
-                        for rcol in result_df.columns:
-                            if key_lower in rcol.lower() or rcol.lower() in key_lower:
-                                if col == rcol:
-                                    matched_col = col
-                                else:
-                                    result_df.rename(columns={rcol: col}, inplace=True)
-                                    matched_col = col
-                                break
-                        if matched_col:
-                            break
+                exp_candidates = [c for c in expected_df.columns if key_lower and
+                                  (key_lower in str(c).lower() or str(c).lower() in key_lower)]
+                res_candidates = [c for c in result_df.columns if key_lower and
+                                  (key_lower in str(c).lower() or str(c).lower() in key_lower)]
+                if len(exp_candidates) == len(res_candidates) == 1:
+                    matched_col = exp_candidates[0]
+                    if res_candidates[0] != matched_col:
+                        result_df.rename(columns={res_candidates[0]: matched_col}, inplace=True)
             if matched_col:
                 available_keys.append(matched_col)
                 logger.info(f"[主键解析] 模糊匹配成功: '{key}' → '{matched_col}'")
+
+    if explicitly_declared and len(set(available_keys)) != len(primary_keys):
+        raise ValueError(f'指定主键 {primary_keys} 缺失或匹配不唯一，不能降级为部分主键对比；已匹配 {available_keys}')
 
     if not available_keys:
         # P1: 优化无主键时的匹配策略
@@ -1897,8 +1901,8 @@ def compare_dataframes(
     # 标准化列名
     result_df = result_df.copy()
     expected_df = expected_df.copy()
-    result_df.columns = [_standardize_column_name(col) for col in result_df.columns]
-    expected_df.columns = [_standardize_column_name(col) for col in expected_df.columns]
+    result_df.columns = _standardize_unique_columns(result_df.columns)
+    expected_df.columns = _standardize_unique_columns(expected_df.columns)
 
     logger.info(f"生成结果: {len(result_df)} 行")
     logger.info(f"预期结果: {len(expected_df)} 行")

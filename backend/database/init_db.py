@@ -41,6 +41,7 @@ def _ensure_postgresql_database(db_url):
             user=parsed.username,
             password=parsed.password,
             dbname="postgres",
+            connect_timeout=max(1, min(int(os.getenv("DATABASE_CONNECT_TIMEOUT", "5")), 120)),
         )
         conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
         cursor = conn.cursor()
@@ -72,6 +73,7 @@ def _ensure_mysql_database(db_url):
             port=parsed.port or 3306,
             user=parsed.username,
             password=parsed.password,
+            connect_timeout=max(1, min(int(os.getenv("DATABASE_CONNECT_TIMEOUT", "5")), 120)),
         )
         cursor = conn.cursor()
         cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{db_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")

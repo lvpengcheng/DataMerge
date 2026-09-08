@@ -10,7 +10,10 @@
 非日期关键词列即使套了日期格式，也读其底层数值（用 dt_to_excel_serial 逆转）。
 """
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from numbers import Real
+import math
+import re
 
 # 排除误匹配（如"工作日数"、"节日"等）；"工作/加班/出勤时间"等是时长(数字)不是日期
 _DATE_EXCLUDE_KEYWORDS = ['日数', '日常', '日志', '日报', '日均', '节日', '假日', '工日',
@@ -53,7 +56,7 @@ def dt_to_excel_serial(v):
     return v
 
 
-def coerce_source_date(v):
+def coerce_source_date(v, epoch=_EXCEL_EPOCH):
     """把日期关键词列的值尽力还原成真 datetime；空值一律返回 None（保持空单元格）。
 
     用于模板模式写 源_ sheet：源里日期列可能存成文本（"2020-06-22"）或裸 Excel 序列号
@@ -66,29 +69,87 @@ def coerce_source_date(v):
     注意：pd.NaT 是 datetime 子类，isinstance(NaT, datetime) 为 True，必须先拦掉。
     """
     import pandas as pd
-    if v is None or v is pd.NaT:
+    if v is None or v is pd.NaT or v is pd.NA:
         return None
-    if isinstance(v, float) and v != v:   # NaN（float 自身不等于自身）
+    if isinstance(v, Real) and not math.isfinite(v):
         return None
+    if isinstance(v, bool):
+        return v
     if isinstance(v, datetime):           # 已是日期（含 pd.Timestamp 子类）→ 原样
         return v
+    if isinstance(v, date):
+        return datetime.combine(v, datetime.min.time())
+    # YYYYMMDD 是业务日期，不能当作两千万天的 Excel 序列号。
+    raw = str(v).strip()
+    if re.fullmatch(r"\d{8}(?:\.0+)?", raw):
+        try:
+            return datetime.strptime(raw.split('.')[0], '%Y%m%d')
+        except ValueError:
+            return v
     if isinstance(v, str):
         s = v.strip()
         if not s:                         # 空串/纯空格 → 空
             return None
+        if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", s):
+            # 年份文本含义不明确，保留；五位数字文本可明确按序列号处理。
+            if len(s.split('.')[0].lstrip('+-')) >= 5:
+                return coerce_source_date(float(s), epoch=epoch)
+            return v
+        s = s.replace('年', '-').replace('月', '-').replace('日', '')
         try:
             ts = pd.to_datetime(s, errors="coerce")
         except Exception:
             return v
         return ts.to_pydatetime() if pd.notna(ts) else v   # 解析不出 → 保留原文本
-    if isinstance(v, (int, float)):
+    if isinstance(v, Real):
         if v <= 0:                        # 0/负数 → 空（避免 0→1899-12-30）
             return None
         try:
-            return _EXCEL_EPOCH + timedelta(days=float(v))
+            from openpyxl.utils.datetime import from_excel
+            return from_excel(float(v), epoch=epoch)
         except Exception:
-            return None
+            return v
     return v
+
+
+def write_source_dataframe(ws, df, column_schemas=None, column_formats=None, header_fill=None):
+    """一次遍历写源表；固定列策略，避免反复 ws['A'] 扫描整个工作表计算边界。"""
+    import pandas as pd
+    from openpyxl.styles import Font
+    from backend.utils.data_helpers import _schema_text_value
+
+    schemas, formats = column_schemas or {}, column_formats or {}
+    policies = []
+    for name in df.columns:
+        schema = schemas.get(name) or {}
+        kind = schema.get('field_type')
+        is_date = kind in ('date', 'datetime') or (not kind and is_date_keyword_column(name))
+        fmt = schema.get('number_format') or formats.get(name) or ('yyyy-mm-dd' if is_date else 'General')
+        policies.append((kind, is_date, fmt))
+    ws.append(list(df.columns))
+    bold = Font(bold=True)
+    for cell in ws[1]:
+        cell.number_format = 'General'
+        if header_fill is not None:
+            cell.fill = header_fill
+            cell.font = bold
+    for ri, row in enumerate(df.itertuples(index=False, name=None), 2):
+        for ci, (value, (kind, is_date, fmt)) in enumerate(zip(row, policies), 1):
+            if value is None or value is pd.NA or pd.isna(value):
+                value = None
+            elif is_date:
+                value = coerce_source_date(value)
+            elif kind == 'text':
+                value = _schema_text_value(value)
+            elif isinstance(value, datetime):
+                value = dt_to_excel_serial(value)
+            cell = ws.cell(ri, ci, value)
+            cell.number_format = fmt
+            # 源数据的文本（包括 = 开头的说明）不得变成新增的可执行公式。
+            if isinstance(value, str):
+                cell.data_type = 's'
+                if kind == 'text' or is_long_digit_text(value):
+                    cell.number_format = '@'
 
 
 def is_long_digit_text(v) -> bool:

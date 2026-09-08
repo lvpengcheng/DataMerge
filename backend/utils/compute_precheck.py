@@ -187,6 +187,8 @@ def precheck_compute(
                     ok, err, file_mapping, _pre = False, f"解析子进程失败（{reason}）", None, None
                 if ok and file_mapping:
                     result.file_mapping = file_mapping
+                    # Internal-only attribute, excluded from dataclass to_dict/asdict.
+                    result._pre_loaded_source_data = _pre
                 else:
                     result.ok = False
                     missing = _extract_missing_columns(source_structure, input_files, err)
@@ -202,6 +204,8 @@ def precheck_compute(
                             logger.warning(f"[Precheck] AI 建议失败（不阻断）: {ai_err}", exc_info=True)
         except Exception as e:
             logger.warning(f"[Precheck] 表头匹配异常: {e}", exc_info=True)
+            result.ok = False
+            result.missing_columns.append({"file": "", "sheet": "", "error": str(e)})
 
     # 步骤 5：历史数据
     _check_history(script_content, tenant_id, salary_year, salary_month, result, use_history)

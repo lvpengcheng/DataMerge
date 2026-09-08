@@ -137,6 +137,32 @@ def _xls_to_xlsx_via_xlrd(xls_path: str, xlsx_path: str) -> bool:
         return False
 
 
+def _restore_decoded_text(decoded_path, target_path):
+    """Only repair text; xlrd's value-only export must never replace formulas/styles."""
+    from Aspose.Cells import Workbook
+    source, target = Workbook(decoded_path), None
+    try:
+        target = Workbook(target_path)
+        if source.Worksheets.Count != target.Worksheets.Count:
+            raise ValueError("编码修复前后 Sheet 数量不同")
+        for si in range(source.Worksheets.Count):
+            src, dst = source.Worksheets[si], target.Worksheets[si]
+            if src.Cells.MaxDataRow != dst.Cells.MaxDataRow or src.Cells.MaxDataColumn != dst.Cells.MaxDataColumn:
+                raise ValueError("编码修复前后数据范围不同")
+            dst.Name = src.Name
+            it = src.Cells.GetEnumerator()
+            while it.MoveNext():
+                cell = it.Current
+                out = dst.Cells[cell.Row, cell.Column]
+                if isinstance(cell.Value, str) and not out.IsFormula:
+                    out.PutValue(cell.Value)
+        target.Save(target_path)
+    finally:
+        source.Dispose()
+        if target is not None:
+            target.Dispose()
+
+
 def convert_xls_to_xlsx(file_path: str, keep_original: bool = False) -> str:
     """把老版 .xls 转成 .xlsx（同目录），返回新路径。
 
@@ -180,7 +206,8 @@ def convert_xls_to_xlsx(file_path: str, keep_original: bool = False) -> str:
                 tmp_path = new_path + ".xlrd.xlsx"
                 if _xls_to_xlsx_via_xlrd(file_path, tmp_path):
                     if _text_quality(_sample_xlsx_text(tmp_path)) > _text_quality(asp_samples):
-                        os.replace(tmp_path, new_path)
+                        _restore_decoded_text(tmp_path, new_path)
+                        os.remove(tmp_path)
                         logger.info(f"[xls转换] 已用 xlrd 编码修复乱码: {os.path.basename(new_path)}")
                     else:
                         try:
@@ -253,7 +280,8 @@ def shrink_inflated_columns(file_path: str) -> bool:
             for _n in _z.namelist():
                 if not (_n.startswith("xl/worksheets/") and _n.endswith(".xml")):
                     continue
-                _head = _z.read(_n)[:4096].decode("utf-8", "ignore")
+                with _z.open(_n) as _entry:
+                    _head = _entry.read(4096).decode("utf-8", "ignore")
                 _m = _re.search(r'<dimension\s+ref="([^"]+)"', _head)
                 if not _m:
                     _inflated = True   # 无 dimension → 交给 Aspose 复核
@@ -370,6 +398,45 @@ def _date_protected_columns(ws, scan_rows: int = 25) -> set:
     return protected
 
 
+def normalize_workbook_source_dates(wb):
+    """Repair misformatted numeric cells in an already open source workbook."""
+    from Aspose.Cells import CellValueType
+    fixed = 0
+    for i in range(wb.Worksheets.Count):
+        ws = wb.Worksheets[i]
+        cells = ws.Cells
+        protected_cols = _date_protected_columns(ws)   # 日期列保护名单
+        it = cells.GetEnumerator()
+        while it.MoveNext():
+            cell = it.Current
+            try:
+                if cell.Type != CellValueType.IsDateTime:
+                    continue
+                serial = float(cell.DoubleValue)
+            except Exception:
+                continue
+            # 真实业务日期（1950 年后）不动
+            if serial >= _REAL_DATE_SERIAL_MIN:
+                continue
+            # 列名是日期列 → 保护，不动（即便序列号偏小，可能是早期生日）
+            try:
+                if cell.Column in protected_cols:
+                    continue
+            except Exception:
+                pass
+            # 被误设成日期格式的数字 → 重置为常规格式
+            try:
+                style = cell.GetStyle()
+                style.Number = 0          # 0 = General/常规
+                style.Custom = ""
+                cell.SetStyle(style)
+                fixed += 1
+            except Exception:
+                continue
+
+    return fixed
+
+
 def normalize_misformatted_dates(file_path: str, out_path: str = None,
                                   calculate_formulas: bool = True) -> int:
     """将源文件中"被误设成日期格式的数字单元格"格式重置为常规。
@@ -416,37 +483,7 @@ def normalize_misformatted_dates(file_path: str, out_path: str = None,
             except Exception as _ce:
                 logger.warning(f"[normalize] CalculateFormula 跳过: {file_path} - {_ce}")
 
-        for i in range(wb.Worksheets.Count):
-            ws = wb.Worksheets[i]
-            cells = ws.Cells
-            protected_cols = _date_protected_columns(ws)   # 日期列保护名单
-            it = cells.GetEnumerator()
-            while it.MoveNext():
-                cell = it.Current
-                try:
-                    if cell.Type != CellValueType.IsDateTime:
-                        continue
-                    serial = float(cell.DoubleValue)
-                except Exception:
-                    continue
-                # 真实业务日期（1950 年后）不动
-                if serial >= _REAL_DATE_SERIAL_MIN:
-                    continue
-                # 列名是日期列 → 保护，不动（即便序列号偏小，可能是早期生日）
-                try:
-                    if cell.Column in protected_cols:
-                        continue
-                except Exception:
-                    pass
-                # 被误设成日期格式的数字 → 重置为常规格式
-                try:
-                    style = cell.GetStyle()
-                    style.Number = 0          # 0 = General/常规
-                    style.Custom = ""
-                    cell.SetStyle(style)
-                    fixed += 1
-                except Exception:
-                    continue
+        fixed = normalize_workbook_source_dates(wb)
 
         if fixed > 0:
             wb.Save(out_path or file_path)

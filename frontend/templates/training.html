@@ -58,6 +58,7 @@
                     </div>
                 </div>
 
+                <div id="session-assets" style="display:none;padding:10px 16px;border-bottom:1px solid #ddd;max-height:150px;overflow:auto;"></div>
                 <div class="chat-messages" id="chat-messages">
                     <div class="chat-placeholder" id="chat-placeholder">
                         <div class="placeholder-content">
@@ -87,12 +88,14 @@
                             <div class="form-row">
                                 <div class="form-group">
                                     <label>源文件:</label>
-                                    <input type="file" id="source-files" multiple accept=".xlsx,.xls">
+                                    <input type="file" id="source-files" multiple accept=".xlsx,.xls,.xlsm">
+                                    <small>已有会话默认新增文件，同名文件替换，其他源文件保留。</small>
+                                    <select id="source-update-mode"><option value="merge">新增 / 同名替换</option><option value="replace">替换全部源文件</option></select>
                                     <div class="file-list" id="source-file-list"></div>
                                 </div>
                                 <div class="form-group">
                                     <label id="target-file-label">目标文件:</label>
-                                    <input type="file" id="target-file" accept=".xlsx,.xls">
+                                    <input type="file" id="target-file" accept=".xlsx,.xls,.xlsm">
                                     <div class="file-list" id="target-file-list"></div>
                                     <small id="target-file-hint" style="display:none;color:#666;font-size:12px;margin-top:4px;"></small>
                                 </div>
@@ -100,7 +103,7 @@
                             <div class="form-row">
                                 <div class="form-group">
                                     <label>规则文件:</label>
-                                    <input type="file" id="rule-files" multiple accept=".md,.txt,.pdf,.docx">
+                                    <input type="file" id="rule-files" multiple accept=".md,.txt,.pdf,.docx,.xlsx,.xls,.xlsm">
                                     <div class="file-list" id="rule-file-list"></div>
                                 </div>
                                 <div class="form-group">
@@ -144,6 +147,11 @@
                                     <label>手动表头 (可选，复杂表头时使用):</label>
                                     <textarea id="manual-headers" rows="3" placeholder='{"文件名.xlsx": {"Sheet1": [3, 3]}}  — 指定表头所在行号'></textarea>
                                 </div>
+                            </div>
+                            <div id="session-asset-actions" style="display:none;margin-top:12px;">
+                                <button type="button" id="save-session-assets" class="btn btn-generate" onclick="saveSessionAssets()">保存文件与配置</button>
+                                <span id="session-asset-status" role="status"></span>
+                                <p>保存后可继续讨论、执行修正或重新生成。正在执行的轮次结束后生效。</p>
                             </div>
                         </div>
                     </div>
@@ -205,6 +213,7 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260722b"></script>
-<script src="/static/js/training.js?v=20260903c"></script>
+<script src="/static/js/training.js?v=20260907-assets"></script>
+<script src="/static/js/training_assets.js?v=20260907-assets"></script>
 </body>
 </html>

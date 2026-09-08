@@ -726,6 +726,9 @@ class TrainingEngine:
                     expected_structure=expected_structure,
                 )
 
+                if execution_result.get("resource_failure"):
+                    from backend.utils.training_validation import TrainingResourceFailure
+                    raise TrainingResourceFailure(execution_result.get("error", "执行资源不足"))
                 # 记录执行结果
                 self.training_logger.log_execution_result(
                     execution_result["success"],
@@ -777,6 +780,9 @@ class TrainingEngine:
                 self.training_logger.log_warning(
                     f"第 {iteration_num} 次迭代失败: {e}，保留已有最佳结果(score={best_score:.2%})"
                 )
+                from backend.utils.training_validation import TrainingResourceFailure
+                if isinstance(e, TrainingResourceFailure):
+                    raise
                 self.logger.error(f"迭代 {iteration_num} 异常: {e}", exc_info=True)
                 continue
 
@@ -851,31 +857,7 @@ class TrainingEngine:
         if historical_best_score > 0:
             self.training_logger.log_info(f"历史最佳分数: {historical_best_score:.2%}")
 
-        # 如果不是强制重新训练，且历史最佳分数已经达到完美匹配阈值，直接返回，不需要再训练
-        if not force_retrain and historical_best_score >= self.training_perfect_threshold and historical_best_code:
-            self.training_logger.log_info(f"历史最佳分数已达到{self.training_perfect_threshold*100:.0f}%，跳过训练，直接使用历史最佳代码")
-            self.training_logger.log_training_complete(
-                best_score=historical_best_score,
-                total_iterations=0,
-                success=True,
-                best_code_length=len(historical_best_code) if historical_best_code else 0
-            )
-            return {
-                "success": True,
-                "best_score": historical_best_score,
-                "current_score": historical_best_score,
-                "historical_best_score": historical_best_score,
-                "total_iterations": 0,
-                "output_path": "",
-                "result_excel": "",
-                "comparison_excel": "",
-                "best_code": historical_best_code,
-                "mode": "formula",
-                "iteration_results": [],
-                "source_structure": source_structure,
-                "expected_structure": expected_structure,
-                "validation_rules": {}
-            }
+        # Historical scores are informational only: every run validates its current inputs.
 
         # 创建公式代码生成器
         formula_generator = FormulaCodeGenerator(
@@ -885,7 +867,7 @@ class TrainingEngine:
 
         # 获取输入输出文件夹
         input_folder = str(Path(source_files[0]).parent) if source_files else ""
-        output_folder = str(Path(expected_file).parent) if expected_file else input_folder
+        output_folder = None  # Each iteration gets a dedicated temporary output directory.
 
         best_code = None
         best_score = 0.0
@@ -939,6 +921,8 @@ class TrainingEngine:
             iteration_num = iteration + 1
             self.training_logger.start_iteration(iteration_num, "formula")
             self.training_logger.log_info(f"--- 公式模式迭代 {iteration_num}/{self.max_iterations} ---")
+            import tempfile
+            output_folder = tempfile.mkdtemp(prefix="formula_iteration_")
 
             try:
                 if iteration == 0:
@@ -1102,6 +1086,9 @@ class TrainingEngine:
                     self.training_logger.log_error(f"沙箱错误: {execution_result['error'][:500]}...")
 
                 if not execution_result["success"]:
+                    if execution_result.get("resource_failure"):
+                        from backend.utils.training_validation import TrainingResourceFailure
+                        raise TrainingResourceFailure(execution_result.get("error", "执行资源不足"))
                     self.training_logger.log_execution_result(
                         False, execution_time, error=execution_result.get("error", "执行失败")
                     )
@@ -1146,7 +1133,23 @@ class TrainingEngine:
                         })
                         continue
 
-                    output_path = str(output_files[0])
+                    from backend.utils.result_selection import pick_result_output
+                    selected_output = pick_result_output(output_files, execution_env.get('_template_override_path'))
+                    if selected_output is None:
+                        raise ValueError('未生成有效结果工作簿')
+                    output_path = str(selected_output)
+                from backend.utils.training_validation import finalize_training_output
+                finalization = finalize_training_output(
+                    output_path, code, expected_structure,
+                    execution_env.get("_template_override_path"))
+                formula_report = finalization.get("formula_report") or {}
+                if finalization.get("formula_warning"):
+                    self.training_logger.log_info(
+                        "公式已重算并保存，检测到可继续对比的公式警告: "
+                        f"#N/A/错误={formula_report.get('error_cache_count', 0)}, "
+                        f"空缓存={formula_report.get('empty_cache_count', 0)}, "
+                        f"#REF={formula_report.get('invalid_ref_formula_count', 0)}, "
+                        f"外部引用={formula_report.get('external_formula_count', 0)}")
                 self.training_logger.log_execution_result(True, execution_time, output_file=output_path)
 
                 # 使用training_logger保存输出Excel到训练日志目录
@@ -1154,26 +1157,20 @@ class TrainingEngine:
 
                 # 比较结果 - 根据预期文件sheet数选择单sheet或多sheet对比
                 comparison_output_file = str(self.training_logger.log_dir / f"差异对比_{iteration_num}.xlsx")
-                _exp_sheet_count = len(expected_structure.get("sheets", {}))
-                if _exp_sheet_count > 1:
-                    comparison_result = compare_excel_files_multi_sheet(
-                        result_file=output_path,
-                        expected_file=expected_file,
-                        output_file=comparison_output_file,
-                        primary_keys=comparison_primary_keys
-                    )
-                else:
-                    comparison_result = compare_excel_files(
-                        result_file=output_path,
-                        expected_file=expected_file,
-                        output_file=comparison_output_file,
-                        primary_keys=comparison_primary_keys
-                    )
+                comparison_result = compare_excel_files_multi_sheet(
+                    result_file=output_path,
+                    expected_file=expected_file,
+                    output_file=comparison_output_file,
+                    primary_keys=comparison_primary_keys, result_calculated=True
+                )
 
                 # 计算匹配分数（基于单元格匹配数量）
                 total_cells = comparison_result.get("total_cells", 0)
                 matched_cells = comparison_result.get("matched_cells", 0)
                 total_diff = comparison_result.get("total_differences", 0)
+
+                from backend.utils.excel_comparator import require_complete_comparison
+                require_complete_comparison(comparison_result)
 
                 # 使用单元格匹配率作为分数
                 if total_cells > 0:
@@ -1239,9 +1236,15 @@ class TrainingEngine:
                     break
 
             except Exception as e:
+                from backend.utils.training_validation import TrainingResourceFailure
+                if isinstance(e, TrainingResourceFailure):
+                    raise
                 self.training_logger.log_error(f"迭代 {iteration_num} 发生错误: {e}", e)
                 import traceback
                 traceback.print_exc()
+            finally:
+                from backend.utils.training_validation import cleanup_training_directory
+                cleanup_training_directory(output_folder)
 
         # 更新历史最佳分数（如果本次分数更高）
         if best_score > historical_best_score and best_code:
@@ -1253,11 +1256,6 @@ class TrainingEngine:
         # 使用历史最佳代码（如果历史最佳分数更高）
         final_code = best_code
         final_score = best_score
-        if historical_best_score > best_score and historical_best_code:
-            final_code = historical_best_code
-            final_score = historical_best_score
-            self.training_logger.log_info(f"使用历史最佳代码（分数: {historical_best_score:.2%}）")
-
         # 构建返回结果
         result = {
             "success": final_score >= self.training_success_threshold,
@@ -1265,7 +1263,7 @@ class TrainingEngine:
             "current_score": best_score,
             "historical_best_score": historical_best_score,
             "total_iterations": len(iteration_results),
-            "output_path": best_output_path,
+            "output_path": best_saved_output_path or best_output_path,
             "result_excel": best_saved_output_path,
             "comparison_excel": best_saved_comparison_path,
             "best_code": final_code,
@@ -1416,6 +1414,9 @@ class TrainingEngine:
                     expected_structure=expected_structure,
                 )
 
+                if execution_result.get("resource_failure"):
+                    from backend.utils.training_validation import TrainingResourceFailure
+                    raise TrainingResourceFailure(execution_result.get("error", "执行资源不足"))
                 # 记录执行结果
                 self.training_logger.log_execution_result(
                     execution_result["success"],
@@ -1463,6 +1464,9 @@ class TrainingEngine:
                     break
 
             except Exception as e:
+                from backend.utils.training_validation import TrainingResourceFailure
+                if isinstance(e, TrainingResourceFailure):
+                    raise
                 self.training_logger.log_error(f"模块化生成迭代 {iteration_num} 失败: {e}")
                 # 获取已生成的代码（如果有）
                 failed_code = code if 'code' in dir() and code else ""
@@ -1738,7 +1742,7 @@ class TrainingEngine:
                     active_sheet_only=not multi_sheet_source,
                     best_region_only=True,
                     password=passwords.get(file_name),
-                    read_formulas=False
+                    read_formulas=True
                 )
 
                 file_structure = {
@@ -1752,16 +1756,23 @@ class TrainingEngine:
                         "sheet_name": sheet_data.sheet_name,
                         "regions": len(sheet_data.regions),
                         "headers": {},
-                        "data_sample": []
+                        "data_sample": [],
+                        "column_schemas": {},
+                        "formulas": {},
                     }
 
                     for region in sheet_data.regions:
                         # 记录表头映射
                         sheet_structure["headers"].update(region.head_data)
+                        sheet_structure["formulas"].update(region.formula or {})
+                        for _name, _letter in region.head_data.items():
+                            _schema = (getattr(region, "column_schemas", None) or {}).get(_letter)
+                            if _schema:
+                                sheet_structure["column_schemas"][_name] = dict(_schema)
 
                         # 记录数据样本（最多3行）
                         if region.data and len(sheet_structure["data_sample"]) < 3:
-                            sheet_structure["data_sample"].append(region.data[0])
+                            sheet_structure["data_sample"].extend(region.data[:3 - len(sheet_structure["data_sample"])])
 
                     file_structure["sheets"][sheet_data.sheet_name] = sheet_structure
                     file_structure["total_regions"] += len(sheet_data.regions)
@@ -1791,12 +1802,18 @@ class TrainingEngine:
 
             parsed_data = self.excel_parser.parse_excel_file(
                 expected_file,
-             max_data_rows=10,  # 训练时只读取10行数据用于分析结构
+                max_data_rows=10,  # 训练时只读取10行数据用于分析结构
                 manual_headers=manual_headers,
                 active_sheet_only=False,  # 加载所有sheet以支持多Sheet训练
                 best_region_only=True,  # 只取有效区域
                 password=(file_passwords or {}).get(Path(expected_file).name)
             )
+            from backend.utils.formula_evidence import collect_formula_evidence
+            try:
+                formula_evidence = collect_formula_evidence(expected_file) or {}
+            except Exception as exc:
+                self.logger.warning('目标全表公式扫描失败，保留解析样本公式: %s', exc)
+                formula_evidence = {}
 
             structure = {
                 "file_name": Path(expected_file).name,
@@ -1809,16 +1826,27 @@ class TrainingEngine:
                     "sheet_name": sheet_data.sheet_name,
                     "regions": len(sheet_data.regions),
                     "headers": {},
-                    "data_sample": []
+                    "data_sample": [],
+                    "column_schemas": {},
+                    "formulas": {},
                 }
 
                 for region in sheet_data.regions:
                     # 记录表头映射
                     sheet_structure["headers"].update(region.head_data)
+                    for _name, _letter in region.head_data.items():
+                        _schema = (getattr(region, "column_schemas", None) or {}).get(_letter)
+                        if _schema:
+                            sheet_structure["column_schemas"][_name] = dict(_schema)
 
                     # 记录数据样本（最多3行）
-                    if region.data and len(sheet_structure["data_sample"]) < 3:
-                        sheet_structure["data_sample"].append(region.data[0])
+                    sheet_structure['data_sample'].extend(
+                        region.data[:max(0, 3 - len(sheet_structure['data_sample']))])
+                    sheet_structure['formulas'].update(region.formula)
+
+                if sheet_data.sheet_name in formula_evidence:
+                    sheet_structure['formulas'] = formula_evidence[sheet_data.sheet_name]['formulas']
+                    sheet_structure['formula_count'] = formula_evidence[sheet_data.sheet_name]['formula_count']
 
                 structure["sheets"][sheet_data.sheet_name] = sheet_structure
                 structure["total_regions"] += len(sheet_data.regions)
@@ -1919,9 +1947,26 @@ class TrainingEngine:
                 self.training_logger.log_debug(f"输出目录中的所有文件: {[f.name for f in all_files]}")
 
                 if output_files:
-                    output_file = output_files[0]
+                    from backend.utils.result_selection import pick_result_output
+                    output_file = pick_result_output(output_files, execution_env.get('_template_override_path'))
+                    if output_file is None:
+                        raise ValueError('未生成有效结果工作簿')
                     result["output_file"] = str(output_file)
                     self.training_logger.log_info(f"找到输出文件: {output_file}")
+
+                    from backend.utils.training_validation import finalize_training_output
+                    finalization = finalize_training_output(
+                        str(output_file), code, expected_structure,
+                        execution_env.get("_template_override_path"))
+                    formula_report = finalization.get("formula_report") or {}
+                    result["formula_report"] = formula_report
+                    result["formula_warning"] = bool(finalization.get("formula_warning"))
+                    if result["formula_warning"]:
+                        self.training_logger.log_info(
+                            "公式已重算并保存，继续准确率对比: "
+                            f"错误={formula_report.get('error_cache_count', 0)}, "
+                            f"#REF={formula_report.get('invalid_ref_formula_count', 0)}, "
+                            f"外部引用={formula_report.get('external_formula_count', 0)}")
 
                     # 将输出文件复制到training文件夹（加上时间戳）
                     from datetime import datetime
@@ -1935,21 +1980,12 @@ class TrainingEngine:
 
                     # 使用独立的差异对比组件进行对比（根据预期sheet数选择）
                     comparison_output_file = str(output_dir / "差异对比.xlsx")
-                    _exp_sheet_count = len((expected_structure or {}).get("sheets", {}))
-                    if _exp_sheet_count > 1:
-                        comparison_result = compare_excel_files_multi_sheet(
-                            result_file=str(output_file),
-                            expected_file=expected_file,
-                            output_file=comparison_output_file,
-                            primary_keys=comparison_primary_keys
-                        )
-                    else:
-                        comparison_result = compare_excel_files(
-                            result_file=str(output_file),
-                            expected_file=expected_file,
-                            output_file=comparison_output_file,
-                            primary_keys=comparison_primary_keys
-                        )
+                    comparison_result = compare_excel_files_multi_sheet(
+                        result_file=str(output_file),
+                        expected_file=expected_file,
+                        output_file=comparison_output_file,
+                        primary_keys=comparison_primary_keys, result_calculated=True
+                    )
 
                     # 保存差异对比Excel到training_logs，然后删除临时文件
                     if Path(comparison_output_file).exists():
@@ -1959,11 +1995,14 @@ class TrainingEngine:
                         # 删除临时的差异对比文件，只保留training_logs中的版本
                         Path(comparison_output_file).unlink(missing_ok=True)
 
+                    from backend.utils.excel_comparator import require_complete_comparison
+                    require_complete_comparison(comparison_result)
+
                     # 根据对比结果判断是否成功
                     total_diff = comparison_result.get("total_differences", 0)
                     matched_cells = comparison_result.get("matched_cells", 0)
                     total_cells = comparison_result.get("total_cells", 0)
-                    result["success"] = total_diff == 0
+                    result["success"] = bool(comparison_result.get("success")) and total_diff == 0
                     if total_diff == 0:
                         result["comparison"] = "所有检查项都通过！"
                     else:
@@ -1983,14 +2022,17 @@ class TrainingEngine:
                     self.training_logger.log_error(result["error"][:500])
             else:
                 result["error"] = execution_result.get("error", "执行失败")
+                result["resource_failure"] = execution_result.get("resource_failure", False)
                 self.training_logger.log_error(f"沙箱执行失败: {result['error'][:500]}...")
 
-            # 清理临时目录
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
         except Exception as e:
+            from backend.utils.training_validation import TrainingResourceFailure
+            result["resource_failure"] = isinstance(e, TrainingResourceFailure)
             result["error"] = f"执行验证过程中出错: {str(e)}"
             self.training_logger.log_error(f"执行验证失败: {e}")
+        finally:
+            from backend.utils.training_validation import cleanup_training_directory
+            cleanup_training_directory(temp_dir)
 
         return result
 
@@ -2036,12 +2078,17 @@ class TrainingEngine:
             sheet_structure = {
                 "sheet_name": sheet_data.sheet_name,
                 "headers": {},
-                "data": []
+                "data": [],
+                "column_schemas": {},
             }
 
             for region in sheet_data.regions:
                 # 合并表头
                 sheet_structure["headers"].update(region.head_data)
+                for _name, _letter in region.head_data.items():
+                    _schema = (getattr(region, "column_schemas", None) or {}).get(_letter)
+                    if _schema:
+                        sheet_structure["column_schemas"][_name] = dict(_schema)
 
                 # 添加数据
                 for row in region.data:

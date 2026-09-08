@@ -49,26 +49,17 @@ class AIRuleGenerator:
             doc_length = len(document_content)
             self.logger.info(f"文档长度: {doc_length} 字符")
 
-            if doc_length > 50000:  # 超长文档
-                self.logger.info("检测到超长文档，使用分步处理策略...")
-                return self._generate_rules_step_by_step(
-                    document_content, source_structure, expected_structure, manual_headers
-                )
-            elif doc_length > 20000:  # 长文档
-                self.logger.info("检测到长文档，使用压缩摘要策略...")
-                return self._generate_rules_with_compression(
-                    document_content, source_structure, expected_structure, manual_headers
-                )
-            else:  # 短文档
-                self.logger.info("文档长度适中，使用标准策略...")
-                return self._generate_rules_standard(
-                    document_content, source_structure, expected_structure, manual_headers
-                )
+            from .rule_organizer import RuleOrganizer
+            reader = RuleOrganizer.__new__(RuleOrganizer)
+            reader.ai_provider = self.ai_provider
+            document_content = reader._prepare_design_context(document_content)
+            return self._generate_rules_standard(
+                document_content, source_structure, expected_structure, manual_headers)
 
         except Exception as e:
             self.logger.error(f"AI规则生成失败: {e}")
-            # 返回默认规则
-            return self._get_default_rules()
+            # 不把分析失败伪装成可训练的默认规则。
+            raise
 
     def _generate_rules_standard(
         self,
@@ -438,11 +429,13 @@ class AIRuleGenerator:
     ) -> str:
         """创建规则生成提示词"""
         # 1. 提取文档关键信息（避免token超限）
-        doc_summary = self._extract_document_summary(document_content)
+        doc_summary = document_content
 
         # 2. 压缩文件结构信息
-        compressed_source = self._compress_structure(source_structure, "源文件")
-        compressed_expected = self._compress_structure(expected_structure, "预期输出文件")
+        from .prompt_generator import PromptGenerator
+        formatter = PromptGenerator()
+        compressed_source = formatter._compress_structure(source_structure)
+        compressed_expected = formatter._compress_structure(expected_structure)
 
         prompt = f"""你是一个专业的数据处理规则分析师。请分析以下需求文档摘要、源文件结构和预期输出结构，生成完整的数据处理规则。
 
@@ -760,11 +753,18 @@ class AIRuleGenerator:
 
                     for sheet_name, sheet_info in sheets.items():
                         headers = list(sheet_info.get('headers', {}).keys())
+                        schemas = sheet_info.get('column_schemas', {}) or {}
                         # 只取前5个表头
                         if len(headers) > 5:
                             headers = headers[:5] + [f"...等{len(headers)-5}列"]
 
-                        sheet_list.append(f"  - {sheet_name}: {', '.join(headers)}")
+                        typed_headers = []
+                        for header in headers:
+                            schema = schemas.get(header) or {}
+                            typed_headers.append(
+                                f"{header}[{schema.get('field_type')}/{schema.get('format_type')}]"
+                                if schema else header)
+                        sheet_list.append(f"  - {sheet_name}: {', '.join(typed_headers)}")
 
                     sheets_text = '\n'.join(sheet_list[:3])  # 最多3个sheet
                     if len(sheets) > 3:
@@ -784,6 +784,7 @@ class AIRuleGenerator:
 
                 for sheet_name, sheet_info in sheets.items():
                     headers = list(sheet_info.get('headers', {}).keys())
+                    schemas = sheet_info.get('column_schemas', {}) or {}
                     # 只取前8个表头
                     if len(headers) > 8:
                         headers = headers[:8] + [f"...等{len(headers)-8}列"]
@@ -791,7 +792,13 @@ class AIRuleGenerator:
                     data_sample = sheet_info.get('data_sample', [])
                     sample_count = len(data_sample)
 
-                    compressed_info.append(f"  - {sheet_name}: {', '.join(headers)}")
+                    typed_headers = []
+                    for header in headers:
+                        schema = schemas.get(header) or {}
+                        typed_headers.append(
+                            f"{header}[{schema.get('field_type')}/{schema.get('format_type')}]"
+                            if schema else header)
+                    compressed_info.append(f"  - {sheet_name}: {', '.join(typed_headers)}")
                     if sample_count > 0:
                         compressed_info[-1] += f" (有{sample_count}条数据示例)"
 

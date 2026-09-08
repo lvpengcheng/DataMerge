@@ -41,7 +41,7 @@ from ..api.training_chat import router as training_chat_router
 from ..api.tools import router as tools_router
 from ..api.assemble_rules import router as assemble_rules_router
 from ..api.assemble import router as assemble_router
-from ..database.connection import engine, get_db, SessionLocal
+from ..database.connection import engine, get_db, SessionLocal, verify_database_connection
 from ..database import models as db_models
 from ..auth.dependencies import get_current_user, get_accessible_tenants, get_operable_tenants
 from sqlalchemy.orm import Session
@@ -647,6 +647,7 @@ async def startup_event():
                 return True
         logging.getLogger("asyncio").addFilter(_WinAcceptNoiseFilter())
 
+    verify_database_connection()
     db_models.Base.metadata.create_all(bind=engine)
     # 增量迁移：为已有表添加新列
     from backend.database.init_db import _migrate_add_columns
@@ -1571,7 +1572,7 @@ async def calculate_data(
                 fast_matcher = FastHeaderMatcher()
                 current_input_files = [
                     f for f in saved_files["input_files"]
-                    if f.endswith(('.xlsx', '.xls')) and not os.path.basename(f).startswith('~')
+                    if f.lower().endswith((".xlsx", ".xls", ".xlsm")) and not os.path.basename(f).startswith('~')
                 ]
                 if current_input_files:
                     # ===== 单次解析优化：每文件仅 1 次 Aspose 调用 =====
@@ -1620,7 +1621,7 @@ async def calculate_data(
             # 更新 input_files 列表
             saved_files["input_files"] = [
                 os.path.join(input_dir, f) for f in os.listdir(input_dir)
-                if f.endswith(('.xlsx', '.xls')) and not f.startswith('~')
+                if f.lower().endswith((".xlsx", ".xls", ".xlsm")) and not f.startswith('~')
             ]
 
         if not match_success:
@@ -2606,7 +2607,7 @@ async def calculate_data_split(
             fast_matcher = FastHeaderMatcher()
             current_input_files = [
                 os.path.join(input_dir, f) for f in os.listdir(input_dir)
-                if f.endswith(('.xlsx', '.xls')) and not f.startswith('~')
+                if f.lower().endswith((".xlsx", ".xls", ".xlsm")) and not f.startswith('~')
             ]
 
             if current_input_files and source_structure:
@@ -2654,7 +2655,7 @@ async def calculate_data_split(
                 # 更新 input_files 列表
                 saved_files["input_files"] = [
                     os.path.join(input_dir, f) for f in os.listdir(input_dir)
-                    if f.endswith(('.xlsx', '.xls')) and not f.startswith('~')
+                    if f.lower().endswith((".xlsx", ".xls", ".xlsm")) and not f.startswith('~')
                 ]
 
                 if not match_success:
@@ -4278,44 +4279,9 @@ def _extract_template_path(script_content: str):
 
 
 def _pick_result_output(output_files, template_path=None):
-    """从 output_dir 里 glob 到的 xlsx 中挑出【真正的结果文件】。
-
-    背景：某些（AI 定制的）模板骨架会先把模板 copy2 成工作副本 out_path，最后却把填充
-    后的工作簿【另存成带时间戳的新文件名】，于是输出目录里同时留下 [模板原样副本, 真实结果]
-    两个文件。上层若按 glob 顺序取 output_files[0]，可能取到那份原样副本 → 用户下载到空模板
-    （fill_report 明明显示改了很多格）。
-
-    策略：① 若知道有效模板且能算哈希，剔除与模板字节完全相同的原样副本；② 再按修改时间
-    倒序取最新——真实结果最后 save，mtime 最新；copy2 出来的副本继承模板的旧 mtime。
-    单靠 mtime 已足以规避本问题；哈希剔除是更强的双保险。返回单个 Path 或 None。
-    """
-    files = list(output_files or [])
-    if len(files) <= 1:
-        return files[0] if files else None
-    try:
-        if template_path and os.path.exists(template_path):
-            import hashlib as _hl
-
-            def _md5(p):
-                _h = _hl.md5()
-                with open(p, "rb") as _fp:
-                    for _chunk in iter(lambda: _fp.read(1 << 20), b""):
-                        _h.update(_chunk)
-                return _h.hexdigest()
-
-            _tpl_md5 = _md5(template_path)
-            _non_tpl = [f for f in files if _md5(str(f)) != _tpl_md5]
-            if _non_tpl:
-                files = _non_tpl
-            else:
-                logger.warning("[输出选择] 所有输出文件都与模板字节相同，可能填充未落盘")
-    except Exception as _pe:
-        logger.warning(f"[输出选择] 剔除模板副本失败（忽略）: {_pe}")
-    try:
-        files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-    except Exception:
-        pass
-    return files[0]
+    """Use the same strict result selection as training."""
+    from backend.utils.result_selection import pick_result_output
+    return pick_result_output(output_files, template_path)
 
 
 def _resolve_script_display_name(tenant_id: str, script_id: str, script_content: str = None):
@@ -4380,208 +4346,163 @@ def _resolve_script_display_name(tenant_id: str, script_id: str, script_content:
 
 
 async def _run_compute_subprocess(task_id: str, buffer, params_file: str, temp_dir: str):
-    """在【独立子进程】运行 run_compute_task，读其 stdout 进度事件并转推给 SSE 缓冲。
-
-    计算用 Aspose(.NET)，pythonnet 调用持 GIL 会冻结事件循环；放子进程后父进程只做
-    管道 IO，事件循环始终空闲 → SSE/status 持续响应 → 前置 WAF 不再 502。
-    """
-    _EVT_PREFIX = "@@EVT@@"
-    _DONE = "@@DONE@@"
-    _proot = str(Path(__file__).resolve().parent.parent.parent)
-
-    # 用同步 subprocess.Popen + 后台线程读管道，而非 asyncio.create_subprocess_exec：
-    # uvicorn 在 Windows 开发模式(reload=True)下装的是 SelectorEventLoop，不支持 asyncio
-    # 子进程（create_subprocess_exec 抛空消息的 NotImplementedError → "计算进程启动失败:"）。
-    # Popen 不依赖事件循环类型，跨平台/跨循环都可用；读操作在线程里跑，事件循环照样空闲，
-    # 仍保留"Aspose/.NET 持 GIL 不冻结事件循环 → SSE 不被 WAF 502"的原始目的。
-    import subprocess as _subprocess
-    import threading as _threading
+    """Run compute with bounded lifetime; never restart an unreaped I/O-blocked child."""
+    import subprocess
+    import threading
+    from backend.utils.resource_guard import (
+        ensure_healthy, memory_limit_mb, process_group_options, terminate_process, trip_circuit,
+    )
+    from backend.utils.subprocess_runner import _process_rss_mb, env_int
+    ensure_healthy()
     loop = asyncio.get_running_loop()
-    _state = {"saw_terminal": False, "returncode": None, "start_error": None,
-              "proc": None, "killed_by_memory": False}
+    state = {"proc": None, "terminal": False, "error": None, "closed": False}
     done = asyncio.Event()
+    stopped = threading.Event()
+    cap = memory_limit_mb(env_int("COMPUTE_PROC_MAX_MEMORY_MB", 0))
+    timeout = max(1, env_int("COMPUTE_PROC_TIMEOUT", 3600))
 
-    # 子进程超时（秒）：读取 .env COMPUTE_PROC_TIMEOUT，默认 3600。
-    # 历史上 await done.wait() 无超时——子进程假死（如 Aspose 计算卡死）时父进程永久等待，
-    # 任务挂死。超时后强杀进程树并推送失败事件。
-    try:
-        _proc_timeout = int(os.getenv("COMPUTE_PROC_TIMEOUT", "3600"))
-    except (TypeError, ValueError):
-        _proc_timeout = 3600
-    try:
-        _proc_max_memory = int(os.getenv("COMPUTE_PROC_MAX_MEMORY_MB", "2048"))
-    except (TypeError, ValueError):
-        _proc_max_memory = 2048
+    def post(callback, *args):
+        if not state["closed"] and not loop.is_closed():
+            loop.call_soon_threadsafe(callback, *args)
 
-    def _reader():
-        proc = None
+    def reader():
         try:
-            _env = os.environ.copy()
-            _env["PYTHONIOENCODING"] = "utf-8"   # 子进程 stdout 统一 UTF-8，避免 Windows GBK 中文乱码
-            _env["PYTHONUTF8"] = "1"
-            proc = _subprocess.Popen(
+            env = os.environ.copy()
+            env.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+            proc = subprocess.Popen(
                 [sys.executable, "-u", "-m", "backend.compute.compute_worker", params_file],
-                cwd=_proot,
-                stdout=_subprocess.PIPE,
-                stderr=_subprocess.STDOUT,
-                env=_env,
-            )
-            _state["proc"] = proc   # 供主协程超时后强杀
+                cwd=str(Path(__file__).resolve().parent.parent.parent),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+                **process_group_options())
+            state["proc"] = proc
+            if stopped.is_set():
+                terminate_process(proc)
+                return
             for raw in proc.stdout:
                 line = raw.decode("utf-8", "replace").rstrip("\r\n")
-                if line.startswith(_EVT_PREFIX):
-                    ev = line[len(_EVT_PREFIX):]
-                    loop.call_soon_threadsafe(buffer.push, task_id, ev)
-                    if '"complete"' in ev or '"error"' in ev:
-                        _state["saw_terminal"] = True
-                elif line.startswith(_DONE):
-                    pass
-                elif line.strip():
-                    logger.debug(f"[compute/subproc] {line}")
-            proc.wait()
-            _state["returncode"] = proc.returncode
-        except Exception as e:
-            _state["start_error"] = e
-        finally:
-            loop.call_soon_threadsafe(done.set)
-
-    _t = _threading.Thread(target=_reader, name=f"compute-subproc-{task_id}", daemon=True)
-    _t.start()
-
-    async def _memory_watchdog():
-        from backend.utils.subprocess_runner import _kill_tree, _process_rss_mb
-        while not done.is_set():
-            await asyncio.sleep(0.5)
-            proc = _state.get("proc")
-            if proc is None or proc.poll() is not None:
-                continue
-            rss = _process_rss_mb(proc.pid)
-            if _proc_max_memory > 0 and rss > _proc_max_memory:
-                _state["killed_by_memory"] = True
-                logger.error(f"[compute/subproc] 内存超限 {rss:.0f}MB > {_proc_max_memory}MB，强杀: {proc.pid}")
-                _kill_tree(proc.pid)
-                return
-
-    _mem_task = asyncio.create_task(_memory_watchdog())
-    try:
-        try:
-            await asyncio.wait_for(done.wait(), timeout=_proc_timeout)
-        except asyncio.TimeoutError:
-            # 真超时：强杀子进程树（taskkill /F /T），推送失败事件并持久化失败状态。
-            # 历史上 await done.wait() 无超时——子进程假死（Aspose 计算卡死/内存失控）时
-            # 永久等待，任务挂死且子进程继续吃内存 → VM swap 风暴假死。
-            _proc = _state.get("proc")
-            if _proc is not None and _proc.poll() is None:
-                logger.error(f"[compute/subproc] 计算子进程超时（{_proc_timeout}s），强杀: {_proc.pid}")
-                try:
-                    from backend.utils.subprocess_runner import _kill_tree
-                    _kill_tree(_proc.pid)
-                except Exception:
+                if line.startswith("@@EVT@@"):
+                    event = line[len("@@EVT@@"):]
                     try:
-                        _proc.kill()
-                    except Exception:
-                        pass
-            _msg = f"计算超时（{_proc_timeout}s），已强制终止"
-            try:
-                buffer.push(task_id, json.dumps({"type": "error", "message": _msg}, ensure_ascii=False))
-            except Exception:
-                pass
-            try:
-                from backend.database.connection import SessionLocal as _SL2
-                _db2 = _SL2()
+                        kind = json.loads(event).get("type")
+                    except (ValueError, AttributeError):
+                        continue
+                    if kind in ("complete", "error"):
+                        state["terminal"] = True
+                    post(buffer.push, task_id, event)
+                elif line.strip() and not line.startswith("@@DONE@@"):
+                    logger.debug("[compute/subproc] %s", line)
+        except Exception as exc:
+            state["error"] = str(exc)
+        finally:
+            post(done.set)
+
+    threading.Thread(target=reader, daemon=True, name=f"compute-{task_id}").start()
+    deadline = time.monotonic() + timeout
+    failure = None
+    terminated = True
+    try:
+        while True:
+            proc = state["proc"]
+            if state["error"]:
+                failure = f"计算进程启动/读取失败: {state['error']}"
+                break
+            if proc is not None and proc.poll() is not None:
                 try:
-                    _persist_compute_failed(_db2, int(task_id), _msg)
-                finally:
-                    _db2.close()
-            except Exception:
-                pass
-        if _state["killed_by_memory"] and not _state["saw_terminal"]:
-            msg = f"计算内存超限（上限 {_proc_max_memory}MB），已强制终止"
-            buffer.push(task_id, json.dumps({"type": "error", "message": msg}, ensure_ascii=False))
-            try:
-                _dbm = SessionLocal()
+                    await asyncio.wait_for(done.wait(), 2)
+                except asyncio.TimeoutError:
+                    failure = "计算进程退出后输出管道未关闭"
+                if proc.returncode != 0 and not state["terminal"]:
+                    failure = f"计算子进程异常退出(code={proc.returncode})"
+                elif not state["terminal"]:
+                    failure = failure or "计算进程未返回完成结果"
+                break
+            if time.monotonic() >= deadline:
+                failure = f"计算超时（{timeout}s）"
+                break
+            if proc is not None:
+                rss = _process_rss_mb(proc.pid)
+                current_cap = memory_limit_mb(cap, rss)
+                if rss > current_cap:
+                    failure = f"计算内存超过安全预算 {current_cap}MB（当前 {rss:.0f}MB）"
+                    break
+            await asyncio.sleep(0.5)
+        if failure:
+            stopped.set()
+            if state["proc"] is None and not done.is_set():
+                trip_circuit("尚未完成启动")
+                terminated = False
+            else:
+                terminated = await asyncio.to_thread(terminate_process, state["proc"])
+            failure += "；进程已终止" if terminated else "；进程仍未退出，已暂停派发新任务，请检查存储 I/O"
+            buffer.push(task_id, json.dumps({"type": "error", "message": failure}, ensure_ascii=False))
+            # A stalled task disk must not block the event loop while persisting status.
+            def persist_failure():
+                db = SessionLocal()
                 try:
-                    _persist_compute_failed(_dbm, int(task_id), msg)
+                    _persist_compute_failed(db, int(task_id), failure)
                 finally:
-                    _dbm.close()
-            except Exception:
-                pass
-        elif _state["start_error"] is not None:
-            e = _state["start_error"]
-            logger.error(f"[compute/subproc] 子进程启动/读取失败: {e}", exc_info=e)
+                    db.close()
             try:
-                buffer.push(task_id, json.dumps({"type": "error", "message": f"计算进程启动失败: {e}"}, ensure_ascii=False))
-            except Exception:
-                pass
-            try:
-                from backend.database.connection import SessionLocal as _SL
-                _db = _SL()
-                try:
-                    _persist_compute_failed(_db, int(task_id), str(e))
-                finally:
-                    _db.close()
-            except Exception:
-                pass
-        elif _state["returncode"] not in (0, None) and not _state["saw_terminal"]:
-            msg = f"计算子进程异常退出(code={_state['returncode']})"
-            try:
-                buffer.push(task_id, json.dumps({"type": "error", "message": msg}, ensure_ascii=False))
-            except Exception:
-                pass
-            try:
-                from backend.database.connection import SessionLocal as _SL
-                _db = _SL()
-                try:
-                    _persist_compute_failed(_db, int(task_id), msg)
-                finally:
-                    _db.close()
-            except Exception:
-                pass
+                await asyncio.wait_for(asyncio.to_thread(persist_failure), 3)
+            except Exception as exc:
+                logger.error("任务失败状态持久化未完成: %s", exc)
     finally:
-        _mem_task.cancel()
-        try:
-            buffer.finish(task_id)
-        except Exception:
-            pass
-        try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except Exception:
-            pass
+        stopped.set()
+        proc = state["proc"]
+        if proc is not None and proc.poll() is None and terminated:
+            terminated = await asyncio.shield(asyncio.to_thread(terminate_process, proc))
+        state["closed"] = True
+        buffer.finish(task_id)
+        # No deletion while a child still owns files or its launch has not returned.
+        if terminated and proc is not None and proc.poll() is not None:
+            try:
+                await asyncio.wait_for(asyncio.to_thread(shutil.rmtree, temp_dir, ignore_errors=True), 3)
+            except Exception as exc:
+                logger.warning("计算临时文件清理延期: %s", exc)
 
 
 async def _run_compute_subprocess_queued(task_id: str, buffer, params_file: str, temp_dir: str):
-    """正式智算有界并发入口；超出槽位的任务排队但持续推送可见状态。"""
+    """Bounded FIFO queue, shared with training and uploads."""
     from backend.utils.upload_stream import get_excel_work_semaphore
+    from backend.utils.subprocess_runner import env_int
     semaphore = get_excel_work_semaphore()
     acquire_task = asyncio.create_task(semaphore.acquire())
     started = time.monotonic()
-    interval = max(5, int(os.getenv("EXCEL_QUEUE_NOTICE_INTERVAL", "15")))
+    interval = max(1, env_int("EXCEL_QUEUE_NOTICE_INTERVAL", 15))
     try:
         while not acquire_task.done():
             done, _ = await asyncio.wait({acquire_task}, timeout=interval)
             if not done:
-                waited = int(time.monotonic() - started)
                 buffer.push(task_id, json.dumps({
                     "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
-                    "level": "info",
-                    "message": f"执行槽已满，任务继续排队（已等待 {waited} 秒）",
+                    "level": "info", "message": f"等待执行资源（已排队 {int(time.monotonic() - started)} 秒）",
                 }, ensure_ascii=False))
         await acquire_task
-        waited = int(time.monotonic() - started)
         buffer.push(task_id, json.dumps({
             "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
-            "level": "info", "message": f"已获得执行槽（排队 {waited} 秒），开始计算",
+            "level": "info", "message": f"已获得执行槽（排队 {int(time.monotonic() - started)} 秒），开始计算",
         }, ensure_ascii=False))
         await _run_compute_subprocess(task_id, buffer, params_file, temp_dir)
-    finally:
-        if acquire_task.done() and not acquire_task.cancelled():
+    except Exception as exc:
+        message = "等待执行资源超时，请稍后重试" if isinstance(exc, TimeoutError) else str(exc)
+        buffer.push(task_id, json.dumps({"type": "error", "message": message}, ensure_ascii=False))
+        def persist_queue_failure():
+            db = SessionLocal()
             try:
-                if acquire_task.result():
-                    semaphore.release()
-            except Exception:
-                pass
-        elif not acquire_task.done():
+                _persist_compute_failed(db, int(task_id), message)
+            finally:
+                db.close()
+        try:
+            await asyncio.wait_for(asyncio.to_thread(persist_queue_failure), 3)
+        except Exception:
+            logger.exception("排队失败状态持久化未完成")
+        buffer.finish(task_id)
+    finally:
+        if not acquire_task.done():
             acquire_task.cancel()
+            await asyncio.gather(acquire_task, return_exceptions=True)
+        if not acquire_task.cancelled() and acquire_task.exception() is None and acquire_task.result():
+            semaphore.release()
 
 
 async def run_compute_task(
@@ -4708,7 +4629,7 @@ async def run_compute_task(
                 passwords_dict = json.loads(file_passwords)
             except Exception:
                 pass
-        logger.info(f"[compute/task密码] raw={repr(file_passwords)}")
+        logger.info(f"[compute/task密码] provided={bool(file_passwords)}")
         logger.info(f"[compute/task密码] parsed keys={list(passwords_dict.keys())}, values_len={[len(str(v)) for v in passwords_dict.values()]}")
 
         # 解密有密码的文件（加密检测已在 submit 端点完成，此处只做解密）
@@ -4794,13 +4715,9 @@ async def run_compute_task(
                 from backend.utils.fast_header_matcher import FastHeaderMatcher
 
                 fast_matcher = FastHeaderMatcher()
-                input_files = [
-                    str(f) for f in source_dir.glob("*.xlsx")
-                    if not f.name.startswith("~")
-                ] + [
-                    str(f) for f in source_dir.glob("*.xls")
-                    if not f.name.startswith("~")
-                ]
+                input_files = [str(f) for f in sorted(source_dir.iterdir())
+                               if f.is_file() and f.suffix.lower() in (".xlsx", ".xls", ".xlsm")
+                               and not f.name.startswith("~")]
 
                 if input_files:
                     log_msg = {
@@ -4817,14 +4734,19 @@ async def run_compute_task(
                     _single_parse_ok = False
                     file_mapping = None
                     try:
-                        match_success, match_error, file_mapping, pre_loaded_source_data = \
-                            await _loop.run_in_executor(None, lambda: fast_matcher.match_parse_and_prepare(
-                                source_structure=source_structure,
-                                input_files=input_files,
-                                manual_headers=manual_headers,
-                                output_dir=str(source_dir),
-                                expected_structure=expected_structure,
-                            ))
+                        from backend.utils.compute_preload_cache import load_preload
+                        cached = await asyncio.to_thread(
+                            load_preload, source_dir, (source_structure, manual_headers, expected_structure))
+                        if cached:
+                            file_mapping, pre_loaded_source_data = cached
+                            match_success, match_error = True, None
+                            logger.info("复用预检查解析结果，无需再次打开源 Excel")
+                        else:
+                            match_success, match_error, file_mapping, pre_loaded_source_data = \
+                                await _loop.run_in_executor(None, lambda: fast_matcher.match_parse_and_prepare(
+                                    source_structure=source_structure, input_files=input_files,
+                                    manual_headers=manual_headers, output_dir=str(source_dir),
+                                    expected_structure=expected_structure))
                         _single_parse_ok = True
                     except Exception as _sp_err:
                         logger.warning(f"[compute/task] 单次解析优化失败: {_sp_err}，回退到多次解析流程", exc_info=True)
@@ -4864,46 +4786,48 @@ async def run_compute_task(
 
                     # ===== 处理匹配结果 =====
                     if match_success and file_mapping:
-                        # 【根治：智算复用训练的同一套加载逻辑】
-                        # 把上传文件按映射重写到 mapped_source（重命名为训练文件名 + 列名映射 + 计算公式），
-                        # 再调用与训练完全相同的 _load_full_source_data 构建 source_data。
-                        # 这样 key 规则、sheet 集合、去重逻辑与训练"同一份代码"产出 → 天然一致，
-                        # 不再出现"训练能跑、智算丢 sheet / 找不到源 / key 对不上"。失败则回退内存预加载。
-                        try:
-                            from backend.api.training_chat import _load_full_source_data as _load_full_train
-                            _mapped_dir = temp_dir / "mapped_source"
-                            if _mapped_dir.exists():
-                                shutil.rmtree(_mapped_dir, ignore_errors=True)
-                            _mapped_dir.mkdir(parents=True, exist_ok=True)
-                            _rw_ok = 0
-                            for _inp, _info in file_mapping.items():
-                                try:
-                                    FastHeaderMatcher.rewrite_excel(_info, str(_mapped_dir))
-                                    _rw_ok += 1
-                                except Exception as _rw_e:
-                                    logger.warning(f"[compute/task] 重写映射文件失败 {_inp}: {_rw_e}")
-                            _ms = bool(source_structure.get("multi_sheet_source")) if isinstance(source_structure, dict) else False
-                            _rsv = set((expected_structure or {}).get("sheets", {}).keys()) if expected_structure else set()
-                            if _rw_ok:
-                                _rebuilt = _load_full_train(
-                                    str(_mapped_dir),
-                                    manual_headers=manual_headers,
-                                    multi_sheet_source=_ms,
-                                    file_passwords=None,   # mapped 文件已是明文+计算值
-                                    reserved_sheet_names=_rsv,
-                                )
-                                if _rebuilt:
-                                    pre_loaded_source_data = _rebuilt
-                                    logger.info(f"[compute/task] 训练同款加载器重建 source_data: {list(_rebuilt.keys())}")
-                                    buffer.push(task_id, json.dumps({
-                                        "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
-                                        "level": "info",
-                                        "message": f"已用训练同款加载器统一构建源数据（{len(_rebuilt)}个sheet，key 与训练一致）"
-                                    }, ensure_ascii=False))
-                                else:
-                                    logger.warning("[compute/task] 训练同款加载器重建为空，回退内存预加载")
-                        except Exception as _root_e:
-                            logger.warning(f"[compute/task] 根治加载失败，回退内存预加载: {_root_e}", exc_info=True)
+                        # 内存映射已使用相同 key/schema 规则，仅旧路径无预加载时才重建文件。
+                        if not pre_loaded_source_data:
+                            # 【根治：智算复用训练的同一套加载逻辑】
+                            # 把上传文件按映射重写到 mapped_source（重命名为训练文件名 + 列名映射 + 计算公式），
+                            # 再调用与训练完全相同的 _load_full_source_data 构建 source_data。
+                            # 这样 key 规则、sheet 集合、去重逻辑与训练"同一份代码"产出 → 天然一致，
+                            # 不再出现"训练能跑、智算丢 sheet / 找不到源 / key 对不上"。失败则回退内存预加载。
+                            try:
+                                from backend.api.training_chat import _load_full_source_data as _load_full_train
+                                _mapped_dir = temp_dir / "mapped_source"
+                                if _mapped_dir.exists():
+                                    shutil.rmtree(_mapped_dir, ignore_errors=True)
+                                _mapped_dir.mkdir(parents=True, exist_ok=True)
+                                _rw_ok = 0
+                                for _inp, _info in file_mapping.items():
+                                    try:
+                                        FastHeaderMatcher.rewrite_excel(_info, str(_mapped_dir))
+                                        _rw_ok += 1
+                                    except Exception as _rw_e:
+                                        logger.warning(f"[compute/task] 重写映射文件失败 {_inp}: {_rw_e}")
+                                _ms = bool(source_structure.get("multi_sheet_source")) if isinstance(source_structure, dict) else False
+                                _rsv = set((expected_structure or {}).get("sheets", {}).keys()) if expected_structure else set()
+                                if _rw_ok:
+                                    _rebuilt = _load_full_train(
+                                        str(_mapped_dir),
+                                        manual_headers=manual_headers,
+                                        multi_sheet_source=_ms,
+                                        file_passwords=None,   # mapped 文件已是明文+计算值
+                                        reserved_sheet_names=_rsv,
+                                    )
+                                    if _rebuilt:
+                                        pre_loaded_source_data = _rebuilt
+                                        logger.info(f"[compute/task] 训练同款加载器重建 source_data: {list(_rebuilt.keys())}")
+                                        buffer.push(task_id, json.dumps({
+                                            "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                            "level": "info",
+                                            "message": f"已用训练同款加载器统一构建源数据（{len(_rebuilt)}个sheet，key 与训练一致）"
+                                        }, ensure_ascii=False))
+                                    else:
+                                        logger.warning("[compute/task] 训练同款加载器重建为空，回退内存预加载")
+                            except Exception as _root_e:
+                                logger.warning(f"[compute/task] 根治加载失败，回退内存预加载: {_root_e}", exc_info=True)
 
                         # 输出映射日志
                         for input_file_name, mapping_info in file_mapping.items():
@@ -4955,7 +4879,7 @@ async def run_compute_task(
                             for train_file, file_data in source_structure.get("files", {}).items():
                                 if "error" in file_data:
                                     continue
-                                file_base = train_file.replace('.xlsx', '').replace('.xls', '')
+                                file_base = os.path.splitext(train_file)[0]
                                 for sn in file_data.get("sheets", {}).keys():
                                     _ek_pairs.append((file_base, sn))
                             _reserved = set((expected_structure or {}).get("sheets", {}).keys()) if expected_structure else set()
@@ -4964,8 +4888,7 @@ async def run_compute_task(
 
                             missing_keys = expected_keys - set(pre_loaded_source_data.keys())
                             if missing_keys:
-                                logger.warning(f"[compute/task] 预加载数据缺少: {missing_keys}，将由脚本自行解析")
-                                pre_loaded_source_data = None
+                                raise ValueError(f"预加载数据缺少训练所需表: {sorted(missing_keys)}")
 
                         log_msg = {
                             "type": "log",
@@ -4975,15 +4898,9 @@ async def run_compute_task(
                         }
                         buffer.push(task_id, json.dumps(log_msg, ensure_ascii=False))
                     elif not match_success:
-                        log_msg = {
-                            "type": "log",
-                            "timestamp": datetime.now().strftime("%H:%M:%S"),
-                            "level": "warning",
-                            "message": f"表头匹配失败: {match_error}，将使用原始文件名"
-                        }
-                        buffer.push(task_id, json.dumps(log_msg, ensure_ascii=False))
+                        raise ValueError(f"源数据表头匹配失败: {match_error}")
         except Exception as e:
-            logger.warning(f"[compute/task] 表头映射过程出错: {e}，将使用原始文件名", exc_info=True)
+            raise ValueError(f"源数据映射未通过，停止计算以避免使用错误表: {e}") from e
 
         # 保存脚本
         script_path = temp_dir / f"{script_id}.py"
@@ -5075,6 +4992,11 @@ async def run_compute_task(
                     logger.info(f"[目标表映射] 注入 _target_sheet_manual_map: {target_sheet_manual_map}")
 
                 spec.loader.exec_module(module)
+                # Script defaults must not overwrite this run's selected period/parameters.
+                for name, value in (("salary_year", salary_year), ("salary_month", salary_month),
+                                    ("monthly_standard_hours", standard_hours)):
+                    if value is not None:
+                        setattr(module, name, value)
 
                 # 兼容旧模板脚本：旧脚本 main() 直接用写死的 TEMPLATE_PATH 常量、不读 _template_override_path。
                 # exec 后（脚本已把 TEMPLATE_PATH 赋成训练值）再覆盖模块级 TEMPLATE_PATH，
@@ -5127,24 +5049,12 @@ async def run_compute_task(
 
                 # 调用main函数
                 if hasattr(module, 'main'):
-                    import inspect
-                    sig = inspect.signature(module.main)
-                    params = list(sig.parameters.keys())
-
-                    kwargs = {}
-                    if len(params) >= 2:
-                        args = [str(source_dir), str(output_dir)]
-                        if 'salary_year' in params and salary_year is not None:
-                            kwargs['salary_year'] = salary_year
-                        if 'salary_month' in params and salary_month is not None:
-                            kwargs['salary_month'] = salary_month
-                        if 'monthly_standard_hours' in params and standard_hours is not None:
-                            kwargs['monthly_standard_hours'] = standard_hours
-                        result = module.main(*args, **kwargs)
-                    elif len(params) == 0:
-                        result = module.main()
-                    else:
-                        result = module.main(str(source_dir))
+                    from backend.utils.script_entry import invoke_script_main
+                    result = invoke_script_main(module.main, {
+                        "input_folder": str(source_dir), "output_folder": str(output_dir),
+                        "salary_year": salary_year, "salary_month": salary_month,
+                        "monthly_standard_hours": standard_hours,
+                    })
                 else:
                     raise Exception("脚本缺少main函数")
 
@@ -5208,75 +5118,34 @@ async def run_compute_task(
                              if (template_override_path and os.path.exists(template_override_path))
                              else _extract_template_path(script_content))
             _picked = _pick_result_output(output_files, _tpl_for_pick)
+            if _picked is None:
+                raise ValueError('未生成有效结果工作簿')
             if _picked is not None:
                 if len(output_files) > 1:
                     logger.info(f"[输出选择] 多个输出文件 {[f.name for f in output_files]}，选定真实结果: {_picked.name}")
                 output_files = [_picked]
         except Exception as _pick_e:
-            logger.warning(f"[输出选择] 选定结果文件失败（保持原列表）: {_pick_e}")
+            raise ValueError(f"无法确认最终结果文件: {_pick_e}") from _pick_e
 
         # 兜底修复：早期模板脚本 keep_vba=True 保存出的 .xlsx 内容类型被错标为 macroEnabled，
         # Excel 会报"文件损坏或扩展名无效"。此处统一改回普通 xlsx 类型，救活旧脚本产物。
         for _of in output_files:
             _normalize_xlsx_content_type(_of)
 
-        # 主键归一：把所有 sheet 的主键/ID 列统一成规范文本，解决跨源类型不一致的 VLOOKUP #N/A
-        # （两端一致：源_ 键列与结果表查找键同规则归一；无论有无模板都跑）
-        try:
-            from backend.utils.output_postprocess import normalize_key_columns_to_text
-            for _of in output_files:
-                await asyncio.to_thread(normalize_key_columns_to_text, str(_of))
-        except Exception as _ke:
-            logger.warning(f"[主键归一] 跳过: {_ke}")
-
-        # 模板格式兜底：把输出单元格格式刷回模板原格式（修复旧脚本里 openpyxl 写 datetime
-        # 自动把常规列改成日期格式的问题）。仅模板模式（能从脚本提取 TEMPLATE_PATH）才执行，
-        # 在反向 sheet 重映射前做——此时输出 sheet 名与有效模板一致。新脚本格式已对 → 幂等。
-        try:
-            _tpl_for_fmt = _extract_template_path(script_content)
-            _eff_tpl_fmt = (template_override_path
-                            if (template_override_path and os.path.exists(template_override_path))
-                            else _tpl_for_fmt)
-            from backend.utils.output_postprocess import (
-                restore_formats_from_template, _normalize_source_sheet_formats_impl,
-            )
-            _tpl_ok = bool(_eff_tpl_fmt and os.path.exists(_eff_tpl_fmt))
-            for _of in output_files:
-                # 放线程执行：openpyxl 读写较慢，避免阻塞事件循环导致 SSE 心跳停、被代理 502
-                # restore_formats_from_template 依赖模板逐格刷回 → 仅模板可用时跑
-                if _tpl_ok:
-                    await asyncio.to_thread(restore_formats_from_template, str(_of), _eff_tpl_fmt)
-                # 源_ sheet 兜底：修复继承模板"日期/时间默认样式"导致数字显示成日期的问题
-                # （覆盖旧脚本，零误伤：只拉回恰好等于默认格式的单元格）。模板不可用时（跨环境
-                # 烘焙路径不存在）内部回退用输出文件自身默认样式，故无论模板在不在都跑。
-                # 注意：本段已在智算子进程内，直接调 _impl（防嵌套子进程占双倍并发槽/死锁）。
-                await asyncio.to_thread(_normalize_source_sheet_formats_impl, str(_of),
-                                        _eff_tpl_fmt if _tpl_ok else None)
-        except Exception as _fmt_e:
-            logger.warning(f"[fmt兜底] 跳过: {_fmt_e}")
-
-        # 汇总行格式兜底：老脚本用 openpyxl 手动增删行导致汇总行（总计/合计）格式不随行跟随、
-        # 数据行掉底色边框。此处用 Aspose 按模板重刷汇总行+数据区样式（只对单一底部汇总行 sheet
-        # 生效，多区域小计 sheet 自动跳过）。须在坐标法 restore_formats_from_template 之后、改名之前跑。
-        try:
-            from backend.utils.output_postprocess import (
-                restore_template_region_format, restore_summary_format_enabled,
-            )
-            if _tpl_ok and restore_summary_format_enabled():
-                for _of in output_files:
-                    await asyncio.to_thread(restore_template_region_format,
-                                            str(_of), _eff_tpl_fmt, script_content)
-        except Exception as _sfe:
-            logger.warning(f"[汇总格式] 跳过: {_sfe}")
-
-        # 【模板 sheet 重映射 · 改名出】把结果文件里临时对齐的训练 sheet 名改回上传模板的原名
-        if _sheet_reverse_map:
-            for _of in output_files:
-                try:
-                    if _rename_xlsx_sheets(str(_of), _sheet_reverse_map):
-                        logger.info(f"[sheet重映射] 改名出：{_sheet_reverse_map} @ {_of.name}")
-                except Exception as _ro_e:
-                    logger.warning(f"[sheet重映射] 改名出失败 {_of}: {_ro_e}")
+        # One output workbook session: repair, rename, calculate, save final atomically.
+        from backend.utils.output_postprocess import finalize_output_workbook
+        _eff_tpl_fmt = (template_override_path
+                        if template_override_path and os.path.exists(template_override_path)
+                        else _extract_template_path(script_content))
+        _finalized = {}
+        for _of in output_files:
+            buffer.push(task_id, json.dumps({
+                "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "level": "info", "message": "正在统一处理输出格式、跨表引用及最终公式计算...",
+            }, ensure_ascii=False))
+            _finalized[str(_of)] = await asyncio.to_thread(
+                finalize_output_workbook, str(_of), _eff_tpl_fmt, expected_structure,
+                script_content, _sheet_reverse_map or None)
 
         output_file = output_files[0]
 
@@ -5292,8 +5161,7 @@ async def run_compute_task(
         # openpyxl 只负责写公式，不会计算缓存值；如果在这些后处理之前计算，
         # 后续再次保存也可能让新公式/跨表引用继续保留旧缓存。
         from backend.utils.excel_comparator import (
-            calculate_excel_formulas, inspect_formula_cache,
-            mark_excel_for_recalculation,
+            inspect_formula_cache,
         )
         buffer.push(task_id, json.dumps({
             "type": "log",
@@ -5301,16 +5169,14 @@ async def run_compute_task(
             "level": "info",
             "message": "正在执行最终公式计算并刷新缓存值..."
         }, ensure_ascii=False))
-        _formula_calc_ok = await asyncio.to_thread(
-            calculate_excel_formulas, str(output_file)
-        )
+        _formula_calc_ok = _finalized[str(output_file)]["calculated"]
         try:
             _formula_report = await asyncio.to_thread(
                 inspect_formula_cache, str(output_file)
             )
         except Exception as _formula_scan_error:
             logger.warning(f"[compute/task] 公式缓存校验失败: {_formula_scan_error}")
-            _formula_report = {}
+            raise RuntimeError("最终公式缓存无法验证，不能确认计算完成") from _formula_scan_error
 
         _formula_total = int(_formula_report.get("formula_count", 0))
         _formula_empty = int(_formula_report.get("empty_cache_count", 0))
@@ -5335,25 +5201,9 @@ async def run_compute_task(
                 "formula_report": _formula_report,
             }, ensure_ascii=False))
         else:
-            # 不把整次智算判失败：仍交付带公式文件；另起一个轻量受控进程，
-            # 只保存 ReCalculateOnOpen / ForceFullCalculate 标记作为兜底。
-            _recalc_marked = await asyncio.to_thread(
-                mark_excel_for_recalculation, str(output_file)
-            )
-            logger.warning(f"[compute/task] 最终公式计算未完成: {output_file}")
-            buffer.push(task_id, json.dumps({
-                "type": "log",
-                "timestamp": datetime.now().strftime("%H:%M:%S"),
-                "level": "warning",
-                "message": (
-                    f"公式计算未能完整刷新缓存（共 {_formula_total} 个公式，"
-                    f"仍有 {_formula_empty} 个缓存为空），已设置 Excel 打开时全量重算"
-                    if _recalc_marked else
-                    f"公式计算未完成且仍有 {_formula_empty} 个缓存为空；"
-                    "重算标记也未能保存，请检查该文件中的复杂公式"
-                ),
-                "formula_report": _formula_report,
-            }, ensure_ascii=False))
+            raise RuntimeError(f"公式缓存未完整生成（{_formula_empty}/{_formula_total}），未发布计算结果")
+        if (_formula_bad_refs or _formula_errors) and os.getenv("COMPUTE_STRICT_FORMULA_ERRORS", "true").lower() not in ("false", "0", "no"):
+            raise RuntimeError(f"结果含 {_formula_errors} 个公式错误、{_formula_bad_refs} 个损坏引用，请修正规则或模板后计算")
 
         # 保存到租户目录
         tenant_dir = storage_manager.get_tenant_dir(tenant_id)
@@ -5386,7 +5236,8 @@ async def run_compute_task(
                 _tpl_for_values = _ov_tpl or _extract_template_path(script_content)
                 # 放线程执行：Aspose CalculateFormula 较重，避免阻塞事件循环导致 SSE 被代理 502
                 if await asyncio.to_thread(make_values_only_copy, str(saved_file), str(_vp),
-                                           "源_", None, _tpl_for_values, _sheet_reverse_map or None):
+                                           "源_", None, _tpl_for_values, _sheet_reverse_map or None,
+                                           recalculate=False):
                     _values_saved = _vp
                     buffer.push(task_id, json.dumps({
                         "type": "log",
@@ -5402,7 +5253,7 @@ async def run_compute_task(
                         "type": "log",
                         "timestamp": datetime.now().strftime("%H:%M:%S"),
                         "level": "warning",
-                        "message": "⚠ 纯值版生成失败（已重试3次），本次仅提供原版下载。原因见服务日志中 [纯值版] 相关行"
+                        "message": "⚠ 纯值版生成失败，本次仅提供原版下载。原因见服务日志中 [纯值版] 相关行"
                     }, ensure_ascii=False))
         except Exception as _ve:
             _values_copy_failed = True
@@ -5417,23 +5268,7 @@ async def run_compute_task(
             except Exception:
                 pass
 
-        # 统计行数（使用 Aspose 轻量读取，避免额外引入 openpyxl）；放线程避免阻塞事件循环
-        def _count_rows(path):
-            _cwb = None
-            try:
-                from Aspose.Cells import Workbook as _CountWb
-                _cwb = _CountWb(str(path))
-                return sum(_cwb.Worksheets[i].Cells.MaxDataRow + 1
-                           for i in range(_cwb.Worksheets.Count))
-            except Exception:
-                return 0
-            finally:
-                if _cwb is not None:
-                    try:
-                        _cwb.Dispose()
-                    except Exception:
-                        pass
-        rows_processed = await asyncio.to_thread(_count_rows, saved_file)
+        rows_processed = _finalized[str(output_file)]["rows_processed"]
 
         log_msg = {
             "type": "log",
@@ -5522,9 +5357,11 @@ def _compute_upload_precheck_subprocess(payload: dict) -> dict:
     from backend.utils.compute_precheck import precheck_compute
 
     encrypted = []
+    encryption = {}
     for fp in source_dir.iterdir():
         if fp.is_file() and fp.suffix.lower() in (".xlsx", ".xls", ".xlsm"):
-            if is_encrypted(str(fp.resolve())) and not passwords_dict.get(fp.name):
+            encryption[fp.name] = is_encrypted(str(fp.resolve()))
+            if encryption[fp.name] and not passwords_dict.get(fp.name):
                 encrypted.append(fp.name)
     if encrypted:
         return {"encrypted_files": encrypted, "pc_result": None,
@@ -5535,7 +5372,7 @@ def _compute_upload_precheck_subprocess(payload: dict) -> dict:
             continue
         fp_str = str(fp.resolve())
         pwd = passwords_dict.get(fp.name)
-        if pwd and is_encrypted(fp_str):
+        if pwd and encryption.get(fp.name):
             decrypted = decrypt_excel(fp_str, password=pwd)
             shutil.move(decrypted, fp_str)
         if fp.suffix.lower() == ".xls":
@@ -5544,10 +5381,7 @@ def _compute_upload_precheck_subprocess(payload: dict) -> dict:
     if template_override_path:
         template_override_path = convert_xls_to_xlsx(template_override_path)
 
-    # 上传预检查只读现有缓存值，禁止全工作簿公式重算。
-    for fp in source_dir.iterdir():
-        if fp.is_file() and fp.suffix.lower() in (".xlsx", ".xls", ".xlsm"):
-            normalize_misformatted_dates(str(fp.resolve()), calculate_formulas=False)
+    # Date repair is performed in the parser's open workbook, without rewriting uploads.
 
     db = SessionLocal()
     try:
@@ -5569,6 +5403,13 @@ def _compute_upload_precheck_subprocess(payload: dict) -> dict:
             template_override_path=template_override_path,
             confirmed_target_map=payload.get("confirmed_target_map"),
         )
+        preloaded = getattr(pc, "_pre_loaded_source_data", None)
+        if pc.ok and preloaded:
+            from backend.utils.compute_preload_cache import save_preload
+            save_preload(source_dir, preloaded, pc.file_mapping,
+                         (payload.get("source_structure"), payload.get("manual_headers"), payload.get("expected_structure")))
+        if hasattr(pc, "_pre_loaded_source_data"):
+            del pc._pre_loaded_source_data  # Do not pickle full tables back into the API process.
         return {"encrypted_files": [], "pc_result": pc,
                 "template_override_path": template_override_path}
     finally:
@@ -5963,7 +5804,7 @@ async def compute_with_script_stream(
                             passwords_dict = json.loads(file_passwords)
                         except Exception:
                             pass
-                    logger.info(f"[compute/stream密码] raw={repr(file_passwords)}")
+                    logger.info(f"[compute/stream密码] provided={bool(file_passwords)}")
                     logger.info(f"[compute/stream密码] parsed keys={list(passwords_dict.keys())}, values_len={[len(str(v)) for v in passwords_dict.values()]}")
 
                     # 保存所有源文件
@@ -6217,7 +6058,7 @@ async def compute_with_script_stream(
                                         for train_file, file_data in source_structure.get("files", {}).items():
                                             if "error" in file_data:
                                                 continue
-                                            file_base = train_file.replace('.xlsx', '').replace('.xls', '')
+                                            file_base = os.path.splitext(train_file)[0]
                                             for sn in file_data.get("sheets", {}).keys():
                                                 _ek_pairs2.append((file_base, sn))
                                         _reserved2 = set((expected_structure or {}).get("sheets", {}).keys()) if expected_structure else set()

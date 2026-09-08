@@ -208,9 +208,14 @@ class TableAnalyzer:
             pk = layer_info["primary_key"]
             pk_src = layer_info.get("primary_source", "")
             if pk_src:
-                pk_src = self._fuzzy_match_sheet(pk_src, source_sheets) or pk_src
+                matched = self._fuzzy_match_sheet(pk_src, source_sheets)
+                if not matched:
+                    raise ValueError(f'规则指定的主键来源表不存在或名称有歧义: {pk_src}')
+                pk_src = matched
             else:
                 pk_src = self._find_key_in_sheets(pk, source_sheets)
+            if not pk_src or not self._sheet_has_column(source_sheets[pk_src], pk):
+                raise ValueError(f'规则指定的主键 {pk} 在来源表中不存在')
             self._add_log(f"Tier1 [列处理分层] 主键={pk}, 来源={pk_src}, 置信度=1.0")
             return pk, pk_src, 1.0
 
@@ -230,18 +235,24 @@ class TableAnalyzer:
             df = sheet_info.get("df")
             if df is None or df.empty:
                 continue
-            detected = detect_primary_keys(df, max_keys=1)
+            detected = [col for col in df.columns if _normalize_col_name(col) in
+                        {_normalize_col_name(k) for k in self.COMMON_KEY_COLUMNS}]
             if detected:
-                col = detected[0]
-                non_null = df[col].dropna()
-                uniqueness = non_null.nunique() / max(len(non_null), 1)
-                score = uniqueness * 100
-                for kw in self.COMMON_KEY_COLUMNS:
-                    if kw in _normalize_col_name(col) or _normalize_col_name(col) in kw:
-                        score += 50
-                        break
-                if score > best_score:
-                    best_pk, best_score, best_src = col, score, sheet_key
+                from backend.utils.data_helpers import _schema_text_value
+                for col in detected:
+                    normalized = df[col].map(_schema_text_value).replace('', None)
+                    non_null = normalized.dropna()
+                    if non_null.empty:
+                        continue
+                    uniqueness = non_null.nunique() / len(non_null)
+                    completeness = len(non_null) / len(df)
+                    across = sum(self._sheet_has_column(info, col) for info in source_sheets.values())
+                    is_name = _normalize_col_name(col) in {'姓名', '员工姓名', '人员姓名', 'name', 'employee_name'}
+                    score = uniqueness * 100 + completeness * 40 + across * 20 + (0 if is_name else 50)
+                    if _normalize_col_name(col) in {_normalize_col_name(c) for c in expected_columns}:
+                        score += 20
+                    if score > best_score:
+                        best_pk, best_score, best_src = col, score, sheet_key
 
         if best_pk:
             self._add_log(f"Tier3 [启发式] 主键={best_pk}, 来源={best_src}, 得分={best_score:.0f}, 置信度=0.7")
@@ -265,14 +276,7 @@ class TableAnalyzer:
                     self._add_log(f"Tier4 [列名交集] 主键={original}, 来源={src}, 置信度=0.5")
                     return original, src, 0.5
 
-        # 最终兜底: expected第一列
-        if expected_columns:
-            pk = expected_columns[0]
-            pk_src = self._find_key_in_sheets(pk, source_sheets)
-            self._add_log(f"Tier5 [兜底] 使用期望结果第一列作为主键: {pk}, 置信度=0.3")
-            return pk, pk_src, 0.3
-
-        self._add_log("未能检测到主键")
+        self._add_log("未能可靠检测到主键，请在规则中明确记录粒度及关联键")
         return "", "", 0.0
 
     # ------------------------------------------------------------------
@@ -306,8 +310,10 @@ class TableAnalyzer:
                     source_sheets[matched], expected_columns
                 )
                 self._add_log(f"StepA [规则声明] 主表={matched}, 列覆盖率={coverage:.1%}")
-                if coverage > 0.3:
-                    return "single", [matched], [], None
+                if primary_key and not self._sheet_has_column(source_sheets[matched], primary_key):
+                    raise ValueError(f'规则指定的主表 {matched} 缺少主键 {primary_key}')
+                return "single", [matched], [], None
+            raise ValueError(f'规则指定的主表不存在或名称有歧义: {declared_main}')
 
         # Step B: 单sheet覆盖率
         candidates = []
@@ -348,7 +354,7 @@ class TableAnalyzer:
         if concat_groups and join_result:
             concat_sheets = concat_groups[0]
             join_sheets, join_key = join_result
-            all_sheets = list(set(concat_sheets + join_sheets))
+            all_sheets = list(dict.fromkeys(concat_sheets + join_sheets))
             merge_cfg = {
                 "type": "composite",
                 "vertical_groups": [concat_sheets],
@@ -664,7 +670,7 @@ class TableAnalyzer:
             range_str = f"${pk_letter}:${last_letter}"
 
             formula = (
-                f"=IFERROR(VLOOKUP({{key}},'{mapping.source_sheet}'!"
+                f"=IFERROR(VLOOKUP({{key}},'{mapping.source_sheet.replace(chr(39), chr(39)*2)}'!"
                 f"{range_str},{col_num},FALSE),0)"
             )
 
@@ -875,13 +881,25 @@ class TableAnalyzer:
         return 0
 
     def _fuzzy_match_sheet(self, name: str, source_sheets: Dict) -> Optional[str]:
-        """模糊匹配sheet名称"""
+        """先精确匹配，再接受唯一的模糊候选，禁止凭遍历顺序选错表。"""
         name_norm = _normalize_col_name(name)
+        if not name_norm:
+            return None
+        exact, partial = [], []
         for key in source_sheets:
             key_norm = _normalize_col_name(key)
-            if name_norm == key_norm or name_norm in key_norm or key_norm in name_norm:
-                return key
-        return None
+            info = source_sheets[key]
+            aliases = [key_norm]
+            if info.get('source_file') and info.get('source_sheet'):
+                from pathlib import Path
+                aliases.append(_normalize_col_name(f"{info['source_file']}.{info['source_sheet']}"))
+                aliases.append(_normalize_col_name(f"{Path(info['source_file']).stem}.{info['source_sheet']}"))
+            if name_norm in aliases:
+                exact.append(key)
+            elif any(name_norm in alias or alias in name_norm for alias in aliases if alias):
+                partial.append(key)
+        candidates = exact or partial
+        return candidates[0] if len(candidates) == 1 else None
 
     def _find_key_in_sheets(self, key_name: str, source_sheets: Dict) -> str:
         """找到包含指定主键列的第一个sheet"""
@@ -897,7 +915,7 @@ class TableAnalyzer:
         col_norm = _normalize_col_name(col_name)
         for c in info.get("columns", []):
             c_norm = _normalize_col_name(c)
-            if col_norm == c_norm or col_norm in c_norm or c_norm in col_norm:
+            if col_norm == c_norm:
                 return True
         return False
 

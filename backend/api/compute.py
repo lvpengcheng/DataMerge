@@ -296,13 +296,16 @@ async def execute_compute(
             "MONTHLY_STANDARD_HOURS": str(params.get("standard_hours", "")),
         }
 
-        exec_result = await asyncio.to_thread(
-            sandbox.execute,
-            script_path=str(script_path),
-            source_dir=str(source_dir),
-            output_dir=str(output_dir),
-            env_vars=env_vars,
-        )
+        from ..utils.upload_stream import get_excel_work_semaphore
+        async with get_excel_work_semaphore():
+            exec_result = await asyncio.to_thread(
+                sandbox.execute_script, script_code,
+                {"input_folder": str(source_dir), "output_folder": str(output_dir),
+                 "tenant_id": task.tenant_id,
+                 "salary_year": params.get("salary_year"),
+                 "salary_month": params.get("salary_month"),
+                 "monthly_standard_hours": params.get("standard_hours"), **env_vars},
+            )
 
         duration = (datetime.utcnow() - start_time).total_seconds()
 
@@ -320,6 +323,7 @@ async def execute_compute(
                 build_result_filename, values_only_name, dual_output_enabled, make_values_only_copy,
                 normalize_source_sheet_formats, normalize_key_columns_to_text,
                 restore_template_region_format, restore_summary_format_enabled,
+                apply_expected_column_schemas,
             )
             saved_assets = []
             tenant_output_dir = PROJECT_ROOT / "tenants" / task.tenant_id / "assets" / "result"
@@ -375,6 +379,13 @@ async def execute_compute(
                     await asyncio.to_thread(normalize_key_columns_to_text, str(dest_path))
                 except Exception as _ke:
                     logger.warning(f"[主键归一] 跳过: {_ke}")
+                # 非模板脚本统一应用训练时解析出的目标字段类型/格式。
+                if not _tpl_for_values and getattr(script, "expected_structure", None):
+                    try:
+                        await asyncio.to_thread(
+                            apply_expected_column_schemas, str(dest_path), script.expected_structure)
+                    except Exception as _se:
+                        logger.warning(f"[目标字段类型] 跳过: {_se}")
                 _register_result(dest_path, new_filename)
 
                 # 双结果：再出纯值版（模版公式保留、新列公式→值；模版所有 sheet 保留）

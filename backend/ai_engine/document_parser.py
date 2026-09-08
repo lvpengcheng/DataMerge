@@ -34,7 +34,7 @@ class DocumentParser:
                 return self._parse_pdf(file_path)
             elif file_ext in ['.doc', '.docx']:
                 return self._parse_word(file_path)
-            elif file_ext in ['.xls', '.xlsx']:
+            elif file_ext in ['.xls', '.xlsx', '.xlsm']:
                 return self._parse_excel(file_path)
             elif file_ext in ['.txt', '.md', '.json', '.yaml', '.yml']:
                 return self._parse_text_file(file_path)
@@ -60,8 +60,11 @@ class DocumentParser:
                 for page_num in range(doc.page_count):
                     page = doc.load_page(page_num)
                     page_text = page.get_text()
+                    text += f"\n## 第 {page_num + 1} 页\n"
                     if page_text:
                         text += page_text + "\n\n"
+                    if page.get_images() or not page_text.strip():
+                        text += "[本页包含图片或扫描内容；文字提取不包含图中规则，请核对原页，勿推断缺失步骤]\n"
                 doc.close()
                 if text.strip():
                     return text.strip()
@@ -132,19 +135,25 @@ class DocumentParser:
                     doc = docx.Document(file_path)
                     text = ""
 
-                    # 提取段落
-                    for paragraph in doc.paragraphs:
-                        if paragraph.text.strip():
-                            text += paragraph.text + "\n"
-
-                    # 提取表格
-                    for table in doc.tables:
-                        text += "\n[表格]\n"
-                        for row in table.rows:
-                            row_text = " | ".join(cell.text.strip() for cell in row.cells)
-                            if row_text.strip():
-                                text += row_text + "\n"
-                        text += "\n"
+                    from docx.text.paragraph import Paragraph
+                    from docx.table import Table
+                    # 按正文 XML 顺序保留章节、段落和表格的相邻关系。
+                    for element in doc.element.body.iterchildren():
+                        if element.tag.endswith('}p'):
+                            paragraph = Paragraph(element, doc)
+                            style = paragraph.style.name if paragraph.style else ''
+                            prefix = ''
+                            if style.startswith('Heading ') and style.split()[-1].isdigit():
+                                prefix = '#' * min(int(style.split()[-1]), 6) + ' '
+                            if paragraph.text.strip():
+                                text += prefix + paragraph.text + '\n'
+                            if element.xpath('.//w:drawing') or element.xpath('.//w:pict'):
+                                text += '[此处有图片/流程图，尚未提取图中规则，需核对原文]\n'
+                        elif element.tag.endswith('}tbl'):
+                            text += '\n[表格]\n'
+                            for row in Table(element, doc).rows:
+                                text += ' | '.join(cell.text.strip().replace('\n', '<br>') for cell in row.cells) + '\n'
+                            text += '\n'
 
                     return text.strip()
                 except ImportError:
@@ -192,18 +201,62 @@ class DocumentParser:
     def _parse_excel(self, file_path: str) -> str:
         """解析Excel文件（提取全部文本内容，适合作为设计文档使用）"""
         try:
+            if Path(file_path).suffix.lower() in ('.xlsx', '.xlsm'):
+                import openpyxl
+                wb = openpyxl.load_workbook(file_path, data_only=False, keep_links=False)
+                parts = []
+                try:
+                    for ws in wb.worksheets:
+                        parts.append(f'=== Sheet: {ws.title} ===')
+                        if ws.merged_cells.ranges:
+                            parts.append('合并单元格: ' + ', '.join(str(r) for r in ws.merged_cells.ranges))
+                        for row in ws.iter_rows():
+                            cells = []
+                            for cell in row:
+                                if cell.value is not None:
+                                    cells.append(f'{cell.coordinate}: {cell.value}')
+                                if cell.comment:
+                                    cells.append(f'{cell.coordinate}批注: {cell.comment.text}')
+                            if cells:
+                                parts.append(' | '.join(cells))
+                        if ws._images:
+                            parts.append('[本 Sheet 含图片，尚未提取图中规则，需核对原文]')
+                    return '\n'.join(parts)
+                finally:
+                    wb.close()
+            if Path(file_path).suffix.lower() == '.xls':
+                import aspose_init
+                aspose_init.ensure_license()
+                from Aspose.Cells import Workbook
+                wb = Workbook(file_path)
+                parts = []
+                try:
+                    for si in range(wb.Worksheets.Count):
+                        ws = wb.Worksheets[si]
+                        parts.append(f'=== Sheet: {ws.Name} ===')
+                        for area in ws.Cells.MergedCells:
+                            parts.append(f'合并区域: R{area.StartRow+1}C{area.StartColumn+1}:R{area.EndRow+1}C{area.EndColumn+1}')
+                        it = ws.Cells.GetEnumerator()
+                        while it.MoveNext():
+                            cell = it.Current
+                            value = cell.Formula if cell.IsFormula else cell.Value
+                            if value is not None:
+                                parts.append(f'{cell.Name}: {value}')
+                        if ws.Shapes.Count:
+                            parts.append('[本 Sheet 含图形对象，需核对原文件中的图示规则]')
+                    return '\n'.join(parts)
+                finally:
+                    wb.Dispose()
             import pandas as pd
 
             text_parts = []
 
             try:
-                excel_file = pd.ExcelFile(file_path)
-                sheet_names = excel_file.sheet_names
-
-                for sheet_name in sheet_names:
+                with pd.ExcelFile(file_path) as excel_file:
+                  for sheet_name in excel_file.sheet_names:
                     try:
                         # 读取全部行
-                        df = pd.read_excel(file_path, sheet_name=sheet_name)
+                        df = excel_file.parse(sheet_name=sheet_name, header=None, dtype=object)
 
                         sheet_text = f"=== Sheet: {sheet_name} ===\n"
                         sheet_text += f"形状: {df.shape[0]}行 x {df.shape[1]}列\n"

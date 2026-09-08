@@ -222,10 +222,13 @@ class FastHeaderMatcher:
                 best_region_only=not multi_sheet_source,
                 headers_only=True, read_formulas=False
             )
+            if not sheet_list:
+                raise ValueError(f"源文件无法提取数据结构: {file_name}")
             return file_path, file_name, sheet_list
 
         # 并行解析所有文件
-        max_workers = min(len(file_paths), 4)
+        # 一个重任务内部也需限流，避免单个任务同时展开四份 Aspose 工作簿。
+        max_workers = min(len(file_paths), max(1, min(2, int(os.getenv("EXCEL_PARSE_WORKERS", "1")))))
         if max_workers <= 1:
             # 单文件直接串行，避免线程池开销
             results = [_parse_one_file(fp) for fp in file_paths]
@@ -791,7 +794,7 @@ class FastHeaderMatcher:
             for _tf, _fd in (source_structure.get("files") or {}).items():
                 if isinstance(_fd, dict) and "error" in _fd:
                     continue
-                _fb = _tf.replace('.xlsx', '').replace('.xls', '')
+                _fb = os.path.splitext(_tf)[0]
                 for _sn in ((_fd.get("sheets") if isinstance(_fd, dict) else None) or {}).keys():
                     _expected_pairs.append((_fb, _sn))
             pre_loaded_source_data = self._build_pre_loaded_from_memory(
@@ -850,7 +853,8 @@ class FastHeaderMatcher:
                 best_region_only=True,   # 与训练侧 _load_full_source_data 一致（每 sheet 取最优区域），
                                          # 否则多 sheet 时智算会拼接多区域 → 行数比智训多 → 结果不一致
                 read_formulas=False,
-                calculate_formulas=True,  # 含公式无缓存值的源（如模板产出）先算再读，避免读到空
+                calculate_formulas=True,  # 含公式无缓存值的源先算再读
+                normalize_source=True, raise_errors=True,
             )
             return file_path, file_name, sheet_list
 
@@ -867,7 +871,7 @@ class FastHeaderMatcher:
                         results.append(future.result())
                     except Exception as e:
                         failed_path = futures[future]
-                        logger.warning(f"[单次解析] 并行解析文件失败: {os.path.basename(failed_path)} - {e}")
+                        raise ValueError(f"源文件解析失败，不能使用不完整数据计算: {os.path.basename(failed_path)} - {e}") from e
 
         # 整理结果
         for file_path, file_name, sheet_list in results:
@@ -903,7 +907,9 @@ class FastHeaderMatcher:
         与脚本 load_source_data 返回格式一致:
         {"文件名_Sheet名": {"df": DataFrame, "columns": [列名]}}
         """
-        from backend.utils.data_helpers import convert_region_to_dataframe, region_formats_by_name
+        from backend.utils.data_helpers import (
+            convert_region_to_dataframe, region_formats_by_name, region_schemas_by_name,
+        )
         import pandas as pd
 
         source_data = {}
@@ -913,7 +919,7 @@ class FastHeaderMatcher:
 
         for input_file_name, mapping_info in file_mapping.items():
             expected_file = mapping_info.get("expected_file", input_file_name)
-            file_base = expected_file.replace('.xlsx', '').replace('.xls', '')
+            file_base = os.path.splitext(expected_file)[0]
             file_path = mapping_info.get("file_path", "")
             needs_rewrite = mapping_info.get("needs_rewrite", False)
             sheet_mapping = mapping_info.get("sheet_mapping", {})
@@ -922,12 +928,12 @@ class FastHeaderMatcher:
             for input_sheet, train_sheet in sheet_mapping.items():
                 sheet_data = parsed_sheets_map.get((file_path, input_sheet))
                 if not sheet_data:
-                    logger.warning(f"[预加载] 未找到解析数据: {input_file_name}/{input_sheet}")
-                    continue
+                    raise ValueError(f"映射表缺少解析数据: {input_file_name}/{input_sheet}")
 
                 dfs = []
                 first_columns = None
                 first_formats = None
+                first_schemas = None
                 for region in sheet_data.regions:
                     # needs_rewrite 时需要映射表头名（input → train）
                     if needs_rewrite and header_mapping:
@@ -935,24 +941,31 @@ class FastHeaderMatcher:
                         mapped_head = {}
                         for col_name, col_letter in region.head_data.items():
                             mapped_name = header_mapping.get(col_name, col_name)
+                            if mapped_name in mapped_head and mapped_head[mapped_name] != col_letter:
+                                raise ValueError(f"多个源列映射为同一列 {mapped_name}: {input_file_name}/{input_sheet}")
                             mapped_head[mapped_name] = col_letter
                         mapped_region = ExcelRegion(
                             head_data=mapped_head,
                             data=region.data,
                             formula=region.formula,
-                            column_formats=getattr(region, "column_formats", None) or {}
+                            column_formats=getattr(region, "column_formats", None) or {},
+                            column_schemas=getattr(region, "column_schemas", None) or {},
                         )
                         df = convert_region_to_dataframe(mapped_region)
                         _fmts = region_formats_by_name(mapped_head, mapped_region.column_formats)
+                        _schemas = region_schemas_by_name(mapped_head, mapped_region.column_schemas)
                     else:
                         df = convert_region_to_dataframe(region)
                         _fmts = region_formats_by_name(region.head_data, getattr(region, "column_formats", None) or {})
+                        _schemas = region_schemas_by_name(
+                            region.head_data, getattr(region, "column_schemas", None) or {})
 
                     if df.empty and len(df.columns) == 0:
                         continue
                     if first_columns is None:
                         first_columns = list(df.columns)
                         first_formats = _fmts
+                        first_schemas = _schemas
                     dfs.append(df)
 
                 if not dfs:
@@ -974,23 +987,28 @@ class FastHeaderMatcher:
                 except Exception:
                     pass
 
-                _collected.append((file_base, train_sheet, merged_df, first_columns, first_formats))
+                _collected.append((file_base, train_sheet, merged_df, first_columns,
+                                   first_formats, first_schemas))
 
         # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 / 撞结果 sheet → 加文件名前缀
         # 关键①：按 (file_base, sheet) 排序后再建字典，顺序确定且与训练侧一致（find_source_sheet 按首个匹配）。
         # 关键②：冲突计数用"训练期望全集"(expected_pairs)，而非仅本次匹配到的文件 —— 否则当本次只匹配到
         #         重复 sheet 的其中一个文件时会漏判冲突 → key 不加前缀(数据)，而训练是(3月_数据)，脚本就找不到源。
         _collected.sort(key=lambda x: (str(x[0]), str(x[1])))
-        _pairs_for_keys = sorted({(fb, sn) for fb, sn, _, _, _ in _collected} | set(expected_pairs or []))
+        _pairs_for_keys = sorted({(fb, sn) for fb, sn, _, _, _, _ in _collected} | set(expected_pairs or []))
         key_map = assign_sheet_keys(
             _pairs_for_keys,
             reserved_names=reserved_sheet_names,
         )
-        for file_base, train_sheet, merged_df, first_columns, first_formats in _collected:
+        for file_base, train_sheet, merged_df, first_columns, first_formats, first_schemas in _collected:
             key = key_map[(file_base, train_sheet)]
+            if key in source_data:
+                raise ValueError(f"多个上传 Sheet 映射到同一训练表 {key}，请明确纵向合并规则")
             entry = {"df": merged_df, "columns": first_columns}
             if first_formats:
                 entry["column_formats"] = first_formats
+            if first_schemas:
+                entry["column_schemas"] = first_schemas
             source_data[key] = entry
             logger.info(f"[预加载] {key}: {len(merged_df)}行 × {len(first_columns)}列")
 

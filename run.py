@@ -81,7 +81,8 @@ def create_example_files():
         }
         source1_df = pd.DataFrame(source1_data)
         source1_file = example_dir / "source1.xlsx"
-        source1_df.to_excel(source1_file, index=False)
+        if not source1_file.exists():
+            source1_df.to_excel(source1_file, index=False)
 
         # 示例源文件2
         source2_data = {
@@ -93,7 +94,8 @@ def create_example_files():
         }
         source2_df = pd.DataFrame(source2_data)
         source2_file = example_dir / "source2.xlsx"
-        source2_df.to_excel(source2_file, index=False)
+        if not source2_file.exists():
+            source2_df.to_excel(source2_file, index=False)
 
         # 示例预期结果
         expected_data = {
@@ -106,7 +108,8 @@ def create_example_files():
         }
         expected_df = pd.DataFrame(expected_data)
         expected_file = example_dir / "expected_result.xlsx"
-        expected_df.to_excel(expected_file, index=False)
+        if not expected_file.exists():
+            expected_df.to_excel(expected_file, index=False)
 
         print(f"示例文件已创建到: {example_dir}")
 

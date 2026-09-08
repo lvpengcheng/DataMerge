@@ -1712,6 +1712,7 @@ from openpyxl.formatting.rule import CellIsRule, FormulaRule
 from openpyxl.utils import get_column_letter, column_index_from_string
 from excel_parser import IntelligentExcelParser
 from backend.utils.source_sheet_writer import dt_to_excel_serial, is_long_digit_text
+from backend.utils.data_helpers import apply_dataframe_column_schemas, region_schemas_by_name, assign_sheet_keys
 
 
 # Excel公式中的特殊值常量（在f-string中使用，避免引号冲突）
@@ -1722,6 +1723,8 @@ ZERO = '0'             # 数字0
 # 训练阶段记录的"结果 sheet 名"集合，供 load_source_data 在源 sheet 与结果 sheet 同名时
 # 自动改写为 "{file_base}_{sheet}" 形式，避免 write_source_sheets / fill_result_sheets 互相覆盖。
 _RESULT_SHEET_NAMES = __RESERVED_SHEETS__
+# 目标列定义来自 excel_parser。公式模式没有模板可继承，保存前按它统一类型/格式。
+_TARGET_COLUMN_SCHEMAS = __TARGET_COLUMN_SCHEMAS__
 
 
 def excel_text(text):
@@ -1798,6 +1801,28 @@ def write_cell(ws, row, column, value, number_format=None):
         cell.number_format = number_format
 
 
+def apply_target_column_schemas(wb):
+    """非模板输出：按目标 Excel 的解析定义固定列格式及直接写入值类型。"""
+    for sheet_name, schemas in (_TARGET_COLUMN_SCHEMAS or {}).items():
+        if sheet_name not in wb.sheetnames or not schemas:
+            continue
+        ws = wb[sheet_name]
+        header_to_col = {str(c.value).strip(): c.column for c in ws[1] if c.value is not None}
+        for name, schema in schemas.items():
+            ci = header_to_col.get(str(name).strip())
+            if not ci:
+                continue
+            field_type = (schema or {}).get("field_type")
+            number_format = (schema or {}).get("number_format") or "General"
+            for ri in range(2, ws.max_row + 1):
+                cell = ws.cell(ri, ci)
+                if field_type == "text" and cell.value is not None and not (
+                        isinstance(cell.value, str) and cell.value.startswith("=")):
+                    cell.value = str(cell.value)
+                    cell.data_type = "s"
+                cell.number_format = number_format
+
+
 def convert_region_to_dataframe(region) -> pd.DataFrame:
     """将ExcelRegion转换为DataFrame
 
@@ -1821,7 +1846,11 @@ def convert_region_to_dataframe(region) -> pd.DataFrame:
             new_row[col_name] = value
         converted_data.append(new_row)
 
-    return pd.DataFrame(converted_data, columns=columns)
+    df = pd.DataFrame(converted_data, columns=columns)
+    schemas = region_schemas_by_name(
+        region.head_data, getattr(region, "column_schemas", None) or {}
+    )
+    return apply_dataframe_column_schemas(df, schemas)
 
 
 def load_source_data(input_folder, manual_headers):
@@ -1847,10 +1876,10 @@ def load_source_data(input_folder, manual_headers):
     _collected = []
 
     for filename in sorted(os.listdir(input_folder)):
-        if not filename.endswith(('.xlsx', '.xls')) or filename.startswith('~'):
+        if not filename.lower().endswith((".xlsx", ".xls", ".xlsm")) or filename.startswith('~'):
             continue
         file_path = os.path.join(input_folder, filename)
-        file_base = filename.replace('.xlsx','').replace('.xls','')
+        file_base = os.path.splitext(filename)[0]
 
         try:
             results = parser.parse_excel_file(
@@ -1859,19 +1888,22 @@ def load_source_data(input_folder, manual_headers):
                 active_sheet_only=__ACTIVE_SHEET_ONLY__,
                 best_region_only=True,  # 只取有效区域（与merge_source_to_target逻辑一致）
                 read_formulas=False,    # 智算阶段不需要公式，使用批量读取提升性能
+                calculate_formulas=True,
+                normalize_source=True,
+                raise_errors=True,
                 # 不限制 max_data_rows → 执行时加载全量数据
                 # （训练时通过 _pre_loaded_source_data 注入预解析的全量数据，通常不会走到这里）
             )
 
             if not results:
-                print(f"[警告] 文件 {filename} 解析结果为空，跳过")
-                continue
+                raise ValueError(f"文件 {filename} 没有可读取的数据区域")
 
             for sheet_data in results:
                 # 收集同sheet下所有region的DataFrame并合并（处理同列头多区域合并场景）
                 dfs = []
                 columns = None
                 col_formats = None
+                col_schemas = None
                 for region in sheet_data.regions:
                     df = convert_region_to_dataframe(region)
                     if df.empty and len(df.columns) == 0:
@@ -1881,6 +1913,8 @@ def load_source_data(input_folder, manual_headers):
                         # 列名→原始格式码（源文件千分位/小数/百分比等），供写回源_sheet 复用
                         _cf = getattr(region, "column_formats", None) or {}
                         col_formats = {_n: _cf[_l] for _n, _l in region.head_data.items() if _cf.get(_l)}
+                        col_schemas = region_schemas_by_name(
+                            region.head_data, getattr(region, "column_schemas", None) or {})
                     dfs.append(df)
 
                 if not dfs:
@@ -1899,41 +1933,24 @@ def load_source_data(input_folder, manual_headers):
                         if merged_df[_sn_col].isna().all():
                             merged_df[_sn_col] = range(1, len(merged_df) + 1)
 
-                _collected.append((file_base, sheet_data.sheet_name, merged_df, columns, col_formats))
+                _collected.append((file_base, sheet_data.sheet_name, merged_df, columns,
+                                   col_formats, col_schemas))
 
         except Exception as e:
-            print(f"[错误] 解析文件 {filename} 失败: {e}")
-            import traceback
-            traceback.print_exc()
+            raise ValueError(f"解析文件 {filename} 失败: {e}") from e
 
     # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 / 撞结果 sheet → 加文件名前缀
-    _name_count = {}
-    for _fb, _sn, _, _, _ in _collected:
-        _name_count[_sn] = _name_count.get(_sn, 0) + 1
+    _collected.sort(key=lambda x: (str(x[0]), str(x[1])))
     _reserved = set(globals().get('_RESULT_SHEET_NAMES', []))
-    _used_keys = set()
-    for file_base, sheet_name_orig, merged_df, columns, col_formats in _collected:
-        _collide_cross_file = _name_count.get(sheet_name_orig, 0) > 1
-        _collide_reserved = sheet_name_orig in _reserved
-        if _collide_cross_file or _collide_reserved:
-            _raw_key = f"{file_base}_{sheet_name_orig}"
-        else:
-            _raw_key = sheet_name_orig
-        if len(_raw_key) > 31:
-            _raw_key = _raw_key[:31]
-        _base = _raw_key
-        _counter = 2
-        sheet_name = _raw_key
-        while sheet_name in _used_keys:
-            _suffix = f"_{_counter}"
-            sheet_name = _base[:31 - len(_suffix)] + _suffix
-            _counter += 1
-        _used_keys.add(sheet_name)
+    _key_map = assign_sheet_keys([(fb, sn) for fb, sn, _, _, _, _ in _collected], reserved_names=_reserved)
+    for file_base, sheet_name_orig, merged_df, columns, col_formats, col_schemas in _collected:
+        sheet_name = _key_map[(file_base, sheet_name_orig)]
 
         source_data[sheet_name] = {
             "df": merged_df,
             "columns": columns,
-            "column_formats": col_formats or {}
+            "column_formats": col_formats or {},
+            "column_schemas": col_schemas or {}
         }
         if len(merged_df) > 0:
             print(f"加载源数据: {sheet_name}, 列: {columns}, 行数: {len(merged_df)}")
@@ -1945,7 +1962,7 @@ def load_source_data(input_folder, manual_headers):
         # 列出输入目录里的文件，帮助定位问题
         try:
             all_files = [f for f in os.listdir(input_folder)
-                         if f.endswith(('.xlsx', '.xls')) and not f.startswith('~')]
+                         if f.lower().endswith((".xlsx", ".xls", ".xlsm")) and not f.startswith('~')]
         except Exception:
             all_files = []
         raise ValueError(
@@ -1957,35 +1974,13 @@ def load_source_data(input_folder, manual_headers):
 
 
 def _is_date_column(col_name, df=None):
-    \"\"\"判断是否为日期列：仅按列名关键词判断，不做数据内容探测\"\"\"
-    name = str(col_name).lower().strip()
-
-    # 排除误匹配（如"工作日数"、"节日"等）
-    exclude_keywords = ['日数', '日常', '日志', '日报', '日均', '节日', '假日', '工日', 'update', 'today']
-    for exc in exclude_keywords:
-        if exc in name:
-            return False
-
-    # 列名含日期关键词才认定为日期列
-    date_keywords = ['日期', 'date', '入职日', '离职日', '生效日', '截止日', '转正日', '生日',
-                     '出生日', '开始日', '结束日', '签订日', '到期日', '发放日', '申请日',
-                     '创建时间', '更新时间', '时间戳', 'datetime', 'timestamp']
-    for kw in date_keywords:
-        if kw in name:
-            return True
-
-    return False
+    from backend.utils.source_sheet_writer import is_date_keyword_column
+    return is_date_keyword_column(col_name)
 
 
 def _to_native_datetime(x):
-    \"\"\"将任意日期值统一转为 Python 原生 datetime.datetime（避免 pd.Timestamp 比较问题）\"\"\"
-    if pd.isna(x) if not isinstance(x, str) else (x == ''):
-        return None
-    try:
-        ts = pd.to_datetime(x)
-        return ts.to_pydatetime()
-    except Exception:
-        return x
+    from backend.utils.source_sheet_writer import coerce_source_date
+    return coerce_source_date(x)
 
 
 def _normalize_date_columns(source_data):
@@ -1993,9 +1988,11 @@ def _normalize_date_columns(source_data):
     必须在 clean_source_data 之前调用，否则清洗代码中的日期比较会触发 TypeError\"\"\"
     for sheet_name, data_info in source_data.items():
         df = data_info["df"]
+        schemas = data_info.get("column_schemas") or {}
         date_cols = set()
         for col_name in df.columns:
-            if _is_date_column(col_name, df):
+            declared = (schemas.get(col_name) or {}).get("field_type")
+            if declared in ("date", "datetime") or (not declared and _is_date_column(col_name, df)):
                 date_cols.add(col_name)
         if date_cols:
             print(f"  [日期预处理] {sheet_name}: 识别到日期列 {list(date_cols)}")
@@ -2026,6 +2023,7 @@ def write_source_sheets(wb, source_data):
         _entry_id_to_primary[_eid] = sheet_name
         df = data_info["df"]
         col_fmts = data_info.get("column_formats") or {}
+        col_schemas = data_info.get("column_schemas") or {}
 
         # 清理列名：只去除换行符和首尾空格，保留列名内的正常空格
         import re as _re_clean
@@ -2042,117 +2040,11 @@ def write_source_sheets(wb, source_data):
 
         ws = wb.create_sheet(title=sheet_name)
 
-        # 预判哪些列是日期列（每个sheet只判断一次）
-        date_cols = set()
-        for col_name in df.columns:
-            if _is_date_column(col_name, df):
-                date_cols.add(col_name)
-
-        # ========== 批量预处理 DataFrame ==========
-        write_df = df.copy()
-
-        # 1) 日期列批量转换为 Python datetime
-        for col_name in date_cols:
-            def _safe_to_datetime(v):
-                if pd.isna(v):
-                    return v
-                if hasattr(v, 'to_pydatetime'):
-                    try:
-                        return v.to_pydatetime()
-                    except Exception:
-                        return v
-                if isinstance(v, str) and v.strip():
-                    try:
-                        return pd.to_datetime(v).to_pydatetime()
-                    except Exception:
-                        return v
-                return v
-            write_df[col_name] = write_df[col_name].apply(_safe_to_datetime)
-
-        # 1.5) 非日期列：若值为 datetime（被套了 yyyy-mm-dd 等日期格式的普通数字），
-        #      逆转回 Excel 序列号（底层数值），避免非日期列被当日期写入。
-        for col_name in write_df.columns:
-            if col_name in date_cols:
-                continue
-            _dt = write_df[col_name].dtype
-            if _dt == object or str(_dt).startswith('datetime'):
-                write_df[col_name] = write_df[col_name].apply(dt_to_excel_serial)
-
-        # 2) NaN → ""
-        write_df = write_df.fillna("")
-
-        # 3) 识别含公式前缀的列（向量化预扫描，减少后处理范围）
-        formula_risk_col_indices = []
-        long_text_col_indices = []
-        for col_idx, col_name in enumerate(write_df.columns):
-            col_data = write_df[col_name]
-            if col_data.dtype == object:
-                try:
-                    str_col = col_data.astype(str)
-                    mask = (str_col.str.len() > 1) & (str_col.str[0].isin(['=', '+', '-']))
-                    if mask.any():
-                        formula_risk_col_indices.append(col_idx)
-                except Exception:
-                    pass
-                # 长数字文本列（身份证/卡号/手机）：写入时需设文本格式
-                try:
-                    if col_data.apply(is_long_digit_text).any():
-                        long_text_col_indices.append(col_idx)
-                except Exception:
-                    pass
-
-        # ========== 写入表头（append + 样式） ==========
-        ws.append(list(write_df.columns))
-        for cell in ws[1]:
-            cell.fill = header_fill
-            cell.font = Font(bold=True)
-
-        # ========== 批量写入数据（values.tolist 在 NumPy C 层转换，比 itertuples 更快） ==========
-        rows = write_df.values.tolist()
-        for row in rows:
-            ws.append(row)
-
-        total_rows = len(write_df)
-
-        # ========== 列级后处理：仅遍历需要特殊处理的列 ==========
-        # 源文件原始格式（千分位/小数/百分比/货币/文本等）：作基底写回；
-        # 日期列、长数字文本列随后的 pass 会覆盖它 → 显式日期/长文本仍胜出。
-        if col_fmts:
-            for ci, col_name in enumerate(write_df.columns):
-                fmt = col_fmts.get(col_name)
-                if not fmt:
-                    continue
-                col_letter = get_column_letter(ci + 1)
-                for cell in ws[col_letter][1:]:  # 跳过表头
-                    if cell.value != "":
-                        cell.number_format = fmt
-
-        # 日期列：设置 number_format
-        if date_cols:
-            date_col_indices = [i for i, c in enumerate(write_df.columns) if c in date_cols]
-            for ci in date_col_indices:
-                col_letter = get_column_letter(ci + 1)
-                for cell in ws[col_letter][1:]:  # 跳过表头
-                    if cell.value != "":
-                        cell.number_format = 'yyyy/mm/dd'
-
-        # 公式风险列：设置 data_type = 's' 防止 Excel 当公式执行
-        if formula_risk_col_indices:
-            for ci in formula_risk_col_indices:
-                col_letter = get_column_letter(ci + 1)
-                for cell in ws[col_letter][1:]:  # 跳过表头
-                    val = cell.value
-                    if isinstance(val, str) and len(val) > 1 and val[0] in ('=', '+', '-'):
-                        cell.data_type = 's'
-
-        # 长数字文本列：设置文本格式，避免 ≥12 位纯数字串被 Excel 转科学计数/丢精度
-        if long_text_col_indices:
-            for ci in long_text_col_indices:
-                col_letter = get_column_letter(ci + 1)
-                for cell in ws[col_letter][1:]:  # 跳过表头
-                    if is_long_digit_text(cell.value):
-                        cell.number_format = '@'
-                        cell.data_type = 's'
+        from backend.utils.source_sheet_writer import write_source_dataframe
+        # 列名清理后同步 schema / 格式映射，避免写回时找不到字段定义。
+        col_schemas = {cleaned_cols.get(k, k): v for k, v in col_schemas.items()}
+        col_fmts = {cleaned_cols.get(k, k): v for k, v in col_fmts.items()}
+        write_source_dataframe(ws, df, col_schemas, col_fmts, header_fill)
 
         source_sheets[sheet_name] = {"df": df, "ws": ws}
 
@@ -2170,110 +2062,8 @@ def write_source_sheets(wb, source_data):
 
 def find_source_sheet(source_sheets, target_columns=None, sheet_name_hint=None,
                       salary_year=None, salary_month=None):
-    """辅助函数：根据sheet名称或列名查找源数据sheet
-
-    匹配优先级（严格顺序）：
-    1. 唯一sheet → 直接返回
-    2. Sheet名称精确匹配（最高优先级 — 与智训一致的sheet名）
-    3. 薪资年月匹配（YYYYMM 格式 sheet 名）
-    4. 表头结构匹配（target_columns 列名匹配度）
-    5. 回退到第一个sheet
-
-    Args:
-        source_sheets: 源数据字典 {"文件名_sheet名": {"df": DataFrame, "ws": worksheet}}
-        target_columns: 目标列名列表（用于匹配），例如 ["姓名", "部门", "基本工资"]
-        sheet_name_hint: sheet名称提示（比如"薪资"、"考勤"等关键词）
-        salary_year: 薪资年份（如 2025），用于匹配 YYYYMM 格式 sheet
-        salary_month: 薪资月份（如 1~12），用于匹配 YYYYMM 格式 sheet
-
-    Returns:
-        匹配的sheet key
-    Raises:
-        KeyError: 找不到匹配的sheet时，抛出包含可用sheet列表的异常
-    """
-    # 策略1: 如果只有一个sheet，直接返回
-    if len(source_sheets) == 1:
-        return list(source_sheets.keys())[0]
-
-    # 所有候选 key 一律按排序遍历，保证"首个匹配"在智训/智算两侧确定一致
-    # （否则同名 sheet 跨文件时，依赖字典顺序会取到不同的源 → 结果不一致）
-    keys_sorted = sorted(source_sheets.keys())
-
-    # 策略2: 根据 sheet 名称提示匹配（最高优先级 — 与智训一致的 sheet 名），由精确到模糊
-    if sheet_name_hint:
-        hint = str(sheet_name_hint).strip()
-        hint_lower = hint.lower()
-
-        def _sheet_part(k):
-            # key 形如 "文件名_sheet名" → 取 sheet 部分；无下划线则整体
-            return (k.split('_', 1)[1] if '_' in k else k).strip()
-
-        # 2a: key 完全等于 hint
-        for k in keys_sorted:
-            if k == hint:
-                return k
-        # 2b: 去文件名前缀后的 sheet 部分完全等于 hint（最精确的语义匹配）
-        m = [k for k in keys_sorted if _sheet_part(k).lower() == hint_lower]
-        if m:
-            return m[0]
-        # 2c: 区分大小写的包含匹配
-        m = [k for k in keys_sorted if hint in k]
-        if m:
-            return m[0]
-        # 2d: 忽略大小写的包含匹配
-        m = [k for k in keys_sorted if hint_lower in k.lower()]
-        if m:
-            return m[0]
-        # 2e: 去文件名前缀后包含匹配（如 hint="社保明细", key="人员信息_社保明细"）
-        m = [k for k in keys_sorted if hint_lower in _sheet_part(k).lower()]
-        if m:
-            return m[0]
-
-    # 策略3: 薪资年月匹配（适用于 202501、2025-01、2025年1月 等格式的 sheet 名）
-    if salary_year and salary_month:
-        ym_patterns = [
-            f"{salary_year}{int(salary_month):02d}",       # 202501
-            f"{salary_year}-{int(salary_month):02d}",      # 2025-01
-            f"{salary_year}年{int(salary_month)}月",        # 2025年1月
-            f"{int(salary_month)}月",                       # 1月
-        ]
-        # 如果有 sheet_name_hint，优先在包含 hint 的 sheet 中匹配年月
-        candidates = list(keys_sorted)
-        if sheet_name_hint:
-            hint_candidates = [k for k in candidates if str(sheet_name_hint).lower() in k.lower()]
-            if hint_candidates:
-                candidates = hint_candidates
-
-        for pattern in ym_patterns:
-            for sheet_key in candidates:
-                if pattern in sheet_key:
-                    return sheet_key
-
-    # 策略4: 根据列名匹配（如果提供了target_columns）——按排序遍历，平分时取确定的首个
-    if target_columns:
-        best_match = None
-        best_score = 0
-        for sheet_key in keys_sorted:
-            sheet_columns = set(source_sheets[sheet_key]["df"].columns)
-            match_count = len(sheet_columns & set(target_columns))
-            if match_count > best_score:
-                best_score = match_count
-                best_match = sheet_key
-        if best_match and best_score > 0:
-            return best_match
-
-    # 策略5: 返回排序后的第一个sheet（确定性）
-    if keys_sorted:
-        return keys_sorted[0]
-
-    # 无可用sheet → 抛出明确异常
-    hint_info = f", sheet_name_hint='{sheet_name_hint}'" if sheet_name_hint else ""
-    col_info = f", target_columns={target_columns}" if target_columns else ""
-    available = list(source_sheets.keys()) if source_sheets else []
-    raise KeyError(
-        f"find_source_sheet: 未找到匹配的源数据sheet"
-        f"{col_info}{hint_info}。可用sheets: {available}"
-    )
+    from backend.utils.source_selector import find_source_sheet as select_source
+    return select_source(source_sheets, target_columns, sheet_name_hint, salary_year, salary_month)
 
 
 def write_params_sheet(wb, salary_year, salary_month, monthly_standard_hours):
@@ -2370,7 +2160,7 @@ def write_history_sheet(wb, history_prov, salary_year, salary_month):
             if output_folder and os.path.exists(output_folder):
                 # 查找预期文件（expected目录中的xlsx文件）
                 expected_files = [f for f in os.listdir(output_folder)
-                                if f.endswith(('.xlsx', '.xls')) and not f.startswith('~')]
+                                if f.lower().endswith((".xlsx", ".xls", ".xlsm")) and not f.startswith('~')]
                 if expected_files:
                     expected_file = os.path.join(output_folder, expected_files[0])
                     # 读取第一个sheet的列名
@@ -2423,40 +2213,9 @@ def write_history_sheet(wb, history_prov, salary_year, salary_month):
 # ============================================================
 
 def _merge_source_tables(source_data, merge_config):
-    """根据预分析配置合并源数据表"""
-    import json as _json
-    if isinstance(merge_config, str):
-        merge_config = _json.loads(merge_config)
+    from backend.utils.table_merge import merge_source_tables
+    return merge_source_tables(source_data, merge_config)
 
-    merged = dict(source_data)
-    output_key = merge_config.get("output_key", "derived_main_table")
-
-    # 纵向合并（结构相同的多个表拼接）
-    for group in merge_config.get("vertical_groups", []):
-        dfs = [source_data[k]["df"] for k in group if k in source_data]
-        if dfs:
-            combined = pd.concat(dfs, ignore_index=True)
-            columns = source_data[group[0]]["columns"]
-            merged[output_key] = {"df": combined, "columns": list(columns)}
-            print(f"  [纵向合并] {group} -> {output_key}, {len(combined)}行")
-
-    # 横向关联（不同表通过主键join）
-    for join_spec in merge_config.get("horizontal_joins", []):
-        left_key = join_spec["left"]
-        right_key = join_spec["right"]
-        join_col = join_spec["on"]
-        left_data = merged.get(left_key)
-        right_data = merged.get(right_key)
-        if left_data and right_data:
-            left_df = left_data["df"]
-            right_df = right_data["df"]
-            right_cols = [c for c in right_df.columns
-                         if c not in left_df.columns or c == join_col]
-            result = left_df.merge(right_df[right_cols], on=join_col, how="left")
-            merged[left_key] = {"df": result, "columns": list(result.columns)}
-            print(f"  [横向关联] {left_key} JOIN {right_key} ON {join_col}, {len(result)}行")
-
-    return merged
 
 # ============================================================
 # 主函数
@@ -2482,13 +2241,6 @@ def main():
     print("步骤1.1: 预处理日期列...")
     _normalize_date_columns(source_data)
 
-    # 步骤1.2: 合并源数据表（由TableAnalyzer预分析，None表示无需合并）
-    _merge_cfg = __MERGE_CONFIG__
-    if _merge_cfg:
-        print("步骤1.2: 合并源数据表...")
-        source_data = _merge_source_tables(source_data, _merge_cfg)
-        print(f"合并完成，共 {len(source_data)} 个源数据sheet")
-
     # 步骤1.5: 应用数据清洗规则（如果定义了clean_source_data函数）
     if 'clean_source_data' in globals():
         print("步骤1.5: 应用数据清洗规则...")
@@ -2498,6 +2250,13 @@ def main():
             print(f"清洗完成，共 {len(source_data)} 个源数据sheet")
         else:
             print("警告: clean_source_data返回None，使用原始数据继续")
+
+    # 步骤1.2: 合并源数据表（由TableAnalyzer预分析，None表示无需合并）
+    _merge_cfg = __MERGE_CONFIG__
+    if _merge_cfg:
+        print("步骤1.2: 合并源数据表...")
+        source_data = _merge_source_tables(source_data, _merge_cfg)
+        print(f"合并完成，共 {len(source_data)} 个源数据sheet")
 
     # 创建Workbook
     wb = Workbook()
@@ -2528,6 +2287,7 @@ def main():
     print("步骤3: 填充结果sheet...")
     # 传递薪资参数给fill_result_sheets，以便在公式中使用
     fill_result_sheets(wb, source_sheets, salary_year_val, salary_month_val, monthly_hours_val)
+    apply_target_column_schemas(wb)
 
     # 删除初始的空sheet（如果还存在）
     if default_sheet.title == "Sheet" and default_sheet in wb.worksheets:
@@ -2584,6 +2344,15 @@ def main():
         complete_code = complete_code.replace(
             "__RESERVED_SHEETS__", _json_rs.dumps(_reserved_names, ensure_ascii=False)
         )
+        _target_schemas = {
+            name: (info.get("column_schemas") or {})
+            for name, info in ((_exp_struct.get("sheets", {}) or {}).items())
+            if isinstance(info, dict) and info.get("column_schemas")
+        }
+        complete_code = complete_code.replace(
+            "__TARGET_COLUMN_SCHEMAS__",
+            repr(_target_schemas),
+        )
 
         # 替换 __USE_HISTORY__ 占位符（控制是否在输出 workbook 中创建历史数据 sheet）
         _uh_value = "True" if getattr(self, "_use_history", False) else "False"
@@ -2593,7 +2362,7 @@ def main():
         if merge_config:
             import json as _json
             complete_code = complete_code.replace(
-                "__MERGE_CONFIG__", _json.dumps(merge_config, ensure_ascii=False)
+                "__MERGE_CONFIG__", repr(merge_config)
             )
         else:
             complete_code = complete_code.replace("__MERGE_CONFIG__", "None")

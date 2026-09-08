@@ -23,7 +23,7 @@ class CodeSandbox:
     _cached_safe_modules = None
     _modules_lock = threading.Lock()
 
-    def __init__(self, timeout: int = 360, max_memory_mb: int = 4096):
+    def __init__(self, timeout: int = 360, max_memory_mb: int = 0):
         # 从 .env 读取沙箱超时/内存限制（CODE_SANDBOX_TIMEOUT / CODE_SANDBOX_MAX_MEMORY）。
         # 历史上这两个变量从未被代码读取——超时一直用默认 360s、内存限制完全没实现，
         # 脚本死循环/吃内存时线程超时不杀、内存无限膨胀 → VM 假死（swap 风暴）。
@@ -35,7 +35,7 @@ class CodeSandbox:
             pass
         try:
             _m = int(os.getenv("CODE_SANDBOX_MAX_MEMORY", ""))
-            if _m > 0:
+            if _m >= 0:
                 max_memory_mb = _m
         except (TypeError, ValueError):
             pass
@@ -171,13 +171,8 @@ class CodeSandbox:
 
         if r.success:
             return r.result
-        if r.timed_out:
-            result["error"] = (f"执行超时: 脚本运行超过{self.timeout}秒，"
-                               f"可能存在死循环或数据量过大（已强杀）")
-        elif r.killed_by_memory:
-            result["error"] = f"执行内存超限被杀（上限 {self.max_memory_mb}MB）"
-        else:
-            result["error"] = r.error or "沙箱执行失败"
+        result["error"] = r.error or "沙箱执行失败"
+        result["resource_failure"] = r.killed or r.termination_failed
         return result
 
     def _run_script_core(self, script_content, execution_env, output_buffer, error_buffer,
@@ -210,9 +205,18 @@ class CodeSandbox:
 
             try:
                 # 编译并执行代码
+                from backend.utils.generated_code_check import check_generated_code, describe_issues
+                issues = check_generated_code(script_content, exec_globals.keys())
+                if issues:
+                    result['code_issues'] = issues
+                    raise ValueError('执行前代码完整性检查失败（未开始处理 Excel）：\n'
+                                     + describe_issues(issues))
                 output_buffer.write(f"开始编译和执行代码...\n")
                 code_obj = compile(script_content, '<sandbox>', 'exec')
                 exec(code_obj, exec_globals)
+                for name in ('salary_year', 'salary_month', 'monthly_standard_hours'):
+                    if execution_env.get(name) is not None:
+                        exec_globals[name] = execution_env[name]
                 output_buffer.write(f"代码编译和执行完成\n")
 
                 # 模板模式：注入运行时模板覆盖路径 + 覆盖脚本烘焙的 TEMPLATE_PATH。
@@ -278,41 +282,8 @@ class CodeSandbox:
 
                 # 尝试调用主函数
                 if 'main' in exec_globals and callable(exec_globals['main']):
-                    main_func = exec_globals['main']
-                    # 检查main函数的签名，智能传递参数
-                    import inspect
-                    sig = inspect.signature(main_func)
-                    params = list(sig.parameters.keys())
-
-                    if len(params) == 0:
-                        # main() 不带参数
-                        output_buffer.write(f"调用 main() 函数\n")
-                        exec_globals['main']()
-                    else:
-                        # main() 带参数，尝试传递执行环境
-                        input_folder = execution_env.get('input_folder', '')
-                        output_folder = execution_env.get('output_folder', '')
-                        output_buffer.write(f"调用 main('{input_folder}', '{output_folder}') 函数\n")
-                        # 尝试匹配参数名
-                        kwargs = {}
-                        if 'input_folder' in params:
-                            kwargs['input_folder'] = input_folder
-                        if 'input_path' in params:
-                            kwargs['input_path'] = input_folder
-                        if 'output_folder' in params:
-                            kwargs['output_folder'] = output_folder
-                        if 'output_path' in params:
-                            kwargs['output_path'] = output_folder
-                        if 'output_file' in params:
-                            # 兼容 output_file 参数名
-                            import os as _os
-                            kwargs['output_file'] = _os.path.join(output_folder, 'output.xlsx')
-
-                        # 按位置参数调用
-                        if len(params) >= 2 and not kwargs:
-                            exec_globals['main'](input_folder, output_folder)
-                        else:
-                            exec_globals['main'](**kwargs)
+                    from backend.utils.script_entry import invoke_script_main
+                    result["return_value"] = invoke_script_main(exec_globals['main'], execution_env)
 
                     output_buffer.write(f"main() 函数执行完成\n")
                 elif 'process_excel_files' in exec_globals and callable(exec_globals['process_excel_files']):

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from backend.ai_engine.ai_provider import (
     ClaudeProvider,
+    _CLAUDE_WORKING_BASE_URLS,
     _is_claude_5_plus_model,
     _model_omits_temperature,
 )
@@ -262,6 +263,66 @@ def test_aws_forward_non_stream_retries_with_anthropic_version():
     assert (content, stop_reason) == ("规则内容", "end_turn")
     assert len(calls) == 2
     assert calls[1]["extra_body"]["anthropic_version"] == "bedrock-2023-05-31"
+
+
+def _protocol_mismatch_exception():
+    outer = RuntimeError("Connection error.")
+    outer.__cause__ = OSError(
+        "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol"
+    )
+    return outer
+
+
+def test_claude_non_stream_switches_https_to_http_on_protocol_mismatch():
+    calls = []
+
+    def _failing_create(**kwargs):
+        calls.append(("https", kwargs))
+        raise _protocol_mismatch_exception()
+
+    def _working_create(**kwargs):
+        calls.append(("http", kwargs))
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="OK")],
+            stop_reason="end_turn",
+        )
+
+    provider = object.__new__(ClaudeProvider)
+    provider.model = "claude-opus-5"
+    provider.max_tokens = 1000
+    provider.base_url = "https://claude.protocol-fallback.example:8080"
+    provider._configured_base_url = provider.base_url
+    provider._protocol_fallback_attempted = False
+    provider._protocol_fallback_from = None
+    provider.anthropic_version = ""
+    provider.thinking = None
+    provider._client = SimpleNamespace(
+        messages=SimpleNamespace(create=_failing_create),
+    )
+
+    def _rebuild():
+        assert provider.base_url == "http://claude.protocol-fallback.example:8080"
+        return SimpleNamespace(messages=SimpleNamespace(create=_working_create))
+
+    provider._build_anthropic_client = _rebuild
+    _CLAUDE_WORKING_BASE_URLS.pop(provider._configured_base_url, None)
+    content, stop_reason = provider._claude_chat(
+        "", [{"role": "user", "content": "ping"}], max_tokens=10,
+    )
+
+    assert (content, stop_reason) == ("OK", "end_turn")
+    assert [scheme for scheme, _ in calls] == ["https", "http"]
+    assert _CLAUDE_WORKING_BASE_URLS[provider._configured_base_url] == provider.base_url
+
+
+def test_claude_protocol_fallback_ignores_ordinary_connection_error():
+    provider = object.__new__(ClaudeProvider)
+    provider.base_url = "https://claude.example"
+    provider._protocol_fallback_attempted = False
+    assert not provider._switch_protocol_after_mismatch(
+        RuntimeError("connection timed out"),
+    )
+    assert provider.base_url == "https://claude.example"
 
 
 def test_aws_forward_downgrades_unsupported_thinking_display():

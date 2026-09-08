@@ -78,6 +78,8 @@ def apply_precise_edits(code_segment: str, edits: list):
 
 def build_prompt(code_segment: str, user_feedback: str, code_label: str = "当前代码",
                  extra_context: str = "") -> str:
+    from backend.utils.generated_code_check import CODE_CONTRACT
+    extra_context = CODE_CONTRACT + '\n' + extra_context
     return f"""你正在做**外科手术式**精确修改。下面是{code_label}。请**只**根据【修改指示】改动直接相关的代码，
 以 JSON 输出一组精确替换，**严禁重写整段代码**。
 
@@ -91,7 +93,7 @@ def build_prompt(code_segment: str, user_feedback: str, code_label: str = "当�
 ## 铁律（违反必败）
 1. `find` 必须是下面代码中**逐字原样、且唯一**出现的片段（连同前导空格/缩进一起复制）；片段太短会不唯一，请多带 1~2 行上下文保证唯一
 2. **只**为【修改指示】直接涉及的内容生成 edit；其它列、其它逻辑**一个字都不要动**，也**不要**为它们生成 edit
-3. 不要改 import、变量名、辅助函数签名，除非指示明确要求
+3. 改动所依赖的 import、变量定义、辅助函数签名及全部调用点必须同步修改，形成完整依赖；不要改无关代码
 4. f-string 引号规范：外层 `f"..."` 双引号，公式内 sheet 名用 `'` 单引号，空串拼接用 `EMPTY`（=`'""'`）
 5. 要新增/删除整行时，`find` 带上相邻锚点行、`replace` 里体现增删；不要凭空插入无锚点代码
 
@@ -156,6 +158,7 @@ def run_precise_edit(
     indent_fixer=None,
     training_logger=None,
     reason_sink: Optional[list] = None,
+    _validation_retry: bool = True,
 ) -> Optional[str]:
     """模式无关精确编辑。
 
@@ -185,6 +188,18 @@ def run_precise_edit(
             reason_sink.append(reason)
         return None
 
+    def retry_validation(reason):
+        if not _validation_retry:
+            return _fail(reason)
+        log('[精确编辑] 完整性检查未通过，携带诊断自动修正一次')
+        return run_precise_edit(
+            ai_provider, full_code, user_feedback,
+            code_segment=code_segment, splice_fn=splice_fn, code_label=code_label,
+            extra_context=extra_context + '\n上次编辑未提交。请重新提供完整替换组并解决：\n' + reason,
+            stream_callback=stream_callback, thinking_callback=thinking_callback,
+            indent_fixer=indent_fixer, training_logger=training_logger,
+            reason_sink=reason_sink, _validation_retry=False)
+
     if not full_code:
         return _fail("没有可修改的原始代码")
     segment = code_segment if code_segment is not None else full_code
@@ -212,6 +227,8 @@ def run_precise_edit(
         return _fail(f"AI 未给出可套用的精确替换，可能是指示不够具体或该改动无法用局部替换表达{_hint}")
 
     patched_segment, applied, failed = apply_precise_edits(segment, edits)
+    if failed:
+        return retry_validation('部分替换无法定位，整组修改已放弃，避免只增加调用却遗漏定义：' + str(failed))
     for note, cnt in failed:
         log(f"[精确编辑] ⚠ 片段无法唯一定位（出现 {cnt} 次），已跳过: {note}")
     if not applied:
@@ -225,7 +242,7 @@ def run_precise_edit(
     # 修复管线（可选，provider/indent_fixer 存在才走）
     if indent_fixer is not None:
         try:
-            patched_segment = indent_fixer.fix(patched_segment)
+            patched_segment = indent_fixer.fix_sandbox_pipeline(patched_segment)
         except Exception as e:
             logger.warning(f"缩进修复异常（不阻断）: {e}")
     try:
@@ -250,6 +267,16 @@ def run_precise_edit(
     if syn_err:
         log(f"[精确编辑] 语法校验未通过：{syn_err}，交由兜底")
         return _fail(f"改动后代码语法不通过（{syn_err}），已放弃以免写入坏代码")
+
+    from backend.utils.generated_code_check import check_generated_code, describe_issues
+    try:
+        baseline = {x['message'] for x in check_generated_code(full_code)}
+    except SyntaxError:
+        baseline = set()
+    introduced = [x for x in check_generated_code(complete_code) if x['message'] not in baseline]
+    if introduced:
+        return retry_validation('修改引入未定义名称或局部作用域错误，需同步修复定义与调用：\n'
+                     + describe_issues(introduced))
 
     log(f"[精确编辑] 完成（complete_code={len(complete_code)} 字符）")
     return complete_code

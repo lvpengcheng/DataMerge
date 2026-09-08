@@ -6,6 +6,7 @@ import os
 import json
 import re
 import logging
+from urllib.parse import urlsplit, urlunsplit
 from abc import ABC, abstractmethod
 from concurrent import futures
 from typing import Dict, List, Any, Optional
@@ -18,6 +19,9 @@ _DEFAULT_BEDROCK_ANTHROPIC_VERSION = "bedrock-2023-05-31"
 # 某些自定义 Claude 网关从错误中才能确认后端是 Bedrock。在进程内
 # 记住已确认的 base_url，避免后续新建 provider 时每次都先收到一个 400。
 _BEDROCK_VERSION_BASE_URLS = set()
+# 进程内记住已经通过真实请求验证过的协议回退结果。key 是用户配置的
+# base_url，value 是可工作的 base_url；后续 provider 无需再次先失败一次。
+_CLAUDE_WORKING_BASE_URLS = {}
 
 
 def _model_omits_temperature(model_name: str) -> bool:
@@ -1523,7 +1527,17 @@ class ClaudeProvider(BaseAIProvider):
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
         self.api_key = config.get("api_key", os.getenv("ANTHROPIC_API_KEY"))
-        self.base_url = config.get("base_url", os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")).rstrip("/")
+        configured_base_url = (
+            config.get("base_url")
+            or os.getenv("ANTHROPIC_BASE_URL")
+            or "https://api.anthropic.com"
+        ).rstrip("/")
+        self._configured_base_url = configured_base_url
+        self.base_url = _CLAUDE_WORKING_BASE_URLS.get(
+            configured_base_url, configured_base_url,
+        )
+        self._protocol_fallback_attempted = self.base_url != configured_base_url
+        self._protocol_fallback_from = None
         # config 无 model 键时兜底读 .env（避免调用方传 config 时丢 ANTHROPIC_MODEL 配置）
         self.model = config.get("model") or os.getenv("ANTHROPIC_MODEL") or "claude-3-sonnet-20240229"
         self.max_tokens = config.get("max_tokens", int(os.getenv("ANTHROPIC_MAX_TOKENS", "80000")))
@@ -1556,13 +1570,72 @@ class ClaudeProvider(BaseAIProvider):
                 if self.base_url in _BEDROCK_VERSION_BASE_URLS else "")
         )
 
+        self._client = self._build_anthropic_client()
+
+    def _build_anthropic_client(self):
+        """按当前 base_url 创建 SDK client，供协议自适应时安全重建。"""
         import anthropic
-        self._client = anthropic.Anthropic(
+        return anthropic.Anthropic(
             api_key=self.api_key,
             base_url=self.base_url,
             timeout=self.timeout,
             default_headers={"anthropic-beta": "context-1m-2025-08-07"},
         )
+
+    @staticmethod
+    def _is_protocol_mismatch_error(exc: Exception) -> bool:
+        """识别 HTTPS 请求打到 HTTP 端口（或重定向到错误协议）的 TLS 错误。"""
+        parts = []
+        current = exc
+        seen = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            parts.append(str(current).casefold())
+            current = getattr(current, "__cause__", None) or getattr(
+                current, "__context__", None,
+            )
+        text = " ".join(parts)
+        tls_marker = "ssl" in text or "tls" in text
+        mismatch_marker = any(marker in text for marker in (
+            "unexpected_eof_while_reading",
+            "unexpected eof while reading",
+            "wrong_version_number",
+            "wrong version number",
+            "unknown protocol",
+            "record layer failure",
+            "packet length too long",
+            "invalid token",
+        ))
+        return tls_marker and mismatch_marker
+
+    def _switch_protocol_after_mismatch(self, exc: Exception) -> bool:
+        """明确发生协议错配时切换 http/https；每个实例最多尝试一次。"""
+        if (getattr(self, "_protocol_fallback_attempted", False)
+                or not self._is_protocol_mismatch_error(exc)):
+            return False
+        parsed = urlsplit(self.base_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return False
+
+        fallback_scheme = "http" if parsed.scheme == "https" else "https"
+        fallback_url = urlunsplit(parsed._replace(scheme=fallback_scheme)).rstrip("/")
+        original_url = self.base_url
+        self._protocol_fallback_attempted = True
+        self._protocol_fallback_from = original_url
+        self.base_url = fallback_url
+        self._client = self._build_anthropic_client()
+        logger.warning(
+            "Claude 端点发生 HTTP/HTTPS 协议错配，已从 %s 自动切换到 %s 并重试",
+            original_url, fallback_url,
+        )
+        return True
+
+    def _remember_working_protocol(self):
+        """只有替代协议真实请求成功后才缓存，避免一次误判污染后续实例。"""
+        original_url = getattr(self, "_protocol_fallback_from", None)
+        if original_url:
+            _CLAUDE_WORKING_BASE_URLS[original_url] = self.base_url
+            self._protocol_fallback_from = None
 
     @staticmethod
     def _missing_anthropic_version(exc: Exception) -> bool:
@@ -1688,8 +1761,11 @@ class ClaudeProvider(BaseAIProvider):
         while True:
             try:
                 response = _create()
+                self._remember_working_protocol()
                 break
             except Exception as exc:
+                if self._switch_protocol_after_mismatch(exc):
+                    continue
                 if self._enable_bedrock_anthropic_version(exc):
                     continue
                 if self._downgrade_thinking_after_validation(exc):
@@ -1847,9 +1923,12 @@ class ClaudeProvider(BaseAIProvider):
                                     thinking_callback(thinking)
                     final_message = stream.get_final_message()
                     stop_reason = final_message.stop_reason
+                self._remember_working_protocol()
                 yield "", stop_reason
                 return
             except Exception as exc:
+                if not attempt_text and self._switch_protocol_after_mismatch(exc):
+                    continue
                 if not attempt_text and self._enable_bedrock_anthropic_version(exc):
                     continue
                 if not attempt_text and self._downgrade_thinking_after_validation(exc):

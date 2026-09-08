@@ -96,7 +96,7 @@ def convert_region_to_dataframe(region) -> pd.DataFrame:
         转换后的DataFrame，列名为中文表头名称
     """
     if not region.data:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=list(region.head_data))
 
     # 创建列字母到列名的反向映射
     col_letter_to_name = {v: k for k, v in region.head_data.items()}
@@ -112,7 +112,11 @@ def convert_region_to_dataframe(region) -> pd.DataFrame:
 
     # 创建DataFrame
     columns = list(region.head_data.keys())
-    return pd.DataFrame(converted_data, columns=columns)
+    df = pd.DataFrame(converted_data, columns=columns)
+    schemas = region_schemas_by_name(
+        region.head_data, getattr(region, "column_schemas", None) or {}
+    )
+    return apply_dataframe_column_schemas(df, schemas)
 
 
 def region_formats_by_name(head_data, column_formats) -> dict:
@@ -129,6 +133,75 @@ def region_formats_by_name(head_data, column_formats) -> dict:
         if f:
             out[name] = f
     return out
+
+
+def region_schemas_by_name(head_data, column_schemas) -> dict:
+    """把 ExcelRegion 的列字母字段定义转为列名字段定义。"""
+    schemas = column_schemas or {}
+    return {
+        name: dict(schemas[letter])
+        for name, letter in (head_data or {}).items()
+        if letter in schemas
+    }
+
+
+def _schema_text_value(value):
+    """文本列的稳定值表示；尤其保证 1001、1001.0 在关联时都是 ``"1001"``。"""
+    if value is None or value is pd.NaT:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value in (float('inf'), float('-inf')):
+            return None
+        return str(int(value)) if value == int(value) else format(value, ".15g")
+    return str(value).strip()
+
+
+def apply_dataframe_column_schemas(df: pd.DataFrame, column_schemas: dict) -> pd.DataFrame:
+    """按 excel_parser 已确定的字段定义固定 DataFrame 类型。
+
+    转换是逐值且保守的：无法按声明转换的值保留原值，避免 ``to_numeric`` 把业务异常值
+    静默变成 NaN。文本列使用 object 而不是 pandas StringDtype，便于沙箱旧代码兼容。
+    """
+    if df is None or not column_schemas:
+        return df
+    for name, schema in column_schemas.items():
+        if name not in df.columns:
+            continue
+        field_type = (schema or {}).get("field_type")
+        if field_type == "text":
+            df[name] = df[name].map(_schema_text_value).astype(object)
+        elif field_type in ("integer", "decimal"):
+            def _number(v):
+                if v is None or isinstance(v, bool):
+                    return v
+                if isinstance(v, (int, float)):
+                    return int(v) if field_type == "integer" and float(v).is_integer() else v
+                if isinstance(v, str):
+                    raw = v.strip()
+                    pct = raw.endswith("%")
+                    raw = raw.rstrip("%").replace(",", "")
+                    try:
+                        n = float(raw)
+                        if pct:
+                            n /= 100
+                        return int(n) if field_type == "integer" and n.is_integer() else n
+                    except Exception:
+                        return v
+                return v
+            df[name] = df[name].map(_number)
+        elif field_type in ("date", "datetime"):
+            from backend.utils.source_sheet_writer import coerce_source_date
+            df[name] = df[name].map(coerce_source_date)
+    return df
 
 
 def normalize_emp_code(emp_code) -> str:
@@ -171,11 +244,14 @@ def make_unique_sheet_key(name: str, existing_keys: set, max_len: int = 31) -> s
     截断是因为 Excel sheet 名最长 31 字符，source_data 的 key 与 sheet 名保持一致。
     会自动将生成的 key 加入 existing_keys 集合。
     """
+    import re
+    name = re.sub(r'[\\/*?:\[\]]', '_', str(name)).strip("'") or 'Sheet'
     if len(name) > max_len:
         name = name[:max_len]
     base = name
     counter = 2
-    while name in existing_keys:
+    existing_lower = {str(key).casefold() for key in existing_keys}
+    while name.casefold() in existing_lower:
         suffix = f"_{counter}"
         name = base[:max_len - len(suffix)] + suffix
         counter += 1
@@ -204,17 +280,21 @@ def assign_sheet_keys(file_sheet_pairs, max_len: int = 31, reserved_names=None):
         保留输入顺序（dict 在 Python 3.7+ 保持插入序）。
     """
     pairs = list(file_sheet_pairs)
+    if len(set(pairs)) != len(pairs):
+        raise ValueError('存在同文件标识、同 Sheet 名的重复源表，请使用不同文件名以避免覆盖数据')
     name_count: dict = {}
     for _file_base, sheet_name in pairs:
-        name_count[sheet_name] = name_count.get(sheet_name, 0) + 1
+        normalized = sheet_name.casefold()
+        name_count[normalized] = name_count.get(normalized, 0) + 1
 
     reserved = set(reserved_names) if reserved_names else set()
+    reserved_lower = {str(name).casefold() for name in reserved}
 
-    used: set = set()
+    used: set = set(reserved)
     result: dict = {}
     for file_base, sheet_name in pairs:
-        collide_cross_file = name_count.get(sheet_name, 0) > 1
-        collide_reserved = sheet_name in reserved
+        collide_cross_file = name_count.get(sheet_name.casefold(), 0) > 1
+        collide_reserved = sheet_name.casefold() in reserved_lower
         if collide_cross_file or collide_reserved:
             raw_key = f"{file_base}_{sheet_name}"
         else:

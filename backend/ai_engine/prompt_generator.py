@@ -503,6 +503,15 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
         lines = ["# ==================== 核心规则（违反=失败）===================="]
         for rule in self.FORMULA_RULES.values():
             lines.append(rule[detail])
+        lines.append(
+            '【运行顺序与准确度】日期列已按字段定义统一为 Excel 日期；禁止把数字序列号直接交给 '
+            'pd.to_datetime（会当纳秒）。clean_source_data 先清洗原始源表，再执行配置的纵向/横向合并；'
+            '如右表一键多行，必须先按明确的业务规则汇总，或配置复合键，不能随意取第一条。'
+            '缺失匹配、无效日期与真实零值须区分；默认补零需要规则依据。'
+            '源表名称用于公式时要将单引号转义成两个单引号。'
+            '循环外预先建立查找索引、计算列号及实际数据末行；SUMPRODUCT 等数组公式禁止全列引用，'
+            '范围按运行时源表长度构建（不能写死训练样例行数）。'
+        )
         if include_extra:
             for rule in self.CORRECTION_EXTRA_RULES.values():
                 lines.append(rule)
@@ -850,24 +859,8 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
         if len(text_output) <= max_length:
             return text_output
 
-        self.logger.info(f"数据结构过长 ({len(text_output)} 字符)，进行压缩...")
-
-        if isinstance(simplified, dict) and "files" in simplified:
-            lines = [f"共 {len(simplified.get('files', {}))} 个文件:"]
-            for file_name, file_data in list(simplified.get("files", {}).items())[:5]:
-                lines.append(f"- {file_name}")
-                if isinstance(file_data, dict) and "sheets" in file_data:
-                    for sheet_name, sheet_info in file_data["sheets"].items():
-                        headers = self._get_headers_from_sheet(sheet_info)
-                        if headers:
-                            lines.append(f"  {sheet_name}: {', '.join(headers[:10])}")
-                            if len(headers) > 10:
-                                lines.append(f"    ...还有 {len(headers)-10} 列")
-            return '\n'.join(lines)
-
-        if len(text_output) > max_length:
-            return text_output[:max_length-50] + '\n...(内容已截断)'
-
+        self.logger.warning('结构含完整字段/公式证据，长度 %s 超过建议值 %s；保留内容避免遗漏',
+                            len(text_output), max_length)
         return text_output
 
     def _structure_to_text(self, structure: Dict[str, Any]) -> str:
@@ -883,6 +876,7 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
                         row_count = sheet_info.get("data_row_count", sheet_info.get("row_count", "?"))
                         if headers:
                             lines.append(f"  Sheet[{sheet_name}] ({row_count}行): {', '.join(headers)}")
+                        lines.extend(self._sheet_evidence_to_text(sheet_info))
 
         elif "sheets" in structure:
             for sheet_name, sheet_info in structure.get("sheets", {}).items():
@@ -890,11 +884,22 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
                 row_count = sheet_info.get("data_row_count", sheet_info.get("row_count", "?"))
                 if headers:
                     lines.append(f"Sheet[{sheet_name}] ({row_count}行): {', '.join(headers)}")
+                lines.extend(self._sheet_evidence_to_text(sheet_info))
 
         if structure.get("file_name"):
             lines.insert(0, f"文件名: {structure['file_name']}")
 
         return '\n'.join(lines)
+
+    @staticmethod
+    def _sheet_evidence_to_text(sheet_info):
+        import json
+        lines = []
+        for field, label in [('column_schemas', '字段定义'), ('data_sample', '数据样例'),
+                             ('formulas', '原始公式'), ('formula', '原始公式')]:
+            if sheet_info.get(field):
+                lines.append(f"  {label}: " + json.dumps(sheet_info[field], ensure_ascii=False, default=str))
+        return lines
 
     def _get_headers_from_sheet(self, sheet_info: Dict[str, Any]) -> List[str]:
         """从Sheet信息中提取列名列表"""
@@ -961,6 +966,9 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
             simplified["headers"] = sheet_data["headers"]
         if "head_data" in sheet_data:
             simplified["head_data"] = sheet_data["head_data"]
+        for key in ['column_schemas', 'formulas', 'formula', 'data_sample', 'formula_count']:
+            if key in sheet_data:
+                simplified[key] = sheet_data[key]
 
         for key in ["head_row_start", "head_row_end", "data_row_start", "data_row_end", "row_count"]:
             if key in sheet_data:
@@ -1043,7 +1051,7 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
 
         compressed = '\n'.join(result)
         if len(compressed) > max_length:
-            compressed = compressed[:max_length]
+            self.logger.warning('规则超过建议长度 %s，保留完整规则，不截断业务条件', max_length)
         return compressed
 
     def _optimize_prompt(self, prompt: str, target_max_length: int = 35000) -> str:

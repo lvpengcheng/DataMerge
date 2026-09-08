@@ -129,6 +129,8 @@ class TemplateCodeGenerator:
             source_struct=source_struct,
             use_history=use_history,
             reserved_names=_reserved_names,
+            multi_sheet_source=multi_sheet_source,
+            manual_headers=manual_headers,
         )
 
         # 7. 缩进修复：交给下面 7.5 的 validate_and_fix_code_format 统一处理。
@@ -496,6 +498,8 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
     # ==================== AI 调用 ====================
 
     def _call_ai(self, prompt: str, stream_callback=None, thinking_callback=None) -> str:
+        from backend.utils.generated_code_check import CODE_CONTRACT
+        prompt = CODE_CONTRACT + '\n' + prompt
         messages = [
             {"role": "system", "content": "你是 Python + openpyxl + Excel 公式专家，擅长 HR 薪酬场景的模板填充。严格按用户给定的输出格式回答。"},
             {"role": "user", "content": prompt},
@@ -716,6 +720,8 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
         source_struct: Dict[str, Any],
         use_history: bool,
         reserved_names: Optional[set] = None,
+        multi_sheet_source: bool = False,
+        manual_headers: Optional[dict] = None,
     ) -> str:
         """把 AI 生成的 fill_template 包到固定的脚本骨架里"""
         import pprint as _pprint
@@ -868,12 +874,14 @@ def load_source_data():
     #   缺失时 源_ sheet 会带 title 横幅 + Unnamed 列 + 未合并双语表头，与智训产出不一致。
     #   懒加载：仅在真正回退时 import，不影响预加载已注入的常规路径。
     from excel_parser import IntelligentExcelParser
-    from backend.utils.data_helpers import convert_region_to_dataframe, region_formats_by_name
+    from backend.utils.data_helpers import (
+        convert_region_to_dataframe, region_formats_by_name, region_schemas_by_name,
+    )
     parser = IntelligentExcelParser()
     # 两趟：先收集 (file_base, sheet, merged_df, columns, formats)，再用 assign_sheet_keys 统一分配 key
     # （与智训 _build_source_map_with_letters / 智算 fast_header_matcher 同一套逻辑）。
     _collected = []
-    for fname in os.listdir(input_folder):
+    for fname in sorted(os.listdir(input_folder)):
         if not fname.lower().endswith((".xlsx", ".xls", ".xlsm")):
             continue
         if fname.startswith("~"):
@@ -882,15 +890,21 @@ def load_source_data():
         try:
             _results = parser.parse_excel_file(
                 fp,
-                active_sheet_only=False,   # 与旧回退一致：读全部 sheet
+                active_sheet_only={not multi_sheet_source!r},
+                manual_headers=globals().get('manual_headers') or {manual_headers or {}!r},
                 best_region_only=True,
                 read_formulas=False,
                 calculate_formulas=True,   # 含公式无缓存值的源先算，否则读到空
+                normalize_source=True,
+                raise_errors=True,
             )
+            if not _results:
+                raise ValueError(f"文件 {{fname}} 没有可读取的数据区域")
             for _sheet_data in (_results or []):
                 _dfs = []
                 _cols = None
                 _fmts = None
+                _schemas = None
                 for _region in _sheet_data.regions:
                     _df = convert_region_to_dataframe(_region)
                     if _df.empty and len(_df.columns) == 0:
@@ -898,6 +912,8 @@ def load_source_data():
                     if _cols is None:
                         _cols = list(_df.columns)
                         _fmts = region_formats_by_name(_region.head_data, getattr(_region, "column_formats", None) or {{}})
+                        _schemas = region_schemas_by_name(
+                            _region.head_data, getattr(_region, "column_schemas", None) or {{}})
                     _dfs.append(_df)
                 if not _dfs:
                     continue
@@ -911,19 +927,24 @@ def load_source_data():
                 except Exception:
                     pass
                 _normalize_key_columns(_merged)
-                _collected.append((Path(fname).stem, _sheet_data.sheet_name, _merged, _cols, _fmts))
+                _collected.append((Path(fname).stem, _sheet_data.sheet_name, _merged, _cols,
+                                   _fmts, _schemas))
         except Exception as e:
-            print(f"[源数据加载警告] {{fname}}: {{e}}")
+            raise ValueError(f"解析文件 {{fname}} 失败: {{e}}") from e
     _collected.sort(key=lambda x: (str(x[0]), str(x[1])))
     _reserved = set(_COL_MAP.keys())
-    _key_map = assign_sheet_keys([(fb, sn) for fb, sn, _, _, _ in _collected], reserved_names=_reserved)
-    for fb, sn, _merged, _cols, _fmts in _collected:
+    _key_map = assign_sheet_keys([(fb, sn) for fb, sn, _, _, _, _ in _collected], reserved_names=_reserved)
+    for fb, sn, _merged, _cols, _fmts, _schemas in _collected:
         key = _key_map[(fb, sn)]
         _entry = {{"df": _merged, "columns": _cols if _cols is not None else list(_merged.columns)}}
         if _fmts:
             _entry["column_formats"] = _fmts
+        if _schemas:
+            _entry["column_schemas"] = _schemas
         out[key] = _entry
     print(f"加载完成：{{len(out)}} 个 sheet")
+    if not out:
+        raise ValueError("没有可读取的源数据，请检查文件和表头配置")
     return out
 
 
@@ -942,6 +963,7 @@ def _append_source_sheets(wb, source_data):
         if df is None:
             continue
         col_fmts = (sv or {{}}).get("column_formats") or {{}}
+        col_schemas = (sv or {{}}).get("column_schemas") or {{}}
         target_name = _SK_TO_SHEET.get(sk) if sk else None
         if not target_name:
             # 兜底：未在烘焙表里的 key（智算偶发多出的 sheet）→ 用同一套命名函数现算
@@ -955,45 +977,8 @@ def _append_source_sheets(wb, source_data):
             )[sk or "源数据"]
         ws = wb.create_sheet(title=target_name)
         cols = list(df.columns)
-        # 逐列判定是否日期列（仅按列名关键词，与 formula 模式一致）
-        _date_col_flags = [is_date_keyword_column(cname) for cname in cols]
-        for ci, cname in enumerate(cols, start=1):
-            _hc = ws.cell(row=1, column=ci)
-            _hc.value = cname
-            # 表头强制 General：否则会继承模板"常规"样式（部分模板的默认样式被设成了
-            # 日期格式如 [$-409]dd/mmm/yy），导致新建的 源_ sheet 表头也显示成日期
-            _hc.number_format = "General"
-        for ri, row in enumerate(df.itertuples(index=False, name=None), start=2):
-            for ci, val in enumerate(row, start=1):
-                if isinstance(val, float) and val != val:
-                    val = None
-                # 日期关键词列：把文本日期/裸序列号也尽力还原成真日期；空值一律保持空
-                # （coerce_source_date 内部拦 None/NaN/NaT/空串/0，绝不写成 1899-12-30/NaT）
-                if _date_col_flags[ci - 1]:
-                    val = coerce_source_date(val)
-                cell = ws.cell(row=ri, column=ci)
-                if isinstance(val, datetime):
-                    if _date_col_flags[ci - 1]:
-                        # 日期关键词列 → 写真日期 + 日期格式，公式方可运算
-                        cell.value = val
-                        cell.number_format = "yyyy-mm-dd"
-                    else:
-                        # 非日期列却为 datetime（被套了日期格式的普通数字）→ 逆转回底层序列号
-                        cell.value = dt_to_excel_serial(val)
-                        cell.number_format = "General"
-                elif is_long_digit_text(val):
-                    # ≥12 位纯数字串（身份证/卡号/手机）→ 文本格式，避免科学计数/丢精度
-                    cell.value = val
-                    cell.number_format = "@"
-                    cell.data_type = "s"
-                else:
-                    # 普通数字/文本：优先用源文件原始格式（千分位/小数/百分比/货币等），
-                    # 没有则强制 General，避免继承模板默认样式里的日期/自定义格式
-                    # （根因：某些模板的 Normal 样式 numFmtId 是 [$-409]dd/mmm/yy，
-                    #  新 sheet 未显式设格式的单元格会吃到它，数字被显示成日期）
-                    cell.value = val
-                    _cf = col_fmts.get(cols[ci - 1])
-                    cell.number_format = _cf if _cf else "General"
+        from backend.utils.source_sheet_writer import write_source_dataframe
+        write_source_dataframe(ws, df, col_schemas, col_fmts)
         appended_map[sk] = target_name
         appended.append(f"{{target_name}}({{len(df)}}行x{{len(cols)}}列)")
     if appended:

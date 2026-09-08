@@ -29,9 +29,9 @@ services:
     # OOM 时被杀的是容器而不是宿主机 VM，避免拖垮整机/无法重启。可在 .env 调整：
     # 固定限制应用容器的内存、CPU 和进程数，避免智算失控拖垮 Ubuntu/Hyper-V 宿主机。
     # memswap_limit 与 mem_limit 相同：不允许容器在 8G 之外继续大量使用 Swap。
-    mem_limit: 8g
+    mem_limit: ${APP_MEM_LIMIT:-8g}
     mem_reservation: ${APP_MEM_RESERVATION:-2g}
-    memswap_limit: 8g
+    memswap_limit: ${APP_MEM_LIMIT:-8g}
     cpus: 2
     pids_limit: 512
     # ===== 容器日志限制 =====

@@ -238,9 +238,12 @@ class ExcelRegion:
     head_data: Dict[str, str] = field(default_factory=dict)
     data: List[Dict[str, Any]] = field(default_factory=list)
     formula: Dict[str, str] = field(default_factory=dict)
-    # 每列原始 number_format（key=列字母）：仅记录"非 General 且非日期"的格式码
-    # （货币/百分比/千分位/小数/文本@ 等），供写回源_sheet 时保留源文件原始显示格式。
+    # 每列可安全复用的 number_format（key=列字母）。
     column_formats: Dict[str, str] = field(default_factory=dict)
+    # 每列字段定义（key=列字母）。field_type 是读取/计算类型，format_type 是 Excel
+    # 显示格式类别，number_format 是原始格式码。下游必须优先使用这份定义，不能再让
+    # pandas/openpyxl 根据单次样例自行猜型。
+    column_schemas: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -1336,7 +1339,9 @@ class IntelligentExcelParser:
                         password: str = None,
                         read_formulas: bool = True,
                         skip_hidden_sheets: bool = None,
-                        calculate_formulas: bool = False) -> List[SheetData]:
+                        calculate_formulas: bool = False,
+                        normalize_source: bool = False,
+                        raise_errors: bool = False) -> List[SheetData]:
         """读取并解析Excel文件
 
         Args:
@@ -1385,6 +1390,10 @@ class IntelligentExcelParser:
             else:
                 aspose_wb = _licensed_workbook(str(file_path), load_opts)
 
+            if normalize_source:
+                from backend.utils.source_normalizer import normalize_workbook_source_dates
+                normalize_workbook_source_dates(aspose_wb)
+
             # 含公式的文件：仅当公式"基本没有缓存值"（openpyxl/模板模式产出、读出来是空）才重算。
             # 重算公式：得到与 Excel 打开时一致的"显示值"。
             # 源文件里可能存有脏缓存值（某些工具写入的错误缓存，如 =ROUND(H47*0.5%,2)
@@ -1394,6 +1403,8 @@ class IntelligentExcelParser:
                     aspose_wb.CalculateFormula()
                     logger.info(f"[calc] 已重算公式取显示值: {os.path.basename(str(file_path))}")
                 except Exception as _calc_err:
+                    if raise_errors:
+                        raise RuntimeError("源文件公式计算失败，不能使用未验证缓存") from _calc_err
                     logger.warning(f"CalculateFormula 处理失败（退回缓存值）[{file_path}]: {_calc_err}")
 
             # 提取当前文件的 manual_headers 配置
@@ -1438,6 +1449,8 @@ class IntelligentExcelParser:
 
         except Exception as e:
             logger.error(f"解析Excel文件失败 [{file_path}]: {e}", exc_info=True)
+            if raise_errors:
+                raise
 
         finally:
             # Aspose Workbook 持有大量非托管内存和文件句柄，不能依赖 Python GC。
@@ -3122,20 +3135,22 @@ class IntelligentExcelParser:
     def _collect_data_bulk(self, worksheet: Any, region: 'ExcelRegion', max_col: int, max_data_rows: int = None):
         """【性能优化】使用 Aspose ExportArray 批量读取数据区域，避免逐格 .NET interop
 
-        一次 interop 调用读取整个数据矩形，然后在纯 Python 中过滤行。
+        按最多 2048 行分块读取；样本读取限制首块大小，然后在纯 Python 中过滤行。
         相比逐格读取，对于 30000行×40列 的数据可减少 ~120万次 interop 调用至 1 次。
         """
         total_rows = region.data_row_end - region.data_row_start + 1
-        if total_rows <= 0:
+        if total_rows <= 0 or (max_data_rows is not None and max_data_rows <= 0):
             return
 
         try:
             # Aspose Cells 使用 0-indexed
             raw_cells = worksheet._ws.Cells
+            batch_start = 0
+            batch_rows = min(total_rows, 2048, max_data_rows if max_data_rows is not None else 2048)
             data_array = raw_cells.ExportArray(
                 region.data_row_start - 1,  # firstRow (0-indexed)
                 0,                           # firstColumn
-                total_rows,                  # totalRows
+                batch_rows,                  # 采样不导出整表，全量读取也分块控制内存
                 max_col                      # totalColumns
             )
         except Exception as e:
@@ -3149,18 +3164,19 @@ class IntelligentExcelParser:
             col_idx = self._get_column_number(column_letter) - 1  # 转为 0-indexed
             col_mapping.append((header, column_letter, col_idx))
 
-        # 逐列采样原始 number_format（每列一次 GetStyle，非每行）：保留源文件千分位/小数/
-        # 百分比/货币/文本等格式，供写回源_sheet 时复用。日期/General 不记录。
+        # 逐列采样类型与格式。类型由列头语义、样例值和 Excel number_format 共同决定。
         try:
             _row0 = region.data_row_start - 1  # ExportArray 同基准，0-indexed
             for _h, _letter, _cidx in col_mapping:
                 if _cidx >= max_col:
                     continue
-                _fmt = self._sample_column_format(
+                _schema = self._sample_column_schema(
                     lambda r, c: raw_cells[r, c],
-                    _row0, _row0 + total_rows - 1, _cidx,
+                    _row0, _row0 + total_rows - 1, _cidx, _h,
                 )
-                if _fmt:
+                region.column_schemas[_letter] = _schema
+                _fmt = _schema.get("number_format")
+                if _fmt and str(_fmt).lower() != "general":
                     region.column_formats[_letter] = _fmt
         except Exception:
             pass
@@ -3170,10 +3186,17 @@ class IntelligentExcelParser:
             if max_data_rows is not None and collected_rows >= max_data_rows:
                 break
 
+            if row_offset >= batch_start + batch_rows:
+                batch_start = row_offset
+                batch_rows = min(total_rows - row_offset, 2048,
+                                 max_data_rows - collected_rows if max_data_rows is not None else 2048)
+                data_array = raw_cells.ExportArray(
+                    region.data_row_start - 1 + batch_start, 0, batch_rows, max_col)
+
             # 从 .NET 数组提取一行值（只访问一次 interop 的结果）
             row_values = []
             for c in range(max_col):
-                row_values.append(data_array[row_offset, c])
+                row_values.append(data_array[row_offset - batch_start, c])
 
             # --- 纯 Python 行过滤 ---
 
@@ -3216,7 +3239,8 @@ class IntelligentExcelParser:
                         except Exception:
                             pass
                     # 主键/ID 列 + >15位长数字：解析层统一成文本，保证公式匹配、防科学计数
-                    val = self._unify_key_value(header, val)
+                    schema = region.column_schemas.get(column_letter) or {}
+                    val = self._coerce_value_by_schema(header, val, schema)
                     data_row[column_letter] = val
                     if val is not None and str(val).strip():
                         has_valid = True
@@ -3230,15 +3254,17 @@ class IntelligentExcelParser:
     def _collect_data_cell_by_cell(self, worksheet: Any, region: 'ExcelRegion', max_col: int, max_data_rows: int = None):
         """逐格读取数据行（原始方式，支持公式读取）"""
         collected_rows = 0
-        # 逐列采样原始 number_format（同 bulk 路径规则；此路径 cell 为 1-indexed）
+        # 逐列采样类型与格式（同 bulk 路径规则；此路径 cell 为 1-indexed）
         try:
             for _h, _letter in region.head_data.items():
                 _col = self._get_column_number(_letter)
-                _fmt = self._sample_column_format(
+                _schema = self._sample_column_schema(
                     lambda r, c: worksheet.cell(r, c)._cell,
-                    region.data_row_start, region.data_row_end, _col,
+                    region.data_row_start, region.data_row_end, _col, _h,
                 )
-                if _fmt:
+                region.column_schemas[_letter] = _schema
+                _fmt = _schema.get("number_format")
+                if _fmt and str(_fmt).lower() != "general":
                     region.column_formats[_letter] = _fmt
         except Exception:
             pass
@@ -3258,7 +3284,10 @@ class IntelligentExcelParser:
             if self._is_title_row(worksheet, row, max_col):
                 continue
 
-            data_row = self._collect_row_data(worksheet, row, max_col, region.head_data, region.formula)
+            data_row = self._collect_row_data(
+                worksheet, row, max_col, region.head_data, region.formula,
+                region.column_schemas,
+            )
 
             if data_row and self._has_valid_data(data_row):
                 region.data.append(data_row)
@@ -3323,6 +3352,170 @@ class IntelligentExcelParser:
                 continue
         return None
 
+    @staticmethod
+    def _format_type(number_id, code) -> str:
+        """把 Excel number format 归为稳定、可供提示词和写入端使用的类别。"""
+        c = str(code or "General").strip()
+        low = c.lower()
+        if c == "@":
+            return "text"
+        if IntelligentExcelParser._fmt_is_clear_time(number_id, c):
+            return "time"
+        if IntelligentExcelParser._fmt_is_clear_date(number_id, c):
+            return "datetime" if any(x in low for x in ("h", "ss", "am/pm")) else "date"
+        if "%" in c:
+            return "percentage"
+        no_locale = re.sub(r"\[\$-[^\]]+\]", "", c)
+        if any(x in no_locale for x in ("¥", "￥", "$", "€", "£")) or re.search(r"\[\$[^\-\]]", c):
+            return "currency"
+        cleaned = re.sub(r'"[^"]*"|\[[^\]]*\]', "", c)
+        if any(ch in cleaned for ch in ("0", "#", "?")):
+            return "decimal" if "." in cleaned else "integer"
+        return "general" if not c or low == "general" else "custom"
+
+    def _sample_column_schema(self, get_cell, row_start, row_end, col_idx, header) -> Dict[str, Any]:
+        """根据列头语义、样例值和格式定义列类型。
+
+        这里的结论会贯穿 DataFrame、主键匹配和 Excel 写入；优先级是明确列头语义 >
+        文本格式(@) > 样例值 > number_format。最多采样 32 个非空格，避免偶发首行污染。
+        """
+        type_counts: Dict[str, int] = {}
+        formats: Dict[str, tuple] = {}
+        limit = min(row_end, row_start + 63)
+        sampled = 0
+        for r in range(row_start, limit + 1):
+            try:
+                cell = get_cell(r, col_idx)
+                if cell is None:
+                    continue
+                style = cell.GetStyle()
+                code = str(style.Custom or "General").strip() or "General"
+                key = (int(style.Number or 0), code)
+                value = cell.Value
+                # 空模板数据格仍可能预设 @/日期/金额格式；非 General 样式必须纳入字段定义。
+                if ((value is not None and str(value).strip() != "")
+                        or code.lower() != "general"):
+                    formats[code] = (formats.get(code, (0, key))[0] + 1, key)
+                if value is None or str(value).strip() == "":
+                    continue
+                name = type(value).__name__
+                if isinstance(value, bool):
+                    vt = "boolean"
+                elif name == "DateTime" or isinstance(value, datetime):
+                    vt = "datetime"
+                elif isinstance(value, str):
+                    vt = "text"
+                elif isinstance(value, int):
+                    vt = "integer"
+                elif isinstance(value, float):
+                    vt = "integer" if value == int(value) else "decimal"
+                else:
+                    vt = "text"
+                type_counts[vt] = type_counts.get(vt, 0) + 1
+                sampled += 1
+                if sampled >= 32:
+                    break
+            except Exception:
+                continue
+
+        if formats:
+            _, (number_id, raw_format) = max(formats.values(), key=lambda item: item[0])
+        else:
+            number_id, raw_format = 0, "General"
+        format_type = self._format_type(number_id, raw_format)
+        clean_format = self._clean_number_format(raw_format) or "General"
+
+        header_name = str(header or "").strip().lower()
+        numeric_header = any(k in header_name for k in (
+            "金额", "工资", "薪资", "数量", "天数", "日数", "时数", "小时", "工时",
+            "比例", "比率", "税额", "费用", "单价", "总价", "合计", "余额", "基数",
+            "count", "amount", "salary", "rate", "ratio", "hours", "days",
+        ))
+        reason = "sample"
+        if self._header_is_key_column(header):
+            field_type, reason = "text", "header:key"
+            # 主键必须以文本写回，避免同一个键在不同文件中一处为数字、一处为文本。
+            format_type, clean_format = "text", "@"
+        elif self._header_is_date_keyword(header):
+            field_type, reason = ("datetime" if format_type == "datetime" else "date"), "header:date"
+            if format_type not in ("date", "datetime"):
+                format_type, clean_format = "date", "yyyy-mm-dd"
+        elif not type_counts and numeric_header:
+            field_type, reason = "decimal", "header:numeric"
+        elif format_type == "text":
+            field_type, reason = "text", "format:text"
+        elif type_counts:
+            # 混合列只要出现文本，就以文本读取，防止代码/主键的前导零和精度被 pandas 吞掉。
+            if type_counts.get("text"):
+                field_type = "text"
+            elif type_counts.get("datetime"):
+                # 明确数值含义的列即使误套日期格式也按数字处理。
+                if numeric_header:
+                    field_type = "decimal"
+                    # 典型脏数据：工资/金额列被套日期样式。字段语义否决该样式，写回也不能复用。
+                    format_type, clean_format = "general", "General"
+                    reason = "header:numeric-veto-date-format"
+                else:
+                    field_type = "datetime" if format_type == "datetime" else "date"
+            elif type_counts.get("decimal"):
+                field_type = "decimal"
+            elif type_counts.get("integer"):
+                field_type = "integer"
+            elif type_counts.get("boolean"):
+                field_type = "boolean"
+            else:
+                field_type = "text"
+        elif format_type in ("date", "datetime", "time"):
+            field_type, reason = format_type, "format"
+        elif format_type in ("percentage", "currency", "decimal"):
+            field_type, reason = "decimal", "format"
+        elif format_type == "integer":
+            field_type, reason = "integer", "format"
+        else:
+            field_type, reason = "text", "empty-default"
+
+        if field_type == "text" and format_type in (
+                "integer", "decimal", "percentage", "currency", "date", "datetime", "time"):
+            format_type, clean_format = "text", "@"
+
+        return {
+            "field_type": field_type,
+            "format_type": format_type,
+            "number_format": clean_format,
+            "sample_count": sampled,
+            "inference": reason,
+        }
+
+    def _coerce_value_by_schema(self, header, val, schema: Dict[str, Any]):
+        """按解析阶段确定的列定义读取值；失败时保留原值。"""
+        if val is None or isinstance(val, bool):
+            return val
+        field_type = (schema or {}).get("field_type")
+        if field_type == "text":
+            if isinstance(val, float):
+                if val != val or val in (float("inf"), float("-inf")):
+                    return val
+                return str(int(val)) if val == int(val) else format(val, ".15g")
+            if isinstance(val, int):
+                return str(val)
+            return str(val).strip() if not isinstance(val, datetime) else str(val)
+        if field_type == "integer" and isinstance(val, str):
+            s = val.strip().replace(",", "")
+            if re.fullmatch(r"[-+]?\d+", s):
+                try:
+                    return int(s)
+                except Exception:
+                    pass
+        if field_type == "decimal" and isinstance(val, str):
+            s = val.strip().replace(",", "").replace("%", "")
+            if re.fullmatch(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", s):
+                try:
+                    n = float(s)
+                    return n / 100 if "%" in val else n
+                except Exception:
+                    pass
+        return self._unify_key_value(header, val)
+
     _DATE_BUILTIN_FMT_IDS = frozenset({14, 15, 16, 17, 22, 27, 28, 29, 30, 31, 36,
                                        50, 51, 52, 53, 54, 55, 56, 57, 58})
 
@@ -3338,6 +3531,9 @@ class IntelligentExcelParser:
         "身份证", "证件号", "身份证号", "银行卡", "卡号", "银行账号",
         "社保号", "社保账号", "公积金号", "公积金账号",
         "手机号", "联系电话", "税号", "纳税人识别号", "编号",
+        "编码", "代码", "主键", "empno", "emp_no", "employee_no", "employee_id",
+        "staff_no", "staff_id", "idcard", "id_card", "id_no", "订单号", "单号",
+        "流水号", "唯一标识",
     )
     # 含关键词但本质是数值/需参与求和的列 → 排除，绝不 text 化
     _KEY_COL_EXCLUDE = ("工资", "金额", "薪资", "比例", "系数", "天数", "月数", "说明", "规则", "姓名")
@@ -3566,6 +3762,8 @@ class IntelligentExcelParser:
             return False
         if any(e in name for e in self._KEY_COL_EXCLUDE):
             return False
+        if name in ("id", "key", "pk"):
+            return True
         return any(k in name for k in self._KEY_COL_KEYWORDS)
 
     def _unify_key_value(self, header, val):
@@ -3593,7 +3791,8 @@ class IntelligentExcelParser:
         return str(int(val))
 
     def _collect_row_data(self, worksheet: Any, row: int, max_col: int,
-                         head_data: Dict[str, str], formula_dict: Dict[str, str]) -> Dict[str, Any]:
+                         head_data: Dict[str, str], formula_dict: Dict[str, str],
+                         column_schemas: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
         """收集行数据"""
         data_row = {}
         
@@ -3602,7 +3801,10 @@ class IntelligentExcelParser:
             cell = worksheet.cell(row, col)
             
             # 传 header：非日期列的"日期格式数值"按原值读取（防 AI 样例把工资等数值列读成日期）
-            data_row[column_letter] = self._unify_key_value(header, self._get_cell_value(cell, header))
+            value = self._get_cell_value(cell, header)
+            data_row[column_letter] = self._coerce_value_by_schema(
+                header, value, (column_schemas or {}).get(column_letter) or {}
+            )
             
             if cell.formula:
                 cell_address = f"{column_letter}{row}"
