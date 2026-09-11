@@ -579,12 +579,12 @@ def extract_col_map(script_code):
     return None
 
 
-def _scan_summary_rows(cells, max_row, max_col):
+def _scan_summary_rows(cells, max_row, max_col, data_start=1):
     """扫描汇总行：前置若干列命中 合计/总计/小计/汇总 等关键字的行。返回 0-based 行号列表。"""
     from backend.utils.template_row_planner import _is_summary_key
     rows = []
     scan_cols = min(max_col, 8) if max_col is not None and max_col >= 0 else 0
-    for r in range(0, (max_row or 0) + 1):
+    for r in range(max(0, data_start), (max_row or 0) + 1):
         for c in range(0, scan_cols + 1):
             v = cells[r, c].Value
             if v is None:
@@ -663,8 +663,10 @@ def restore_template_region_format(output_path, template_path, script_code=None)
                 continue
 
             # 护栏1：两侧都恰好 1 个汇总行（单底部总计），否则跳过（多区域小计不碰）
-            o_sums = _scan_summary_rows(ocells, o_maxr, o_maxc)
-            t_sums = _scan_summary_rows(tcells, t_maxr, t_maxc)
+            # 表头中的 Net total/累计收入不是汇总行，必须从数据区开始扫描。
+            scan_start = ds_by_sheet.get(str(ows.Name), 1)
+            o_sums = _scan_summary_rows(ocells, o_maxr, o_maxc, scan_start)
+            t_sums = _scan_summary_rows(tcells, t_maxr, t_maxc, scan_start)
             if len(o_sums) != 1 or len(t_sums) != 1:
                 continue
             o_sr, t_sr = o_sums[0], t_sums[0]
@@ -696,6 +698,7 @@ def restore_template_region_format(output_path, template_path, script_code=None)
 
             # 重刷数据行 [ds, o_sr-1]
             for r in range(ds, o_sr):
+                ocells.SetRowHeight(r, tcells.GetRowHeight(t_sample))
                 for c in range(ncols + 1):
                     if _apply_style(ocells[r, c], data_styles[c]):
                         restored += 1

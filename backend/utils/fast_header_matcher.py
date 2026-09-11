@@ -386,7 +386,7 @@ class FastHeaderMatcher:
 
         if errors:
             error_msg = "以下训练时的数据源在上传文件中未找到匹配:\n" + "\n".join(errors)
-            return {"success": False, "error": error_msg}
+            return {"success": False, "error": error_msg, "determined": match_results}
 
         # 同结构兜底（单 sheet 训练）：训练时只见过 1 个 sheet（source_structure 只记录了 1 个），
         # 但智算/重训时上传了多个相同结构的 sheet（如多月数据）。此时 _is_template_mode 因
@@ -736,7 +736,8 @@ class FastHeaderMatcher:
         input_files: List[str],
         manual_headers: Optional[Dict[str, Any]] = None,
         output_dir: Optional[str] = None,
-        expected_structure: Optional[Dict[str, Any]] = None
+        expected_structure: Optional[Dict[str, Any]] = None,
+        ai_provider_name: Optional[str] = None,
     ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
         """单次解析：全量读取 + 表头匹配 + 构建预加载数据 + 写 fallback 文件
 
@@ -781,8 +782,20 @@ class FastHeaderMatcher:
             # 步骤3: 对比表头（纯 Python，复用已有匹配算法）
             logger.info("[单次解析] ===== 步骤3: 对比表头 =====")
             match_result = self._match_by_training_base(train_sheets, input_sheets)
+            if not match_result['success'] and ai_provider_name:
+                from .ai_source_mapping import match_sources_with_ai
+                logger.info('[源数据映射] 快速匹配失败，尝试一次 AI 语义匹配')
+                try:
+                    match_result = match_sources_with_ai(self, train_sheets, input_sheets, ai_provider_name,
+                                                        match_result.get('determined'))
+                    logger.info('[源数据映射] AI 映射完整性校验通过，继续构建源数据')
+                except Exception as exc:
+                    match_result = {'success': False, 'error': f"{match_result['error']}；AI 匹配未通过: {exc}"}
             if not match_result["success"]:
-                return False, match_result["error"], None, None
+                diagnostics = {'mapping_failed': True, 'actual_paths': [
+                    f"{s['file_name']} > {s['sheet_name']} > {col}"
+                    for s in input_sheets for col in s['headers']]}
+                return False, match_result["error"], None, diagnostics
 
             file_mapping = match_result["mapping"]["file_mapping"]
 

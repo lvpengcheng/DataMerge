@@ -362,6 +362,7 @@ function _showPrecheckDialog(data) {
         const confirmBtn = document.getElementById('_pre_confirm');
         if (confirmBtn && !confirmBtn.disabled) {
             confirmBtn.onclick = () => {
+                // 空选项表示不映射，允许提交；已选择项仍需检查冲突。
                 // 重复检查 1：同一上传列被多个训练期望列选中（红色标记，理论上应一一匹配）
                 if (_markAiDup()) {
                     alert('存在重复匹配：同一个上传列被多个训练期望列选中（已用红色框标记），请修正后再确认');

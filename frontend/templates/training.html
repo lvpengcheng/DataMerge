@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>DataMerge - 智训</title>
-    <link rel="stylesheet" href="/static/css/training.css?v=20260812a">
+    <link rel="stylesheet" href="/static/css/training.css?v=20260910-scroll">
 </head>
 <body>
     <div class="container">
@@ -89,8 +89,6 @@
                                 <div class="form-group">
                                     <label>源文件:</label>
                                     <input type="file" id="source-files" multiple accept=".xlsx,.xls,.xlsm">
-                                    <small>已有会话默认新增文件，同名文件替换，其他源文件保留。</small>
-                                    <select id="source-update-mode"><option value="merge">新增 / 同名替换</option><option value="replace">替换全部源文件</option></select>
                                     <div class="file-list" id="source-file-list"></div>
                                 </div>
                                 <div class="form-group">
@@ -99,6 +97,11 @@
                                     <div class="file-list" id="target-file-list"></div>
                                     <small id="target-file-hint" style="display:none;color:#666;font-size:12px;margin-top:4px;"></small>
                                 </div>
+                            </div>
+                            <div class="source-update-row">
+                                <label for="source-update-mode">源文件更新:</label>
+                                <select id="source-update-mode" aria-describedby="source-update-hint"><option value="merge">新增 / 同名替换</option><option value="replace">替换全部源文件</option></select>
+                                <small id="source-update-hint">已有会话默认新增，同名替换，其他源文件保留。</small>
                             </div>
                             <div class="form-row">
                                 <div class="form-group">
@@ -148,11 +151,11 @@
                                     <textarea id="manual-headers" rows="3" placeholder='{"文件名.xlsx": {"Sheet1": [3, 3]}}  — 指定表头所在行号'></textarea>
                                 </div>
                             </div>
-                            <div id="session-asset-actions" style="display:none;margin-top:12px;">
-                                <button type="button" id="save-session-assets" class="btn btn-generate" onclick="saveSessionAssets()">保存文件与配置</button>
-                                <span id="session-asset-status" role="status"></span>
-                                <p>保存后可继续讨论、执行修正或重新生成。正在执行的轮次结束后生效。</p>
-                            </div>
+                        </div>
+                        <div id="session-asset-actions" class="session-asset-actions" style="display:none;">
+                            <button type="button" id="save-session-assets" class="btn btn-generate" onclick="saveSessionAssets()">保存文件与配置</button>
+                            <span id="session-asset-status" role="status"></span>
+                            <p>保存后可继续讨论、执行修正或重新生成。正在执行的轮次结束后生效。</p>
                         </div>
                     </div>
                 </div>
@@ -213,7 +216,7 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260722b"></script>
-<script src="/static/js/training.js?v=20260907-assets"></script>
+<script src="/static/js/training.js?v=20260910-scroll"></script>
 <script src="/static/js/training_assets.js?v=20260907-assets"></script>
 </body>
 </html>

@@ -1,0 +1,17 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const context = vm.createContext({document: {addEventListener() {}}, console});
+vm.runInContext(fs.readFileSync('frontend/static/js/tools.js', 'utf8') + '\nthis.tools = Tools;', context);
+context.tools._intAllCols = () => ['B.xlsx.部门', '姓名'];
+assert.equal(context.tools._intCheckFx('A.xlsx', '姓名&" / "&B.xlsx.部门').ok, true);
+assert.equal(context.tools._intCheckFx('A.xlsx', '姓名&未知列').ok, false);
+assert.equal(context.tools._intCheckFx('A.xlsx', '姓名&"未闭合').ok, false);
+const tokens = context.tools._intTokenize('姓名&"姓名"&B.xlsx.部门', 'A.xlsx');
+assert.equal(tokens.filter(t => t.t === 'col').length, 2);
+assert.equal(context.tools._intFxRemoveCol('姓名&B.xlsx.部门', 'B.xlsx.部门', 'A.xlsx'), '姓名');
+vm.runInContext('let attempts = 0; _modalCallback = () => { attempts++; };', context);
+context.tools.confirmModal();
+context.tools.confirmModal();
+assert.equal(vm.runInContext('attempts', context), 2, 'validation failure must allow retry');
+console.log('Integration text and modal retry checks passed');

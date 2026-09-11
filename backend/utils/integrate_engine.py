@@ -130,6 +130,11 @@ def _excel_round(value, digits=0):
 
 def _normalize_excel_formula(expr: str) -> str:
     text = str(expr or "").strip()
+    literals = []
+    def protect(match):
+        literals.append(repr(match.group()[1:-1].replace('""', '"')))
+        return f'__literal_{len(literals) - 1}__'
+    text = _re.sub(r'"(?:[^"]|"")*"', protect, text)
     if text.startswith("="):
         text = text[1:].lstrip()
     text = text.replace("<>", "!=")
@@ -138,29 +143,47 @@ def _normalize_excel_formula(expr: str) -> str:
     # 统一大写后再交给 AST 解析。
     for name in _FORMULA_FUNCTIONS:
         text = _re.sub(rf"\b{_re.escape(name)}\s*(?=\()", name, text, flags=_re.IGNORECASE)
+    for i, literal in enumerate(literals):
+        text = text.replace(f'__literal_{i}__', literal)
     return text
 
 
 def validate_formula_remainder(rest: str) -> bool:
     """列 token 被移除后，是否只剩受支持的 Excel 公式语法。"""
-    text = _normalize_excel_formula(rest)
+    text = _normalize_excel_formula(_re.sub(r'"(?:[^"]|"")*"', '0', rest))
     probe = _re.sub(r"(?<![A-Za-z0-9_.])(?:\d+(?:\.\d*)?|\.\d+)[eE][+\-]?\d+", "0", text)
     names = _re.findall(r"[A-Za-z_][A-Za-z0-9_]*", probe)
     if any(name.upper() not in _FORMULA_FUNCTIONS and name.lower() not in {"true", "false"}
            for name in names):
         return False
     without_names = _re.sub(r"[A-Za-z_][A-Za-z0-9_]*", "", probe)
-    return bool(_re.fullmatch(r"[0-9eE.+\-*/(),<>=!\s]*", without_names))
+    return bool(_re.fullmatch(r"[0-9eE.+\-*/(),<>=!&\s]*", without_names))
 
 
-def _safe_arith_eval(expr: str) -> Optional[float]:
+def _safe_arith_eval(expr: str, values=None) -> Any:
     """安全计算受控 Excel 子集：四则、比较、ROUND/IF/ABS/MIN/MAX/SUM/AND/OR/NOT。"""
     try:
         node = _ast.parse(_normalize_excel_formula(expr), mode="eval").body
     except Exception:
         return None
 
-    def ev(n):
+    def text_value(value):
+        if isinstance(value, bool):
+            return 'TRUE' if value else 'FALSE'
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value)
+
+    def ev(n, as_text=False):
+        if isinstance(n, _ast.Name) and values and n.id in values:
+            return values[n.id][1 if as_text else 0]
+        if isinstance(n, _ast.BinOp) and isinstance(n.op, _ast.BitAnd):
+            left, right = ev(n.left, True), ev(n.right, True)
+            if left is None or right is None:
+                return None
+            return text_value(left) + text_value(right)
+        if isinstance(n, _ast.Constant) and isinstance(n.value, str):
+            return n.value
         if isinstance(n, _ast.BinOp) and type(n.op) in _ARITH_BINOPS:
             l, r = ev(n.left), ev(n.right)
             if l is None or r is None:
@@ -200,7 +223,7 @@ def _safe_arith_eval(expr: str) -> Optional[float]:
                 if len(n.args) != 3:
                     return None
                 cond = ev(n.args[0])
-                return ev(n.args[1] if bool(cond) else n.args[2]) if cond is not None else None
+                return ev(n.args[1] if bool(cond) else n.args[2], as_text) if cond is not None else None
             if name in {"AND", "OR"}:
                 if not n.args:
                     return None
@@ -225,7 +248,10 @@ def _safe_arith_eval(expr: str) -> Optional[float]:
             return None
         return None
 
-    return ev(node)
+    try:
+        return ev(node)
+    except (TypeError, ValueError, ArithmeticError):
+        return None
 
 
 def _cols_by_len_desc(cols: List[str]) -> List[str]:
@@ -246,7 +272,7 @@ def _expr_has_operator(expr: str, cols: List[str]) -> bool:
     rest = expr
     for c in _cols_by_len_desc(cols):
         rest = rest.replace(c, " ")
-    return (any(op in rest for op in "+-*/<>=!,") or
+    return (any(op in rest for op in "+-*/<>=!,&") or
             any(_re.search(rf"\b{name}\s*\(", rest, _re.IGNORECASE)
                 for name in _FORMULA_FUNCTIONS))
 
@@ -265,7 +291,7 @@ def _is_cross_formula_expr(expr: str, default_file: str,
     for ref in sorted(set(refs), key=len, reverse=True):
         rest = rest.replace(ref, " ")
     stripped = rest.strip()
-    return (stripped.startswith("=") or any(op in rest for op in "+-*/<>=!,") or
+    return (stripped.startswith("=") or any(op in rest for op in "+-*/<>=!,&") or
             any(_re.search(rf"\b{name}\s*\(", rest, _re.IGNORECASE)
                 for name in _FORMULA_FUNCTIONS))
 
@@ -280,6 +306,8 @@ def eval_source_expr(expr, rows: List[dict], cols: List[str]):
     expr = str(expr or "").strip()
     if not expr or not rows:
         return None
+    if '&' in expr:
+        return eval_source_expr_cross(expr, '', {'': {'cols': cols, 'rows': {'key': rows}}}, 'key')
     is_formula = _expr_has_operator(expr, cols)
 
     if not is_formula:
@@ -376,9 +404,16 @@ def eval_source_expr_cross(expr: str, default_file: str,
         if ch.isspace():
             i += 1
             continue
-        if ch in "+-*/(),<>=!":
+        if ch == '"':
+            literal = _re.match(r'"(?:[^"]|"")*"', expr[i:])
+            if not literal:
+                return None
+            toks.append(('literal', literal.group()))
+            i += len(literal.group())
+            continue
+        if ch in "+-*/(),<>=!&":
             toks.append(("op", ch))
-            if ch in "+-*/<>=!,":
+            if ch in "+-*/<>=!,&":
                 has_op = True
             i += 1
             continue
@@ -431,20 +466,26 @@ def eval_source_expr_cross(expr: str, default_file: str,
     if not any(t[3][3] for t in cols):
         return None
     subst = ""
+    values = {}
     for t in toks:
         if t[0] == "col":
             _s, _first, all_num, available = t[3]
-            subst += f"({_s if available and all_num else 0})"
+            name = f'__col_{len(values)}'
+            # 拼接保留文本原值（含前导零），四则仍按原规则汇总。
+            values[name] = (_s if available and all_num else 0, _first if available else '')
+            subst += name
+        elif t[0] == 'literal':
+            subst += t[1]
         elif t[0] == "op":
             subst += t[1]
         elif t[0] == "raw" and (t[1].isalnum() or t[1] in "._"):
             subst += t[1]
         else:
             return None
-    if not validate_formula_remainder(subst):
+    if not validate_formula_remainder(_re.sub(r'__col_\d+', '0', subst)):
         return None
-    val = _safe_arith_eval(subst)
-    return None if val is None else round(val, 6)
+    val = _safe_arith_eval(subst, values)
+    return round(val, 6) if isinstance(val, (int, float)) else val
 
 
 def resolve_overwrites(key: str,

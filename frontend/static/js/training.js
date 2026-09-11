@@ -754,6 +754,30 @@ function _addSystemMessage(content, msgType, metadata, target) {
     return contentDiv;
 }
 
+// 合并同一帧内的流式更新，等 DOM 渲染后同步内外滚动框。
+const _streamScrollTargets = new Set();
+let _streamScrollFrame = null;
+function _scrollStreamingToBottom(contentDiv) {
+    if (!contentDiv) return;
+    _streamScrollTargets.add(contentDiv);
+    if (_streamScrollFrame !== null) return;
+    _streamScrollFrame = requestAnimationFrame(() => {
+        _streamScrollFrame = null;
+        const container = document.getElementById('chat-messages');
+        let updated = false;
+        for (const content of _streamScrollTargets) {
+            // 切换会话后，旧消息不能影响新会话的滚动位置。
+            if (!container || !container.contains(content)) continue;
+            content.querySelectorAll('.thinking-block, pre, .code-collapse.expanded').forEach(block => {
+                block.scrollTop = block.scrollHeight;
+            });
+            updated = true;
+        }
+        _streamScrollTargets.clear();
+        if (updated) container.scrollTop = container.scrollHeight;
+    });
+}
+
 function _updateStreamingMessage(contentDiv, text, thinkingText, thinkingDirty) {
     // 思考过程用【增量 textContent】更新（不重解析 HTML/markdown）：DeepSeek 思考 token 逐块
     // 到达且思考可能长达数分钟/数万字，每 token 全量 _escapeHtml(全部思考)+markdown 重建是
@@ -778,8 +802,7 @@ function _updateStreamingMessage(contentDiv, text, thinkingText, thinkingDirty) 
         }
         body.innerHTML = _renderMarkdown(text || '');
     }
-    const container = document.getElementById('chat-messages');
-    container.scrollTop = container.scrollHeight;
+    _scrollStreamingToBottom(contentDiv);
 }
 
 function _finishStreamingMessage(contentDiv) {
@@ -843,9 +866,21 @@ function _replaceCodeStream(code) {
 
 function _renderCodeStreamOnce() {
     if (!_codeStreamEl) return;
-    _codeStreamEl.innerHTML = _renderMarkdown('```python\n' + _codeStreamBuf + '\n```');
-    const container = document.getElementById('chat-messages');
-    container.scrollTop = container.scrollHeight;
+    let code = _codeStreamEl.querySelector('pre code');
+    if (!code) {
+        const pre = document.createElement('pre');
+        code = document.createElement('code');
+        pre.appendChild(code);
+        _codeStreamEl.replaceChildren(pre);
+    }
+    // 保留 DOM，仅追加新字符；普通请求回退替换时重置文本。
+    const previous = code.textContent;
+    if (_codeStreamBuf.startsWith(previous) && code.firstChild) {
+        code.firstChild.appendData(_codeStreamBuf.slice(previous.length));
+    } else {
+        code.textContent = _codeStreamBuf;
+    }
+    _scrollStreamingToBottom(_codeStreamEl);
 }
 
 function _finishCodeStream() {

@@ -70,6 +70,7 @@ def precheck_compute(
     expected_structure: Optional[dict] = None,
     template_override_path: Optional[str] = None,
     confirmed_target_map: Optional[Dict[str, str]] = None,
+    in_worker: bool = False,
 ) -> PrecheckResult:
     """智算事前校验主入口
 
@@ -78,6 +79,9 @@ def precheck_compute(
         - None     : 未训练标记(存量脚本)，回退到关键字扫描
     """
     result = PrecheckResult()
+    # 前端只确认历史提示或未选择列时会提交空封装，不能当作映射已通过。
+    if isinstance(confirmed_mapping, dict) and 'file_mapping' in confirmed_mapping:
+        confirmed_mapping = confirmed_mapping.get('file_mapping') or None
 
     if not source_structure:
         # 老脚本可能没存 source_structure，无法校验，直接放行
@@ -146,11 +150,7 @@ def precheck_compute(
     if confirmed_mapping:
         try:
             _apply_confirmed_mapping(source_dir, source_structure, confirmed_mapping)
-            result.file_mapping = confirmed_mapping.get("file_mapping") or confirmed_mapping
-            # 文件已按用户确认改写，跳过表头匹配/AI 步骤
-            _check_history(script_content, tenant_id, salary_year, salary_month, result, use_history)
-            _check_target_sheets(script_content, tenant_id, template_override_path, confirmed_target_map, result)
-            return result
+            # 确认映射只指导改写，必须验证完整性并缓存预加载数据供正式计算复用。
         except Exception as e:
             logger.error(f"[Precheck] 应用 confirmed_mapping 失败: {e}", exc_info=True)
             result.ok = False
@@ -173,35 +173,36 @@ def precheck_compute(
                 from backend.utils.subprocess_runner import (
                     run_in_subprocess, default_max_memory_mb, default_timeout,
                 )
-                _r = run_in_subprocess(
-                    "backend.utils.compute_precheck:_header_match_subprocess",
-                    (source_structure, input_files, manual_headers, expected_structure),
-                    timeout=default_timeout("parse"),
-                    max_memory_mb=default_max_memory_mb(),
-                )
-                if _r.success:
-                    ok, err, file_mapping, _pre = _r.result
+                args = (source_structure, input_files, manual_headers, expected_structure, ai_provider_name)
+                if in_worker:
+                    # 外层已有总超时/内存护栏，直接解析避免嵌套进程和大表 pickle 往返。
+                    ok, err, file_mapping, _pre = _header_match_subprocess(*args)
                 else:
-                    reason = "超时" if _r.timed_out else ("内存超限" if _r.killed_by_memory else _r.error)
-                    logger.warning(f"[Precheck] 解析子进程失败（{reason}），跳过表头匹配")
-                    ok, err, file_mapping, _pre = False, f"解析子进程失败（{reason}）", None, None
+                    _r = run_in_subprocess(
+                        "backend.utils.compute_precheck:_header_match_subprocess", args,
+                        timeout=default_timeout("parse"), max_memory_mb=default_max_memory_mb())
+                    if _r.success:
+                        ok, err, file_mapping, _pre = _r.result
+                    else:
+                        reason = "超时" if _r.timed_out else ("内存超限" if _r.killed_by_memory else _r.error)
+                        ok, err, file_mapping, _pre = False, f"解析子进程失败（{reason}）", None, None
                 if ok and file_mapping:
                     result.file_mapping = file_mapping
                     # Internal-only attribute, excluded from dataclass to_dict/asdict.
                     result._pre_loaded_source_data = _pre
                 else:
-                    result.ok = False
+                    raw_fallback = bool((_pre or {}).get('mapping_failed'))
+                    if raw_fallback:
+                        result._source_mapping_warning = err
+                        logger.warning('[Precheck] 映射未通过，将使用原文件继续计算: %s', err)
+                    else:
+                        result.ok = False
                     missing = _extract_missing_columns(source_structure, input_files, err)
                     result.missing_columns = missing
                     logger.warning(f"[Precheck] 表头匹配失败: {err}")
-                    # 步骤 4：调 AI 给建议（同时返回上传文件实际列全集，前端手动选择用）
-                    if ai_provider_name:
-                        try:
-                            result.ai_suggestions, result.actual_paths = _ai_suggest_column_mapping(
-                                missing, source_structure, input_files, ai_provider_name
-                            )
-                        except Exception as ai_err:
-                            logger.warning(f"[Precheck] AI 建议失败（不阻断）: {ai_err}", exc_info=True)
+                    # 单次解析阶段已尝试 AI；直接复用列清单，不能再次解析全部 Excel/调用 AI。
+                    result.actual_paths = (_pre or {}).get('actual_paths', [])
+                    result.ai_suggestions = _suggest_structural_columns(missing, result.actual_paths)
         except Exception as e:
             logger.warning(f"[Precheck] 表头匹配异常: {e}", exc_info=True)
             result.ok = False
@@ -221,6 +222,7 @@ def _header_match_subprocess(
     input_files: list,
     manual_headers: Optional[dict],
     expected_structure: Optional[dict],
+    ai_provider_name: Optional[str] = None,
 ):
     """模块级包装（subprocess_runner 定位入口）：全量解析 + 表头匹配在独立子进程执行。
 
@@ -234,6 +236,7 @@ def _header_match_subprocess(
         manual_headers=manual_headers,
         output_dir=None,  # 校验阶段不写 fallback
         expected_structure=expected_structure,
+        ai_provider_name=ai_provider_name,
     )
 
 
@@ -369,6 +372,58 @@ def _extract_missing_columns(
     return missing
 
 
+def _suggest_structural_columns(expected_entries: list, actual_paths: list) -> list:
+    """为确认界面提供保守的默认值，不改写文件，也不重复解析/请求 AI。"""
+    def columns_index(columns):
+        index = {}
+        for column in columns:
+            key = ''.join(str(column).split()).casefold()
+            if key:
+                index.setdefault(key, []).append(column)
+        # 规范化后重名的列不能自动选择。
+        return {key: values[0] for key, values in index.items() if len(values) == 1}
+
+    actual = {}
+    for path in dict.fromkeys(actual_paths):
+        parts = path.split(' > ', 2)
+        if len(parts) == 3:
+            actual.setdefault(tuple(parts[:2]), []).append(parts[2])
+    actual = {key: columns_index(cols) for key, cols in actual.items()}
+    expected = {(entry['file'], entry['sheet']): columns_index(entry['expected_columns'])
+                for entry in expected_entries if entry.get('expected_columns')}
+    choices = {}
+    for target, columns in expected.items():
+        candidates = []
+        for source, source_columns in actual.items():
+            common = columns.keys() & source_columns.keys()
+            score = len(common) / max(len(columns), len(source_columns), 1)
+            if score < 0.7 or (len(common) < 2 and score != 1):
+                continue
+            # 完整路径相同优先，但不能只凭名称忽略列结构。
+            candidates.append((score + (1 if source == target else 0), source, common))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        if candidates and (len(candidates) == 1 or candidates[0][0] - candidates[1][0] >= 0.1):
+            choices[target] = candidates[0]
+
+    suggestions = []
+    for target, (score, source, common) in choices.items():
+        # 不允许两张训练表抢用同一张表，或产生文件级映射冲突。
+        if any(other != target and (candidate[1] == source or
+               (other[0] == target[0] and candidate[1][0] != source[0]) or
+               (other[0] != target[0] and candidate[1][0] == source[0]))
+               for other, candidate in choices.items()):
+            continue
+        for key, column in expected[target].items():
+            if key in common:
+                suggestions.append({
+                    'expected_path': ' > '.join((*target, str(column))),
+                    'suggested_path': ' > '.join((*source, str(actual[source][key]))),
+                    'confidence': min(score, 1.0),
+                    'reason': '列结构匹配（表名可不同），请确认',
+                })
+    return suggestions
+
+
 def _apply_confirmed_mapping(source_dir: str, source_structure: dict, confirmed_mapping: dict) -> None:
     """按用户确认的列映射改写文件
 
@@ -402,15 +457,15 @@ def _apply_confirmed_mapping(source_dir: str, source_structure: dict, confirmed_
         if multi_sheet_source:
             info["multi_sheet_source"] = True
         try:
-            FastHeaderMatcher.rewrite_excel(info, source_dir)
+            rewritten = FastHeaderMatcher.rewrite_excel(info, source_dir)
             expected = info.get("expected_file")
             if expected and expected != input_name:
                 old = os.path.join(source_dir, input_name)
                 new = os.path.join(source_dir, expected)
-                if os.path.exists(old) and old != new:
-                    if os.path.exists(new):
-                        os.remove(new)
-                    shutil.move(old, new)
+                if not os.path.isfile(rewritten):
+                    raise ValueError('映射文件未生成')
+                if os.path.exists(old) and os.path.abspath(old) != os.path.abspath(new):
+                    os.remove(old)  # 新文件已包含映射，不能再用旧文件覆盖它。
         except Exception as e:
             raise RuntimeError(f"改写文件 {input_name} 失败: {e}") from e
 

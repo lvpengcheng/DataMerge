@@ -96,7 +96,10 @@ def inspect_formula_cache(file_path: str, sample_limit: int = 20) -> Dict[str, A
                     "formula": formula_text[:300],
                 }
 
-                if cached_value in (None, ""):
+                # t=str 且有空 v 节点表示公式已求值得到空字符串（如 IF(...,"",...)）。
+                # 无 v 节点或数值类型的空 v 才是缺少缓存。
+                empty_string_result = cell.attrib.get('t') == 'str' and value_node is not None
+                if cached_value in (None, "") and not empty_string_result:
                     report["empty_cache_count"] += 1
                     if len(report["empty_cache_samples"]) < sample_limit:
                         report["empty_cache_samples"].append(sample)

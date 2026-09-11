@@ -110,6 +110,7 @@ def main():
             file_passwords=p.get("file_passwords"),
             pre_validated_mapping=p.get("pre_validated_mapping"),
             precheck_auto_filled=p.get("precheck_auto_filled"),
+            source_mapping_warning=p.get("source_mapping_warning"),
             template_override_path=p.get("template_override_path"),
             target_sheet_manual_map=p.get("target_sheet_manual_map"),
         ))

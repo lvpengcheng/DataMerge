@@ -2775,7 +2775,8 @@ _compare_history = []  # 进程级对比历史存储
 async def compare_excel(
     source_file: UploadFile = File(..., description="源文件（基准文件）"),
     compare_file: UploadFile = File(..., description="对比文件"),
-    primary_keys: str = Form(default="工号,中文姓名", description="主键列名，多个用逗号分隔")
+    primary_keys: str = Form(default="工号,中文姓名", description="主键列名，多个用逗号分隔"),
+    current_user=Depends(get_current_user),
 ):
     """对比两个Excel文件的差异（支持多Sheet）"""
     from pathlib import Path
@@ -2790,7 +2791,8 @@ async def compare_excel(
         compare_dir.mkdir(exist_ok=True)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        session_id = f"compare_{timestamp}"
+        import uuid
+        session_id = f"compare_{timestamp}_{uuid.uuid4().hex}"
         session_dir = compare_dir / session_id
         session_dir.mkdir(exist_ok=True)
 
@@ -2856,6 +2858,7 @@ async def compare_excel(
         # 存入历史
         _compare_history.append({
             **resp,
+            "user_id": current_user.id,
             "created_at": datetime.now().isoformat(),
         })
 
@@ -2867,7 +2870,7 @@ async def compare_excel(
 
 
 @app.get("/api/compare/download/{session_id}/{filename}")
-async def download_compare_result(session_id: str, filename: str):
+async def download_compare_result(session_id: str, filename: str, current_user=Depends(get_current_user)):
     """下载对比结果文件
 
     Args:
@@ -2878,6 +2881,11 @@ async def download_compare_result(session_id: str, filename: str):
     from urllib.parse import quote
 
     try:
+        if not any(item.get('session_id') == session_id and item.get('user_id') == current_user.id
+                   for item in _compare_history):
+            raise HTTPException(404, '对比记录不存在')
+        if Path(filename).name != filename or '/' in filename or '\\' in filename:
+            raise HTTPException(404, '文件不存在')
         # 支持两种目录格式
         file_path = Path("compare_results") / session_id / filename
         if not file_path.exists():
@@ -2906,16 +2914,16 @@ async def download_compare_result(session_id: str, filename: str):
 
 
 @app.get("/api/compare/history")
-async def list_compare_history():
+async def list_compare_history(current_user=Depends(get_current_user)):
     """获取对比历史列表（最近50条，最新在前）"""
-    return _compare_history[-50:][::-1]
+    return [item for item in _compare_history if item.get('user_id') == current_user.id][-50:][::-1]
 
 
 @app.get("/api/compare/history/{session_id}")
-async def get_compare_detail(session_id: str):
+async def get_compare_detail(session_id: str, current_user=Depends(get_current_user)):
     """获取某次对比的详细结果"""
     for item in _compare_history:
-        if item.get("session_id") == session_id:
+        if item.get("session_id") == session_id and item.get('user_id') == current_user.id:
             return item
     raise HTTPException(status_code=404, detail="对比记录不存在")
 
@@ -4518,6 +4526,7 @@ async def run_compute_task(
     file_passwords=None,
     pre_validated_mapping=None,
     precheck_auto_filled=None,
+    source_mapping_warning=None,
     template_override_path: Optional[str] = None,
     target_sheet_manual_map=None,
 ):
@@ -4667,6 +4676,10 @@ async def run_compute_task(
             _script_info = _load_script_info_for_precheck(tenant_id, script_id)
 
             source_structure = _script_info.get("source_structure")
+            if source_mapping_warning:
+                buffer.push(task_id, json.dumps({'type': 'log', 'level': 'warning',
+                    'message': f'源数据自动映射未通过，使用原文件继续计算；请核查结果。原因: {source_mapping_warning}'}, ensure_ascii=False))
+                source_structure = None  # 预检已完成解析和一次 AI 尝试，不重复匹配。
             manual_headers = _script_info.get("manual_headers")
             expected_structure = _script_info.get("expected_structure")
             if isinstance(expected_structure, str):
@@ -4746,7 +4759,9 @@ async def run_compute_task(
                                 await _loop.run_in_executor(None, lambda: fast_matcher.match_parse_and_prepare(
                                     source_structure=source_structure, input_files=input_files,
                                     manual_headers=manual_headers, output_dir=str(source_dir),
-                                    expected_structure=expected_structure))
+                                    expected_structure=expected_structure,
+                                    ai_provider_name=_resolve_enabled_ai_provider(
+                                        _script_info.get('ai_provider') or os.getenv('AI_PROVIDER', 'deepseek'))))
                         _single_parse_ok = True
                     except Exception as _sp_err:
                         logger.warning(f"[compute/task] 单次解析优化失败: {_sp_err}，回退到多次解析流程", exc_info=True)
@@ -4898,7 +4913,12 @@ async def run_compute_task(
                         }
                         buffer.push(task_id, json.dumps(log_msg, ensure_ascii=False))
                     elif not match_success:
-                        raise ValueError(f"源数据表头匹配失败: {match_error}")
+                        if (pre_loaded_source_data or {}).get('mapping_failed'):
+                            pre_loaded_source_data = None
+                            buffer.push(task_id, json.dumps({'type': 'log', 'level': 'warning',
+                                'message': f'表头映射失败，使用原文件继续计算: {match_error}'}, ensure_ascii=False))
+                        else:
+                            raise ValueError(f"源数据表头匹配失败: {match_error}")
         except Exception as e:
             raise ValueError(f"源数据映射未通过，停止计算以避免使用错误表: {e}") from e
 
@@ -5182,16 +5202,20 @@ async def run_compute_task(
         _formula_empty = int(_formula_report.get("empty_cache_count", 0))
         _formula_errors = int(_formula_report.get("error_cache_count", 0))
         _formula_bad_refs = int(_formula_report.get("invalid_ref_formula_count", 0))
-        _formula_cache_complete = _formula_calc_ok and _formula_empty == 0
-
-        if _formula_cache_complete:
+        if _formula_calc_ok:
             logger.info(f"[compute/task] 最终公式计算完成: {output_file}")
-            _calc_level = "warning" if _formula_errors else "success"
-            _calc_message = f"最终公式计算完成，已刷新 {_formula_total} 个公式缓存"
-            if _formula_errors:
+            _calc_level = "warning" if (_formula_empty or _formula_errors or _formula_bad_refs) else "success"
+            _calc_message = f"最终公式计算完成，{_formula_total - _formula_empty}/{_formula_total} 个公式有缓存值"
+            if _formula_empty:
+                _empty_locations = '、'.join(
+                    f"{s.get('sheet')}!{s.get('cell')}"
+                    for s in _formula_report.get('empty_cache_samples', [])[:10])
+                _calc_message += (f"；{_formula_empty} 个公式缓存缺失（{_empty_locations or '位置见公式报告'}），"
+                                  "已保留公式并允许下载，请在 Excel 中重算并核查这些单元格")
+            if _formula_errors or _formula_bad_refs:
                 _calc_message += (
                     f"；其中 {_formula_errors} 个结果为公式错误"
-                    f"（含 {_formula_bad_refs} 个损坏引用 #REF!），请检查模板/规则"
+                    f"，另检测到 {_formula_bad_refs} 个损坏引用 #REF!；结果可下载，请核查相关单元格"
                 )
             buffer.push(task_id, json.dumps({
                 "type": "log",
@@ -5201,8 +5225,8 @@ async def run_compute_task(
                 "formula_report": _formula_report,
             }, ensure_ascii=False))
         else:
-            raise RuntimeError(f"公式缓存未完整生成（{_formula_empty}/{_formula_total}），未发布计算结果")
-        if (_formula_bad_refs or _formula_errors) and os.getenv("COMPUTE_STRICT_FORMULA_ERRORS", "true").lower() not in ("false", "0", "no"):
+            raise RuntimeError("最终公式计算未成功完成，未发布计算结果")
+        if (_formula_bad_refs or _formula_errors) and os.getenv("COMPUTE_STRICT_FORMULA_ERRORS", "false").strip().lower() in ("true", "1", "yes", "on"):
             raise RuntimeError(f"结果含 {_formula_errors} 个公式错误、{_formula_bad_refs} 个损坏引用，请修正规则或模板后计算")
 
         # 保存到租户目录
@@ -5312,7 +5336,9 @@ async def run_compute_task(
                 "rows_processed": rows_processed,
                 "tenant_id": tenant_id,
                 "script_id": script_id,
-                "values_copy_failed": _values_copy_failed
+                "values_copy_failed": _values_copy_failed,
+                "formula_warning": bool(_formula_empty or _formula_errors or _formula_bad_refs),
+                "formula_report": _formula_report,
             }
         }
         buffer.push(task_id, json.dumps(final_result, ensure_ascii=False))
@@ -5402,6 +5428,7 @@ def _compute_upload_precheck_subprocess(payload: dict) -> dict:
             expected_structure=payload.get("expected_structure"),
             template_override_path=template_override_path,
             confirmed_target_map=payload.get("confirmed_target_map"),
+            in_worker=True,
         )
         preloaded = getattr(pc, "_pre_loaded_source_data", None)
         if pc.ok and preloaded:
@@ -5601,6 +5628,7 @@ async def compute_submit(
                 "standard_hours": standard_hours, "file_passwords": file_passwords,
                 "pre_validated_mapping": pc_result.file_mapping,
                 "precheck_auto_filled": pc_result.auto_filled,
+                "source_mapping_warning": getattr(pc_result, '_source_mapping_warning', None),
                 "template_override_path": template_override_path,
                 "target_sheet_manual_map": _confirmed_target_map or pc_result.target_map or {},
             }
