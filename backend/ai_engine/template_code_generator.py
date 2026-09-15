@@ -1719,10 +1719,11 @@ if __name__ == "__main__":
 
 ## 输出要求
 **只输出修正后的 `def fill_template(...)` 完整函数**，用 ```python 代码块包裹。
-- 不要 import 模块（除从 openpyxl.utils 临时导入）
+- 不要 import 模块（除从 openpyxl.utils 或 backend.utils.template_fill_binding 临时导入）
 - 不要 main、不要解释文字、不要 Workbook() 创建新 wb
 - 未在用户反馈中提到的列，其代码必须与上一轮完全一致
 - **严禁用 `ws.insert_rows()` / `ws.delete_rows()` 改行数**；若上一轮代码在 `fill_template` 或 `main()` 里用 openpyxl 手动增删行导致汇总行格式不跟随，本次应删除该逻辑、改在函数上方输出 `CLEANING_SPEC`（走 Aspose 阶段0，样式原生跟随），`fill_template` 内改用 `cleaned_rows(sheet_name)` 逐行填列
+- 更换模板后，禁止用源表 max_row 决定目标写入行，禁止把旧模板的中间项列字母直接写入新模板。优先使用清洗后行布局；未清洗时按实际列头、主键数据区定位，并排除表头/汇总。可调用 template_fill_binding.bind_template_fill(ws, expected_columns, helper_columns) 获取实际行号和列映射。中间项必须放在模板已有内容之后；写入位置变化时使用 remap_local_formula 同步转换本表公式引用，不能改动源表引用或字符串。不得通过跳过 MergedCell 或全部取消合并来掩盖错位。
 """
 
         if self.training_logger and hasattr(self.training_logger, "log_full_prompt"):

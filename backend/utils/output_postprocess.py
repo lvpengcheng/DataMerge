@@ -405,11 +405,24 @@ def restore_formats_from_template(output_path, template_path) -> int:
             ocells = ows.Cells
             tcells = tws.Cells
             # 只遍历输出中"实际存在"的单元格（GetEnumerator 不含空格 → 不会给输出灌空单元格）
+            # 同列唯一且公式相同的单元格可作为移动锚点（如汇总行 TODAY）。
+            # 重复公式不猜位置，继续使用原坐标规则。
+            formula_cells = {}
+            ti = tcells.GetEnumerator()
+            while ti.MoveNext():
+                cell = ti.Current
+                if cell.IsFormula:
+                    key = (cell.Column, str(cell.Formula).strip())
+                    formula_cells.setdefault(key, []).append(cell)
             it = ocells.GetEnumerator()
             while it.MoveNext():
                 ocell = it.Current
                 try:
                     tcell = tcells[ocell.Row, ocell.Column]   # 访问模板空格仅在模板侧实例化，不落盘
+                    if ocell.IsFormula:
+                        candidates = formula_cells.get((ocell.Column, str(ocell.Formula).strip()), [])
+                        if len(candidates) == 1:
+                            tcell = candidates[0]
                     tstyle = tcell.GetStyle()
                     ostyle = ocell.GetStyle()
                     if ostyle.Number != tstyle.Number or (ostyle.Custom or "") != (tstyle.Custom or ""):

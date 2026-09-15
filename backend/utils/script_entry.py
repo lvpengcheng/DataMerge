@@ -4,6 +4,8 @@ import os
 
 
 def invoke_script_main(main, environment):
+    from backend.utils.openpyxl_compat import ensure_custom_filter_compat
+    ensure_custom_filter_compat()
     aliases = {
         'input_folder': 'input_folder', 'input_dir': 'input_folder', 'input_path': 'input_folder',
         'source_dir': 'input_folder', 'source_folder': 'input_folder',

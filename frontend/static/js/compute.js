@@ -569,6 +569,7 @@ async function _autoCheckEncryption(filesToCheck) {
             const checkResp = await AUTH.authFetch('/api/files/check-encrypted', {
                 method: 'POST', body: checkFd
             });
+            if (!checkResp.ok) throw new Error('文件密码检测失败，请重试');
             if (checkResp.ok) {
                 const checkResult = await checkResp.json();
                 (checkResult.encrypted_files || []).forEach(name => {
@@ -576,14 +577,18 @@ async function _autoCheckEncryption(filesToCheck) {
                 });
             }
         }
-        if (encrypted.length > 0) {
-            const passwords = await _promptFilePasswords(encrypted);
+        const missingPasswords = encrypted.filter(name => !(_filePasswordsMap || {})[name]);
+        if (missingPasswords.length > 0) {
+            const passwords = await _promptFilePasswords(missingPasswords);
             if (passwords) {
                 _filePasswordsMap = { ...(_filePasswordsMap || {}), ...passwords };
-            }
+            } else return false;
         }
+        return true;
     } catch (e) {
         console.error('[加密检测] 异常:', e);
+        alert('文件密码检测未完成，请重新选择文件后重试。');
+        return false;
     } finally {
         _encryptionCheckInProgress = false;
         if (btn) {
@@ -640,6 +645,10 @@ document.addEventListener('DOMContentLoaded', function() {
     const _tplInput = document.getElementById('template-file');
     if (_tplInput) {
         _tplInput.addEventListener('change', function () {
+            for (const file of Array.from(this.files || [])) {
+                if (_filePasswordsMap) delete _filePasswordsMap[file.name];
+            }
+            _autoCheckEncryption(Array.from(this.files || []));
             const list = document.getElementById('template-file-list');
             if (!list) return;
             list.innerHTML = (this.files && this.files.length > 0)
@@ -923,6 +932,8 @@ async function startCompute() {
         return;
     }
 
+    const encryptionFiles = [...Array.from(files), ...Array.from(document.getElementById('template-file')?.files || [])];
+    if (!await _autoCheckEncryption(encryptionFiles)) return;
     btn.disabled = true;
     btn.textContent = '计算中...';
     clearResult();
@@ -1026,8 +1037,8 @@ async function startCompute() {
                     cancelled = true;
                     break;
                 }
-                _filePasswordsMap = passwords;
-                formData.set('file_passwords', JSON.stringify(passwords));
+                _filePasswordsMap = { ...(_filePasswordsMap || {}), ...passwords };
+                formData.set('file_passwords', JSON.stringify(_filePasswordsMap));
                 addLog('info', '正在使用密码重新提交...');
                 continue;
             }

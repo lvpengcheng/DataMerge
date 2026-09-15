@@ -4153,6 +4153,8 @@ def _inject_sandbox_helpers(module):
     AI 生成代码若裸用 find_column/safe_get_column/normalize_emp_code/EMPTY/write_cell 等
     会在智算报 name X is not defined。此处在 exec_module 之前注入，脚本若自定义同名会自然覆盖。
     """
+    from backend.utils.openpyxl_compat import ensure_custom_filter_compat
+    ensure_custom_filter_compat()
     # data_helpers 函数（兼容两种导入路径）
     try:
         try:
@@ -5389,6 +5391,10 @@ def _compute_upload_precheck_subprocess(payload: dict) -> dict:
             encryption[fp.name] = is_encrypted(str(fp.resolve()))
             if encryption[fp.name] and not passwords_dict.get(fp.name):
                 encrypted.append(fp.name)
+    template_encrypted = bool(template_override_path and is_encrypted(template_override_path))
+    template_password = passwords_dict.get(Path(template_override_path).name) if template_override_path else None
+    if template_encrypted and not template_password:
+        encrypted.append(Path(template_override_path).name)
     if encrypted:
         return {"encrypted_files": encrypted, "pc_result": None,
                 "template_override_path": template_override_path}
@@ -5405,6 +5411,9 @@ def _compute_upload_precheck_subprocess(payload: dict) -> dict:
             convert_xls_to_xlsx(fp_str)
 
     if template_override_path:
+        if template_encrypted:
+            decrypted = decrypt_excel(template_override_path, password=template_password)
+            shutil.move(decrypted, template_override_path)
         template_override_path = convert_xls_to_xlsx(template_override_path)
 
     # Date repair is performed in the parser's open workbook, without rewriting uploads.

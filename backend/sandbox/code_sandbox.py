@@ -212,6 +212,8 @@ class CodeSandbox:
                     raise ValueError('执行前代码完整性检查失败（未开始处理 Excel）：\n'
                                      + describe_issues(issues))
                 output_buffer.write(f"开始编译和执行代码...\n")
+                from backend.utils.openpyxl_compat import ensure_custom_filter_compat
+                ensure_custom_filter_compat()
                 code_obj = compile(script_content, '<sandbox>', 'exec')
                 exec(code_obj, exec_globals)
                 for name in ('salary_year', 'salary_month', 'monthly_standard_hours'):
