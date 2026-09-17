@@ -20,6 +20,7 @@
 /_pptx_extract
 /__pycache__
 /.codex-pptx-work
+/.codex-build
 *.docx
 *.xlsx
 nul
