@@ -33,6 +33,37 @@ black backend/
 flake8 backend/
 ```
 
+## 代码导航（先查表，再局部读）
+
+**规则：本仓库多个核心文件超过 3000 行，整读会直接撑爆上下文窗口。**
+
+`backend/app/main.py` 7,680 行 · `excel_parser.py` 5,105 行 · `backend/api/training_chat.py` 4,206 行 · `backend/ai_engine/formula_code_generator.py` 3,546 行 · `frontend/static/js/tools.js` 3,366 行 · `backend/ai_engine/ai_provider.py` 2,639 行
+
+> 任何超过 500 行的文件：先用 Grep 定位符号名 → 再用 Read 的 `offset`/`limit` 读目标 ±80 行。**禁止整读。**
+
+| 要改什么 | 去哪 |
+|---|---|
+| Excel 解析 / 表头识别 / 区域边界 | `excel_parser.py:1187` `IntelligentExcelParser`、`:323` `HeaderRuleEngine`、`:882` `EnhancedRowAnalyzer`、`:470` `ColumnConsistencyValidator`、`:723` `BoundaryCandidateEvaluator` |
+| 公式模式代码生成 | `backend/ai_engine/formula_code_generator.py:51` `FormulaCodeGenerator`、`:1856` `load_source_data`、`:2004` `write_source_sheets`、`:2063` `find_source_sheet` |
+| 模板填充（结果表） | `backend/ai_engine/template_code_generator.py:419` `fill_template`、`:1372` `_resolve_target_sheets`、`:1228` `_restore_number_formats` |
+| 输出后处理 / 日期格式还原 | `backend/utils/output_postprocess.py:363` `restore_formats_from_template`、`:458` `normalize_date_formatted_values`、`:612` `restore_template_region_format`、`:989` `normalize_source_sheet_formats` |
+| Excel 比对 | `backend/utils/excel_comparator.py:911` `compare_excel_files`、`:1465` 多表版、`:1518` `_compare_dataframes_core` |
+| 合并 / 整合对比 | `backend/utils/merge_engine.py:36` `compute_header_fingerprint`、`:256` `norm_compare`；`backend/utils/integrate_engine.py:61` `build_key_index`、`:131` `_normalize_excel_formula` |
+| 表头 / 列匹配 | `backend/utils/fast_header_matcher.py:44`、`backend/utils/smart_matcher.py:15`、`backend/utils/ai_source_mapping.py:5` |
+| 模板与目标表定位 | `backend/utils/template_resolver.py:107` `resolve_template_path`、`backend/utils/target_sheet_resolver.py:75` `resolve_target_sheets` |
+| 模板行列规划 / 清行 | `backend/utils/template_row_planner.py:80` `build_row_plan`、`:202`、`:265` `clean_template_rows` |
+| 沙箱执行 | `backend/sandbox/code_sandbox.py:19` `CodeSandbox`、`:1086` `_execute_script_in_proc` |
+| 子进程隔离 / 超时 / 内存护栏 | `backend/utils/subprocess_runner.py`、`backend/utils/subprocess_worker.py:69` `_run_task` |
+| 上传并发闸门 | `backend/utils/upload_stream.py:12` `ExcelWorkGate` |
+| AI 提供方 / 流式 / 思考流 | `backend/ai_engine/ai_provider.py`、`backend/ai_engine/training_logger.py:538` `StreamAwareAIProvider` |
+| 提示词构造 | `backend/ai_engine/prompt_generator.py:13` `PromptGenerator` |
+| 训练主循环 | `backend/ai_engine/training_engine.py:20` `TrainingEngine` |
+| 表格结构分析 | `backend/ai_engine/table_analyzer.py:97` `TableAnalyzer` |
+
+**`main.py` 内联端点速查**：训练 `:688` / `:1050`(SSE) · 智算 `:5454` / `:5684`(SSE) / `:1489` / `:2349`(split) · 对比 `:2774` · 调代码 `:3340` · 重校验 `:2932` · 加密检查 `:141` · 规则整理 `:175`/`:268` · 邮件 `:3096`/`:3148` · 存储与历史 `:1817`/`:1828` · 对话训练见 `backend/api/training_chat.py:35`
+
+> 排除规则只认 `.claude/settings.json` 的 `permissions.deny`。`.claudeignore` 文件和 `settings.json` 的 `ignorePatterns` 键**从未生效**（已于 2026-09 删除），不要重新添加。
+
 ## Architecture Overview
 
 **DataMerge** is an AI-driven Excel data integration system for HR/payroll scenarios (salary, attendance, social insurance, tax). It uses AI to generate Python scripts from user-provided rules, validates them against expected results through iterative refinement, then executes those scripts on new data.
@@ -60,7 +91,7 @@ Controlled by `USE_FORMULA_MODE` and `USE_MODULAR_GENERATION` in `.env`.
 
 ### Key Directories
 
-- `backend/app/main.py` — Main FastAPI app (~5200 lines). Contains 40+ inline endpoint handlers plus router registrations
+- `backend/app/main.py` — Main FastAPI app (**7,680 lines**). Contains 40+ inline endpoint handlers plus router registrations — see 代码导航 above before reading
 - `backend/api/` — Factored-out API routers (assets, compute, training, training_chat, rules, dashboard)
 - `backend/ai_engine/` — AI code generation, prompt building, training loop, rule extraction
 - `backend/database/` — SQLAlchemy models (14 tables), connection setup, DB init/migrations
@@ -68,7 +99,7 @@ Controlled by `USE_FORMULA_MODE` and `USE_MODULAR_GENERATION` in `.env`.
 - `backend/auth/` — JWT authentication (login, token creation, password hashing)
 - `backend/admin/` — User/role/org/tenant management
 - `backend/utils/` — Excel comparison, header matching, data validation, Aspose helpers
-- `excel_parser.py` — Core Excel parser (~158KB), wraps Aspose.Cells .NET via pythonnet
+- `excel_parser.py` — Core Excel parser (**5,105 lines / ~237KB**), wraps Aspose.Cells .NET via pythonnet
 - `aspose_init.py` — .NET runtime initialization for Aspose.Cells
 - `tenants/` — Per-tenant isolated file storage (gitignored)
 - `global_assets/` — Global reference data files shared across tenants

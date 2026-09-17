@@ -1,21 +1,5 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "ignorePatterns": [
-    "libs/**",
-    "tenants/**",
-    "compare_results/**",
-    "fonts/**",
-    "docs/**",
-    "examples/**",
-    "global_assets/**",
-    "logs/**",
-    "releases/**",
-    "releaser/**",
-    "temp/**",
-    "**/*.md",
-    "!.claude/**",
-    "!CLAUDE.md"
-  ],
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
     "deny": [
       "Read(libs/**)",
@@ -29,13 +13,22 @@
       "Read(releases/**)",
       "Read(releaser/**)",
       "Read(temp/**)",
+      "Read(tmp/**)",
+      "Read(data/**)",
+      "Read(output/**)",
+      "Read(参考/**)",
+      "Read(_pptx_extract/**)",
+      "Read(.kilo/**)",
+      "Read(.codex-build/**)",
+      "Read(.codex-pptx-work/**)",
       "Read(**/*.xlsx)",
       "Read(**/*.xls)",
       "Read(**/*.ttf)",
       "Read(**/*.ttc)",
       "Read(**/*.dll)",
       "Read(**/*.so)",
-      "Read(**/*.db)"
+      "Read(**/*.db)",
+      "Read(.env)"
     ]
   }
 }
