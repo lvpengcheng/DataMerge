@@ -619,7 +619,7 @@ function _promptFilePasswords(encryptedFiles) {
     return new Promise((resolve) => {
         const inputs = encryptedFiles.map((name, i) =>
             `<div style="margin-bottom:10px;">
-                <label style="display:block;font-size:13px;margin-bottom:4px;color:#333;">${name}</label>
+                <label style="display:block;font-size:13px;margin-bottom:4px;color:#333;">${_escapeHtml(name)}</label>
                 <input id="_enc_pwd_${i}" type="password" placeholder="请输入打开密码"
                     style="width:100%;padding:8px 12px;border:1.5px solid #d1d5db;border-radius:8px;box-sizing:border-box;font-size:13px;">
             </div>`
@@ -2095,17 +2095,33 @@ async function _doUploadCode(codeFile, templateFile) {
             : `正在上传并验证代码文件: ${codeFile.name}`;
         _addSystemMessage(tip, 'status');
 
-        const resp = await AUTH.authFetch(`/api/training/chat/sessions/${_currentSessionId}/upload-code`, {
-            method: 'POST',
-            body: formData,
-            signal: controller.signal,
-        });
-        if (!resp.ok) {
-            const err = await resp.json().catch(() => ({}));
-            throw new Error(err.detail || `HTTP ${resp.status}`);
+        if (templateFile && await _probeModernExcelEncryption(templateFile) === true) {
+            clearTimeout(idleTimer);
+            const passwords = await _promptFilePasswords([templateFile.name]);
+            if (!passwords) return;
+            formData.set('template_password', passwords[templateFile.name]);
         }
-        resetTimeout();
-        const data = await _readUploadCodeResponse(resp, resetTimeout);
+        let data;
+        while (true) {
+            resetTimeout(180000);
+            const resp = await AUTH.authFetch(`/api/training/chat/sessions/${_currentSessionId}/upload-code`, {
+                method: 'POST',
+                body: formData,
+                signal: controller.signal,
+            });
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({}));
+                throw new Error(err.detail || `HTTP ${resp.status}`);
+            }
+            resetTimeout();
+            data = await _readUploadCodeResponse(resp, resetTimeout);
+            clearTimeout(idleTimer);
+            if (data.error_type !== 'encrypted_files') break;
+            _addSystemMessage(data.error, 'status');
+            const passwords = await _promptFilePasswords(data.encrypted_files);
+            if (!passwords) return;
+            formData.set('template_password', passwords[templateFile.name]);
+        }
 
         if (data.success) {
             const accPct = (data.accuracy * 100).toFixed(1);

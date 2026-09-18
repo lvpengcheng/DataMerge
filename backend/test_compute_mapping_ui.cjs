@@ -158,6 +158,16 @@ console.log('PASS: multi-round selections, sheet-scoped columns, remap replaceme
     assert.ok(html.includes('data-target-key="当月2"'), '已解决的 Sheet 仍可修改');
     assert.ok(html.includes('value="202608(2)" selected'), '回显手工选择而非第一推荐');
     console.log('PASS: resolved sheet choices remain editable with confirmed value selected');
+    ctx._showPrecheckDialog({
+        actual_sources:[{file:'source.xlsx', sheet:'原始工资表', original_file:'原始上传.xls', original_sheet:'原始工资表'}],
+        actual_paths:['source.xlsx > 原始工资表 > 工号'],
+        file_mapping:{'source.xlsx':{expected_file:'训练名称.xlsx', sheet_mapping:{'原始工资表':'训练Sheet'}, header_mapping:{'工号':'工号'}}}
+    });
+    const originalHtml = doc.getElementById('_compute_precheck_overlay').html;
+    assert.ok(originalHtml.includes('原始上传.xls &gt; 原始工资表'), '选择标签必须展示原始文件和真实 Sheet');
+    assert.ok(originalHtml.includes('value="source.xlsx &gt; 原始工资表 &gt; 工号"'), '提交值保留稳定身份，不受显示标签影响');
+    assert.ok(originalHtml.includes('data-source-sheet-detail'), '长文件名提供完整来源信息');
+    console.log('PASS: original upload labels and full source details preserve stable mapping identities');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 
 

@@ -5,6 +5,8 @@ let currentScriptId = '';
 let scriptsCache = [];          // 当前租户脚本列表（含 mode，供模板入口判断）
 let _filePasswordsMap = null;  // 文件名→密码映射
 let _encryptionCheckInProgress = false;  // 加密检测进行中
+let _encryptionCheckQueue = Promise.resolve();
+let _encryptionChecksPending = 0;
 let _currentEventSource = null;  // 当前 EventSource 连接
 let _lastEventId = 0;           // 最后收到的 SSE event id
 let _currentTaskId = null;      // 当前计算任务 ID
@@ -19,7 +21,7 @@ function _promptFilePasswords(encryptedFiles) {
         const inputs = encryptedFiles.map((name, i) =>
             `<div style="margin-bottom:10px;">
                 <label style="display:block;font-size:13px;margin-bottom:4px;color:#333;">
-                    <span style="color:#e65100;">🔒</span> ${name}
+                    <span style="color:#e65100;">🔒</span> ${_escapeHtml(name.startsWith('template::') ? '模板：' + name.slice(10) : '源文件：' + name)}
                 </label>
                 <input id="_enc_pwd_${i}" type="password" placeholder="请输入打开密码"
                     style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box;">
@@ -70,6 +72,8 @@ function _promptFilePasswords(encryptedFiles) {
  */
 function _precheckSummary(data) {
     const reasons = [];
+    if (data.mapping_notice) reasons.push(data.mapping_notice);
+    if (data.mapping_requires_confirmation) reasons.push('结构匹配未能确定全部来源，已结合脚本生成 AI 推荐，请确认文件、Sheet 和字段关系');
     const columns = (data.missing_columns || []).reduce((n, row) => n + (row.expected_columns || []).length, 0);
     if (columns) reasons.push(`待确认 ${columns} 列；没有对应列可保留“无匹配”继续。`);
     if ((data.missing_files || []).length) reasons.push(`缺失文件 ${data.missing_files.length} 个`);
@@ -104,6 +108,21 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
     }
     data = {...data, target_candidates: choices.target_candidates, rename_candidates: choices.rename_candidates};
     return new Promise((resolve) => {
+        // Labels describe the original upload; option values retain stable server identities.
+        const sourceIdentities = new Map((data.actual_sources || []).map(source =>
+            [JSON.stringify([source.file, source.sheet]), source]));
+        const sourceFileNames = new Map((data.actual_sources || []).map(source =>
+            [source.file, source.original_file || source.file]));
+        const sourceFileLabel = file => sourceFileNames.get(file) || file;
+        const sourceSheetLabel = value => {
+            const [file, sheet] = JSON.parse(value);
+            const source = sourceIdentities.get(value);
+            return `${source?.original_file || sourceFileLabel(file)} > ${source?.original_sheet || sheet}`;
+        };
+        const sourceColumnLabel = path => {
+            const parsed = _splitPath(path);
+            return parsed ? `${sourceSheetLabel(JSON.stringify([parsed.file, parsed.sheet]))} > ${parsed.col}` : path;
+        };
         const missingFiles = data.missing_files || [];
         const missingColumns = data.missing_columns || [];
         const suggestionMap = new Map((data.ai_suggestions || []).map(row => [row.expected_path, {...row}]));
@@ -114,9 +133,9 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
                 Object.entries(columns).forEach(([column, targetColumn]) => {
                     const expected_path = `${info.expected_file || file} > ${targetSheet} > ${targetColumn}`;
                     const suggested_path = `${file} > ${sheet} > ${column}`;
-                    suggestionMap.set(expected_path, {expected_path, suggested_path,
+                    suggestionMap.set(expected_path, {...suggestionMap.get(expected_path), expected_path, suggested_path,
                         confidence: expected_path === suggested_path ? 1 : null,
-                        reason: '已选择的匹配，可继续调整'});
+                        reason: suggestionMap.get(expected_path)?.reason || '已选择的匹配，可继续调整'});
                 });
             });
         });
@@ -169,11 +188,26 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
                 const p = _splitPath(row.suggested_path); return p ? JSON.stringify([p.file, p.sheet]) : null;
             }).filter(Boolean));
             const chosen = suggested.size === 1 ? [...suggested][0] : '';
-            return `<div style="margin:6px 0;"><label>${JSON.parse(key).map(_escapeHtml).join(' > ')}
-                <select data-source-sheet-key="${_escapeHtml(key)}" style="width:100%;padding:5px;">
-                <option value="">（选择源 Sheet；无匹配可跳过）</option>
-                ${sourceSheets.map(value => `<option value="${_escapeHtml(value)}"${value === chosen ? ' selected' : ''}>${JSON.parse(value).map(_escapeHtml).join(' > ')}</option>`).join('')}
-                </select></label></div>`;
+            const [expectedFile, expectedSheet] = JSON.parse(key);
+            const reasons = [...new Set(rows.map(row => row.sheet_reason || row.reason).filter(Boolean))].slice(0, 2);
+            const recommendation = chosen
+                ? `<div style="font-size:11px;color:#2e7d32;"><b>${rows.some(row => row.recommendation_source === 'ai') ? '✨ AI 推荐' : '✓ 初始对应'}：${_escapeHtml(sourceSheetLabel(chosen))}</b></div>
+                   ${reasons.map(reason => `<div style="font-size:11px;color:#666;margin-top:4px;overflow-wrap:anywhere;">${_escapeHtml(String(reason).slice(0, 300))}</div>`).join('')}`
+                : '<span style="font-size:11px;color:#e65100;">尚未确定唯一来源，请选择对应 Sheet；没有对应表可保留无匹配。</span>';
+            return `<tr>
+                <td style="padding:6px;border:1px solid #ffe0b2;vertical-align:top;overflow-wrap:anywhere;">
+                    <div style="font-family:monospace;font-size:12px;">${_escapeHtml(expectedFile)}</div>
+                    <div style="font-size:12px;color:#5d4037;margin-top:4px;">Sheet：<b>${_escapeHtml(expectedSheet)}</b></div>
+                </td>
+                <td style="padding:4px;border:1px solid #ffe0b2;vertical-align:top;">
+                    <select data-source-sheet-key="${_escapeHtml(key)}" aria-label="${_escapeHtml(expectedFile + ' > ' + expectedSheet + ' 对应的上传 Sheet')}" style="width:100%;min-width:0;padding:4px;font-size:11px;font-family:monospace;">
+                        <option value="">（无匹配，可跳过）</option>
+                        ${sourceSheets.map(value => `<option value="${_escapeHtml(value)}"${value === chosen ? ' selected' : ''}>${_escapeHtml(sourceSheetLabel(value))}</option>`).join('')}
+                    </select>
+                    <div data-source-sheet-detail style="font-size:11px;color:#5d4037;padding:5px 2px;white-space:normal;overflow-wrap:anywhere;">${chosen ? _escapeHtml(sourceSheetLabel(chosen)) : '请选择原始上传文件中的 Sheet'}</div>
+                </td>
+                <td style="padding:6px;border:1px solid #ffe0b2;vertical-align:top;overflow-wrap:anywhere;">${recommendation}</td>
+            </tr>`;
         }).join('');
         const renderMappingTable = rows => rows.length === 0
             ? '<div style="color:#999;font-size:13px;padding:8px;">无 AI 建议</div>'
@@ -201,7 +235,7 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
                         return p && groupSources.has(JSON.stringify([p.file, p.sheet]));
                     }) : actualPaths;
                     const options = ['<option value="">（无匹配，继续计算）</option>']
-                        .concat(availablePaths.map(p => `<option value="${_escapeHtml(p)}"${p === s.suggested_path ? ' selected' : ''}>${_escapeHtml(p)}</option>`))
+                        .concat(availablePaths.map(p => `<option value="${_escapeHtml(p)}"${p === s.suggested_path ? ' selected' : ''}>${_escapeHtml(sourceColumnLabel(p))}</option>`))
                         .join('');
                     return `<tr>
                         <td style="padding:6px;border:1px solid #e0e0e0;font-family:monospace;font-size:11px;">${_escapeHtml(s.expected_path || '')}</td>
@@ -253,7 +287,7 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
         // 自动改名块（高置信度组合评分匹配）
         const autoRenamedHtml = autoRenamed.length === 0 ? '' : `
             <div style="margin-bottom:14px;padding:10px 12px;border:1px solid #c8e6c9;background:#e8f5e9;border-radius:6px;">
-                <div style="font-weight:bold;color:#2e7d32;margin-bottom:6px;">✓ 已自动识别改名上传文件</div>
+                <div style="font-weight:bold;color:#2e7d32;margin-bottom:6px;">✓ 已自动识别文件对应关系（保留上传原名）</div>
                 <ul style="margin:0;padding-left:20px;font-size:12px;color:#1b5e20;">
                     ${autoRenamed.map(r => `<li>${_escapeHtml(r.from)} → <b>${_escapeHtml(r.to)}</b>${r.score != null ? ` <span style="color:#666;">(score=${r.score})</span>` : ''}</li>`).join('')}
                 </ul>
@@ -265,7 +299,7 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
             <div style="margin-bottom:14px;padding:10px 12px;border:1px solid #ffe0b2;background:#fff3e0;border-radius:6px;">
                 <div style="font-weight:bold;color:#e65100;margin-bottom:6px;">⚠ 上传文件名与训练期望不一致，请确认对应关系</div>
                 <div style="font-size:12px;color:#5d4037;margin-bottom:8px;">
-                    系统按"列头 + 文件名"组合评分给出候选；当多候选难以决断时，AI 会语义判断并标记 ✨ 推荐项（已默认选中），请核对或修改后确认。
+                    左侧保留原始上传文件名和 Sheet 信息，右侧选择训练时对应的文件。候选按结构与名称相似度排序；只有一个候选也不代表已匹配，请结合业务用途确认。
                 </div>
                 <table style="width:100%;border-collapse:collapse;font-size:12px;">
                     <thead><tr style="background:#fff8e1;">
@@ -293,7 +327,9 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
                             ? `<div style="font-size:11px;color:#2e7d32;"><b>✨ ${_escapeHtml(aiRec)}</b>${aiConf ? ` (置信度 ${aiConf})` : ''} <span style="color:#888;">[${recSource}]</span></div>${aiReason ? `<div style="font-size:11px;color:#666;margin-top:2px;">${_escapeHtml(aiReason)}</div>` : ''}`
                             : '<span style="color:#999;font-size:11px;">无</span>';
                         return `<tr>
-                            <td style="padding:6px;border:1px solid #ffe0b2;font-family:monospace;font-size:12px;vertical-align:top;">${_escapeHtml(rc.uploaded)}</td>
+                            <td style="padding:6px;border:1px solid #ffe0b2;font-family:monospace;font-size:12px;vertical-align:top;overflow-wrap:anywhere;">${_escapeHtml(sourceFileLabel(rc.uploaded))}
+                                <div style="font-size:11px;color:#666;margin-top:4px;">${(rc.uploaded_sheets || []).map(sheet => 'Sheet：' + _escapeHtml(sheet.name)).join('<br>')}</div>
+                            </td>
                             <td style="padding:4px;border:1px solid #ffe0b2;vertical-align:top;">
                                 <select data-rename-uploaded="${_escapeHtml(rc.uploaded)}" style="width:100%;padding:4px;font-size:11px;font-family:monospace;">${opts}</select>
                             </td>
@@ -372,9 +408,20 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
         // AI 建议块
         const aiSuggestionsHtml = `
             <div style="margin-bottom:14px;">
-                <div style="font-weight:bold;margin-bottom:6px;">源 Sheet 对应关系</div>
-                <div style="font-size:12px;color:#666;">先为每张训练源表选择一个上传 Sheet。选择后，下方字段立即切换到该 Sheet；同名字段自动对应，不同名字段保留可选。</div>
-                ${sourceSheetHtml}
+                ${sourceGroups.size ? `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid #ffe0b2;background:#fff3e0;border-radius:6px;">
+                    <div style="font-weight:bold;color:#e65100;margin-bottom:6px;">⚠ 源 Sheet 对应关系，请确认读取来源</div>
+                    <div style="font-size:12px;color:#5d4037;margin-bottom:8px;">左侧是训练期望名称，中间显示原始上传文件名和实际 Sheet 名，两者可以不同。下拉框下方展示完整来源；先确认文件，再确认 Sheet，最后核对字段。</div>
+                    <div style="overflow-x:auto;">
+                        <table style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:12px;">
+                            <thead><tr style="background:#fff8e1;">
+                                <th style="width:27%;padding:6px;border:1px solid #ffe0b2;text-align:left;">训练期望源表</th>
+                                <th style="width:38%;padding:6px;border:1px solid #ffe0b2;text-align:left;">对应上传文件 / Sheet</th>
+                                <th style="padding:6px;border:1px solid #ffe0b2;text-align:left;">推荐依据（供核对）</th>
+                            </tr></thead>
+                            <tbody>${sourceSheetHtml}</tbody>
+                        </table>
+                    </div>
+                </div>` : ''}
                 <div style="font-weight:bold;font-size:13px;margin-bottom:6px;color:#333;">源数据列匹配确认（优先检查变动项）</div>
                 <div style="font-size:12px;color:#666;margin-bottom:6px;">目标 Sheet 决定结果写入位置；这里决定读取哪个源文件的字段。源字段重复仍需单独处理。</div>
                 <div style="max-height:280px;overflow:auto;border:1px solid #e0e0e0;border-radius:4px;">${aiTableHtml}</div>
@@ -494,6 +541,8 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
         overlay.onchange = (e) => {
             if (!e.target?.matches) return;
             if (e.target.matches('select[data-source-sheet-key]')) {
+                const detail = e.target.parentElement?.querySelector('[data-source-sheet-detail]');
+                if (detail) detail.textContent = e.target.value ? sourceSheetLabel(e.target.value) : '未选择源 Sheet';
                 const fields = [...aiSelects()];
                 const current = new Map(fields.map(sel => [Number(sel.dataset.aiIdx), sel.value]));
                 const updates = _sourceSheetFieldUpdates(allExpectedRows, current,
@@ -502,7 +551,7 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
                     const sel = fields.find(field => Number(field.dataset.aiIdx) === update.index);
                     if (!sel) continue;
                     sel.innerHTML = '<option value="">（无匹配，继续计算）</option>' + update.options.map(path =>
-                        `<option value="${_escapeHtml(path)}"${path === update.value ? ' selected' : ''}>${_escapeHtml(path)}</option>`).join('');
+                        `<option value="${_escapeHtml(path)}"${path === update.value ? ' selected' : ''}>${_escapeHtml(sourceColumnLabel(path))}</option>`).join('');
                     sel.value = update.value;
                     sel.dataset.mappingEdited = '1';
                 }
@@ -921,10 +970,19 @@ async function _probeModernExcelEncryption(file) {
     return null;
 }
 
-async function _autoCheckEncryption(filesToCheck) {
-    const btn = document.getElementById('compute-btn');
+function _autoCheckEncryption(filesToCheck, role = 'source') {
+    const files = Array.from(filesToCheck || []);
+    if (!files.length) return Promise.resolve(true);
+    _encryptionChecksPending++;
+    _encryptionCheckInProgress = true;
+    checkCanCompute();
+    const result = _encryptionCheckQueue.then(() => _runEncryptionCheck(files, role));
+    _encryptionCheckQueue = result.catch(() => false);
+    return result;
+}
 
-    if (!filesToCheck || filesToCheck.length === 0) return;
+async function _runEncryptionCheck(filesToCheck, role) {
+    const btn = document.getElementById('compute-btn');
 
     _encryptionCheckInProgress = true;
     if (btn) {
@@ -955,7 +1013,8 @@ async function _autoCheckEncryption(filesToCheck) {
                 });
             }
         }
-        const missingPasswords = encrypted.filter(name => !(_filePasswordsMap || {})[name]);
+        const missingPasswords = encrypted.map(name => role === 'template' ? 'template::' + name : name)
+            .filter(name => !(_filePasswordsMap || {})[name]);
         if (missingPasswords.length > 0) {
             const passwords = await _promptFilePasswords(missingPasswords);
             if (passwords) {
@@ -968,10 +1027,11 @@ async function _autoCheckEncryption(filesToCheck) {
         alert('文件密码检测未完成，请重新选择文件后重试。');
         return false;
     } finally {
-        _encryptionCheckInProgress = false;
+        _encryptionChecksPending--;
+        _encryptionCheckInProgress = _encryptionChecksPending > 0;
         if (btn) {
-            btn.disabled = false;
-            btn.textContent = '开始计算';
+            btn.textContent = _encryptionCheckInProgress ? '检测文件中...' : '开始计算';
+            checkCanCompute();
         }
     }
 }
@@ -1006,8 +1066,10 @@ document.addEventListener('DOMContentLoaded', function() {
     // 文件选择事件
     document.getElementById('source-files').addEventListener('change', () => {
         // 数据源变更：清掉上一次计算的结果/任务/密码映射，避免旧状态污染本次计算的列映射
+        const templatePasswords = Object.fromEntries(Object.entries(_filePasswordsMap || {})
+            .filter(([key]) => key.startsWith('template::')));
         resetCompute();
-        _filePasswordsMap = null;
+        _filePasswordsMap = templatePasswords;
         updateFileList();
         checkCanCompute();
         _autoCheckEncryption(Array.from(document.getElementById('source-files').files));
@@ -1024,13 +1086,13 @@ document.addEventListener('DOMContentLoaded', function() {
     if (_tplInput) {
         _tplInput.addEventListener('change', function () {
             for (const file of Array.from(this.files || [])) {
-                if (_filePasswordsMap) delete _filePasswordsMap[file.name];
+                if (_filePasswordsMap) delete _filePasswordsMap['template::' + file.name];
             }
-            _autoCheckEncryption(Array.from(this.files || []));
+            _autoCheckEncryption(Array.from(this.files || []), 'template');
             const list = document.getElementById('template-file-list');
             if (!list) return;
             list.innerHTML = (this.files && this.files.length > 0)
-                ? `<div>${this.files[0].name}</div>` : '';
+                ? `<div>${_escapeHtml(this.files[0].name)}</div>` : '';
         });
     }
 
@@ -1263,7 +1325,7 @@ function checkCanCompute() {
     const hasFiles = document.getElementById('source-files').files.length > 0;
     const hasTenant = currentTenantId && currentScriptId;
     const allowed = !currentTenantId || !_permittedLoaded || _permittedTenantIds.has(currentTenantId);
-    btn.disabled = !(hasFiles && hasTenant && allowed);
+    btn.disabled = _encryptionCheckInProgress || !(hasFiles && hasTenant && allowed);
     if (!allowed) btn.title = '您无权操作此租户';
 }
 
@@ -1360,8 +1422,8 @@ async function startCompute() {
         return;
     }
 
-    const encryptionFiles = [...Array.from(files), ...Array.from(document.getElementById('template-file')?.files || [])];
-    if (!await _autoCheckEncryption(encryptionFiles)) return;
+    if (!await _autoCheckEncryption(files)) return;
+    if (!await _autoCheckEncryption(document.getElementById('template-file')?.files, 'template')) return;
     btn.disabled = true;
     btn.textContent = '计算中...';
     clearResult();
@@ -1473,7 +1535,7 @@ async function startCompute() {
 
             // 加密文件
             if (errorData && errorData.error_type === 'encrypted_files') {
-                addLog('warning', `检测到加密文件: ${errorData.encrypted_files.join(', ')}`);
+                addLog('warning', errorData.message || '文件需要有效密码，请重新输入');
                 const passwords = await _promptFilePasswords(errorData.encrypted_files);
                 if (!passwords) {
                     addLog('info', '用户取消了密码输入');

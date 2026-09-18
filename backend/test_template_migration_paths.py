@@ -45,3 +45,16 @@ class TemplateMigrationPathTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+def test_saved_crlf_script_keeps_explicit_continuation_valid(tmp_path):
+    from backend.storage.storage_manager import StorageManager
+    code = 'value = 1 + ' + chr(92) + '\r\n    2\r\n'
+    storage = StorageManager(str(tmp_path))
+    info = storage.save_script('tenant', code, {'success': True}, {})
+    for path in (tmp_path / 'tenant').rglob('*.py'):
+        raw = path.read_bytes()
+        assert b'\r\r\n' not in raw
+        compile(raw.decode('utf-8'), str(path), 'exec')
+    compile(storage.get_script_content('tenant', info['script_id']), 'loaded', 'exec')

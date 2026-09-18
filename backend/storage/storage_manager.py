@@ -109,7 +109,7 @@ class StorageManager:
 
         # 保存脚本文件
         script_file = scripts_dir / f"{script_id}.py"
-        with open(script_file, 'w', encoding='utf-8') as f:
+        with open(script_file, 'w', encoding='utf-8', newline='') as f:
             f.write(script_content)
 
         # 保存脚本信息
@@ -169,7 +169,7 @@ class StorageManager:
 
             # 保存脚本文件
             script_file = result_dir / f"{script_id}.py"
-            with open(script_file, 'w', encoding='utf-8') as f:
+            with open(script_file, 'w', encoding='utf-8', newline='') as f:
                 f.write(script_content)
 
             # 准备训练结果数据

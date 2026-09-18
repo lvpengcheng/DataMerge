@@ -806,7 +806,7 @@ def _persist_iteration_files(tenant_id: str, session_id: int, iteration_num: int
 
         # 保存脚本
         script_path = iter_dir / "script.py"
-        script_path.write_text(code, encoding="utf-8")
+        script_path.write_text(code, encoding="utf-8", newline="")
         paths["script_file"] = str(script_path)
 
         # 复制生成的 Excel
@@ -1934,7 +1934,7 @@ def main(source_dir, output_dir, **kwargs):
                     persist_dir = Path(_sm2.get_tenant_dir(tenant_id)) / "training_chat" / str(sid)
                     persist_dir.mkdir(parents=True, exist_ok=True)
                     script_path = persist_dir / f"iter_{iteration_num}_script.py"
-                    script_path.write_text(passthrough_code, encoding="utf-8")
+                    script_path.write_text(passthrough_code, encoding="utf-8", newline="")
                     saved_files["script_file"] = str(script_path)
                 except Exception as e:
                     logger.warning(f"直接导入持久化失败: {e}")
@@ -3384,6 +3384,7 @@ async def upload_code(
     code: str = Form(None),
     code_file: UploadFile = File(None),
     template_file: UploadFile = File(None),
+    template_password: str = Form(None),
     stream: bool = Form(False),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
@@ -3405,6 +3406,11 @@ async def upload_code(
             code_content = code
         else:
             raise HTTPException(status_code=400, detail="请提供代码内容或代码文件")
+
+        try:
+            compile(code_content, code_file.filename if code_file else '<uploaded_code>', 'exec')
+        except SyntaxError as exc:
+            raise HTTPException(status_code=422, detail=f"上传脚本语法错误：第 {exc.lineno} 行（{exc.msg}）") from exc
 
         # UploadFile belongs to the request; stage it before handing work to a
         # background task, which owns its database session and temporary files.
@@ -3433,7 +3439,8 @@ async def upload_code(
     def validate():
         with SessionLocal() as worker_db:
             return _validate_uploaded_code(
-                session_id, code_content, template_upload, user_id, worker_db, emit)
+                session_id, code_content, template_upload, user_id, worker_db, emit,
+                template_password=template_password)
 
     async def run():
         try:
@@ -3471,7 +3478,7 @@ async def upload_code(
     })
 
 
-def _validate_uploaded_code(session_id, code_content, template_upload, user_id, db, emit):
+def _validate_uploaded_code(session_id, code_content, template_upload, user_id, db, emit, template_password=None):
     """Run source parsing, sandbox validation and persistence off the event loop."""
     session = db.query(TrainingSession).filter_by(id=session_id).first()
     if not session:
@@ -3495,6 +3502,17 @@ def _validate_uploaded_code(session_id, code_content, template_upload, user_id, 
     # 这样以后智算按【名+哈希】也能命中；同时作为显式 override 传给本次验证，立即生效。
     _tpl_override = None
     if template_upload:
+        from ..utils.compute_ingest import prepare_source_dir
+        staged_path = Path(template_upload[0])
+        empty_sources = staged_path.parent / 'decrypt_sources'
+        empty_sources.mkdir(exist_ok=True)
+        blocked, plaintext_path = prepare_source_dir(
+            str(empty_sources), {'template::' + staged_path.name: template_password}, str(staged_path))
+        if blocked:
+            return {'success': False, 'error_type': 'encrypted_files',
+                    'encrypted_files': [template_upload[1]],
+                    'error': '模板需要有效密码（未提供密码或解密失败），请输入后重试'}
+        template_upload = (plaintext_path, template_upload[1])
         try:
             from ..utils.template_resolver import extract_template_ref
             from ..storage.storage_manager import StorageManager

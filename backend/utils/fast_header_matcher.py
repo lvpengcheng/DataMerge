@@ -804,27 +804,49 @@ class FastHeaderMatcher:
         train_sheets: List[Dict[str, Any]],
         input_sheets: List[Dict[str, Any]],
         ai_provider_name: Optional[str] = None,
+        matching_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """纯表头层匹配（无 Aspose、无 DataFrame）：规则匹配失败时尝试一次 AI 语义匹配。
 
         失败时在返回值里带 diagnostics（mapping_failed / actual_paths），
         供上层生成手动选择下拉，不需要再解析文件。
         """
-        match_result = self._match_by_training_base(train_sheets, input_sheets)
+        from .structural_source_mapping import match_structural_sources
+        if not train_sheets:
+            return self._match_by_training_base(train_sheets, input_sheets)
+        match_result = match_structural_sources(self, train_sheets, input_sheets)
         determined = match_result.get('determined') or []
         if not match_result['success'] and ai_provider_name:
             from .ai_source_mapping import match_sources_with_ai
             logger.info('[源数据映射] 快速匹配失败，尝试一次 AI 语义匹配')
             try:
                 match_result = match_sources_with_ai(self, train_sheets, input_sheets, ai_provider_name,
-                                                    match_result.get('determined'))
+                                                    match_result.get('determined'), matching_context)
+                match_result['match_method'] = 'ai'
+                match_result['needs_confirmation'] = True
                 logger.info('[源数据映射] AI 映射完整性校验通过，继续构建源数据')
             except Exception as exc:
-                match_result = {'success': False, 'error': f"{match_result['error']}；AI 匹配未通过: {exc}"}
+                import json
+                if isinstance(exc, TimeoutError):
+                    reason = 'AI 推荐请求超时'
+                elif 'AI_RESPONSE_TRUNCATED' in str(exc):
+                    reason = 'AI 推荐结果超出输出长度限制，返回内容不完整'
+                elif 'AI_RESPONSE_EMPTY' in str(exc):
+                    reason = 'AI 服务返回了空的推荐内容'
+                elif isinstance(exc, json.JSONDecodeError):
+                    reason = 'AI 推荐结果不是有效的 JSON'
+                elif isinstance(exc, ValueError):
+                    reason = 'AI 推荐包含无效或冲突的文件、Sheet、字段关系'
+                else:
+                    reason = 'AI 推荐服务调用失败'
+                logger.warning('[源数据映射] provider=%s 推荐失败: %s (%s)',
+                               ai_provider_name, reason, type(exc).__name__)
+                match_result = {'success': False, 'ai_failure_reason': reason,
+                                'error': f"{match_result['error']}；AI 匹配未通过: {exc}"}
         if not match_result['success']:
             # Missing optional sheets must not erase already resolved sources.
             if determined:
-                match_result['mapping'] = {'file_mapping': self._build_file_mapping(determined)}
+                match_result.setdefault('mapping', {'file_mapping': self._build_file_mapping(determined)})
             match_result.setdefault('diagnostics', {
                 'mapping_failed': True,
                 'actual_paths': [f"{s['file_name']} > {s['sheet_name']} > {col}"

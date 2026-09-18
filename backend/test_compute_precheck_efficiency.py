@@ -41,6 +41,7 @@ def test_refresh_confirmation_never_dispatches_calculation(tmp_path, monkeypatch
         calls.append(True)
         return {'started': True}
     namespace = {'asyncio': asyncio,
+                 '_resolve_compute_ai_provider': lambda: 'deepseek',
                  '_get_compute_session': lambda *args: {'temp_dir': str(tmp_path), 'params': {}},
                  '_compute_pending_payload': lambda pc, session: {'session_id': session},
                  '_dispatch_compute_task': dispatch,
@@ -48,8 +49,12 @@ def test_refresh_confirmation_never_dispatches_calculation(tmp_path, monkeypatch
     module = ast.fix_missing_locations(ast.Module(body=[endpoint], type_ignores=[]))
     exec(compile(module, str(source), 'exec'), namespace)
     monkeypatch.setattr(compute_ingest, 'ingest_ready', lambda *args: True)
-    monkeypatch.setattr(compute_ingest, 'read_meta', lambda *args: object())
-    monkeypatch.setattr(compute_ingest, 'resolve_with_confirmations', lambda *args, **kwargs: PrecheckResult(ok=True))
+    from types import SimpleNamespace
+    monkeypatch.setattr(compute_ingest, 'read_meta', lambda *args: SimpleNamespace(ai_provider_name='claude'))
+    def resolve(meta, **kwargs):
+        assert meta.ai_provider_name == 'deepseek'
+        return PrecheckResult(ok=True)
+    monkeypatch.setattr(compute_ingest, 'resolve_with_confirmations', resolve)
     fn = namespace['compute_session_confirm']
     refreshed = asyncio.run(fn('s1', {'refresh_only': True, 'confirmed_target_map': {'当月2': '202608(2)'}}))
     assert refreshed['mapping_refreshed'] is True
@@ -102,7 +107,7 @@ def test_structure_defaults_reject_unrelated_columns():
 
 @pytest.mark.parametrize('mapping_failed', [False, True])
 def test_empty_confirmation_still_validates_once_in_existing_worker(monkeypatch, tmp_path, mapping_failed):
-    """空确认封装不算通过；源文件只解析一次；诊断可用时不阻断、只记 warning。"""
+    """空确认封装不算通过；源文件只解析一次；匹配失败须确认而非原文件直通。"""
     from backend.utils import compute_precheck as pre, source_auto_filler as filler
     from backend.utils.fast_header_matcher import FastHeaderMatcher
     (tmp_path / 'input.xlsx').touch()
@@ -126,9 +131,7 @@ def test_empty_confirmation_still_validates_once_in_existing_worker(monkeypatch,
     result = pre.precheck_compute(str(tmp_path), {'files': {'train.xlsx': {'sheets': {'S': {'headers': {'编号': 'A'}}}}}},
         None, '', 'test', None, None, None, confirmed_mapping={'file_mapping': {}},
         ai_provider_name='claude', in_worker=True)
-    assert result.ok == mapping_failed and len(parses) == 1
-    if mapping_failed:
-        assert result._source_mapping_warning == 'not matched'
+    assert not result.ok and len(parses) == 1
     assert result.actual_paths == ['input.xlsx > Sheet > ID']
 
 

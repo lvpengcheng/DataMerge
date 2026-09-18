@@ -1350,7 +1350,10 @@ if __name__ == "__main__":
 
     def chat(self, messages: List[Dict[str, str]], **kwargs) -> str:
         """对话接口"""
-        content, _ = self._openai_chat(messages, **kwargs)
+        require_complete = kwargs.pop('require_complete', False)
+        content, finish_reason = self._openai_chat(messages, **kwargs)
+        if require_complete and finish_reason == 'length':
+            raise ValueError('AI_RESPONSE_TRUNCATED: AI 输出达到长度上限，结果不完整')
         return content
 
     def chat_stream(self, messages: List[Dict[str, str]], chunk_callback: callable = None,
@@ -2471,7 +2474,7 @@ _ai_call_executor = futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix
 
 
 def chat_with_timeout(provider: BaseAIProvider, messages: List[Dict[str, Any]],
-                      timeout: Optional[int] = None, **kwargs) -> Any:
+                      timeout: Optional[int] = None, raise_on_error: bool = False, **kwargs) -> Any:
     """带总超时的 AI 调用：超时/异常返回 None（调用方降级，不阻断主流程）。
 
     timeout 默认读 .env PRECHECK_AI_TIMEOUT（默认 60s）。用于智算 precheck 的
@@ -2489,9 +2492,14 @@ def chat_with_timeout(provider: BaseAIProvider, messages: List[Dict[str, Any]],
     except futures.TimeoutError:
         logging.getLogger(__name__).warning(
             f"[AI超时] {type(provider).__name__} 调用超过 {_timeout}s，跳过本次 AI 环节")
+        fut.cancel()
+        if raise_on_error:
+            raise TimeoutError(f'AI 匹配调用超过 {_timeout}s') from None
         return None
     except Exception as e:
         logging.getLogger(__name__).warning(f"[AI超时] 调用失败: {e}")
+        if raise_on_error:
+            raise
         return None
 
 

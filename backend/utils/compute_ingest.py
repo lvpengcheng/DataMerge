@@ -16,6 +16,7 @@
 """
 
 import os
+import json
 import pickle
 import logging
 import tempfile
@@ -26,7 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 # 解析逻辑或产物结构变化时 +1，旧会话产物自动失效
-INGEST_VERSION = 2
+INGEST_VERSION = 4
 
 _META_NAME = "_ingest_meta.pkl"
 _SOURCES_NAME = "_ingest_sources.pkl"
@@ -122,12 +123,19 @@ def prepare_source_dir(
     from backend.utils.aspose_helper import decrypt_excel
     from backend.utils.source_normalizer import convert_xls_to_xlsx
 
-    passwords_dict = passwords_dict or {}
+    passwords_dict = dict(passwords_dict or {})
     src = Path(source_dir)
+    names_path = src / '_upload_names.json'
+    original_names = json.loads(names_path.read_text(encoding='utf-8')) if names_path.exists() else {}
     candidates = [(str(fp.resolve()), fp.name) for fp in src.iterdir()
                   if fp.is_file() and fp.suffix.lower() in _EXCEL_EXTS]
     if template_override_path:
-        candidates.append((template_override_path, Path(template_override_path).name))
+        template_name = Path(template_override_path).name
+        template_key = 'template::' + template_name
+        # Older clients used bare names; do not reuse a source password for a same-named template.
+        if template_key not in passwords_dict and not any(name == template_name for _, name in candidates):
+            passwords_dict[template_key] = passwords_dict.get(template_name)
+        candidates.append((template_override_path, template_key))
 
     encrypted_names = set(detect_encrypted_files(candidates))
     blocked = [name for name in encrypted_names if not passwords_dict.get(name)]
@@ -136,12 +144,31 @@ def prepare_source_dir(
 
     for path, name in candidates:
         if name in encrypted_names:
-            decrypted = decrypt_excel(path, password=passwords_dict.get(name))
-            shutil.move(decrypted, path)
+            decrypted = None
+            try:
+                decrypted = decrypt_excel(path, password=passwords_dict.get(name))
+                if detect_encrypted_files([(decrypted, name)]):
+                    blocked.append(name)
+                    continue
+                shutil.move(decrypted, path)
+            except Exception:
+                # Return to the password dialog without exposing passwords or losing the upload.
+                blocked.append(name)
+            finally:
+                if decrypted and Path(decrypted).resolve() != Path(path).resolve():
+                    Path(decrypted).unlink(missing_ok=True)
+    if blocked:
+        return blocked, template_override_path
 
     for fp in list(src.iterdir()):
         if fp.is_file() and fp.suffix.lower() == ".xls":
-            convert_xls_to_xlsx(str(fp.resolve()))
+            # A separately uploaded .xlsx with the same stem must not be overwritten.
+            if fp.with_suffix('.xlsx').exists():
+                continue
+            converted = Path(convert_xls_to_xlsx(str(fp.resolve())))
+            if converted.name != fp.name:
+                original_names[converted.name] = original_names.get(fp.name, fp.name)
+    names_path.write_text(json.dumps(original_names, ensure_ascii=False), encoding='utf-8')
     if template_override_path:
         template_override_path = convert_xls_to_xlsx(template_override_path)
     return [], template_override_path
@@ -185,16 +212,7 @@ def ingest_source_dir(
     meta.manual_headers = manual_headers
     meta.expected_structure = expected_structure
 
-    # 步骤 0：用户此前确认过的改名先落地（legacy 全量重传路径会带上）
-    if confirmed_renames:
-        try:
-            from .source_auto_filler import apply_confirmed_renames
-            applied = apply_confirmed_renames(source_dir, confirmed_renames)
-            if applied:
-                meta.auto_renamed.extend(applied)
-        except Exception as e:
-            logger.warning(f"[Ingest] 应用 confirmed_renames 失败: {e}", exc_info=True)
-
+    # 人工文件关系也只作为约束，禁止覆盖上传文件名。
     meta.multi_sheet_source = bool(FastHeaderMatcher._infer_multi_sheet_source(structure))
     meta.train_sheets = matcher._build_training_sheets(structure)
 
@@ -211,40 +229,21 @@ def ingest_source_dir(
             logger.error(f"[Ingest] 解析源文件失败: {e}", exc_info=True)
             return meta, {}
     meta.signatures = _signatures_from_sheets(input_sheets)
+    names_path = Path(source_dir) / '_upload_names.json'
+    original_names = json.loads(names_path.read_text(encoding='utf-8')) if names_path.exists() else {}
+    for sheet in input_sheets:
+        sheet['original_file_name'] = original_names.get(sheet['file_name'], sheet['file_name'])
+        sheet['original_sheet_name'] = sheet['sheet_name']
 
-    # 步骤 2：改名评分（复用步骤 1 的表头，不再打开文件）
-    try:
-        from .source_auto_filler import (
-            auto_rename_uploaded_by_combined_score, ai_disambiguate_rename_candidates,
-        )
-        renamed, ambiguous, uploaded_headers_map = auto_rename_uploaded_by_combined_score(
-            source_dir=source_dir,
-            source_structure=structure,
-            salary_year=salary_year,
-            salary_month=salary_month,
-            uploaded_signatures=meta.signatures,
-        )
-        if renamed:
-            meta.auto_renamed.extend(renamed)
-            # 物理改名后同步内存里的路径/文件名，保证 parsed_sheets_map 键与映射一致
-            input_sheets, parsed_sheets_map = _remap_after_rename(
-                source_dir, renamed, input_sheets, parsed_sheets_map)
-            meta.signatures = _signatures_from_sheets(input_sheets)
-        if ambiguous and ai_provider_name:
-            try:
-                ambiguous = ai_disambiguate_rename_candidates(
-                    ambiguous=ambiguous,
-                    source_structure=structure,
-                    uploaded_headers_map=uploaded_headers_map,
-                    ai_provider_name=ai_provider_name,
-                )
-            except Exception as ai_err:
-                logger.warning(f"[Ingest] AI 改名裁决失败（不阻断）: {ai_err}", exc_info=True)
-        meta.rename_candidates = ambiguous or []
-        if meta.rename_candidates:
-            logger.warning(f"[Ingest] 改名候选需用户确认: {[c.get('uploaded') for c in meta.rename_candidates]}")
-    except Exception as e:
-        logger.warning(f"[Ingest] 自动改名评分异常: {e}", exc_info=True)
+    # 文件名、Sheet 名改变不应先触发 AI。完整结构能唯一确定时直接复用。
+    structural = matcher.match_headers_only(meta.train_sheets, input_sheets)
+    structural_files = {info['expected_file'] for info in
+                        (structural.get('mapping') or {}).get('file_mapping', {}).values()}
+    if not structural['success']:
+        from .structural_source_mapping import suggest_file_relations
+        meta.auto_renamed, meta.rename_candidates = suggest_file_relations(
+            meta.train_sheets, input_sheets,
+            (structural.get('mapping') or {}).get('file_mapping') or {}, salary_year, salary_month)
 
     # 步骤 3：基础资料兜底；改名候选可能占用的期望名不参与兜底（避免覆盖用户文件）
     if db_session is not None and tenant_id:
@@ -255,7 +254,9 @@ def ingest_source_dir(
                 source_structure=structure,
                 tenant_id=tenant_id,
                 db_session=db_session,
-                assume_present=meta.candidate_targets(),
+                assume_present=(meta.candidate_targets() | structural_files |
+                                {r['to'] for r in meta.auto_renamed} |
+                                {v for v in (confirmed_renames or {}).values() if v}),
             )
             meta.auto_filled = filled or []
             meta.missing_files = list(still_missing or [])
@@ -312,6 +313,10 @@ def resolve_with_confirmations(
     from .fast_header_matcher import FastHeaderMatcher
 
     result = PrecheckResult()
+    result.actual_sources = [{'file': s['file_name'], 'sheet': s['sheet_name'],
+                              'original_file': s.get('original_file_name', s['file_name']),
+                              'original_sheet': s.get('original_sheet_name', s['sheet_name'])}
+                             for s in meta.input_sheets]
     from .confirmed_source_mapping import fully_unmatched_sheets
     result.unmatched_columns = list((confirmed_mapping or {}).get('unmatched_columns', []))
     unmatched_sheets = fully_unmatched_sheets(meta.source_structure, result.unmatched_columns)
@@ -335,8 +340,8 @@ def resolve_with_confirmations(
         return result
 
     # 改名：用户确认优先，未确认则用最高分候选试探（同时把候选继续报给前端）
-    probe = meta.rename_probe()
-    effective_renames = dict(probe)
+    # 未确认的名称候选不能伪装成同名文件，干扰结构优先级或 AI 判断。
+    effective_renames = {r['from']: r['to'] for r in meta.auto_renamed if r.get('decision') == 'period_role'}
     _raw_renames = confirmed_renames or {}
     _decided_files = {str(k) for k in _raw_renames.keys() if k}
     confirmed_renames = {str(k): str(v) for k, v in _raw_renames.items() if k and str(v).strip()}
@@ -386,19 +391,33 @@ def resolve_with_confirmations(
     # Leave unconfirmed probes free to participate in normal automatic matching.
     for sheet in virtual_sheets:
         actual_file = os.path.basename(sheet['file_path'])
-        if actual_file in confirmed_renames:
-            sheet['_confirmed_file'] = confirmed_renames[actual_file]
+        # Matching keys and AI suggestions must retain the physical upload identity.
+        sheet['file_name'] = actual_file
+        if actual_file in effective_renames:
+            sheet['_confirmed_file'] = effective_renames[actual_file]
     if (locked or result.unmatched_columns) and not train_remaining:
         match_result = {"success": True, "mapping": {"file_mapping": {}}}
     elif not virtual_sheets:
         match_result = {"success": False, "error": "上传的文件无法读取或为空"}
     elif train_remaining:
         match_result = FastHeaderMatcher().match_headers_only(
-            train_remaining, virtual_sheets, meta.ai_provider_name)
+            train_remaining, virtual_sheets, meta.ai_provider_name,
+            {'script_content': script_content or '',
+             'template_name': os.path.basename(template_override_path or ''),
+             'target_sheets': list((meta.expected_structure or {}).get('sheets', {})),
+             'target_columns': {name: list(info.get('headers') or {}) for name, info in
+                                (meta.expected_structure or {}).get('sheets', {}).items()
+                                if isinstance(info, dict)},
+             'original_file_names': meta.auto_renamed})
     else:
         match_result = {"success": True, "mapping": {"file_mapping": {}}}
     composed = _compose_file_mapping(
         (match_result.get("mapping") or {}).get("file_mapping") or {}, xlate)
+    if 'AI 匹配未通过' in (match_result.get('error') or ''):
+        result.mapping_notice = ((match_result.get('ai_failure_reason') or 'AI 推荐未通过校验')
+                                 + '；已保留程序匹配结果，其余来源请确认。')
+    elif not match_result.get('success') and match_result.get('match_method') == 'ai':
+        result.mapping_notice = 'AI 已保留能够确定的匹配；剩余缺失或不确定的来源、字段请确认。'
     if locked:
         composed = apply_confirmed_mapping(meta, composed, confirmed_mapping)
         # 文件/Sheet 已被明确指定后，同文件的改名候选不再重复询问。
@@ -407,6 +426,11 @@ def resolve_with_confirmations(
         result.missing_files = [f for f in result.missing_files if f not in mapped_files]
         result.ok = not (result.rename_candidates or result.missing_files)
     if composed:
+        # 已由结构或语义匹配解决的来源不再因旧的文件名候选重复弹窗。
+        result.rename_candidates = [c for c in result.rename_candidates if c.get('uploaded') not in composed]
+        mapped_files = {info['expected_file'] for info in composed.values()}
+        result.missing_files = [f for f in result.missing_files if f not in mapped_files]
+        result.ok = not (result.rename_candidates or result.missing_files)
         result.file_mapping = composed
         covered = {(info['expected_file'], sheet) for info in composed.values()
                    for sheet in info.get('sheet_mapping', {}).values()}
@@ -443,22 +467,21 @@ def resolve_with_confirmations(
                                    if any(o.get('expected') not in _skipped_files for o in c.get('candidates', []))]
         result.ok = not (result.rename_candidates or result.missing_files)
     else:
-        # 与旧流程完全一致：匹配未通过但拿到了实际列清单时**不阻断**，
-        # 记 warning 并用原文件继续算（大量用户场景下列名只是多/少几列）；
-        # 只有连列清单都拿不到（解析失败/无训练基准）才判定为不可计算。
+        # 未确定的来源必须先确认，不能静默把未匹配文件交给脚本猜测。
         diagnostics = match_result.get("diagnostics") or {}
-        raw_fallback = bool(diagnostics.get("mapping_failed")) and not confirmed_mapping
-        if raw_fallback:
-            result._source_mapping_warning = match_result.get("error")
-            logger.warning("[Ingest] 映射未通过，将使用原文件继续计算: %s", match_result.get("error"))
-        else:
-            result.ok = False
+        result.ok = False
         result.actual_paths = diagnostics.get("actual_paths") or _actual_paths(meta.input_sheets)
         missing = _extract_missing_columns(
             meta.source_structure, [s["file_path"] for s in meta.input_sheets],
             match_result.get("error"))
         result.missing_columns = missing
         result.ai_suggestions = _suggest_structural_columns(missing, result.actual_paths)
+
+    if match_result.get('needs_confirmation'):
+        result.ok = False
+        result.mapping_requires_confirmation = True
+        result.actual_paths = _actual_paths(meta.input_sheets)
+        result.ai_suggestions.extend(match_result.get('ai_suggestions') or [])
 
     if not skip_history_check:
         _check_history(script_content, tenant_id, salary_year, salary_month, result, use_history)
@@ -564,6 +587,8 @@ def _build_virtual_sheets(
             "file_path": s["file_path"],
             "sheet_name": v_sheet,
             "headers": v_headers,
+            "original_file_name": s.get('original_file_name', actual_name),
+            "original_sheet_name": s.get('original_sheet_name', s['sheet_name']),
         })
     return virtual, xlate
 

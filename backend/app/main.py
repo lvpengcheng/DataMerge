@@ -3849,6 +3849,14 @@ def _resolve_enabled_ai_provider(preferred: Optional[str]) -> Optional[str]:
     return preferred if preferred in enabled else None
 
 
+def _resolve_compute_ai_provider() -> Optional[str]:
+    """匹配使用当前配置，不继承训练脚本或会话缓存中的模型。"""
+    from dotenv import dotenv_values
+    configured = dotenv_values(Path(__file__).resolve().parents[2] / '.env').get('AI_PROVIDER')
+    preferred = (configured or os.environ.get('AI_PROVIDER') or 'deepseek').strip().lower()
+    return _resolve_enabled_ai_provider(preferred)
+
+
 def _load_script_info_for_precheck(tenant_id: str, script_id: str) -> dict:
     """加载脚本元数据（source_structure / manual_headers / use_history），事前校验时使用。
 
@@ -4860,8 +4868,7 @@ async def run_compute_task(
                                         source_structure=source_structure, input_files=input_files,
                                         manual_headers=manual_headers, output_dir=str(source_dir),
                                         expected_structure=expected_structure,
-                                        ai_provider_name=_resolve_enabled_ai_provider(
-                                            _script_info.get('ai_provider') or os.getenv('AI_PROVIDER', 'deepseek'))))
+                                        ai_provider_name=_resolve_compute_ai_provider()))
                         _single_parse_ok = True
                     except Exception as _sp_err:
                         if pre_validated_mapping:
@@ -5040,7 +5047,7 @@ async def run_compute_task(
 
         # 保存脚本
         script_path = temp_dir / f"{script_id}.py"
-        script_path.write_text(script_content, encoding='utf-8')
+        script_path.write_text(script_content, encoding='utf-8', newline='')
 
         # 执行脚本
         output_dir = temp_dir / "output"
@@ -5554,7 +5561,10 @@ def _compute_pending_payload(pc_result, session_id: Optional[str] = None) -> dic
         "rename_candidates": pc_result.rename_candidates,
         "missing_columns": pc_result.missing_columns,
         "ai_suggestions": pc_result.ai_suggestions,
+        "mapping_requires_confirmation": pc_result.mapping_requires_confirmation,
+        "mapping_notice": pc_result.mapping_notice,
         "actual_paths": pc_result.actual_paths,
+        "actual_sources": pc_result.actual_sources,
         "history_warnings": pc_result.history_warnings,
         "target_candidates": pc_result.target_candidates,
         "file_mapping": pc_result.file_mapping,
@@ -5646,8 +5656,7 @@ def _compute_upload_precheck_subprocess(payload: dict) -> dict:
             salary_year=payload.get("salary_year"),
             salary_month=payload.get("salary_month"),
             db_session=db,
-            ai_provider_name=_resolve_enabled_ai_provider(
-                payload.get("ai_provider_name") or os.environ.get("AI_PROVIDER", "deepseek")),
+            ai_provider_name=_resolve_compute_ai_provider(),
             confirmed_mapping=payload.get("confirmed_mapping"),
             confirmed_renames=payload.get("confirmed_renames"),
             use_history=payload.get("use_history"),
@@ -5708,6 +5717,12 @@ async def compute_submit(
         script_content = storage_manager.get_script_content(tenant_id, script_id)
         if not script_content:
             raise HTTPException(status_code=404, detail=f"脚本不存在: {script_id}")
+
+        try:
+            compile(script_content, f"{script_id}.py", "exec")
+        except SyntaxError as exc:
+            raise HTTPException(status_code=422, detail=(
+                f"脚本语法错误：{script_id}.py 第 {exc.lineno} 行（{exc.msg}）。请修正脚本后再匹配和计算。")) from exc
 
         # 2. 保存文件到临时目录
         temp_dir = Path(tempfile.mkdtemp(prefix="compute_"))
@@ -5806,7 +5821,7 @@ async def compute_submit(
             "use_history": _use_history_flag, "expected_structure": _expected_structure,
             "confirmed_target_map": _confirmed_target_map,
             "skipped_missing_files": _skipped_missing,
-            "ai_provider_name": _script_info.get("ai_provider"),
+            "ai_provider_name": _resolve_compute_ai_provider(),
             "session_dir": str(temp_dir),
         }
         async def _finish_compute_submission():
@@ -5833,7 +5848,7 @@ async def compute_submit(
                     shutil.rmtree(temp_dir, ignore_errors=True)
                     return {"error_type": "encrypted_files",
                             "encrypted_files": _pre["encrypted_files"],
-                            "message": f"检测到加密文件: {', '.join(_pre['encrypted_files'])}"}
+                            "message": "文件需要有效密码（未提供密码或解密失败），请重新输入"}
 
                 pc_result = _pre["pc_result"]
                 _session = _register_compute_session(tenant_id, script_id, temp_dir, {
@@ -5847,7 +5862,7 @@ async def compute_submit(
                     "confirmed_mapping": _confirmed, "confirmed_renames": _confirmed_renames,
                     "confirmed_target_map": _confirmed_target_map, "skipped_missing_files": _skipped_missing,
                     "skip_history_check": skip_history_check,
-                    "ai_provider_name": _script_info.get("ai_provider"),
+                    "ai_provider_name": _pre_payload["ai_provider_name"],
                 })
 
                 if (not pc_result.ok) or (pc_result.history_warnings and not skip_history_check):
@@ -5920,6 +5935,7 @@ async def compute_session_confirm(
         return {"error_type": "session_expired", "message": "计算会话已过期，请重新提交文件"}
 
     from backend.utils.confirmed_source_mapping import save_confirmation_state
+    meta.ai_provider_name = await asyncio.to_thread(_resolve_compute_ai_provider)
     try:
         body = await asyncio.to_thread(save_confirmation_state, sess['temp_dir'], body, sess['params'])
     except ValueError as exc:
@@ -6411,7 +6427,7 @@ async def compute_with_script_stream(
 
                     # 保存脚本
                     script_path = temp_dir / f"{script_id}.py"
-                    script_path.write_text(script_content, encoding='utf-8')
+                    script_path.write_text(script_content, encoding='utf-8', newline='')
 
                     # 执行脚本
                     output_dir = temp_dir / "output"
@@ -6812,7 +6828,7 @@ async def compute_with_script(
 
                 # 保存脚本
                 script_path = temp_dir / f"{script_id}.py"
-                script_path.write_text(script_content, encoding='utf-8')
+                script_path.write_text(script_content, encoding='utf-8', newline='')
 
                 output_dir = temp_dir / "output"
                 output_dir.mkdir(parents=True, exist_ok=True)

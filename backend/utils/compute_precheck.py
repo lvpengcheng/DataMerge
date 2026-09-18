@@ -39,8 +39,11 @@ class PrecheckResult:
     rename_candidates: List[Dict[str, Any]] = field(default_factory=list)
     missing_columns: List[Dict[str, Any]] = field(default_factory=list)
     ai_suggestions: List[Dict[str, Any]] = field(default_factory=list)
+    mapping_requires_confirmation: bool = False
+    mapping_notice: str = ''
     # 上传文件的实际列路径全集（file > sheet > col），供前端手动选择下拉全量列出
     actual_paths: List[str] = field(default_factory=list)
+    actual_sources: List[Dict[str, str]] = field(default_factory=list)
     history_warnings: List[str] = field(default_factory=list)
     # 目标模板表（②模板目标侧）：歧义时的候选，交前端人工选择；确认后的映射透传给计算
     target_candidates: List[Dict[str, Any]] = field(default_factory=list)
