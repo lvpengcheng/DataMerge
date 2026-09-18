@@ -188,7 +188,7 @@ def test_training_prompt_retains_evidence_even_over_recommended_size():
     structure = {'sheets': {'结果': {'headers': {'工资': 'A'}, 'formulas': {'A2': '=B2*2'},
                                   'data_sample': [{'A': 123}], 'column_schemas': {'工资': {'field_type': 'decimal'}}}}}
     result = PromptGenerator()._compress_structure(structure, max_length=20)
-    assert '=B2*2' in result and '123' in result and 'decimal' in result
+    assert '=B2*2' in result and '[已脱敏]' in result and '123' not in result and 'decimal' in result
 
 
 def function_namespace(code, extra=None):

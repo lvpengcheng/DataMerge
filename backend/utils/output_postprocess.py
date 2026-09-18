@@ -259,6 +259,32 @@ def _apply_expected_schemas_in_workbook(wb, structure):
                 cell.SetStyle(style)
 
 
+def _sheet_summary_from_workbook(wb) -> list:
+    """在已打开的工作簿上取每个 sheet 的行数/列数/表头（display-only 元数据）。
+
+    表头取前 10 行里第一个非空单元 >= 2 的行；列数用 MaxDataColumn
+    （MaxColumn 会被空白带样式列撑高）。
+    """
+    summary = []
+    for index in range(wb.Worksheets.Count):
+        ws = wb.Worksheets[index]
+        cells = ws.Cells
+        max_row = cells.MaxDataRow
+        max_col = cells.MaxDataColumn
+        headers = []
+        for row in range(0, min(max_row, 9) + 1):
+            values = []
+            for col in range(0, min(max_col, 49) + 1):
+                value = cells[row, col].StringValue
+                values.append(str(value).strip() if value is not None else "")
+            if sum(1 for v in values if v) >= 2:
+                headers = [v for v in values if v]
+                break
+        summary.append({"sheet_name": str(ws.Name), "rows": max_row + 1,
+                        "cols": max_col + 1, "headers": headers[:50]})
+    return summary
+
+
 def finalize_output_workbook(output_path, template_path=None, expected_structure=None,
                              script_code=None, sheet_name_map=None):
     """One output open, repairs in memory, one calculation and one atomic final save.
@@ -300,13 +326,15 @@ def finalize_output_workbook(output_path, template_path=None, expected_structure
         wb.Settings.ReCalculateOnOpen = True
         wb.CalculateFormula()  # failure propagates; never publish a partial calculation
         rows = sum(wb.Worksheets[i].Cells.MaxDataRow + 1 for i in range(wb.Worksheets.Count))
+        # 顺带产出资产登记用的表头摘要：本会话已把工作簿打开着，登记时不必再开一次
+        summary = _sheet_summary_from_workbook(wb)
         fd, staged = tempfile.mkstemp(prefix=".final_", suffix=os.path.splitext(str(output_path))[1],
                                       dir=os.path.dirname(os.path.abspath(str(output_path))))
         os.close(fd)
         wb.Save(staged)
         os.replace(staged, output_path)
         staged = None
-        return {"calculated": True, "rows_processed": rows}
+        return {"calculated": True, "rows_processed": rows, "sheet_summary": summary}
     finally:
         _workbook_session.reset(token)
         session.close()

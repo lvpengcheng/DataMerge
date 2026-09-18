@@ -21,8 +21,10 @@ def _signature(source_dir, context):
                 except ValueError:
                     break
         return value
-    canonical = json.dumps([files, [normalize(x) for x in context]], sort_keys=True,
-                           ensure_ascii=False, default=str).encode("utf-8")
+    # 解析逻辑/产物结构变化时（INGEST_VERSION 递增）旧缓存自动失效
+    from .compute_ingest import INGEST_VERSION
+    canonical = json.dumps([files, [normalize(x) for x in context], INGEST_VERSION],
+                           sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
 
 

@@ -116,6 +116,7 @@ def write_source_dataframe(ws, df, column_schemas=None, column_formats=None, hea
     """一次遍历写源表；固定列策略，避免反复 ws['A'] 扫描整个工作表计算边界。"""
     import pandas as pd
     from openpyxl.styles import Font
+    from openpyxl.styles.numbers import is_date_format
     from backend.utils.data_helpers import _schema_text_value
 
     schemas, formats = column_schemas or {}, column_formats or {}
@@ -123,8 +124,12 @@ def write_source_dataframe(ws, df, column_schemas=None, column_formats=None, hea
     for name in df.columns:
         schema = schemas.get(name) or {}
         kind = schema.get('field_type')
-        is_date = kind in ('date', 'datetime') or (not kind and is_date_keyword_column(name))
+        is_date = kind in ('date', 'datetime') or is_date_keyword_column(name)
         fmt = schema.get('number_format') or formats.get(name) or ('yyyy-mm-dd' if is_date else 'General')
+        if is_date and not is_date_format(fmt):
+            source_fmt = formats.get(name)
+            fmt = source_fmt if source_fmt and is_date_format(source_fmt) else (
+                'yyyy-mm-dd hh:mm:ss' if kind == 'datetime' else 'yyyy-mm-dd')
         policies.append((kind, is_date, fmt))
     ws.append(list(df.columns))
     bold = Font(bold=True)
@@ -148,7 +153,7 @@ def write_source_dataframe(ws, df, column_schemas=None, column_formats=None, hea
             # 源数据的文本（包括 = 开头的说明）不得变成新增的可执行公式。
             if isinstance(value, str):
                 cell.data_type = 's'
-                if kind == 'text' or is_long_digit_text(value):
+                if (kind == 'text' and not is_date) or is_long_digit_text(value):
                     cell.number_format = '@'
 
 

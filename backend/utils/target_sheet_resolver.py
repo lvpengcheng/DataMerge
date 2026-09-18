@@ -8,15 +8,20 @@
   sheet 临时改名对齐 _COL_MAP 键，填完改回
 
 匹配分层（越靠前越优先，命中即锁定）：
-  1) 精确名     —— key 本身就是 wb 里的 sheet 名（训练=智算模板同名时零变化）
-  2) 人工映射   —— manual_map 里用户已指定的
+  1) 人工映射   —— manual_map 里用户已指定的（显式决定，优先于同名猜测；
+                   **空值 = 明确跳过该表**，不占用任何 sheet）
+  2) 精确名     —— key 本身就是 wb 里的 sheet 名（训练=智算模板同名时零变化）
   3) 列签名语义 —— 顶部多行合并词表，每个列名按「整名或去 前缀- 取尾段」命中；
                    覆盖度≥阈值且唯一显著领先才自动认领
 出现歧义（多候选并列、无法唯一确定）→ 计入 ambiguous，**绝不按出现位置猜**；
 彻底无候选的键 → 计入 unresolved（当月缺该表的合法场景）。
+**已被人工表态过的键永不进 ambiguous**（否则前端对同一个键反复弹窗，用户跳不过去）。
 """
 
+import logging
 from typing import Any, Dict, List, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 def _norm_name(s) -> str:
@@ -91,6 +96,10 @@ def resolve_target_sheets(
     manual = manual_map or {}
     resolved: Dict[str, str] = {}
     claimed = set()
+    # 人工已决定的键（含"空值=明确跳过"）：无论如何都不再进 ambiguous，
+    # 否则前端会对同一个键反复弹窗，用户永远跳不过去。
+    decided = {str(k) for k in manual.keys() if k}
+    skipped = {str(k) for k, v in manual.items() if k and not str(v).strip()}
 
     def _candidates():
         out = []
@@ -105,25 +114,38 @@ def resolve_target_sheets(
             out.append(sn)
         return out
 
-    # 1) 精确名
+    # 1) 人工映射优先于一切（含精确同名）：这是用户的显式决定，模板表名按月变动时
+    #    自动猜测反而会抢走用户指定的表。空值=明确跳过该表，不占用任何 sheet。
     for key in col_map.keys():
-        if key in wb.sheetnames:
-            resolved[key] = key
-            claimed.add(key)
-
-    # 2) 人工映射（用户在前端已指定的，优先于语义猜测）
-    for key in col_map.keys():
-        if key in resolved:
+        if key in skipped:
             continue
-        tgt = manual.get(key)
-        if tgt and tgt in wb.sheetnames and tgt not in claimed:
+        tgt = str(manual.get(key) or "").strip()
+        if not tgt:
+            continue
+        if tgt in wb.sheetnames and tgt not in claimed:
             resolved[key] = tgt
             claimed.add(tgt)
+
+    # 2) 精确名（人工未决定的键）
+    for key in col_map.keys():
+        if key in resolved or key in skipped:
+            continue
+        if key in wb.sheetnames and key not in claimed:
+            resolved[key] = key
+            claimed.add(key)
 
     # 3) 列签名语义匹配（仅对还没解决的键）
     ambiguous: Dict[str, list] = {}
     unresolved: List[str] = []
     for key in [k for k in col_map.keys() if k not in resolved]:
+        if key in decided:
+            # 用户已表态（跳过，或指定的表不存在/已被别的键占用）→ 记为无对应，不再问
+            unresolved.append(key)
+            if key not in skipped:
+                logger.warning(
+                    "[TargetSheet] 人工指定的表无法采用（不存在或已被占用），按跳过处理: "
+                    f"{key} → {manual.get(key)!r}")
+            continue
         sig = _key_signature(col_map, key)
         if not sig:
             unresolved.append(key)

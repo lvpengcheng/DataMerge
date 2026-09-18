@@ -4,6 +4,8 @@
 生成结构化的 rules.md 供下载使用。
 """
 
+from backend.utils.desensitize import mask_ai_samples
+
 import logging
 import os
 import re
@@ -292,7 +294,7 @@ class RuleOrganizer:
                         )
                         part += f"  表头: {headers_str}\n"
                         part += self._format_region_schemas(region)
-                        for sample_index, sample in enumerate(region.data, 1):
+                        for sample_index, sample in enumerate(mask_ai_samples(region.head_data, region.data), 1):
                             sample_str = ", ".join(
                                 f"{col}={val}" for col, val in sample.items()
                             )
@@ -341,7 +343,7 @@ class RuleOrganizer:
                     result += f"  表头: {headers_str}\n"
                     result += self._format_region_schemas(region)
                     # 数据样本
-                    for sample_index, sample in enumerate(region.data, 1):
+                    for sample_index, sample in enumerate(mask_ai_samples(region.head_data, region.data), 1):
                         sample_str = ", ".join(
                             f"{col}={val}" for col, val in sample.items()
                         )

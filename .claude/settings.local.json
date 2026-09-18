@@ -116,7 +116,20 @@
       "Bash(taskkill /F /IM EXCEL.EXE)",
       "Read(//c/Users/Administrator/.claude/plans/**)",
       "Read(//c/Program Files/LibreOffice/program/**)",
-      "Read(//c/Program Files \\\\\\(x86\\\\\\)/LibreOffice/program/**)"
+      "Read(//c/Program Files \\\\\\(x86\\\\\\)/LibreOffice/program/**)",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import ast;ast.parse\\(open\\('backend/utils/source_auto_filler.py',encoding='utf-8'\\).read\\(\\)\\);print\\('OK'\\)\")",
+      "Bash(python -c \"import ast;ast.parse\\(open\\('backend/utils/compute_ingest.py',encoding='utf-8'\\).read\\(\\)\\);print\\('OK'\\)\")",
+      "Bash(python -)",
+      "Bash(python -c \"import ast;ast.parse\\(open\\('backend/utils/compute_precheck.py',encoding='utf-8'\\).read\\(\\)\\);print\\('OK'\\)\")",
+      "Bash(python -m pytest backend/test_compute_precheck_efficiency.py backend/test_resource_and_output.py backend/test_ai_source_mapping.py -x -q)",
+      "Bash(python -m pytest backend/test_compute_precheck_efficiency.py backend/test_resource_and_output.py backend/test_ai_source_mapping.py -q)",
+      "Bash(awk -F: '$1>4550 && $1<5380')",
+      "Bash(python -m flake8 --max-line-length=200 --select=F backend/app/main.py backend/utils/compute_ingest.py backend/utils/compute_precheck.py backend/utils/output_postprocess.py)",
+      "Bash(python -m flake8 --max-line-length=200 --select=F821,F811,F841 backend/app/main.py)",
+      "Bash(awk -F: '$2>4380 && $2<5850')",
+      "Bash(node --check frontend/static/js/compute.js)",
+      "Bash(python -c \"import ast;ast.parse\\(open\\('backend/app/main.py',encoding='utf-8'\\).read\\(\\)\\);print\\('ok'\\)\")"
     ],
     "additionalDirectories": [
       "E:\\project\\DataMerge20260224\\DataMerge\\backend\\test_data\\data_cleaning_test",

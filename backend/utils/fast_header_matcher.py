@@ -308,6 +308,14 @@ class FastHeaderMatcher:
         # 这种模式下，上传 sheet 名是动态实例名（员工名），脚本通常按 sheet title 提取
         # 实例标识，所以匹配后必须保留 INPUT 原 sheet 名，不能重命名为训练 sheet 名。
         template_mode = self._is_template_mode(train_sheets)
+        # These are fixed source aliases used by existing scripts, not dynamic
+        # employee-sheet templates. Keep 上月1/2 even when only payroll remains.
+        import re
+        if any(re.fullmatch(r'(?:上月|当月)\d+', s['sheet_name'].strip()) for s in train_sheets) and any(
+                s.get('_confirmed_file') and re.fullmatch(
+                    r'\d{4}(?:0[1-9]|1[0-2])\s*[（(]\d+[）)]', s['sheet_name'].strip())
+                for s in input_sheets):
+            template_mode = False
         if template_mode:
             logger.info("[匹配] 检测到多Sheet模板模式（每个 sheet 共享同一稳定列集合）")
 
@@ -325,6 +333,9 @@ class FastHeaderMatcher:
 
             for input_idx, input_sheet in enumerate(input_sheets):
                 if input_idx in used_input_indices:
+                    continue
+
+                if not self._is_candidate_allowed(train_sheet, input_sheet, input_sheets):
                     continue
 
                 input_headers = input_sheet["headers"]
@@ -405,6 +416,10 @@ class FastHeaderMatcher:
                     continue
                 # 找一个已匹配的 train sheet，其稳定列被该 input sheet 覆盖
                 for mr in match_results:
+                    if not self._is_candidate_allowed(
+                            {'file_name': mr['train_file'], 'sheet_name': mr['train_sheet']},
+                            input_sheet, input_sheets):
+                        continue
                     train_cols_stable = frozenset(
                         h for h in mr.get("train_headers", {}).keys()
                         if self._is_valid_header(h) and not self._is_data_like_header(h)
@@ -448,6 +463,8 @@ class FastHeaderMatcher:
             for input_idx, input_sheet in enumerate(input_sheets):
                 if input_idx in used_input_indices:
                     continue
+                if not self._is_candidate_allowed(template_train, input_sheet, input_sheets):
+                    continue
                 input_cols_stable = frozenset(
                     h for h in input_sheet["headers"].keys()
                     if self._is_valid_header(h) and not self._is_data_like_header(h)
@@ -482,6 +499,27 @@ class FastHeaderMatcher:
 
         file_mapping = self._build_file_mapping(match_results)
         return {"success": True, "mapping": {"file_mapping": file_mapping}}
+
+    @staticmethod
+    def _is_candidate_allowed(training, actual, all_actual):
+        """Respect confirmed files and numbered monthly sheets within those files."""
+        import re
+        confirmed_file = actual.get('_confirmed_file')
+        if confirmed_file is None:
+            return True
+        if confirmed_file != training['file_name']:
+            return False
+        target = re.fullmatch(r'(?:上月|当月)(\d+)', training['sheet_name'].strip())
+        if target is None:
+            return True
+        def month_number(name):
+            match = re.fullmatch(r'\d{4}(?:0[1-9]|1[0-2])\s*[（(](\d+)[）)]', name.strip())
+            return int(match.group(1)) if match else None
+        numbered = [month_number(s['sheet_name']) for s in all_actual
+                    if s.get('_confirmed_file') == confirmed_file]
+        if not any(number is not None for number in numbered):
+            return True
+        return month_number(actual['sheet_name']) == int(target.group(1))
 
     def _is_template_mode(self, train_sheets: List[Dict[str, Any]]) -> bool:
         """判定训练是否为"多 Sheet 同模板"模式。
@@ -597,8 +635,9 @@ class FastHeaderMatcher:
             fm = file_mapping[input_file]
             fm["sheet_mapping"][mr["input_sheet"]] = mr["train_sheet"]
             fm["header_mapping"].update(mr["col_mapping"])
+            fm.setdefault('header_mapping_by_sheet', {})[mr['input_sheet']] = dict(mr['col_mapping'])
 
-            if mr["needs_rewrite"]:
+            if mr["needs_rewrite"] or mr['input_sheet'] != mr['train_sheet']:
                 fm["needs_rewrite"] = True
 
         return file_mapping
@@ -707,6 +746,9 @@ class FastHeaderMatcher:
         wb = openpyxl.Workbook(write_only=True)
 
         for sheet_data in parsed_data:
+            header_mapping = (mapping_info.get('header_mapping_by_sheet') or {}).get(
+                sheet_data.sheet_name, mapping_info.get('header_mapping') or {})
+            selected_columns = (mapping_info.get('selected_columns_by_sheet') or {}).get(sheet_data.sheet_name)
             target_sheet_name = sheet_mapping.get(sheet_data.sheet_name, sheet_data.sheet_name)
             ws = wb.create_sheet(title=target_sheet_name)
 
@@ -714,6 +756,8 @@ class FastHeaderMatcher:
                 # 构建映射后的列顺序: [(映射后列名, 原始列字母), ...]
                 col_order = []
                 for col_name, col_letter in region.head_data.items():
+                    if selected_columns is not None and col_name not in selected_columns:
+                        continue
                     target_name = header_mapping.get(col_name, col_name)
                     col_order.append((target_name, col_letter))
 
@@ -728,7 +772,92 @@ class FastHeaderMatcher:
         logger.info(f"[匹配] 生成映射文件(write_only): {output_path} ({len(parsed_data)}个sheet)")
         return output_path
 
-    # ==================== 单次解析入口（性能优化版） ====================
+    # ==================== 单次解析的三段：解析 / 匹配 / 构建 ====================
+    # compute_ingest 分阶段调用这三段（解析只做一次，匹配可在人工确认后纯内存重跑）；
+    # match_parse_and_prepare 保留为三段的薄封装，legacy 调用方签名与行为不变。
+
+    @staticmethod
+    def normalize_structure(source_structure: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """source_structure 可能是 JSON 字符串（SQLite JSON 列），统一成 dict。"""
+        if isinstance(source_structure, str):
+            import json
+            try:
+                source_structure = json.loads(source_structure)
+            except (json.JSONDecodeError, TypeError):
+                return None, "source_structure 格式异常（非有效JSON字符串）"
+        if not isinstance(source_structure, dict):
+            return None, f"source_structure 类型异常: {type(source_structure).__name__}"
+        return source_structure, None
+
+    def parse_inputs(
+        self,
+        input_files: List[str],
+        manual_headers: Optional[Dict[str, Any]] = None,
+        multi_sheet_source: bool = False,
+    ) -> Tuple[List[Dict[str, Any]], Dict[tuple, Any]]:
+        """全量解析入口：每个文件仅 1 次 Aspose 打开。整条智算链路只应调用这里一次。"""
+        return self._parse_all_files_full(
+            input_files, manual_headers, multi_sheet_source=multi_sheet_source)
+
+    def match_headers_only(
+        self,
+        train_sheets: List[Dict[str, Any]],
+        input_sheets: List[Dict[str, Any]],
+        ai_provider_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """纯表头层匹配（无 Aspose、无 DataFrame）：规则匹配失败时尝试一次 AI 语义匹配。
+
+        失败时在返回值里带 diagnostics（mapping_failed / actual_paths），
+        供上层生成手动选择下拉，不需要再解析文件。
+        """
+        match_result = self._match_by_training_base(train_sheets, input_sheets)
+        determined = match_result.get('determined') or []
+        if not match_result['success'] and ai_provider_name:
+            from .ai_source_mapping import match_sources_with_ai
+            logger.info('[源数据映射] 快速匹配失败，尝试一次 AI 语义匹配')
+            try:
+                match_result = match_sources_with_ai(self, train_sheets, input_sheets, ai_provider_name,
+                                                    match_result.get('determined'))
+                logger.info('[源数据映射] AI 映射完整性校验通过，继续构建源数据')
+            except Exception as exc:
+                match_result = {'success': False, 'error': f"{match_result['error']}；AI 匹配未通过: {exc}"}
+        if not match_result['success']:
+            # Missing optional sheets must not erase already resolved sources.
+            if determined:
+                match_result['mapping'] = {'file_mapping': self._build_file_mapping(determined)}
+            match_result.setdefault('diagnostics', {
+                'mapping_failed': True,
+                'actual_paths': [f"{s['file_name']} > {s['sheet_name']} > {col}"
+                                 for s in input_sheets for col in s['headers']],
+            })
+        return match_result
+
+    @staticmethod
+    def expected_pairs(source_structure: Dict[str, Any]) -> List[tuple]:
+        """训练期望的 (file_base, sheet) 全集，用于 key 冲突计数（与训练侧前缀规则一致）。"""
+        pairs = []
+        for train_file, file_data in (source_structure.get("files") or {}).items():
+            if isinstance(file_data, dict) and "error" in file_data:
+                continue
+            base = os.path.splitext(train_file)[0]
+            for sheet_name in ((file_data.get("sheets") if isinstance(file_data, dict) else None) or {}).keys():
+                pairs.append((base, sheet_name))
+        return pairs
+
+    def build_preload(
+        self,
+        file_mapping: Dict[str, Any],
+        parsed_sheets_map: Dict[tuple, Any],
+        source_structure: Optional[Dict[str, Any]] = None,
+        expected_structure: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """从内存解析结果 + 最终映射构建 pre_loaded_source_data（含列改名，不落盘）。"""
+        reserved = set((expected_structure or {}).get("sheets", {}).keys()) if expected_structure else set()
+        return self._build_pre_loaded_from_memory(
+            file_mapping, parsed_sheets_map,
+            reserved_sheet_names=reserved,
+            expected_pairs=self.expected_pairs(source_structure or {}),
+        )
 
     def match_parse_and_prepare(
         self,
@@ -750,14 +879,9 @@ class FastHeaderMatcher:
         """
         try:
             # 防御性处理：source_structure 可能是 JSON 字符串
-            if isinstance(source_structure, str):
-                import json
-                try:
-                    source_structure = json.loads(source_structure)
-                except (json.JSONDecodeError, TypeError):
-                    return False, "source_structure 格式异常（非有效JSON字符串）", None, None
-            if not isinstance(source_structure, dict):
-                return False, f"source_structure 类型异常: {type(source_structure).__name__}", None, None
+            source_structure, _struct_err = self.normalize_structure(source_structure)
+            if _struct_err:
+                return False, _struct_err, None, None
 
             # 步骤1: 从 source_structure 提取训练基准
             logger.info("[单次解析] ===== 步骤1: 提取训练基准 =====")
@@ -771,7 +895,7 @@ class FastHeaderMatcher:
 
             # 步骤2: 全量解析所有上传文件（每文件仅 1 次 Aspose，read_formulas=False + ExportArray）
             logger.info(f"[单次解析] ===== 步骤2: 全量解析上传文件（并行, multi_sheet_source={multi_sheet_source}） =====")
-            input_sheets, parsed_sheets_map = self._parse_all_files_full(
+            input_sheets, parsed_sheets_map = self.parse_inputs(
                 input_files, manual_headers, multi_sheet_source=multi_sheet_source
             )
             if not input_sheets:
@@ -781,39 +905,18 @@ class FastHeaderMatcher:
 
             # 步骤3: 对比表头（纯 Python，复用已有匹配算法）
             logger.info("[单次解析] ===== 步骤3: 对比表头 =====")
-            match_result = self._match_by_training_base(train_sheets, input_sheets)
-            if not match_result['success'] and ai_provider_name:
-                from .ai_source_mapping import match_sources_with_ai
-                logger.info('[源数据映射] 快速匹配失败，尝试一次 AI 语义匹配')
-                try:
-                    match_result = match_sources_with_ai(self, train_sheets, input_sheets, ai_provider_name,
-                                                        match_result.get('determined'))
-                    logger.info('[源数据映射] AI 映射完整性校验通过，继续构建源数据')
-                except Exception as exc:
-                    match_result = {'success': False, 'error': f"{match_result['error']}；AI 匹配未通过: {exc}"}
+            match_result = self.match_headers_only(train_sheets, input_sheets, ai_provider_name)
             if not match_result["success"]:
-                diagnostics = {'mapping_failed': True, 'actual_paths': [
-                    f"{s['file_name']} > {s['sheet_name']} > {col}"
-                    for s in input_sheets for col in s['headers']]}
-                return False, match_result["error"], None, diagnostics
+                return False, match_result["error"], None, match_result.get('diagnostics')
 
             file_mapping = match_result["mapping"]["file_mapping"]
 
             # 步骤4: 从内存构建预加载数据（纯 Python，region → DataFrame → 列重命名）
             logger.info("[单次解析] ===== 步骤4: 构建预加载数据 =====")
-            _reserved_names = set((expected_structure or {}).get("sheets", {}).keys()) if expected_structure else set()
-            # 训练期望的 (file_base, sheet) 全集，用于冲突计数，保证 key 前缀与训练完全一致
-            _expected_pairs = []
-            for _tf, _fd in (source_structure.get("files") or {}).items():
-                if isinstance(_fd, dict) and "error" in _fd:
-                    continue
-                _fb = os.path.splitext(_tf)[0]
-                for _sn in ((_fd.get("sheets") if isinstance(_fd, dict) else None) or {}).keys():
-                    _expected_pairs.append((_fb, _sn))
-            pre_loaded_source_data = self._build_pre_loaded_from_memory(
+            pre_loaded_source_data = self.build_preload(
                 file_mapping, parsed_sheets_map,
-                reserved_sheet_names=_reserved_names,
-                expected_pairs=_expected_pairs,
+                source_structure=source_structure,
+                expected_structure=expected_structure,
             )
 
             # 步骤5: 文件处理
@@ -939,6 +1042,9 @@ class FastHeaderMatcher:
             header_mapping = mapping_info.get("header_mapping", {})
 
             for input_sheet, train_sheet in sheet_mapping.items():
+                header_mapping = (mapping_info.get('header_mapping_by_sheet') or {}).get(
+                    input_sheet, mapping_info.get('header_mapping') or {})
+                selected_columns = (mapping_info.get('selected_columns_by_sheet') or {}).get(input_sheet)
                 sheet_data = parsed_sheets_map.get((file_path, input_sheet))
                 if not sheet_data:
                     raise ValueError(f"映射表缺少解析数据: {input_file_name}/{input_sheet}")
@@ -949,10 +1055,12 @@ class FastHeaderMatcher:
                 first_schemas = None
                 for region in sheet_data.regions:
                     # needs_rewrite 时需要映射表头名（input → train）
-                    if needs_rewrite and header_mapping:
+                    if header_mapping:
                         from excel_parser import ExcelRegion
                         mapped_head = {}
                         for col_name, col_letter in region.head_data.items():
+                            if selected_columns is not None and col_name not in selected_columns:
+                                continue
                             mapped_name = header_mapping.get(col_name, col_name)
                             if mapped_name in mapped_head and mapped_head[mapped_name] != col_letter:
                                 raise ValueError(f"多个源列映射为同一列 {mapped_name}: {input_file_name}/{input_sheet}")
@@ -1049,6 +1157,9 @@ class FastHeaderMatcher:
                 wb = openpyxl.Workbook(write_only=True)
 
                 for input_sheet, train_sheet in sheet_mapping.items():
+                    header_mapping = (mapping_info.get('header_mapping_by_sheet') or {}).get(
+                        input_sheet, mapping_info.get('header_mapping') or {})
+                    selected_columns = (mapping_info.get('selected_columns_by_sheet') or {}).get(input_sheet)
                     sheet_data = parsed_sheets_map.get((file_path, input_sheet))
                     if not sheet_data:
                         continue
@@ -1058,6 +1169,8 @@ class FastHeaderMatcher:
                     for region in sheet_data.regions:
                         col_order = []
                         for col_name, col_letter in region.head_data.items():
+                            if selected_columns is not None and col_name not in selected_columns:
+                                continue
                             target_name = header_mapping.get(col_name, col_name)
                             col_order.append((target_name, col_letter))
 

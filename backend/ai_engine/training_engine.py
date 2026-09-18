@@ -2,6 +2,8 @@
 训练引擎 - 管理AI训练过程
 """
 
+from backend.utils.desensitize import mask_ai_samples
+
 import os
 import json
 import time
@@ -1772,7 +1774,7 @@ class TrainingEngine:
 
                         # 记录数据样本（最多3行）
                         if region.data and len(sheet_structure["data_sample"]) < 3:
-                            sheet_structure["data_sample"].extend(region.data[:3 - len(sheet_structure["data_sample"])])
+                            sheet_structure["data_sample"].extend(mask_ai_samples(region.head_data, region.data[:3 - len(sheet_structure["data_sample"])]))
 
                     file_structure["sheets"][sheet_data.sheet_name] = sheet_structure
                     file_structure["total_regions"] += len(sheet_data.regions)
@@ -1841,7 +1843,7 @@ class TrainingEngine:
 
                     # 记录数据样本（最多3行）
                     sheet_structure['data_sample'].extend(
-                        region.data[:max(0, 3 - len(sheet_structure['data_sample']))])
+                        mask_ai_samples(region.head_data, region.data[:max(0, 3 - len(sheet_structure['data_sample']))]))
                     sheet_structure['formulas'].update(region.formula)
 
                 if sheet_data.sheet_name in formula_evidence:

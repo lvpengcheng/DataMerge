@@ -1057,8 +1057,30 @@ const Tools = {
         let picks = [];
         try { picks = JSON.parse(tr.dataset.src || '[]'); } catch (_) {}
         cell.innerHTML = picks.length
-            ? picks.map(p => `<span style="background:#eef4fb;padding:1px 6px;border-radius:3px;margin:1px;display:inline-block;font-size:12px;">${_escape(p.file)} · ${_escape(p.expr || p.col || '')}</span>`).join(' ')
+            ? picks.map(p => `<span style="background:#eef4fb;padding:1px 6px;border-radius:3px;margin:1px;display:inline-block;font-size:12px;white-space:pre-wrap;">${_escape(this._intSourceDisplay(p))}</span>`).join(' ')
             : '<span style="color:#999;">点击选择对照列…</span>';
+    },
+
+    // 仅用于来源列展示：所有字段补全文件名，原始表达式及保存数据保持不变。
+    _intSourceDisplay(source) {
+        const refs = new Map();
+        (this._intColsOf(source.file) || []).forEach(col => {
+            if (col) refs.set(col, `${source.file}.${col}`);
+        });
+        this._intNonMainFiles().forEach(file => (file.columns || []).forEach(col => {
+            if (col) refs.set(`${file.name}.${col}`, `${file.name}.${col}`);
+        }));
+        const names = [...refs.keys()].sort((a, b) => b.length - a.length);
+        const expr = source.expr || source.col || '';
+        let result = '', i = 0;
+        while (i < expr.length) {
+            const literal = expr[i] === '"' && expr.slice(i).match(/^"(?:[^"]|"")*"/);
+            const ref = !literal && names.find(name => expr.startsWith(name, i));
+            const token = literal ? literal[0] : ref || expr[i];
+            result += ref ? refs.get(ref) : token;
+            i += token.length;
+        }
+        return result;
     },
 
     // 公式校验：列名之外允许受控 Excel 子集（四则、比较、ROUND/IF 等），后端同规则安全求值。
@@ -1156,17 +1178,24 @@ const Tools = {
         return this._intTokenize(expr, file).filter(t => t.t === 'col').map(t => t.v).sort().join('');
     },
 
+    // 弹窗内将旧方案按当前首张对照表转换引用。
+    _intUnifiedExpr(source) {
+        const file = this._intNonMainFiles()[0]?.name || '';
+        const expr = source.expr || source.col || '';
+        if (source.file === file) return expr;
+        return this._intTokenize(expr, source.file)
+            .map(t => t.t === 'col' && (this._intColsOf(source.file) || []).includes(t.v)
+                ? source.file + '.' + t.v : t.v).join('');
+    },
+
     // 全部对照表字段共用一个公式；沿用后端跨表公式协议。
     _intOpenSrcPicker(kind, tr) {
         let selected = [];
         try { selected = JSON.parse(tr.dataset.src || '[]'); } catch (_) {}
         const files = this._intNonMainFiles();
         const file = files[0]?.name || '';
-        const toExpr = s => this._intTokenize(s.expr || s.col || '', s.file)
-            .map(t => t.t === 'col' && (this._intColsOf(s.file) || []).includes(t.v)
-                ? (s.file === file ? t.v : s.file + '.' + t.v) : t.v).join('');
         // 旧多来源是“首个非空”回退，不能默默转换成相加。
-        const preset = selected.length === 1 ? toExpr(selected[0]) : '';
+        const preset = selected.length === 1 ? this._intUnifiedExpr(selected[0]) : '';
         const body = `
             <p style="font-size:12px;color:#888;">勾选各表字段，在下方公式框中设置跨表计算。默认以 + 连接；文本请用 &amp; 拼接，例如：姓名 &amp; " / " &amp; 部门。文本取同一主键首个非空值，数值运算仍跨行求和。</p>
             ${selected.length > 1 ? '<p style="color:#b36b00;">旧方案含多个优先级来源，请重新选择字段并确认联合公式；取消将保留旧方案。</p>' : ''}

@@ -68,11 +68,63 @@ function _promptFilePasswords(encryptedFiles) {
  * @param {object} data - 后端 422 返回体: {missing_files, missing_columns, ai_suggestions, history_warnings, auto_filled, file_mapping}
  * @returns {Promise<{confirmed_mapping?: object, skip_history_check?: boolean}|null>}
  */
-function _showPrecheckDialog(data) {
+function _precheckSummary(data) {
+    const reasons = [];
+    const columns = (data.missing_columns || []).reduce((n, row) => n + (row.expected_columns || []).length, 0);
+    if (columns) reasons.push(`待确认 ${columns} 列；没有对应列可保留“无匹配”继续。`);
+    if ((data.missing_files || []).length) reasons.push(`缺失文件 ${data.missing_files.length} 个`);
+    if ((data.rename_candidates || []).length) reasons.push(`文件来源 ${data.rename_candidates.length} 项待确认`);
+    if ((data.target_candidates || []).length) reasons.push(`目标 Sheet ${data.target_candidates.length} 项待确认`);
+    if ((data.history_warnings || []).length) reasons.push(`历史数据提示 ${data.history_warnings.length} 项`);
+    const error = (data.missing_columns || []).find(row => row.error)?.error;
+    if (error) reasons.push(String(error).split('\n')[0].slice(0, 100) + (String(error).length > 100 ? '…（展开详情）' : ''));
+    return reasons.join('；');
+}
+
+function _confirmationFingerprint(value) {
+    const normalize = item => {
+        if (Array.isArray(item)) return item.map(normalize);
+        if (item && typeof item === 'object') return Object.fromEntries(
+            Object.keys(item).sort().map(key => [key, normalize(item[key])]));
+        return item;
+    };
+    return JSON.stringify(normalize(value));
+}
+
+function _closePrecheckDialog() {
+    document.getElementById('_compute_precheck_overlay')?.remove();
+}
+
+function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
+    // Keep selectors available after the server considers an ambiguity resolved.
+    for (const [field, key] of [['target_candidates', 'key'], ['rename_candidates', 'uploaded']]) {
+        const merged = new Map((choices[field] || []).map(item => [item[key], item]));
+        (data[field] || []).forEach(item => merged.set(item[key], item));
+        choices[field] = [...merged.values()];
+    }
+    data = {...data, target_candidates: choices.target_candidates, rename_candidates: choices.rename_candidates};
     return new Promise((resolve) => {
         const missingFiles = data.missing_files || [];
         const missingColumns = data.missing_columns || [];
-        const aiSuggestions = data.ai_suggestions || [];
+        const suggestionMap = new Map((data.ai_suggestions || []).map(row => [row.expected_path, {...row}]));
+        // 重新确认时优先回显已选择的来源，不能用新一轮默认建议覆盖它。
+        Object.entries(data.file_mapping || {}).forEach(([file, info]) => {
+            Object.entries(info.sheet_mapping || {}).forEach(([sheet, targetSheet]) => {
+                const columns = (info.header_mapping_by_sheet || {})[sheet] || info.header_mapping || {};
+                Object.entries(columns).forEach(([column, targetColumn]) => {
+                    const expected_path = `${info.expected_file || file} > ${targetSheet} > ${targetColumn}`;
+                    const suggested_path = `${file} > ${sheet} > ${column}`;
+                    suggestionMap.set(expected_path, {expected_path, suggested_path,
+                        confidence: expected_path === suggested_path ? 1 : null,
+                        reason: '已选择的匹配，可继续调整'});
+                });
+            });
+        });
+        (data.unmatched_columns || []).forEach(([file, sheet, column]) => {
+            const expected_path = `${file} > ${sheet} > ${column}`;
+            suggestionMap.set(expected_path, {expected_path, suggested_path: null, confidence: null, reason: '已确认无匹配，可继续计算'});
+        });
+        const aiSuggestions = [...suggestionMap.values()];
         const historyWarnings = data.history_warnings || [];
         const autoFilled = data.auto_filled || [];
         const autoRenamed = data.auto_renamed || [];
@@ -100,8 +152,30 @@ function _showPrecheckDialog(data) {
         const extraRows = expectedPaths
             .filter(p => !sugExpected.has(p))
             .map(p => ({ expected_path: p, confidence: null, reason: '无 AI 建议（可手动选择）' }));
-        const allExpectedRows = [...aiSuggestions, ...extraRows];
-        const aiTableHtml = allExpectedRows.length === 0
+        const allExpectedRows = _constrainSourceSheetSuggestions([...aiSuggestions, ...extraRows], data.file_mapping);
+        const sourceSheets = [...new Set(actualPaths.map(path => {
+            const p = _splitPath(path); return p ? JSON.stringify([p.file, p.sheet]) : null;
+        }).filter(Boolean))];
+        const sourceGroups = new Map();
+        allExpectedRows.forEach(row => {
+            const p = _splitPath(row.expected_path);
+            if (!p) return;
+            const key = JSON.stringify([p.file, p.sheet]);
+            if (!sourceGroups.has(key)) sourceGroups.set(key, []);
+            sourceGroups.get(key).push(row);
+        });
+        const sourceSheetHtml = [...sourceGroups].map(([key, rows]) => {
+            const suggested = new Set(rows.map(row => {
+                const p = _splitPath(row.suggested_path); return p ? JSON.stringify([p.file, p.sheet]) : null;
+            }).filter(Boolean));
+            const chosen = suggested.size === 1 ? [...suggested][0] : '';
+            return `<div style="margin:6px 0;"><label>${JSON.parse(key).map(_escapeHtml).join(' > ')}
+                <select data-source-sheet-key="${_escapeHtml(key)}" style="width:100%;padding:5px;">
+                <option value="">（选择源 Sheet；无匹配可跳过）</option>
+                ${sourceSheets.map(value => `<option value="${_escapeHtml(value)}"${value === chosen ? ' selected' : ''}>${JSON.parse(value).map(_escapeHtml).join(' > ')}</option>`).join('')}
+                </select></label></div>`;
+        }).join('');
+        const renderMappingTable = rows => rows.length === 0
             ? '<div style="color:#999;font-size:13px;padding:8px;">无 AI 建议</div>'
             : `<table style="width:100%;border-collapse:collapse;font-size:12px;">
                 <thead><tr style="background:#f5f5f5;">
@@ -111,12 +185,23 @@ function _showPrecheckDialog(data) {
                     <th style="padding:6px;border:1px solid #e0e0e0;text-align:left;">原因</th>
                 </tr></thead>
                 <tbody>
-                ${allExpectedRows.map((s, i) => {
+                ${rows.map(s => {
+                    const i = allExpectedRows.indexOf(s);
                     const hasConf = s.confidence != null;
                     const conf = hasConf ? Number(s.confidence).toFixed(2) : '-';
                     const confColor = hasConf ? (s.confidence >= 0.8 ? '#388e3c' : (s.confidence >= 0.5 ? '#f57c00' : '#d32f2f')) : '#999';
-                    const options = ['<option value="">（不映射）</option>']
-                        .concat(actualPaths.map(p => `<option value="${_escapeHtml(p)}"${p === s.suggested_path ? ' selected' : ''}>${_escapeHtml(p)}</option>`))
+                    const expected = _splitPath(s.expected_path);
+                    const group = expected ? sourceGroups.get(JSON.stringify([expected.file, expected.sheet])) : [];
+                    const groupSources = new Set((group || []).map(row => {
+                        const path = _splitPath(row.suggested_path);
+                        return path ? JSON.stringify([path.file, path.sheet]) : null;
+                    }).filter(Boolean));
+                    const availablePaths = groupSources.size === 1 ? actualPaths.filter(path => {
+                        const p = _splitPath(path);
+                        return p && groupSources.has(JSON.stringify([p.file, p.sheet]));
+                    }) : actualPaths;
+                    const options = ['<option value="">（无匹配，继续计算）</option>']
+                        .concat(availablePaths.map(p => `<option value="${_escapeHtml(p)}"${p === s.suggested_path ? ' selected' : ''}>${_escapeHtml(p)}</option>`))
                         .join('');
                     return `<tr>
                         <td style="padding:6px;border:1px solid #e0e0e0;font-family:monospace;font-size:11px;">${_escapeHtml(s.expected_path || '')}</td>
@@ -130,14 +215,30 @@ function _showPrecheckDialog(data) {
                 </tbody>
             </table>`;
 
+        const stableRows = allExpectedRows.filter(_isUnchangedMapping);
+        const changedRows = allExpectedRows.filter(row => !_isUnchangedMapping(row));
+        const aiTableHtml = `
+            <div style="font-weight:bold;color:#b45309;margin:8px 0;">需重点确认：有变动或未匹配（${changedRows.length}）</div>
+            ${changedRows.length ? renderMappingTable(changedRows) : '<div>没有需要重新匹配的列。</div>'}
+            <details style="margin-top:12px;">
+                <summary style="cursor:pointer;color:#2e7d32;">完全一致的匹配（置信度 1，共 ${stableRows.length} 项，点击展开）</summary>
+                ${renderMappingTable(stableRows)}
+            </details>`;
+
         // 缺失文件块
         const missingFilesHtml = missingFiles.length === 0 ? '' : `
             <div style="margin-bottom:14px;padding:10px 12px;border:1px solid #ffcdd2;background:#ffebee;border-radius:6px;">
                 <div style="font-weight:bold;color:#c62828;margin-bottom:6px;">⚠ 缺失文件（基础资料未能兜底）</div>
                 <ul style="margin:0;padding-left:20px;font-size:13px;color:#b71c1c;">
-                    ${missingFiles.map(f => `<li>${_escapeHtml(f)}</li>`).join('')}
+                    ${missingFiles.map(f => `<li style="margin-bottom:4px;">
+                        <span style="font-family:monospace;">${_escapeHtml(f)}</span>
+                        <label style="display:inline-flex;align-items:center;margin-left:10px;font-size:12px;color:#5d4037;cursor:pointer;">
+                            <input type="checkbox" data-skip-missing="${_escapeHtml(f)}" style="margin-right:4px;">
+                            本月确实没有此文件，跳过它继续计算
+                        </label>
+                    </li>`).join('')}
                 </ul>
-                <div style="font-size:12px;color:#666;margin-top:6px;">请关闭此弹窗，补齐文件后重试。</div>
+                <div style="font-size:12px;color:#666;margin-top:6px;">补齐文件后重试；确实没有的文件请勾选跳过（涉及该文件的列将不参与计算）。</div>
             </div>`;
 
         // 自动兜底块
@@ -175,14 +276,15 @@ function _showPrecheckDialog(data) {
                     <tbody>
                     ${renameCandidates.map((rc) => {
                         const aiRec = rc.ai_recommended || '';
+                        const chosenFile = previousConfirmations?.confirmed_renames?.[rc.uploaded] ?? aiRec;
                         const aiConf = rc.ai_confidence != null ? Number(rc.ai_confidence).toFixed(2) : '';
                         const aiReason = rc.ai_reason || '';
                         const recSource = rc.recommendation_source === 'ai' ? 'AI'
                             : (rc.recommendation_source === 'structure_fallback' ? '结构兜底' : '规则');
-                        const opts = ['<option value="">（不映射）</option>']
+                        const opts = [`<option value=""${chosenFile === '' ? ' selected' : ''}>（不映射）</option>`]
                             .concat((rc.candidates || []).map(c => {
                                 const isAi = aiRec && c.expected === aiRec;
-                                const selected = isAi ? ' selected' : '';
+                                const selected = c.expected === chosenFile ? ' selected' : '';
                                 const star = isAi ? '✨ ' : '';
                                 return `<option value="${_escapeHtml(c.expected)}"${selected}>${star}${_escapeHtml(c.expected)} — score=${c.score}（列头=${c.header_jaccard}, 文件名=${c.name_similarity}）</option>`;
                             }))
@@ -221,14 +323,15 @@ function _showPrecheckDialog(data) {
                         const scoreMap = {};
                         (tc.candidates || []).forEach(c => { scoreMap[c.sheet] = c.score; });
                         const topSheet = (tc.candidates && tc.candidates.length) ? tc.candidates[0].sheet : '';
+                        const selectedSheet = previousConfirmations?.confirmed_target_map?.[tc.key] ?? data.target_map?.[tc.key] ?? topSheet;
                         const sheetList = (tc.all_sheets && tc.all_sheets.length) ? tc.all_sheets : (tc.candidates || []).map(c => c.sheet);
-                        const opts = ['<option value="">（不映射，跳过该表）</option>']
+                        const opts = [`<option value=""${selectedSheet === '' ? ' selected' : ''}>（不映射，跳过该表）</option>`]
                             .concat(sheetList.map(sn => {
                                 const sc = scoreMap[sn];
                                 const isTop = sn === topSheet;
                                 const star = isTop ? '✨ ' : '';
                                 const scoreTxt = sc != null ? ` — 匹配度=${sc}` : '';
-                                return `<option value="${_escapeHtml(sn)}"${isTop ? ' selected' : ''}>${star}${_escapeHtml(sn)}${scoreTxt}</option>`;
+                                return `<option value="${_escapeHtml(sn)}"${sn === selectedSheet ? ' selected' : ''}>${star}${_escapeHtml(sn)}${scoreTxt}</option>`;
                             }))
                             .join('');
                         return `<tr>
@@ -245,7 +348,7 @@ function _showPrecheckDialog(data) {
         // 缺失列块
         const missingColsHtml = missingColumns.length === 0 ? '' : `
             <div style="margin-bottom:14px;padding:10px 12px;border:1px solid #ffe0b2;background:#fff3e0;border-radius:6px;">
-                <div style="font-weight:bold;color:#e65100;margin-bottom:6px;">⚠ 列匹配未通过</div>
+                <div style="font-weight:bold;color:#e65100;margin-bottom:6px;">待确认列（允许无匹配）</div>
                 <details><summary style="cursor:pointer;font-size:12px;color:#666;">展开详情（${missingColumns.length} 项）</summary>
                 <ul style="margin:6px 0 0;padding-left:20px;font-size:11px;color:#5d4037;max-height:120px;overflow:auto;">
                     ${missingColumns.map(c => `<li>${_escapeHtml(c.file)} > ${_escapeHtml(c.sheet)} ${c.error ? '：' + _escapeHtml(c.error) : ''}</li>`).join('')}
@@ -269,7 +372,11 @@ function _showPrecheckDialog(data) {
         // AI 建议块
         const aiSuggestionsHtml = `
             <div style="margin-bottom:14px;">
-                <div style="font-weight:bold;font-size:13px;margin-bottom:6px;color:#333;">AI 列映射建议（可手动调整）</div>
+                <div style="font-weight:bold;margin-bottom:6px;">源 Sheet 对应关系</div>
+                <div style="font-size:12px;color:#666;">先为每张训练源表选择一个上传 Sheet。选择后，下方字段立即切换到该 Sheet；同名字段自动对应，不同名字段保留可选。</div>
+                ${sourceSheetHtml}
+                <div style="font-weight:bold;font-size:13px;margin-bottom:6px;color:#333;">源数据列匹配确认（优先检查变动项）</div>
+                <div style="font-size:12px;color:#666;margin-bottom:6px;">目标 Sheet 决定结果写入位置；这里决定读取哪个源文件的字段。源字段重复仍需单独处理。</div>
                 <div style="max-height:280px;overflow:auto;border:1px solid #e0e0e0;border-radius:4px;">${aiTableHtml}</div>
                 <div style="font-size:11px;color:#999;margin-top:4px;">
                     格式：<code>文件名 > Sheet名 > 列名</code>。Sheet 名可能包含 banner 后缀（如 <code>数据-合同工</code>）。
@@ -278,12 +385,14 @@ function _showPrecheckDialog(data) {
 
         const canRetry = missingFiles.length === 0;
         // 改名候选场景下，要求至少为一个上传文件选了目标，才允许重试
-        const overlay = document.createElement('div');
+        const overlay = document.getElementById('_compute_precheck_overlay') || document.createElement('div');
+        overlay.id = '_compute_precheck_overlay';
         overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:9999;display:flex;align-items:center;justify-content:center;';
         overlay.innerHTML = `
             <div style="background:#fff;border-radius:10px;padding:24px;width:780px;max-width:96vw;max-height:90vh;display:flex;flex-direction:column;box-shadow:0 4px 20px rgba(0,0,0,0.2);">
-                <h3 style="margin:0 0 6px;font-size:17px;">事前校验未通过</h3>
+                <h3 style="margin:0 0 6px;font-size:17px;">${previousConfirmations ? '确认结果：仍有待处理项' : '计算前确认'}</h3>
                 <p style="margin:0 0 14px;font-size:13px;color:#666;">系统检测到部分文件/列与训练时不一致。请查看并确认后再继续。</p>
+                <div id="_pre_validation_error" style="color:#b71c1c;font-size:13px;margin-bottom:10px;white-space:pre-wrap;">${_escapeHtml((data.mapping_refreshed ? '已按最新表关系刷新，请检查源字段后继续。\n' : '') + _precheckSummary(data))}</div>
                 <div style="overflow:auto;flex:1;padding-right:4px;">
                     ${missingFilesHtml}
                     ${autoFilledHtml}
@@ -297,14 +406,24 @@ function _showPrecheckDialog(data) {
                 <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px;border-top:1px solid #eee;padding-top:12px;">
                     <button id="_pre_cancel" style="padding:8px 20px;border:1px solid #ddd;border-radius:4px;background:#fff;cursor:pointer;">取消</button>
                     <button id="_pre_confirm" ${canRetry ? '' : 'disabled'} style="padding:8px 20px;border:none;border-radius:4px;background:${canRetry ? '#1976d2' : '#bdbdbd'};color:#fff;cursor:${canRetry ? 'pointer' : 'not-allowed'};">
-                        ${canRetry ? (hasRenameCandidates ? '按已选映射重试' : '按当前映射重试') : '请先补齐缺失文件'}
+                        ${canRetry ? (hasRenameCandidates ? '按已选映射重试' : '按当前映射重试') : '请先补齐或勾选跳过缺失文件'}
                     </button>
                 </div>
             </div>`;
-        document.body.appendChild(overlay);
+        if (!overlay.parentNode) document.body.appendChild(overlay);
 
         // ===== 重复匹配检测：一个上传列被多个训练期望列选中 → 红色框实时标记 =====
         const aiSelects = () => overlay.querySelectorAll('select[data-ai-idx]');
+        function _syncSourceSheetOptions() {
+            const selections = [...overlay.querySelectorAll('select[data-source-sheet-key]')];
+            for (const sel of selections) {
+                for (const option of sel.options) {
+                    option.disabled = !!option.value && option.value !== sel.value &&
+                        selections.some(other => other !== sel && other.value === option.value);
+                }
+            }
+        }
+        _syncSourceSheetOptions();
         function _markAiDup() {
             const cnt = new Map();
             aiSelects().forEach(sel => {
@@ -323,9 +442,6 @@ function _showPrecheckDialog(data) {
             });
             return hasDup;
         }
-        overlay.addEventListener('change', (e) => {
-            if (e.target && e.target.matches && e.target.matches('select[data-ai-idx]')) _markAiDup();
-        });
 
         // ===== 改名候选重复检测：同一训练期望文件被多个上传文件选中 → 红色框实时标记 =====
         // 两个上传文件（两行）选了同一个源文件时，这两个选择框红色高亮，一眼可辨。
@@ -348,9 +464,6 @@ function _showPrecheckDialog(data) {
             });
             return hasDup;
         }
-        overlay.addEventListener('change', (e) => {
-            if (e.target && e.target.matches && e.target.matches('select[data-rename-uploaded]')) _markRenameDup();
-        });
         // 弹窗打开时也标记一次：AI 推荐项默认选中，可能已经重复
         _markRenameDup();
 
@@ -360,8 +473,109 @@ function _showPrecheckDialog(data) {
         };
 
         const confirmBtn = document.getElementById('_pre_confirm');
-        if (confirmBtn && !confirmBtn.disabled) {
-            confirmBtn.onclick = () => {
+        let tableMappingDirty = false;
+
+        // 缺失文件：勾选"跳过"即为显式决定；全部有决定后才放开确认按钮
+        const skipBoxes = () => overlay.querySelectorAll('input[data-skip-missing]');
+        const _collectSkippedMissing = () => Array.from(skipBoxes())
+            .filter(cb => cb.checked)
+            .map(cb => cb.dataset.skipMissing);
+        function _refreshConfirmState() {
+            if (!confirmBtn) return;
+            const pending = Array.from(skipBoxes()).filter(cb => !cb.checked &&
+                !allExpectedRows.some(row => _splitPath(row.expected_path)?.file === cb.dataset.skipMissing)).length;
+            confirmBtn.disabled = pending > 0;
+            confirmBtn.style.background = pending > 0 ? '#bdbdbd' : '#1976d2';
+            confirmBtn.style.cursor = pending > 0 ? 'not-allowed' : 'pointer';
+            confirmBtn.textContent = pending > 0
+                ? '请先补齐或勾选跳过缺失文件'
+                : (tableMappingDirty ? '应用表关系并刷新字段' : '确认并继续计算');
+        }
+        overlay.onchange = (e) => {
+            if (!e.target?.matches) return;
+            if (e.target.matches('select[data-source-sheet-key]')) {
+                const fields = [...aiSelects()];
+                const current = new Map(fields.map(sel => [Number(sel.dataset.aiIdx), sel.value]));
+                const updates = _sourceSheetFieldUpdates(allExpectedRows, current,
+                    e.target.dataset.sourceSheetKey, e.target.value, actualPaths);
+                for (const update of updates) {
+                    const sel = fields.find(field => Number(field.dataset.aiIdx) === update.index);
+                    if (!sel) continue;
+                    sel.innerHTML = '<option value="">（无匹配，继续计算）</option>' + update.options.map(path =>
+                        `<option value="${_escapeHtml(path)}"${path === update.value ? ' selected' : ''}>${_escapeHtml(path)}</option>`).join('');
+                    sel.value = update.value;
+                    sel.dataset.mappingEdited = '1';
+                }
+                _syncSourceSheetOptions();
+                _markAiDup();
+                _refreshConfirmState();
+                document.getElementById('_pre_validation_error').textContent =
+                    '已按选择的源 Sheet 更新本表全部字段。未找到同名字段的列可手动选择或保留无匹配。';
+            }
+            if (e.target.matches('select[data-ai-idx]')) { e.target.dataset.mappingEdited = '1'; _markAiDup(); _refreshConfirmState(); }
+            if (e.target.matches('select[data-rename-uploaded]')) _markRenameDup();
+            if (e.target.matches('select[data-rename-uploaded]')) {
+                tableMappingDirty = true;
+                document.getElementById('_pre_validation_error').textContent =
+                    '表对应关系已更改，请先应用并刷新字段。旧字段标记将在重新校验后更新；刷新不会启动计算。';
+                _refreshConfirmState();
+            }
+            if (e.target.matches('select[data-target-key]')) {
+                document.getElementById('_pre_validation_error').textContent =
+                    '目标 Sheet 已更新。源字段选择保持不变，确认后按当前关系计算。';
+                _refreshConfirmState();
+            }
+            if (e.target.matches('input[data-skip-missing]')) _refreshConfirmState();
+        };
+        _refreshConfirmState();
+
+        if (confirmBtn) {
+            confirmBtn.onclick = async () => {
+                if (confirmBtn.disabled) return;
+                if (tableMappingDirty && data.session_id) {
+                    // Revalidate table choices before checking stale column suggestions.
+                    // Only edited column selections become confirmations in this step.
+                    if (_markRenameDup()) {
+                        alert('多个上传文件选择了同一个训练文件，请先修正文件对应关系');
+                        return;
+                    }
+                    let updated;
+                    try {
+                        const edits = _collectEditedColumnConfirmations(overlay, allExpectedRows);
+                        updated = _mergeConfirmations(previousConfirmations, {
+                            confirmed_renames: _collectConfirmedRenames(overlay),
+                            confirmed_target_map: _collectConfirmedTargetMap(overlay),
+                            ...(edits ? {confirmed_mapping: edits} : {}),
+                            skipped_missing_files: _collectSkippedMissing(),
+                            skip_history_check: document.getElementById('_pre_skip_history')?.checked || false,
+                        });
+                    } catch (error) {
+                        document.getElementById('_pre_validation_error').textContent = error.message;
+                        return;
+                    }
+                    confirmBtn.disabled = true;
+                    confirmBtn.textContent = '正在刷新字段…';
+                    const controls = [...overlay.querySelectorAll('input,select')];
+                    controls.forEach(el => { el.disabled = true; });
+                    document.getElementById('_pre_cancel').disabled = true;
+                    try {
+                        const response = await AUTH.authFetch(`/api/compute/session/${data.session_id}/confirm`, {
+                            method: 'POST', headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({...updated, refresh_only: true}),
+                        });
+                        const refreshed = await _readComputeSubmitJson(response);
+                        if (!response.ok || !refreshed?.mapping_refreshed) {
+                            throw new Error(refreshed?.detail || refreshed?.message || '刷新失败，请重试；计算尚未开始。');
+                        }
+                        _showPrecheckDialog(refreshed, updated, choices).then(resolve);
+                    } catch (error) {
+                        controls.forEach(el => { el.disabled = false; });
+                        document.getElementById('_pre_cancel').disabled = false;
+                        document.getElementById('_pre_validation_error').textContent = error.message;
+                        _refreshConfirmState();
+                    }
+                    return;
+                }
                 // 空选项表示不映射，允许提交；已选择项仍需检查冲突。
                 // 重复检查 1：同一上传列被多个训练期望列选中（红色标记，理论上应一一匹配）
                 if (_markAiDup()) {
@@ -411,15 +625,26 @@ function _showPrecheckDialog(data) {
                     return;
                 }
                 // 收集用户调整后的 AI 映射 → 转换为 file_mapping 结构
-                const fileMapping = _buildFileMappingFromAiSelections(overlay, allExpectedRows, data.file_mapping);
-                // 收集用户对改名候选的选择
                 const confirmedRenames = _collectConfirmedRenames(overlay);
+                // A newly confirmed file must be matched before untouched blank columns
+                // can be interpreted as skipping its entire contents.
+                overlay._pendingFileTargets = new Set(Object.entries(confirmedRenames)
+                    .filter(([file, target]) => target && previousConfirmations?.confirmed_renames?.[file] !== target)
+                    .map(([, target]) => target));
+                let fileMapping;
+                try {
+                    fileMapping = _buildFileMappingFromAiSelections(overlay, allExpectedRows, data.file_mapping);
+                } catch (error) {
+                    alert(error.message);
+                    return;
+                }
+                // 收集用户对改名候选的选择
                 // 收集用户对目标模板表的选择（②）
                 const confirmedTargetMap = _collectConfirmedTargetMap(overlay);
                 const skipHistory = document.getElementById('_pre_skip_history')?.checked || false;
-                document.body.removeChild(overlay);
+                const skippedMissing = _collectSkippedMissing();
                 const out = {
-                    confirmed_mapping: { file_mapping: fileMapping },
+                    confirmed_mapping: { file_mapping: fileMapping, unmatched_columns: _collectUnmatchedColumns(overlay, allExpectedRows) },
                     skip_history_check: skipHistory,
                 };
                 if (Object.keys(confirmedRenames).length > 0) {
@@ -428,6 +653,20 @@ function _showPrecheckDialog(data) {
                 if (Object.keys(confirmedTargetMap).length > 0) {
                     out.confirmed_target_map = confirmedTargetMap;
                 }
+                if (skippedMissing.length > 0) {
+                    out.skipped_missing_files = skippedMissing;
+                }
+                if (!data.mapping_refreshed && previousConfirmations && _confirmationFingerprint(_mergeConfirmations(previousConfirmations, out)) ===
+                        _confirmationFingerprint(previousConfirmations)) {
+                    document.getElementById('_pre_validation_error').textContent =
+                        '本次选择与上次相同，请先修正下方待处理项；无需重复提交。\n' + _precheckSummary(data);
+                    return;
+                }
+                // 请求期间保留同一个窗口；失败时更新内容，成功后再关闭。
+                document.getElementById('_pre_confirm').disabled = true;
+                document.getElementById('_pre_confirm').textContent = '正在校验…';
+                document.getElementById('_pre_cancel').disabled = true;
+                overlay.querySelectorAll('input,select').forEach(el => { el.disabled = true; });
                 resolve(out);
             };
         }
@@ -436,16 +675,17 @@ function _showPrecheckDialog(data) {
 
 /**
  * 收集改名候选下拉框的用户选择
- * 返回：{"上传文件名": "目标期望文件名", ...}（不含被选择"不映射"的项）
+ * 返回：{"上传文件名": "目标期望文件名", ...}
+ * 选了"（不映射）"的项值为空串 —— 空串是**显式跳过**的决定，必须一起上报，
+ * 否则后端认为该项仍未确认，同一个框会反复弹出（用户永远跳不过去）。
  */
 function _collectConfirmedRenames(overlay) {
     const result = {};
     const selects = overlay.querySelectorAll('select[data-rename-uploaded]');
     selects.forEach(sel => {
         const uploaded = sel.dataset.renameUploaded;
-        const target = sel.value;
-        if (uploaded && target) {
-            result[uploaded] = target;
+        if (uploaded) {
+            result[uploaded] = sel.value || '';
         }
     });
     return result;
@@ -453,14 +693,14 @@ function _collectConfirmedRenames(overlay) {
 
 /**
  * 收集目标模板表映射下拉框的用户选择（②模板目标侧）
- * 返回：{"<训练目标表键>": "<当月模板实际sheet名>", ...}（不含"不映射"的项）
+ * 返回：{"<训练目标表键>": "<当月模板实际sheet名>", ...}
+ * 同上：选"（不映射，跳过该表）"的键值为空串，表示明确跳过该表，一并上报。
  */
 function _collectConfirmedTargetMap(overlay) {
     const result = {};
     overlay.querySelectorAll('select[data-target-key]').forEach(sel => {
         const key = sel.dataset.targetKey;
-        const val = sel.value;
-        if (key && val) result[key] = val;
+        if (key) result[key] = sel.value || '';
     });
     return result;
 }
@@ -476,39 +716,177 @@ function _collectConfirmedTargetMap(overlay) {
  *   }
  * }
  */
-function _buildFileMappingFromAiSelections(overlay, aiSuggestions, originalFileMapping) {
-    const result = {};
-    const selects = overlay.querySelectorAll('select[data-ai-idx]');
-    selects.forEach(sel => {
-        const idx = parseInt(sel.dataset.aiIdx, 10);
-        const sug = aiSuggestions[idx];
-        if (!sug || !sug.expected_path) return;
-        const actualPath = sel.value;
-        if (!actualPath) return;
+function _isUnchangedMapping(row) {
+    // 文件/Sheet/列任一变化，即使分数为 1，也属于需要关注的匹配。
+    return Number(row.confidence) === 1 && !!row.suggested_path &&
+        row.expected_path === row.suggested_path;
+}
 
-        const exp = _splitPath(sug.expected_path);
-        const act = _splitPath(actualPath);
-        if (!exp || !act) return;
-
-        // 以「上传文件名」为 key
-        if (!result[act.file]) {
-            result[act.file] = {
-                expected_file: exp.file,
-                sheet_mapping: {},
-                header_mapping: {},
-            };
-        }
-        result[act.file].sheet_mapping[act.sheet] = exp.sheet;
-        result[act.file].header_mapping[act.col] = exp.col;
-    });
-
-    // 合并原始 file_mapping（如果有）做兜底
-    if (originalFileMapping && typeof originalFileMapping === 'object') {
-        Object.entries(originalFileMapping).forEach(([k, v]) => {
-            if (!result[k]) result[k] = v;
+function _mergeFileMappings(previous, incoming) {
+    const result = JSON.parse(JSON.stringify(previous || {}));
+    Object.entries(incoming || {}).forEach(([file, info]) => {
+        const targetFile = info.expected_file || file;
+        Object.entries(info.sheet_mapping || {}).forEach(([sheet, targetSheet]) => {
+            const columns = (info.header_mapping_by_sheet || {})[sheet] || info.header_mapping || {};
+            const targets = new Set(Object.values(columns));
+            // 删除同一目标列的旧来源，避免旧选择在另一文件/Sheet 下残留。
+            Object.entries(result).forEach(([oldFile, old]) => {
+                if (old.expected_file !== targetFile) return;
+                Object.entries(old.sheet_mapping || {}).forEach(([oldSheet, oldTarget]) => {
+                    if (oldTarget !== targetSheet) return;
+                    const scoped = Object.assign({}, (old.header_mapping_by_sheet || {})[oldSheet] || old.header_mapping || {});
+                    Object.keys(scoped).forEach(col => { if (targets.has(scoped[col])) delete scoped[col]; });
+                    (old.header_mapping_by_sheet ||= {})[oldSheet] = scoped;
+                    if (!Object.keys(scoped).length) {
+                        delete old.sheet_mapping[oldSheet];
+                        delete old.header_mapping_by_sheet[oldSheet];
+                    }
+                });
+                if (!Object.keys(old.sheet_mapping || {}).length) delete result[oldFile];
+            });
+            const entry = result[file] ||= {expected_file: targetFile, sheet_mapping: {}, header_mapping_by_sheet: {}};
+            if (entry.expected_file !== targetFile) throw new Error(`上传文件「${file}」被选给了不同训练文件，请统一选择。`);
+            if (entry.sheet_mapping[sheet] && entry.sheet_mapping[sheet] !== targetSheet) {
+                throw new Error(`「${file} > ${sheet}」被选给了不同训练 Sheet，请统一选择。`);
+            }
+            entry.sheet_mapping[sheet] = targetSheet;
+            const scoped = (entry.header_mapping_by_sheet ||= {})[sheet] ||= {};
+            Object.entries(columns).forEach(([col, target]) => {
+                if (scoped[col] && scoped[col] !== target) throw new Error(`「${file} > ${sheet} > ${col}」重复映射，请选择不同来源列。`);
+                scoped[col] = target;
+            });
+            // 仅兼容旧消费者；多 Sheet 的最终列映射以 scoped 结构为准。
+            entry.header_mapping = Object.assign({}, ...Object.values(entry.header_mapping_by_sheet));
         });
-    }
+    });
+    const destinations = new Map();
+    Object.entries(result).forEach(([file, info]) => Object.entries(info.sheet_mapping || {}).forEach(([sheet, target]) => {
+        const key = JSON.stringify([info.expected_file, target]);
+        const path = `${file} > ${sheet}`;
+        if (destinations.has(key) && destinations.get(key) !== path) {
+            throw new Error(`训练表「${info.expected_file} > ${target}」的列来自不同上传 Sheet，请统一来源；跨表合并需在规则中配置。`);
+        }
+        destinations.set(key, path);
+    }));
     return result;
+}
+
+function _collectUnmatchedColumns(overlay, rows) {
+    return [...overlay.querySelectorAll('select[data-ai-idx]')].filter(sel => !sel.value).map(sel => {
+        const path = _splitPath(rows[Number(sel.dataset.aiIdx)]?.expected_path);
+        if (path && overlay._pendingFileTargets?.has(path.file) && sel.dataset.mappingEdited !== '1') return null;
+        return path ? [path.file, path.sheet, path.col] : null;
+    }).filter(Boolean);
+}
+
+function _collectEditedColumnConfirmations(overlay, rows) {
+    const edited = [...overlay.querySelectorAll('select[data-ai-idx]')]
+        .filter(sel => sel.dataset.mappingEdited === '1');
+    if (!edited.length) return null;
+    const view = {querySelectorAll: () => edited};
+    return {file_mapping: _buildFileMappingFromAiSelections(view, rows, {}),
+            unmatched_columns: _collectUnmatchedColumns(view, rows)};
+}
+
+function _sourceSheetFieldUpdates(rows, current, expectedKey, sourceKey, actualPaths) {
+    const selectedSource = sourceKey ? JSON.parse(sourceKey) : null;
+    const options = actualPaths.filter(path => {
+        const p = _splitPath(path);
+        return p && selectedSource && p.file === selectedSource[0] && p.sheet === selectedSource[1];
+    });
+    const used = new Set();
+    const updates = [];
+    rows.forEach((row, index) => {
+        const expected = _splitPath(row.expected_path);
+        if (!expected || JSON.stringify([expected.file, expected.sheet]) !== expectedKey) return;
+        const old = _splitPath(current.get(index));
+        const byColumn = name => options.find(path => _splitPath(path).col === name && !used.has(path));
+        const value = (old && byColumn(old.col)) || byColumn(expected.col) || '';
+        if (value) used.add(value);
+        updates.push({index, value, options});
+    });
+    return updates;
+}
+
+function _constrainSourceSheetSuggestions(rows, fileMapping) {
+    const sheetKey = path => {
+        const p = _splitPath(path); return p ? JSON.stringify([p.file, p.sheet]) : null;
+    };
+    const fixed = new Map();
+    const owners = new Map();
+    Object.entries(fileMapping || {}).forEach(([file, info]) => {
+        Object.entries(info.sheet_mapping || {}).forEach(([source, target]) => {
+            const sourceKey = JSON.stringify([file, source]);
+            const targetKey = JSON.stringify([info.expected_file || file, target]);
+            if (!owners.has(sourceKey)) owners.set(sourceKey, new Set());
+            owners.get(sourceKey).add(targetKey);
+            if (!fixed.has(targetKey)) fixed.set(targetKey, new Set());
+            fixed.get(targetKey).add(sourceKey);
+        });
+    });
+    const proposed = new Map();
+    for (const row of rows) {
+        const target = sheetKey(row.expected_path), source = sheetKey(row.suggested_path);
+        if (!target || !source) continue;
+        if (owners.has(source) && !owners.get(source).has(target)) continue;
+        if (fixed.has(target) && !fixed.get(target).has(source)) continue;
+        if (!proposed.has(source)) proposed.set(source, new Set());
+        proposed.get(source).add(target);
+    }
+    const targetSources = new Map();
+    for (const [source, targets] of proposed) for (const target of targets) {
+        if (!targetSources.has(target)) targetSources.set(target, new Set());
+        targetSources.get(target).add(source);
+    }
+    return rows.map(row => {
+        const target = sheetKey(row.expected_path), source = sheetKey(row.suggested_path);
+        if (!source) return row;
+        const valid = proposed.get(source)?.has(target) && proposed.get(source).size === 1 &&
+            targetSources.get(target)?.size === 1;
+        return valid ? row : {...row, suggested_path:null, confidence:null,
+            reason:'源 Sheet 对应关系冲突，请在上方选定 Sheet 后自动匹配本表字段'};
+    });
+}
+
+function _withoutUnmatchedMappings(mapping, unmatched) {
+    const skipped = new Set((unmatched || []).map(item => JSON.stringify(item)));
+    const result = JSON.parse(JSON.stringify(mapping || {}));
+    Object.entries(result).forEach(([file, info]) => {
+        Object.entries(info.sheet_mapping || {}).forEach(([sheet, target]) => {
+            const columns = {...((info.header_mapping_by_sheet || {})[sheet] || info.header_mapping || {})};
+            Object.keys(columns).forEach(col => {
+                if (skipped.has(JSON.stringify([info.expected_file || file, target, columns[col]]))) delete columns[col];
+            });
+            (info.header_mapping_by_sheet ||= {})[sheet] = columns;
+            if (!Object.keys(columns).length) {
+                delete info.sheet_mapping[sheet];
+                delete info.header_mapping_by_sheet[sheet];
+            }
+        });
+        if (!Object.keys(info.sheet_mapping || {}).length) delete result[file];
+        else info.header_mapping = Object.assign({}, ...Object.values(info.header_mapping_by_sheet));
+    });
+    return result;
+}
+
+function _buildFileMappingFromAiSelections(overlay, aiSuggestions, originalFileMapping) {
+    const selected = {};
+    overlay.querySelectorAll('select[data-ai-idx]').forEach(sel => {
+        const suggestion = aiSuggestions[Number(sel.dataset.aiIdx)];
+        if (!suggestion) return;
+        if (!sel.value) return;
+        const exp = _splitPath(suggestion.expected_path), act = _splitPath(sel.value);
+        if (!exp || !act) throw new Error('列匹配路径不完整，请重新选择。');
+        const entry = selected[act.file] ||= {expected_file: exp.file, sheet_mapping: {}, header_mapping_by_sheet: {}};
+        if (entry.expected_file !== exp.file || (entry.sheet_mapping[act.sheet] && entry.sheet_mapping[act.sheet] !== exp.sheet)) {
+            throw new Error(`「${act.file} > ${act.sheet}」被选给了不同训练表，请统一来源。`);
+        }
+        entry.sheet_mapping[act.sheet] = exp.sheet;
+        const columns = entry.header_mapping_by_sheet[act.sheet] ||= {};
+        if (columns[act.col] && columns[act.col] !== exp.col) throw new Error(`来源列「${sel.value}」被重复选择。`);
+        columns[act.col] = exp.col;
+    });
+    return _mergeFileMappings(_withoutUnmatchedMappings(originalFileMapping, _collectUnmatchedColumns(overlay, aiSuggestions)), selected);
 }
 
 function _splitPath(path) {
@@ -912,6 +1290,56 @@ async function _readComputeSubmitJson(resp) {
     return body.trim() ? JSON.parse(body.trim()) : null;
 }
 
+// 累积多轮确认项：改名/列名/目标表可能分几轮确认，后一轮不能把前一轮的选择清掉
+function _mergeConfirmations(prev, dialogResult) {
+    const merged = Object.assign({}, prev || {});
+    if (dialogResult.confirmed_mapping) {
+        const incoming = dialogResult.confirmed_mapping;
+        const unmatched = new Map([...(merged.confirmed_mapping?.unmatched_columns || []),
+            ...(incoming.unmatched_columns || [])].map(item => [JSON.stringify(item), item]));
+        Object.entries(incoming.file_mapping || {}).forEach(([file, info]) => {
+            Object.entries(info.sheet_mapping || {}).forEach(([sheet, target]) => {
+                Object.values((info.header_mapping_by_sheet || {})[sheet] || info.header_mapping || {}).forEach(col =>
+                    unmatched.delete(JSON.stringify([info.expected_file || file, target, col])));
+            });
+        });
+        const skipped = [...unmatched.values()];
+        merged.confirmed_mapping = {file_mapping: _mergeFileMappings(
+            _withoutUnmatchedMappings((merged.confirmed_mapping || {}).file_mapping, skipped), incoming.file_mapping),
+            unmatched_columns: skipped};
+    }
+    if (dialogResult.confirmed_renames && Object.keys(dialogResult.confirmed_renames).length > 0) {
+        merged.confirmed_renames = Object.assign({}, merged.confirmed_renames || {}, dialogResult.confirmed_renames);
+    }
+    if (dialogResult.confirmed_target_map && Object.keys(dialogResult.confirmed_target_map).length > 0) {
+        merged.confirmed_target_map = Object.assign({}, merged.confirmed_target_map || {}, dialogResult.confirmed_target_map);
+    }
+    if (dialogResult.skipped_missing_files && dialogResult.skipped_missing_files.length > 0) {
+        merged.skipped_missing_files = Array.from(new Set(
+            (merged.skipped_missing_files || []).concat(dialogResult.skipped_missing_files)));
+    }
+    if (dialogResult.skip_history_check) merged.skip_history_check = true;
+    return merged;
+}
+
+// 会话丢失时退回"整包重传"老路：把已确认项写进 FormData
+function _applyConfirmationsToFormData(formData, confirmations) {
+    if (!confirmations) return;
+    if (confirmations.confirmed_mapping) {
+        formData.set('confirmed_mapping', JSON.stringify(confirmations.confirmed_mapping));
+    }
+    if (confirmations.confirmed_renames && Object.keys(confirmations.confirmed_renames).length > 0) {
+        formData.set('confirmed_renames', JSON.stringify(confirmations.confirmed_renames));
+    }
+    if (confirmations.confirmed_target_map && Object.keys(confirmations.confirmed_target_map).length > 0) {
+        formData.set('confirmed_target_map', JSON.stringify(confirmations.confirmed_target_map));
+    }
+    if (confirmations.skipped_missing_files && confirmations.skipped_missing_files.length > 0) {
+        formData.set('skipped_missing_files', JSON.stringify(confirmations.skipped_missing_files));
+    }
+    if (confirmations.skip_history_check) formData.set('skip_history_check', 'true');
+}
+
 async function startCompute() {
     const btn = document.getElementById('compute-btn');
     const files = document.getElementById('source-files').files;
@@ -983,48 +1411,63 @@ async function startCompute() {
         updateProgress(20);
         addLog('info', '正在提交计算任务...');
 
-        // 提交循环：每次 422 + precheck_failed / encrypted_files 都弹窗补料后重试
+        // 提交循环：文件只在第一次带上；之后的人工确认轮只发 JSON（服务端复用会话里的解析产物）
         const MAX_RETRY = 6;
         let resp = null;
         let responseData = null;
         let attempt = 0;
         let cancelled = false;
+        let sessionId = null;
+        let confirmations = null;
+        const dialogChoices = {};
         while (attempt < MAX_RETRY) {
             attempt += 1;
-            resp = await AUTH.authFetch('/api/compute/submit', {
-                method: 'POST',
-                body: formData,
-            });
+            if (sessionId && confirmations) {
+                resp = await AUTH.authFetch(`/api/compute/session/${sessionId}/confirm`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(confirmations),
+                });
+            } else {
+                resp = await AUTH.authFetch('/api/compute/submit', {
+                    method: 'POST',
+                    body: formData,
+                });
+            }
             responseData = null;
             try { responseData = await _readComputeSubmitJson(resp); } catch (e) {}
             // 提交端使用流式 JSON 保活：预检业务错误也以 JSON error_type 返回，
             // 不能再只依赖 HTTP 422 判断。
-            if (resp.ok && responseData && !responseData.error_type) break;
+            if (resp.ok && responseData && !responseData.error_type) { _closePrecheckDialog(); break; }
 
             const errorData = responseData;
 
+            // 会话过期/服务重启：退回带文件重传的老路（安全网）
+            if (errorData && errorData.error_type === 'session_expired') {
+                addLog('warning', '计算会话已过期，正在带文件重新提交...');
+                _applyConfirmationsToFormData(formData, confirmations);
+                sessionId = null;
+                continue;
+            }
+
             // 事前校验失败
             if (errorData && errorData.error_type === 'precheck_failed') {
-                addLog('warning', '事前校验未通过，等待用户确认...');
-                const dialogResult = await _showPrecheckDialog(errorData);
+                addLog('warning', _precheckSummary(errorData) || '请确认计算来源匹配');
+                const dialogResult = await _showPrecheckDialog(errorData, confirmations, dialogChoices);
                 if (!dialogResult) {
                     addLog('info', '用户取消了校验确认');
                     cancelled = true;
                     break;
                 }
-                if (dialogResult.confirmed_mapping) {
-                    formData.set('confirmed_mapping', JSON.stringify(dialogResult.confirmed_mapping));
+                confirmations = _mergeConfirmations(confirmations, dialogResult);
+                if (errorData.session_id) {
+                    sessionId = errorData.session_id;
+                    addLog('info', '正在用确认后的参数继续（无需重传文件）...');
+                } else {
+                    // 老服务端未返回会话 → 保持整包重传
+                    _applyConfirmationsToFormData(formData, confirmations);
+                    addLog('info', '正在用确认后的参数重新提交...');
                 }
-                if (dialogResult.confirmed_renames && Object.keys(dialogResult.confirmed_renames).length > 0) {
-                    formData.set('confirmed_renames', JSON.stringify(dialogResult.confirmed_renames));
-                }
-                if (dialogResult.confirmed_target_map && Object.keys(dialogResult.confirmed_target_map).length > 0) {
-                    formData.set('confirmed_target_map', JSON.stringify(dialogResult.confirmed_target_map));
-                }
-                if (dialogResult.skip_history_check) {
-                    formData.set('skip_history_check', 'true');
-                }
-                addLog('info', '正在用确认后的参数重新提交...');
                 continue;
             }
 
@@ -1039,6 +1482,9 @@ async function startCompute() {
                 }
                 _filePasswordsMap = { ...(_filePasswordsMap || {}), ...passwords };
                 formData.set('file_passwords', JSON.stringify(_filePasswordsMap));
+                // 密码要在解密前给到，这一支必须带文件重传；已确认项写回 FormData 别丢
+                _applyConfirmationsToFormData(formData, confirmations);
+                sessionId = null;
                 addLog('info', '正在使用密码重新提交...');
                 continue;
             }
@@ -1069,6 +1515,7 @@ async function startCompute() {
         _connectComputeStream(_currentTaskId, 0);
 
     } catch (e) {
+        _closePrecheckDialog();
         console.error('计算提交失败:', e);
         addLog('error', `计算失败: ${e.message}`);
         updateStatus('计算失败');

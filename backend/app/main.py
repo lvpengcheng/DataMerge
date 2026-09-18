@@ -666,6 +666,16 @@ async def startup_event():
                 logger.warning(f"清理日志缓冲区异常: {e}")
     asyncio.create_task(_cleanup_log_buffers())
 
+    # 定期清理超时未确认的智算会话（连同其上传文件与解析产物）
+    async def _cleanup_compute_sessions():
+        while True:
+            await asyncio.sleep(300)
+            try:
+                _sweep_compute_sessions()
+            except Exception as e:
+                logger.warning(f"清理智算会话异常: {e}")
+    asyncio.create_task(_cleanup_compute_sessions())
+
 
 # 挂载前端静态文件
 _frontend_dir = Path(__file__).resolve().parent.parent.parent / "frontend"
@@ -3967,44 +3977,69 @@ def _persist_compute_start(tenant_id: str, script_id_str: str,
         return None, None
 
 
-def _persist_source_file(db, task_id, tenant_id, src_file_path, file_name, file_size):
-    """注册源文件为数据资产并关联到计算任务（仅存表头摘要，不全量解析）"""
+def _file_sha256(path, chunk_size: int = 1024 * 1024) -> Optional[str]:
+    """分块算文件指纹（不落副本时用它标识这份上传）。"""
+    import hashlib
     try:
-        project_root = Path(__file__).resolve().parent.parent.parent
-        asset_dir = project_root / "tenants" / tenant_id / "assets" / "source"
-        asset_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        dest_path = asset_dir / f"{timestamp}_{file_name}"
-        shutil.copy2(src_file_path, dest_path)
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(chunk_size), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except Exception as e:
+        logger.warning(f"计算源文件指纹失败: {e}")
+        return None
+
+
+def _persist_source_file(db, task_id, tenant_id, src_file_path, file_name, file_size,
+                         sheet_summary=None, copy_file: bool = False):
+    """注册源文件为数据资产并关联到计算任务（只登记元数据）
+
+    sheet_summary: 由 ingest 解析结果直接给出时不再打开文件（零额外 Aspose 调用）。
+    copy_file:     默认不再把上传件复制进 tenants/*/assets/source —— 没有任何代码按
+                   asset_type="source" 回读文件，副本只占磁盘。需要留档时显式传 True。
+    """
+    try:
+        dest_path = None
+        if copy_file:
+            project_root = Path(__file__).resolve().parent.parent.parent
+            asset_dir = project_root / "tenants" / tenant_id / "assets" / "source"
+            asset_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            dest_path = asset_dir / f"{timestamp}_{file_name}"
+            shutil.copy2(src_file_path, dest_path)
 
         # 仅读取表头摘要（headers_only + read_formulas=False），避免全量解析大文件
-        sheet_summary = None
-        try:
-            from excel_parser import IntelligentExcelParser
-            parser = IntelligentExcelParser()
-            results = parser.parse_excel_file(
-                str(dest_path), headers_only=True, read_formulas=False, best_region_only=True
-            )
-            sheet_summary = []
-            for sd in results:
-                headers = []
-                total_rows = 0
-                for r in sd.regions:
-                    headers.extend(list(r.head_data.keys()) if r.head_data else [])
-                    total_rows += len(r.data)
-                sheet_summary.append({"sheet_name": sd.sheet_name, "rows": total_rows, "headers": headers[:50], "regions": len(sd.regions)})
-        except Exception as parse_err:
-            logger.warning(f"解析源文件表头失败: {parse_err}")
+        if sheet_summary is None:
+            try:
+                from excel_parser import IntelligentExcelParser
+                parser = IntelligentExcelParser()
+                results = parser.parse_excel_file(
+                    str(dest_path or src_file_path), headers_only=True,
+                    read_formulas=False, best_region_only=True
+                )
+                sheet_summary = []
+                for sd in results:
+                    headers = []
+                    total_rows = 0
+                    for r in sd.regions:
+                        headers.extend(list(r.head_data.keys()) if r.head_data else [])
+                        total_rows += len(r.data)
+                    sheet_summary.append({"sheet_name": sd.sheet_name, "rows": total_rows, "headers": headers[:50], "regions": len(sd.regions)})
+            except Exception as parse_err:
+                logger.warning(f"解析源文件表头失败: {parse_err}")
 
         asset = db_models.DataAsset(
             tenant_id=tenant_id,
             asset_type="source",
             name=file_name,
-            file_path=str(dest_path),
+            # 不留副本时记一个来源标记（列非空），并把指纹写进 tags 供追溯
+            file_path=str(dest_path) if dest_path else f"session://{task_id}/{file_name}",
             file_name=file_name,
             file_size=file_size,
             sheet_summary=sheet_summary,
             parsed_data=None,
+            tags=None if dest_path else {"sha256": _file_sha256(src_file_path)},
         )
         db.add(asset)
         db.commit()
@@ -4027,29 +4062,32 @@ def _persist_source_file(db, task_id, tenant_id, src_file_path, file_name, file_
         return None
 
 
-def _persist_result_file(db, task_id, tenant_id, saved_file_path, original_name):
-    """注册计算结果为数据资产（仅存表头摘要，不做公式计算和全量解析）"""
+def _persist_result_file(db, task_id, tenant_id, saved_file_path, original_name, sheet_summary=None):
+    """注册计算结果为数据资产（仅存表头摘要，不做公式计算和全量解析）
+
+    sheet_summary: finalize_output_workbook 顺带返回的摘要；给了就不再打开结果文件。
+    """
     try:
         saved_path = Path(saved_file_path) if not isinstance(saved_file_path, Path) else saved_file_path
 
         # 仅读取表头和行数摘要，跳过 CalculateFormula（用户打开 Excel 时自动重算）
-        sheet_summary = None
-        try:
-            from excel_parser import IntelligentExcelParser
-            parser = IntelligentExcelParser()
-            results = parser.parse_excel_file(
-                str(saved_path), headers_only=True, read_formulas=False, best_region_only=True
-            )
-            sheet_summary = []
-            for sd in results:
-                headers = []
-                total_rows = 0
-                for r in sd.regions:
-                    headers.extend(list(r.head_data.keys()) if r.head_data else [])
-                    total_rows += len(r.data)
-                sheet_summary.append({"sheet_name": sd.sheet_name, "rows": total_rows, "headers": headers[:50], "regions": len(sd.regions)})
-        except Exception as parse_err:
-            logger.warning(f"解析结果文件表头失败: {parse_err}")
+        if sheet_summary is None:
+            try:
+                from excel_parser import IntelligentExcelParser
+                parser = IntelligentExcelParser()
+                results = parser.parse_excel_file(
+                    str(saved_path), headers_only=True, read_formulas=False, best_region_only=True
+                )
+                sheet_summary = []
+                for sd in results:
+                    headers = []
+                    total_rows = 0
+                    for r in sd.regions:
+                        headers.extend(list(r.head_data.keys()) if r.head_data else [])
+                        total_rows += len(r.data)
+                    sheet_summary.append({"sheet_name": sd.sheet_name, "rows": total_rows, "headers": headers[:50], "regions": len(sd.regions)})
+            except Exception as parse_err:
+                logger.warning(f"解析结果文件表头失败: {parse_err}")
 
         asset = db_models.DataAsset(
             tenant_id=tenant_id,
@@ -4471,27 +4509,33 @@ async def _run_compute_subprocess(task_id: str, buffer, params_file: str, temp_d
                 logger.warning("计算临时文件清理延期: %s", exc)
 
 
-async def _run_compute_subprocess_queued(task_id: str, buffer, params_file: str, temp_dir: str):
-    """Bounded FIFO queue, shared with training and uploads."""
+async def _run_compute_subprocess_queued(task_id: str, buffer, params_file: str, temp_dir: str,
+                                         slot_held: bool = False):
+    """Bounded FIFO queue, shared with training and uploads.
+
+    slot_held: 调用方（提交端点）已持有 Excel 闸门槽并移交给本任务 —— 一次计算只排一次队，
+    解析与计算之间不放手，避免被别人插队。释放责任随之转到这里的 finally。
+    """
     from backend.utils.upload_stream import get_excel_work_semaphore
     from backend.utils.subprocess_runner import env_int
     semaphore = get_excel_work_semaphore()
-    acquire_task = asyncio.create_task(semaphore.acquire())
+    acquire_task = None if slot_held else asyncio.create_task(semaphore.acquire())
     started = time.monotonic()
     interval = max(1, env_int("EXCEL_QUEUE_NOTICE_INTERVAL", 15))
     try:
-        while not acquire_task.done():
-            done, _ = await asyncio.wait({acquire_task}, timeout=interval)
-            if not done:
-                buffer.push(task_id, json.dumps({
-                    "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
-                    "level": "info", "message": f"等待执行资源（已排队 {int(time.monotonic() - started)} 秒）",
-                }, ensure_ascii=False))
-        await acquire_task
-        buffer.push(task_id, json.dumps({
-            "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
-            "level": "info", "message": f"已获得执行槽（排队 {int(time.monotonic() - started)} 秒），开始计算",
-        }, ensure_ascii=False))
+        if acquire_task is not None:
+            while not acquire_task.done():
+                done, _ = await asyncio.wait({acquire_task}, timeout=interval)
+                if not done:
+                    buffer.push(task_id, json.dumps({
+                        "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "level": "info", "message": f"等待执行资源（已排队 {int(time.monotonic() - started)} 秒）",
+                    }, ensure_ascii=False))
+            await acquire_task
+            buffer.push(task_id, json.dumps({
+                "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "level": "info", "message": f"已获得执行槽（排队 {int(time.monotonic() - started)} 秒），开始计算",
+            }, ensure_ascii=False))
         await _run_compute_subprocess(task_id, buffer, params_file, temp_dir)
     except Exception as exc:
         message = "等待执行资源超时，请稍后重试" if isinstance(exc, TimeoutError) else str(exc)
@@ -4508,10 +4552,14 @@ async def _run_compute_subprocess_queued(task_id: str, buffer, params_file: str,
             logger.exception("排队失败状态持久化未完成")
         buffer.finish(task_id)
     finally:
-        if not acquire_task.done():
-            acquire_task.cancel()
-            await asyncio.gather(acquire_task, return_exceptions=True)
-        if not acquire_task.cancelled() and acquire_task.exception() is None and acquire_task.result():
+        held = slot_held
+        if acquire_task is not None:
+            if not acquire_task.done():
+                acquire_task.cancel()
+                await asyncio.gather(acquire_task, return_exceptions=True)
+            held = (not acquire_task.cancelled() and acquire_task.exception() is None
+                    and bool(acquire_task.result()))
+        if held:
             semaphore.release()
 
 
@@ -4531,6 +4579,7 @@ async def run_compute_task(
     source_mapping_warning=None,
     template_override_path: Optional[str] = None,
     target_sheet_manual_map=None,
+    unmatched_columns=None,
 ):
     """独立的计算任务函数，由 submit 端点触发后台运行。
 
@@ -4545,7 +4594,7 @@ async def run_compute_task(
         salary_month: 薪资月份
         standard_hours: 标准工时
         file_passwords: 文件密码 JSON 字符串
-        pre_validated_mapping: submit 阶段事前校验通过的 file_mapping（仅用于日志，不阻断重新匹配）
+        pre_validated_mapping: submit 阶段保存的最终 file_mapping，计算时必须复用，不能重新推断覆盖
         precheck_auto_filled: submit 阶段自动从基础资料补全的文件列表（仅日志展示）
     """
     from backend.compute.task_log_buffer import TaskLogBuffer
@@ -4660,13 +4709,23 @@ async def run_compute_task(
                             "level": "info", "message": f"已解密文件: {file_path.name}"
                         }, ensure_ascii=False))
 
+        # 会话产物（预检那唯一一次解析的结果）：资产摘要与源数据都从这里来，不再重开源文件
+        from backend.utils.compute_ingest import ingest_ready as _ingest_ready, read_meta as _read_ingest_meta
+        _ingest_meta = None
+        _has_session_ingest = _ingest_ready(str(temp_dir))
+        if _has_session_ingest:
+            _ingest_meta = _read_ingest_meta(str(temp_dir))
+            _has_session_ingest = _ingest_meta is not None
+
         # DB持久化：注册源文件为数据资产
         if db_session:
+            _asset_summaries = (getattr(_ingest_meta, "sheet_summary", None) or {}) if _ingest_meta else {}
             for src_file in source_dir.iterdir():
                 if src_file.is_file():
                     _persist_source_file(
                         db_session, compute_task_id, tenant_id,
-                        str(src_file), src_file.name, src_file.stat().st_size
+                        str(src_file), src_file.name, src_file.stat().st_size,
+                        sheet_summary=_asset_summaries.get(src_file.name)
                     )
 
         # ========== 【关键修复】根据列头映射表名/sheet名/列名 ==========
@@ -4705,7 +4764,9 @@ async def run_compute_task(
                     manual_headers = None
 
             # ========== 自动补全缺失源文件（从基础资料） ==========
-            if source_structure and db_session:
+            # 会话产物存在时，ingest 阶段已做过兜底并把补进来的文件一起解析了；
+            # 这里再跑一遍只会重复查库（缺失文件已在预检阶段拦下），直接跳过。
+            if source_structure and db_session and not _has_session_ingest:
                 try:
                     from backend.utils.source_auto_filler import auto_fill_missing_sources
                     _filled, _still_missing = auto_fill_missing_sources(
@@ -4734,7 +4795,11 @@ async def run_compute_task(
                                if f.is_file() and f.suffix.lower() in (".xlsx", ".xls", ".xlsm")
                                and not f.name.startswith("~")]
 
-                if input_files:
+                from backend.utils.confirmed_source_mapping import fully_unmatched_sheets
+                _unmatched_sheets = fully_unmatched_sheets(source_structure, unmatched_columns)
+                _all_source_sheets = {(f, s) for f, info in source_structure.get('files', {}).items()
+                                      for s in info.get('sheets', {})}
+                if input_files and not (_all_source_sheets and _all_source_sheets <= _unmatched_sheets):
                     log_msg = {
                         "type": "log",
                         "timestamp": datetime.now().strftime("%H:%M:%S"),
@@ -4749,23 +4814,58 @@ async def run_compute_task(
                     _single_parse_ok = False
                     file_mapping = None
                     try:
-                        from backend.utils.compute_preload_cache import load_preload
-                        cached = await asyncio.to_thread(
-                            load_preload, source_dir, (source_structure, manual_headers, expected_structure))
-                        if cached:
-                            file_mapping, pre_loaded_source_data = cached
+                        # 会话产物优先：源文件在本次计算中一次都不再打开，
+                        # 直接用预检那唯一一次解析的结果 + 最终映射构建 source_data。
+                        _session_preload = None
+                        if _has_session_ingest and pre_validated_mapping:
+                            from backend.utils.compute_ingest import (
+                                build_preload as _ingest_build_preload, read_sources as _read_sources,
+                            )
+                            _sources = await asyncio.to_thread(_read_sources, str(temp_dir))
+                            if _sources:
+                                _session_preload = await asyncio.to_thread(
+                                    _ingest_build_preload, _ingest_meta, _sources, pre_validated_mapping)
+                        _cached = None
+                        if not _session_preload:
+                            from backend.utils.compute_preload_cache import load_preload
+                            _cached = await asyncio.to_thread(
+                                load_preload, source_dir, (source_structure, manual_headers, expected_structure))
+                        if _session_preload:
+                            file_mapping = pre_validated_mapping
+                            pre_loaded_source_data = _session_preload
+                            match_success, match_error = True, None
+                            logger.info(f"复用会话解析产物构建源数据（源文件零重开）: {list(_session_preload.keys())}")
+                        elif _cached:
+                            if pre_validated_mapping and _cached[0] != pre_validated_mapping:
+                                raise ValueError('预加载缓存与最终确认映射不一致，请重新提交计算')
+                            file_mapping, pre_loaded_source_data = _cached
                             match_success, match_error = True, None
                             logger.info("复用预检查解析结果，无需再次打开源 Excel")
                         else:
-                            match_success, match_error, file_mapping, pre_loaded_source_data = \
-                                await _loop.run_in_executor(None, lambda: fast_matcher.match_parse_and_prepare(
-                                    source_structure=source_structure, input_files=input_files,
-                                    manual_headers=manual_headers, output_dir=str(source_dir),
-                                    expected_structure=expected_structure,
-                                    ai_provider_name=_resolve_enabled_ai_provider(
-                                        _script_info.get('ai_provider') or os.getenv('AI_PROVIDER', 'deepseek'))))
+                            if pre_validated_mapping:
+                                _, _parsed = await asyncio.to_thread(
+                                    fast_matcher.parse_inputs, input_files, manual_headers,
+                                    multi_sheet_source=bool((source_structure or {}).get('multi_sheet_source')) or
+                                    any(len(info.get('sheet_mapping', {})) > 1 for info in pre_validated_mapping.values()))
+                                file_mapping = pre_validated_mapping
+                                pre_loaded_source_data = await asyncio.to_thread(
+                                    fast_matcher.build_preload, file_mapping, _parsed,
+                                    source_structure, expected_structure)
+                                if not pre_loaded_source_data:
+                                    raise ValueError('无法按最终确认映射构建计算数据')
+                                match_success, match_error = True, None
+                            else:
+                                match_success, match_error, file_mapping, pre_loaded_source_data = \
+                                    await _loop.run_in_executor(None, lambda: fast_matcher.match_parse_and_prepare(
+                                        source_structure=source_structure, input_files=input_files,
+                                        manual_headers=manual_headers, output_dir=str(source_dir),
+                                        expected_structure=expected_structure,
+                                        ai_provider_name=_resolve_enabled_ai_provider(
+                                            _script_info.get('ai_provider') or os.getenv('AI_PROVIDER', 'deepseek'))))
                         _single_parse_ok = True
                     except Exception as _sp_err:
+                        if pre_validated_mapping:
+                            raise ValueError(f'最终确认映射无法应用，已停止计算: {_sp_err}') from _sp_err
                         logger.warning(f"[compute/task] 单次解析优化失败: {_sp_err}，回退到多次解析流程", exc_info=True)
 
                     # ===== 回退：原有多次解析流程 =====
@@ -4902,6 +5002,9 @@ async def run_compute_task(
                             _reserved = set((expected_structure or {}).get("sheets", {}).keys()) if expected_structure else set()
                             _ek_map = assign_sheet_keys(_ek_pairs, reserved_names=_reserved)
                             expected_keys = set(_ek_map.values())
+                            expected_keys -= {_ek_map[(os.path.splitext(f)[0], sn)]
+                                              for f, sn in _unmatched_sheets
+                                              if (os.path.splitext(f)[0], sn) in _ek_map}
 
                             missing_keys = expected_keys - set(pre_loaded_source_data.keys())
                             if missing_keys:
@@ -4923,6 +5026,17 @@ async def run_compute_task(
                             raise ValueError(f"源数据表头匹配失败: {match_error}")
         except Exception as e:
             raise ValueError(f"源数据映射未通过，停止计算以避免使用错误表: {e}") from e
+
+        # 直接读 Excel 的定制脚本也必须使用人工确认后的文件/Sheet/列。
+        # 从最终 DataFrame 生成独立执行目录，上传文件保持不变。
+        execution_source_dir = str(source_dir)
+        if pre_validated_mapping and any(info.get('confirmed') for info in pre_validated_mapping.values()):
+            if not pre_loaded_source_data:
+                raise ValueError('人工映射缺少最终源数据，停止计算')
+            from backend.utils.confirmed_source_mapping import write_execution_sources
+            execution_source_dir = await asyncio.to_thread(
+                write_execution_sources, temp_dir / 'confirmed_source', pre_validated_mapping,
+                pre_loaded_source_data, source_structure, expected_structure)
 
         # 保存脚本
         script_path = temp_dir / f"{script_id}.py"
@@ -4958,7 +5072,7 @@ async def run_compute_task(
                 module = importlib.util.module_from_spec(spec)
 
                 # 设置全局变量
-                module.input_folder = str(source_dir)
+                module.input_folder = execution_source_dir
                 module.output_folder = str(output_dir)
                 if salary_year is not None:
                     module.salary_year = salary_year
@@ -5073,7 +5187,7 @@ async def run_compute_task(
                 if hasattr(module, 'main'):
                     from backend.utils.script_entry import invoke_script_main
                     result = invoke_script_main(module.main, {
-                        "input_folder": str(source_dir), "output_folder": str(output_dir),
+                        "input_folder": execution_source_dir, "output_folder": str(output_dir),
                         "salary_year": salary_year, "salary_month": salary_month,
                         "monthly_standard_hours": standard_hours,
                     })
@@ -5306,16 +5420,19 @@ async def run_compute_task(
 
         # DB持久化：注册结果文件 + 标记任务完成
         if db_session:
+            # 摘要来自 finalize_output_workbook（同一次打开顺带算出），不再为登记重开结果文件；
+            # 纯值版与原版 sheet/行列一致，共用同一份摘要。
+            _result_summary = _finalized[str(output_file)].get("sheet_summary")
             _persist_result_file(
                 db_session, compute_task_id, tenant_id,
-                saved_file, _result_name
+                saved_file, _result_name, sheet_summary=_result_summary
             )
             # 纯值版也注册为结果文件
             if _values_saved:
                 try:
                     _persist_result_file(
                         db_session, compute_task_id, tenant_id,
-                        _values_saved, _values_saved.name
+                        _values_saved, _values_saved.name, sheet_summary=_result_summary
                     )
                 except Exception as _pe:
                     logger.warning(f"[纯值版] 注册结果文件失败（不阻断）: {_pe}")
@@ -5373,48 +5490,148 @@ async def run_compute_task(
 
 # ==================== 新版计算接口：任务队列 + SSE 重连 ====================
 
+# 智算会话：一次上传的文件与解析产物在会话目录里存活，人工确认轮只发 JSON、不重传文件。
+# 进程内 dict 为权威（重启即失效 → 前端收到 session_expired 自动退回带文件重传）。
+_COMPUTE_SESSIONS: Dict[str, dict] = {}
+
+
+def _compute_session_ttl() -> int:
+    try:
+        return max(60, int(os.getenv("COMPUTE_SESSION_TTL", "1800")))
+    except (TypeError, ValueError):
+        return 1800
+
+
+def _sweep_compute_sessions():
+    """清掉超时未确认的会话（连同上传文件与解析产物）。"""
+    deadline = time.time() - _compute_session_ttl()
+    for sid, sess in list(_COMPUTE_SESSIONS.items()):
+        if sess.get("created_at", 0) < deadline:
+            _COMPUTE_SESSIONS.pop(sid, None)
+            if not sess.get("consumed"):
+                shutil.rmtree(sess.get("temp_dir", ""), ignore_errors=True)
+                logger.info(f"[compute/session] 会话过期已清理: {sid}")
+
+
+def _register_compute_session(tenant_id: str, script_id: str, temp_dir: Path, params: dict) -> dict:
+    import uuid
+    _sweep_compute_sessions()
+    session_id = uuid.uuid4().hex
+    sess = {"session_id": session_id, "tenant_id": tenant_id, "script_id": script_id,
+            "temp_dir": str(temp_dir), "created_at": time.time(),
+            "params": params, "consumed": False}
+    _COMPUTE_SESSIONS[session_id] = sess
+    try:  # 落一份便于排查（权威仍是内存 dict）
+        (temp_dir / "session.json").write_text(json.dumps(
+            {"session_id": session_id, "tenant_id": tenant_id, "script_id": script_id,
+             "created_at": sess["created_at"]}, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+    return sess
+
+
+def _get_compute_session(session_id: str, accessible_tenants: list) -> Optional[dict]:
+    """取会话；不存在/过期/已消费返回 None，租户不匹配抛 403（防越权读别人的上传）。"""
+    _sweep_compute_sessions()
+    sess = _COMPUTE_SESSIONS.get(str(session_id))
+    if not sess or sess.get("consumed"):
+        return None
+    if sess["tenant_id"] not in (accessible_tenants or []):
+        raise HTTPException(status_code=403, detail=f"无权访问租户 '{sess['tenant_id']}'")
+    if not Path(sess["temp_dir"]).exists():
+        _COMPUTE_SESSIONS.pop(str(session_id), None)
+        return None
+    return sess
+
+
+def _compute_pending_payload(pc_result, session_id: Optional[str] = None) -> dict:
+    """预检未通过时返回给前端的全部待确认项（改名 / 列名 / 目标表 / 历史一次性给全）。"""
+    payload = {
+        "error_type": "precheck_failed",
+        "missing_files": pc_result.missing_files,
+        "auto_filled": pc_result.auto_filled,
+        "auto_renamed": pc_result.auto_renamed,
+        "rename_candidates": pc_result.rename_candidates,
+        "missing_columns": pc_result.missing_columns,
+        "ai_suggestions": pc_result.ai_suggestions,
+        "actual_paths": pc_result.actual_paths,
+        "history_warnings": pc_result.history_warnings,
+        "target_candidates": pc_result.target_candidates,
+        "file_mapping": pc_result.file_mapping,
+        "unmatched_columns": pc_result.unmatched_columns,
+        "target_map": pc_result.target_map,
+    }
+    if session_id:
+        payload["session_id"] = session_id
+    return payload
+
+
+async def _dispatch_compute_task(sess: dict, pc_result, confirmed_target_map=None,
+                                 slot_held: bool = False) -> dict:
+    """预检通过 → 建 DB 任务 + 写参数 + 派发 worker 子进程。submit 与 confirm 共用这一段。"""
+    p = sess["params"]
+    temp_dir = Path(sess["temp_dir"])
+    db_session, compute_task_id = _persist_compute_start(
+        p["tenant_id"], p["script_id"],
+        salary_year=p.get("salary_year"), salary_month=p.get("salary_month"))
+    try:
+        db_session.close()
+    except Exception:
+        pass
+    task_id_str = str(compute_task_id) if compute_task_id else str(id(temp_dir))
+
+    from backend.compute.task_log_buffer import TaskLogBuffer
+    buffer = TaskLogBuffer.get_instance()
+    buffer.create_task(task_id_str)
+    buffer.push(task_id_str, json.dumps({
+        "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "level": "info", "message": "预检完成，任务已进入 Excel 有界并发队列",
+    }, ensure_ascii=False))
+
+    compute_params = {
+        "task_id": task_id_str, "tenant_id": p["tenant_id"], "script_id": p["script_id"],
+        "script_content": p["script_content"], "source_dir": p["source_dir"],
+        "salary_year": p.get("salary_year"), "salary_month": p.get("salary_month"),
+        "standard_hours": p.get("standard_hours"), "file_passwords": p.get("file_passwords"),
+        "pre_validated_mapping": pc_result.file_mapping,
+        "unmatched_columns": pc_result.unmatched_columns,
+        "precheck_auto_filled": pc_result.auto_filled,
+        "source_mapping_warning": getattr(pc_result, "_source_mapping_warning", None),
+        "template_override_path": p.get("template_override_path"),
+        # 自动解析出的非同名映射 + 用户人工指定（人工优先覆盖）。两者必须合并：
+        # 只传人工那几个键会让其余按月改名的表在运行时重新猜，整表静默漏填。
+        "target_sheet_manual_map": {**(pc_result.target_map or {}),
+                                    **(confirmed_target_map or {})},
+    }
+    params_file = temp_dir / "_compute_params.json"
+    params_file.write_text(
+        json.dumps(compute_params, ensure_ascii=False, default=str), encoding="utf-8")
+
+    # 会话交棒给计算进程：目录由 _run_compute_subprocess 的 finally 统一清理
+    sess["consumed"] = True
+    _COMPUTE_SESSIONS.pop(sess.get("session_id", ""), None)
+    asyncio.create_task(_run_compute_subprocess_queued(
+        task_id_str, buffer, str(params_file), str(temp_dir), slot_held=slot_held))
+    logger.info(f"[compute/submit] 任务已提交: task_id={task_id_str}")
+    return {"task_id": task_id_str}
+
 
 def _compute_upload_precheck_subprocess(payload: dict) -> dict:
     """智算上传预处理子进程：解密、xls 转换、规范化和预检查。"""
     source_dir = Path(payload["source_dir"])
-    template_override_path = payload.get("template_override_path")
-    passwords_dict = payload.get("passwords_dict") or {}
 
-    from backend.utils.aspose_helper import is_encrypted, decrypt_excel
-    from backend.utils.source_normalizer import convert_xls_to_xlsx, normalize_misformatted_dates
+    from backend.utils.compute_ingest import prepare_source_dir
     from backend.utils.compute_precheck import precheck_compute
 
-    encrypted = []
-    encryption = {}
-    for fp in source_dir.iterdir():
-        if fp.is_file() and fp.suffix.lower() in (".xlsx", ".xls", ".xlsm"):
-            encryption[fp.name] = is_encrypted(str(fp.resolve()))
-            if encryption[fp.name] and not passwords_dict.get(fp.name):
-                encrypted.append(fp.name)
-    template_encrypted = bool(template_override_path and is_encrypted(template_override_path))
-    template_password = passwords_dict.get(Path(template_override_path).name) if template_override_path else None
-    if template_encrypted and not template_password:
-        encrypted.append(Path(template_override_path).name)
+    # 解密 + xls 转换（加密判定走 8 字节魔数，只有含糊的文件才落到 Aspose）
+    encrypted, template_override_path = prepare_source_dir(
+        str(source_dir),
+        payload.get("passwords_dict") or {},
+        payload.get("template_override_path"),
+    )
     if encrypted:
         return {"encrypted_files": encrypted, "pc_result": None,
                 "template_override_path": template_override_path}
-
-    for fp in list(source_dir.iterdir()):
-        if not fp.is_file() or fp.suffix.lower() not in (".xlsx", ".xls", ".xlsm"):
-            continue
-        fp_str = str(fp.resolve())
-        pwd = passwords_dict.get(fp.name)
-        if pwd and encryption.get(fp.name):
-            decrypted = decrypt_excel(fp_str, password=pwd)
-            shutil.move(decrypted, fp_str)
-        if fp.suffix.lower() == ".xls":
-            convert_xls_to_xlsx(fp_str)
-
-    if template_override_path:
-        if template_encrypted:
-            decrypted = decrypt_excel(template_override_path, password=template_password)
-            shutil.move(decrypted, template_override_path)
-        template_override_path = convert_xls_to_xlsx(template_override_path)
 
     # Date repair is performed in the parser's open workbook, without rewriting uploads.
 
@@ -5438,6 +5655,8 @@ def _compute_upload_precheck_subprocess(payload: dict) -> dict:
             template_override_path=template_override_path,
             confirmed_target_map=payload.get("confirmed_target_map"),
             in_worker=True,
+            session_dir=payload.get("session_dir"),
+            skipped_missing_files=payload.get("skipped_missing_files"),
         )
         preloaded = getattr(pc, "_pre_loaded_source_data", None)
         if pc.ok and preloaded:
@@ -5464,6 +5683,7 @@ async def compute_submit(
     confirmed_mapping: Optional[str] = Form(None),
     confirmed_renames: Optional[str] = Form(None),
     confirmed_target_map: Optional[str] = Form(None),
+    skipped_missing_files: Optional[str] = Form(None),
     skip_history_check: Optional[bool] = Form(False),
     current_user=Depends(get_current_user),
     accessible_tenants: list = Depends(get_operable_tenants),
@@ -5524,12 +5744,13 @@ async def compute_submit(
             except Exception as _ce:
                 logger.warning(f"[compute/submit] confirmed_mapping 解析失败: {_ce}")
 
+        # 空值 = 用户明确选择"不映射/跳过"，必须原样透传（过滤掉会让同一个确认框反复弹）
         _confirmed_renames = None
         if confirmed_renames:
             try:
                 _parsed = json.loads(confirmed_renames)
                 if isinstance(_parsed, dict):
-                    _confirmed_renames = {str(k): str(v) for k, v in _parsed.items() if k and v}
+                    _confirmed_renames = {str(k): str(v or "") for k, v in _parsed.items() if k}
             except Exception as _cr:
                 logger.warning(f"[compute/submit] confirmed_renames 解析失败: {_cr}")
 
@@ -5538,9 +5759,18 @@ async def compute_submit(
             try:
                 _parsed_t = json.loads(confirmed_target_map)
                 if isinstance(_parsed_t, dict):
-                    _confirmed_target_map = {str(k): str(v) for k, v in _parsed_t.items() if k and v}
+                    _confirmed_target_map = {str(k): str(v or "") for k, v in _parsed_t.items() if k}
             except Exception as _ct:
                 logger.warning(f"[compute/submit] confirmed_target_map 解析失败: {_ct}")
+
+        _skipped_missing = None
+        if skipped_missing_files:
+            try:
+                _parsed_s = json.loads(skipped_missing_files)
+                if isinstance(_parsed_s, list):
+                    _skipped_missing = [str(f) for f in _parsed_s if f]
+            except Exception as _cs:
+                logger.warning(f"[compute/submit] skipped_missing_files 解析失败: {_cs}")
 
         _script_info = _load_script_info_for_precheck(tenant_id, script_id)
         _source_structure = _script_info.get("source_structure")
@@ -5575,79 +5805,64 @@ async def compute_submit(
             "confirmed_mapping": _confirmed, "confirmed_renames": _confirmed_renames,
             "use_history": _use_history_flag, "expected_structure": _expected_structure,
             "confirmed_target_map": _confirmed_target_map,
+            "skipped_missing_files": _skipped_missing,
             "ai_provider_name": _script_info.get("ai_provider"),
+            "session_dir": str(temp_dir),
         }
         async def _finish_compute_submission():
             nonlocal template_override_path
             from backend.utils.upload_stream import get_excel_work_semaphore
-            async with get_excel_work_semaphore():
+            # 一次计算只排一次闸门：ingest 与随后的计算共用同一个槽（中间不放手，防插队）
+            semaphore = get_excel_work_semaphore()
+            await semaphore.acquire()
+            slot_held = True
+            try:
                 _pre_sub = await run_in_fresh_subprocess_async(
                     "backend.app.main:_compute_upload_precheck_subprocess",
                     args=(_pre_payload,),
                     timeout=int(os.getenv("COMPUTE_PRECHECK_TIMEOUT", "600")),
                     max_memory_mb=int(os.getenv("COMPUTE_PRECHECK_MAX_MEMORY_MB", "1536")),
                 )
-            if not _pre_sub.success:
-                raise RuntimeError(f"智算上传预处理失败: {_pre_sub.error}")
-            _pre = _pre_sub.result
-            template_override_path = _pre.get("template_override_path") or template_override_path
+                if not _pre_sub.success:
+                    raise RuntimeError(f"智算上传预处理失败: {_pre_sub.error}")
+                _pre = _pre_sub.result
+                template_override_path = _pre.get("template_override_path") or template_override_path
 
-            if _pre["encrypted_files"]:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                return {"error_type": "encrypted_files",
-                        "encrypted_files": _pre["encrypted_files"],
-                        "message": f"检测到加密文件: {', '.join(_pre['encrypted_files'])}"}
+                if _pre["encrypted_files"]:
+                    # 密码必须在解密前给到，这一支仍需重传，会话无意义 → 直接清理
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    return {"error_type": "encrypted_files",
+                            "encrypted_files": _pre["encrypted_files"],
+                            "message": f"检测到加密文件: {', '.join(_pre['encrypted_files'])}"}
 
-            pc_result = _pre["pc_result"]
-            if (not pc_result.ok) or (pc_result.history_warnings and not skip_history_check):
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                return {
-                    "error_type": "precheck_failed",
-                    "missing_files": pc_result.missing_files,
-                    "auto_filled": pc_result.auto_filled,
-                    "auto_renamed": pc_result.auto_renamed,
-                    "rename_candidates": pc_result.rename_candidates,
-                    "missing_columns": pc_result.missing_columns,
-                    "ai_suggestions": pc_result.ai_suggestions,
-                    "actual_paths": pc_result.actual_paths,
-                    "history_warnings": pc_result.history_warnings,
-                    "target_candidates": pc_result.target_candidates,
-                }
+                pc_result = _pre["pc_result"]
+                _session = _register_compute_session(tenant_id, script_id, temp_dir, {
+                    "tenant_id": tenant_id, "script_id": script_id,
+                    "script_content": script_content, "source_dir": str(source_dir),
+                    "salary_year": salary_year, "salary_month": salary_month,
+                    "standard_hours": standard_hours, "file_passwords": file_passwords,
+                    "template_override_path": template_override_path,
+                    "source_structure": _source_structure, "manual_headers": _manual_headers,
+                    "expected_structure": _expected_structure, "use_history": _use_history_flag,
+                    "confirmed_mapping": _confirmed, "confirmed_renames": _confirmed_renames,
+                    "confirmed_target_map": _confirmed_target_map, "skipped_missing_files": _skipped_missing,
+                    "skip_history_check": skip_history_check,
+                    "ai_provider_name": _script_info.get("ai_provider"),
+                })
 
-            db_session, compute_task_id = _persist_compute_start(
-                tenant_id, script_id, salary_year=salary_year, salary_month=salary_month)
-            try:
-                db_session.close()
-            except Exception:
-                pass
-            task_id_str = str(compute_task_id) if compute_task_id else str(id(temp_dir))
+                if (not pc_result.ok) or (pc_result.history_warnings and not skip_history_check):
+                    # 不再删临时目录：上传文件与解析产物留在会话里，确认轮只发 JSON
+                    logger.info(f"[compute/submit] 预检待确认，会话保留: {_session['session_id']}")
+                    return _compute_pending_payload(pc_result, _session["session_id"])
 
-            from backend.compute.task_log_buffer import TaskLogBuffer
-            buffer = TaskLogBuffer.get_instance()
-            buffer.create_task(task_id_str)
-            buffer.push(task_id_str, json.dumps({
-                "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
-                "level": "info", "message": "预检完成，任务已进入 Excel 有界并发队列",
-            }, ensure_ascii=False))
-
-            compute_params = {
-                "task_id": task_id_str, "tenant_id": tenant_id, "script_id": script_id,
-                "script_content": script_content, "source_dir": str(source_dir),
-                "salary_year": salary_year, "salary_month": salary_month,
-                "standard_hours": standard_hours, "file_passwords": file_passwords,
-                "pre_validated_mapping": pc_result.file_mapping,
-                "precheck_auto_filled": pc_result.auto_filled,
-                "source_mapping_warning": getattr(pc_result, '_source_mapping_warning', None),
-                "template_override_path": template_override_path,
-                "target_sheet_manual_map": _confirmed_target_map or pc_result.target_map or {},
-            }
-            params_file = temp_dir / "_compute_params.json"
-            params_file.write_text(
-                json.dumps(compute_params, ensure_ascii=False, default=str), encoding="utf-8")
-            asyncio.create_task(_run_compute_subprocess_queued(
-                task_id_str, buffer, str(params_file), str(temp_dir)))
-            logger.info(f"[compute/submit] 任务已提交: task_id={task_id_str}")
-            return {"task_id": task_id_str}
+                result = await _dispatch_compute_task(
+                    _session, pc_result, confirmed_target_map=_confirmed_target_map,
+                    slot_held=True)
+                slot_held = False  # 槽已移交给计算任务，由其 finally 释放
+                return result
+            finally:
+                if slot_held:
+                    semaphore.release()
 
         async def _stream_submit_result():
             """流式 JSON：先发空白保活，最后发一个完整 JSON；JSON 解析允许前导空白。"""
@@ -5679,6 +5894,75 @@ async def compute_submit(
             shutil.rmtree(temp_dir, ignore_errors=True)
         logger.error(f"[compute/submit] 提交失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/compute/session/{session_id}/confirm")
+async def compute_session_confirm(
+    session_id: str,
+    payload: Optional[dict] = Body(None),
+    current_user=Depends(get_current_user),
+    accessible_tenants: list = Depends(get_operable_tenants),
+):
+    """人工确认轮：只读会话内的表头元数据重算映射。
+
+    不重传文件、不打开 Excel、不排 Excel 闸门（毫秒级），可反复确认多轮。
+    会话丢失/过期返回 error_type=session_expired，前端退回带文件重传的老路。
+    """
+    body = payload or {}
+    refresh_only = body.get('refresh_only') is True
+    sess = _get_compute_session(session_id, accessible_tenants)
+    from backend.utils.compute_ingest import ingest_ready, read_meta, resolve_with_confirmations
+    if not sess or not ingest_ready(sess["temp_dir"]):
+        return {"error_type": "session_expired", "message": "计算会话已过期，请重新提交文件"}
+
+    meta = await asyncio.to_thread(read_meta, sess["temp_dir"])
+    if meta is None:
+        return {"error_type": "session_expired", "message": "计算会话已过期，请重新提交文件"}
+
+    from backend.utils.confirmed_source_mapping import save_confirmation_state
+    try:
+        body = await asyncio.to_thread(save_confirmation_state, sess['temp_dir'], body, sess['params'])
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f'确认映射冲突: {exc}') from exc
+
+    def _clean_map(value):
+        """键存在即"已表态"，空值 = 明确选择不映射/跳过 → 必须保留，不能当无效项丢掉。"""
+        if not isinstance(value, dict):
+            return None
+        return {str(k): str(v or "") for k, v in value.items() if k} or None
+
+    _confirmed = body.get("confirmed_mapping")
+    if isinstance(_confirmed, dict) and "file_mapping" in _confirmed and not _confirmed.get('unmatched_columns'):
+        _confirmed = _confirmed.get("file_mapping") or None
+    _confirmed_renames = _clean_map(body.get("confirmed_renames"))
+    _confirmed_target_map = _clean_map(body.get("confirmed_target_map"))
+    _skipped_missing = [str(f) for f in (body.get("skipped_missing_files") or []) if f]
+    _skip_history = bool(body.get("skip_history_check"))
+
+    p = sess["params"]
+    pc_result = await asyncio.to_thread(lambda: resolve_with_confirmations(
+        meta,
+        confirmed_renames=_confirmed_renames,
+        confirmed_mapping=_confirmed,
+        confirmed_target_map=_confirmed_target_map,
+        script_content=p.get("script_content"),
+        tenant_id=p.get("tenant_id"),
+        salary_year=p.get("salary_year"),
+        salary_month=p.get("salary_month"),
+        use_history=p.get("use_history"),
+        template_override_path=p.get("template_override_path"),
+        skip_history_check=_skip_history,
+        skipped_missing_files=_skipped_missing,
+    ))
+
+    if refresh_only or (not pc_result.ok) or (pc_result.history_warnings and not _skip_history):
+        logger.info(f"[compute/confirm] 仍有待确认项，会话保留: {session_id}")
+        pending = _compute_pending_payload(pc_result, session_id)
+        pending['mapping_refreshed'] = refresh_only
+        return pending
+
+    return await _dispatch_compute_task(
+        sess, pc_result, confirmed_target_map=_confirmed_target_map)
 
 
 @app.get("/api/compute/{task_id}/stream")

@@ -23,6 +23,8 @@ def match_sources_with_ai(matcher, training, actual, provider_name, determined=N
         for ai, a in enumerate(actual):
             if ai in used_a:
                 continue
+            if not matcher._is_candidate_allowed(t, a, actual):
+                continue
             same = {c: c for c in a['headers'] if c in t['headers']}
             fixed[ti, ai] = same
             choices.append({'actual_id': ai, 'file': a['file_name'], 'sheet': a['sheet_name'],
@@ -76,6 +78,8 @@ def validate_mapping(matcher, training, actual, response):
                 or not 0 <= ai < len(actual) or ti in used_training or ai in used_actual):
             raise ValueError('AI 表映射重复或引用不存在的表')
         t, a = training[ti], actual[ai]
+        if not matcher._is_candidate_allowed(t, a, actual):
+            raise ValueError('AI 映射不能覆盖人工确认的文件及月份分表关系')
         columns = item.get('columns')
         if (not isinstance(columns, dict) or not columns
                 or any(not isinstance(v, str) for v in columns.values())

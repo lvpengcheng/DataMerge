@@ -324,7 +324,7 @@ function _statusText(status) {
 }
 
 function createNewSession() {
-    if (_savingAssets) return;
+    if (_isStreaming || _savingAssets) return;
     _sessionSettings = null;
     // 允许手动输入租户名称
     if (!_currentTenantId) {
@@ -1941,6 +1941,8 @@ function _setUIStreaming(streaming) {
     sendBtn.disabled = streaming || _savingAssets;
     if (genBtn) genBtn.disabled = streaming || _savingAssets;
     if (regenBtn) regenBtn.disabled = streaming || _savingAssets;
+    const uploadBtn = document.getElementById('btn-upload-code');
+    if (uploadBtn) uploadBtn.disabled = streaming || _savingAssets;
     if (streaming) {
         sendBtn.textContent = '处理中...';
     } else {
@@ -1991,6 +1993,7 @@ function showUploadCode() {
 
 // 打开上传代码弹窗（代码必选 + 模板可选）
 function openUploadCodeModal() {
+    if (_isStreaming || _savingAssets) return;
     if (!_currentSessionId) { alert('请先选择一个训练会话'); return; }
     const modal = document.getElementById('upload-code-modal');
     if (!modal) {
@@ -2040,15 +2043,53 @@ async function handleUploadCode(event) {
     await _doUploadCode(file, null);
 }
 
+async function _readUploadCodeResponse(response, onActivity) {
+    // Keep compatibility with servers that still return a single JSON result.
+    if (!(response.headers.get('content-type') || '').includes('text/event-stream')) {
+        return await response.json();
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) throw new Error('验证连接提前结束，后台可能仍在执行，请稍后重新打开会话查看结果，勿重复上传');
+            onActivity();
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            for (const line of lines) {
+                if (!line.startsWith('data:')) continue;
+                const event = JSON.parse(line.slice(5).trim());
+                if (event.type === 'error') throw new Error(event.message || '代码验证失败');
+                if (event.type === 'upload_complete') return event;
+                if (event.type === 'status' || event.type === 'heartbeat') _handleSSEEvent(event);
+            }
+        }
+    } finally {
+        reader.cancel().catch(() => {});
+        reader.releaseLock();
+    }
+}
+
 async function _doUploadCode(codeFile, templateFile) {
-    if (!codeFile || !_currentSessionId) return;
+    if (!codeFile || !_currentSessionId || _isStreaming || _savingAssets) return;
 
     const formData = new FormData();
     formData.append('code_file', codeFile);
+    formData.append('stream', 'true');
     if (templateFile) formData.append('template_file', templateFile);
+    const controller = new AbortController();
+    let idleTimer;
+    const resetTimeout = (timeout = 60000) => {
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => controller.abort(), timeout);
+    };
 
     try {
         _setUIStreaming(true);
+        resetTimeout(180000); // Allow file transfer; then expect the server's 15s heartbeat.
         const tip = templateFile
             ? `正在上传并验证代码文件: ${codeFile.name}（含模板: ${templateFile.name}）`
             : `正在上传并验证代码文件: ${codeFile.name}`;
@@ -2057,12 +2098,14 @@ async function _doUploadCode(codeFile, templateFile) {
         const resp = await AUTH.authFetch(`/api/training/chat/sessions/${_currentSessionId}/upload-code`, {
             method: 'POST',
             body: formData,
+            signal: controller.signal,
         });
         if (!resp.ok) {
             const err = await resp.json().catch(() => ({}));
             throw new Error(err.detail || `HTTP ${resp.status}`);
         }
-        const data = await resp.json();
+        resetTimeout();
+        const data = await _readUploadCodeResponse(resp, resetTimeout);
 
         if (data.success) {
             const accPct = (data.accuracy * 100).toFixed(1);
@@ -2073,15 +2116,23 @@ async function _doUploadCode(codeFile, templateFile) {
                 msg += '\n\n' + _formatDiffDetails(data.diff_details);
             }
             _addSystemMessage(msg, data.accuracy < 1.0 ? 'diff' : 'status', { accuracy: data.accuracy });
+            _showDownloadBar(_currentSessionId, data.files);
         } else {
             _addSystemMessage(`代码上传执行失败: ${data.error || '未知错误'}`, 'status', { error: data.error });
         }
-        _updateActionButtons({ status: 'running', has_script: false });
+        _updateActionButtons({ status: data.success ? 'running' : 'failed', has_script: false });
         loadSessions();
     } catch (e) {
-        _addSystemMessage('上传代码失败: ' + e.message, 'status', { error: true });
+        const message = e.name === 'AbortError'
+            ? '长时间未收到服务器响应，已恢复页面操作。后台可能仍在验证，请稍后重新打开会话查看结果，勿重复上传。'
+            : /HTTP 504|Failed to fetch|NetworkError/i.test(e.message || '')
+                ? '上传验证连接中断或网关超时，已恢复页面操作。后台可能仍在验证，请稍后重新打开会话查看结果，勿重复上传。'
+                : e.message;
+        _addSystemMessage('上传代码失败: ' + message, 'status', { error: true });
     } finally {
+        clearTimeout(idleTimer);
         _setUIStreaming(false);
+        refreshSessionAssets();
     }
 }
 

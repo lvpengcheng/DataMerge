@@ -2,6 +2,8 @@
 对话式训练 API - 支持交互式代码调试
 """
 
+from backend.utils.desensitize import mask_ai_samples
+
 import os
 import json
 import asyncio
@@ -362,7 +364,7 @@ def _build_source_structure_from_dir_impl(source_dir: str, manual_headers: Dict 
                 samples, formulas = [], {}
                 for region in sheet_data.regions:
                     headers.update(region.head_data)
-                    samples.extend((region.data or [])[:3 - len(samples)])
+                    samples.extend(mask_ai_samples(region.head_data, (region.data or [])[:3 - len(samples)]))
                     formulas.update(region.formula or {})
                     for name, letter in region.head_data.items():
                         schema = (getattr(region, "column_schemas", None) or {}).get(letter)
@@ -446,7 +448,7 @@ def _analyze_expected_structure_impl(expected_file: str) -> Dict[str, Any]:
                 if schema:
                     sheet_structure["column_schemas"][name] = dict(schema)
             if region.data and len(sheet_structure["data_sample"]) < 3:
-                sheet_structure["data_sample"].extend(region.data[:3 - len(sheet_structure["data_sample"])])
+                sheet_structure["data_sample"].extend(mask_ai_samples(region.head_data, region.data[:3 - len(sheet_structure["data_sample"])]))
 
         structure["sheets"][sheet_data.sheet_name] = sheet_structure
         structure["total_regions"] += len(sheet_data.regions)
@@ -3370,28 +3372,110 @@ def set_as_best(
     }
 
 
+# Keep strong references: a disconnected browser must not interrupt persistence or
+# release the same-session guard while the worker is still running.
+_upload_code_tasks = set()
+_upload_code_sessions = set()
+
+
 @router.post("/sessions/{session_id}/upload-code")
 async def upload_code(
     session_id: int,
     code: str = Form(None),
     code_file: UploadFile = File(None),
     template_file: UploadFile = File(None),
+    stream: bool = Form(False),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """直接上传代码，执行并验证。可选随代码一起上传模板文件（模板模式脚本用）。"""
+    """上传代码；页面使用带心跳的进度流，旧客户端仍可获取 JSON。"""
+    if not db.query(TrainingSession).filter_by(id=session_id).first():
+        raise HTTPException(status_code=404, detail="会话不存在")
+    if session_id in _upload_code_sessions:
+        raise HTTPException(status_code=409, detail="该会话的代码仍在验证，请稍后查看会话结果，勿重复上传")
+    _upload_code_sessions.add(session_id)
+    work_dir = None
+    try:
+        if code_file:
+            try:
+                code_content = (await code_file.read()).decode("utf-8", errors="replace")
+            finally:
+                await code_file.close()
+        elif code:
+            code_content = code
+        else:
+            raise HTTPException(status_code=400, detail="请提供代码内容或代码文件")
+
+        # UploadFile belongs to the request; stage it before handing work to a
+        # background task, which owns its database session and temporary files.
+        template_upload = None
+        if template_file and template_file.filename:
+            from ..utils.upload_stream import save_upload_file
+            work_dir = tempfile.mkdtemp(prefix="training_code_")
+            template_path = str(Path(work_dir) / "template.upload")
+            template_name = template_file.filename
+            await save_upload_file(template_file, template_path)
+            template_upload = (template_path, template_name)
+        user_id = current_user.id
+        # Do not hold the request's read transaction throughout a long SSE stream.
+        db.rollback()
+    except BaseException:
+        _upload_code_sessions.discard(session_id)
+        if work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        raise
+
+    if stream:
+        _, emit, events = _create_sse_stream(asyncio.get_running_loop())
+    else:
+        emit, events = lambda event: None, None
+
+    def validate():
+        with SessionLocal() as worker_db:
+            return _validate_uploaded_code(
+                session_id, code_content, template_upload, user_id, worker_db, emit)
+
+    async def run():
+        try:
+            result = await _run_training_serialized(validate, emit)
+            emit({"type": "upload_complete", **result})
+            return result
+        except Exception as exc:
+            logger.exception("上传代码验证失败: session=%s", session_id)
+            if not stream:
+                raise
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            emit({"type": "error", "message": f"上传代码失败: {detail}"})
+        finally:
+            _upload_code_sessions.discard(session_id)
+            if work_dir:
+                await asyncio.to_thread(shutil.rmtree, work_dir, ignore_errors=True)
+            emit(None)
+
+    emit({"type": "status", "message": "上传完成，正在等待代码验证资源..."})
+    task = asyncio.create_task(run())
+    _upload_code_tasks.add(task)
+
+    def finished(completed):
+        _upload_code_tasks.discard(completed)
+        if not completed.cancelled():
+            completed.exception()
+
+    task.add_done_callback(finished)
+    if not stream:
+        return await asyncio.shield(task)
+    return StreamingResponse(events, media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    })
+
+
+def _validate_uploaded_code(session_id, code_content, template_upload, user_id, db, emit):
+    """Run source parsing, sandbox validation and persistence off the event loop."""
     session = db.query(TrainingSession).filter_by(id=session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="会话不存在")
-
-    # 获取代码
-    if code_file:
-        code_content = (await code_file.read()).decode("utf-8", errors="replace")
-    elif code:
-        code_content = code
-    else:
-        raise HTTPException(status_code=400, detail="请提供代码内容或代码文件")
-
     # 手动上传也属于跨环境脚本导入：源文件绝对路径无法随租户/部署目录重定位，
     # 必须明确阻止，避免验证时碰巧可用、迁到 Docker/IIS 后静默读错文件。
     from ..utils.template_resolver import (
@@ -3410,18 +3494,18 @@ async def upload_code(
     # 可选：随代码一起上传的模板文件。按脚本里烘焙的 TEMPLATE_NAME 存到当前租户 templates/，
     # 这样以后智算按【名+哈希】也能命中；同时作为显式 override 传给本次验证，立即生效。
     _tpl_override = None
-    if template_file and template_file.filename:
+    if template_upload:
         try:
             from ..utils.template_resolver import extract_template_ref
             from ..storage.storage_manager import StorageManager
-            from ..utils.upload_stream import save_upload_file, safe_upload_name
+            from ..utils.upload_stream import safe_upload_name
             _baked_name, _, _ = extract_template_ref(code_content)
             _save_name = safe_upload_name(
-                (_baked_name or template_file.filename).replace(" ", "_"), "template.xlsx")
+                (_baked_name or template_upload[1]).replace(" ", "_"), "template.xlsx")
             _tpl_dir = StorageManager().get_tenant_dir(session.tenant_id) / "templates"
             _tpl_dir.mkdir(parents=True, exist_ok=True)
             _tpl_path = _tpl_dir / _save_name
-            await save_upload_file(template_file, _tpl_path)
+            shutil.copyfile(template_upload[0], _tpl_path)
             _tpl_override = str(_tpl_path)
             # 回写会话 config，训练/复算再跑也能定位
             config["template_path"] = _tpl_override
@@ -3430,7 +3514,7 @@ async def upload_code(
             logger.info(f"[upload-code] 已保存随代码上传的模板: {_tpl_path}"
                         f"（存为烘焙名={bool(_baked_name)}）")
         except Exception as _te:
-            logger.warning(f"[upload-code] 保存上传模板失败: {_te}")
+            raise RuntimeError(f"保存上传模板失败: {_te}") from _te
 
     # 没随代码上传模板时，必须在当前租户目录/绑定路径中严格找到同名同哈希模板。
     # 找不到就拒绝保存，防止迁移显示成功但执行时误用别的同名模板。
@@ -3460,12 +3544,12 @@ async def upload_code(
     # 缺了这步，脚本会回退到自带 load_source_data 的朴素 pd.read_excel(header=0)，
     # 把标题横幅行当表头 → 列名全成 'Unnamed: N' → 按列名查找（如 '姓名'）全落空 →
     # fill_template 构造的 order 为空 → 一个 cell 都不填，却因空结果与空模板对比而显示 100%。
+    emit({"type": "status", "message": "正在解析全量源数据..."})
     _src_dir = config.get("source_dir", "")
     _full_source_data = None
     if _src_dir and os.path.isdir(_src_dir):
         try:
-            _full_source_data = await run_in_threadpool(
-                _load_full_source_data_subproc,
+            _full_source_data = _load_full_source_data_subproc(
                 _src_dir,
                 config.get("manual_headers"),
                 config.get("multi_sheet_source", False),
@@ -3477,10 +3561,10 @@ async def upload_code(
         except Exception as _le:
             raise HTTPException(status_code=422, detail=f"全量源数据加载失败，未执行脚本: {_le}") from _le
 
-    # 执行验证（放入线程池，避免阻塞事件循环导致 Windows 反向代理 502）
+    # 整个验证流程在有界工作线程执行，Web 事件循环持续发送心跳。
+    emit({"type": "status", "message": "正在执行上传代码并对比结果..."})
     iteration_num = (session.total_iterations or 0) + 1
-    run_result = await run_in_threadpool(
-        _run_single_iteration,
+    run_result = _run_single_iteration(
         session_id, code_content, session.tenant_id,
         _src_dir,
         config.get("expected_file", ""),
@@ -3495,6 +3579,7 @@ async def upload_code(
         template_override_path=_tpl_override,
     )
 
+    emit({"type": "status", "message": "验证结束，正在保存脚本和结果..."})
     from ..api.training_persistence import TrainingPersistence
     persistence = TrainingPersistence(db)
 
@@ -3512,8 +3597,7 @@ async def upload_code(
     persistence.update_session_best(session_id, accuracy, iteration_num)
 
     # 持久化迭代产物（脚本、生成Excel、差异Excel）到磁盘，更新下载路径
-    iter_files = await run_in_threadpool(
-        _persist_iteration_files,
+    iter_files = _persist_iteration_files(
         session.tenant_id, session_id, iteration_num,
         code_content, run_result
     )
@@ -3531,8 +3615,7 @@ async def upload_code(
     try:
         from ..storage.storage_manager import StorageManager
         _sm = StorageManager()
-        await run_in_threadpool(
-            _sm.save_script,
+        _sm.save_script(
             session.tenant_id, code_content,
             {"success": run_result.get("success", False),
              "best_score": accuracy,
@@ -3584,7 +3667,7 @@ async def upload_code(
             mode=mode,
             source_session_id=session_id,
             accuracy=accuracy,
-            created_by=current_user.id,
+            created_by=user_id,
             config=_saved_script_cfg,
             manual_headers=config.get("manual_headers"),
             source_structure=session.source_structure,
@@ -3615,6 +3698,7 @@ async def upload_code(
 
     return {
         "ok": True,
+        "files": iter_files,
         "iteration": iteration_num,
         "accuracy": accuracy,
         "success": run_result.get("success", False),

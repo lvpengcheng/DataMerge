@@ -2,11 +2,9 @@
 
 在 compute_submit 同步阶段拦截，避免事后脚本运行时炸出难定位的二手错误。
 
-校验顺序（全部失败项收集后一次性返回，便于前端一次展示）：
-1. 基础资料兜底：用 source_auto_filler 自动从 reference assets 补全缺失文件
-2. 表头匹配：复用 FastHeaderMatcher
-3. AI 辅助列匹配建议（仅当 step 2 失败时调用，与训练同 provider）
-4. 历史数据校验（仅当脚本含 history_provider/load_history 等关键字时检查）
+实现委托给 `compute_ingest`：源文件只被解析一次，改名候选 / 低置信列名 /
+目标表歧义 / 历史缺口在**同一轮**里全部收集返回（前端一次弹窗即可确认完）。
+本模块保留 PrecheckResult 结构、目标表与历史校验，以及给前端的默认建议算法。
 
 confirmed_mapping 透传：用户在前端弹窗确认 AI 建议后，重提时携带，本模块直接使用、跳过 AI 步骤。
 """
@@ -14,7 +12,6 @@ confirmed_mapping 透传：用户在前端弹窗确认 AI 建议后，重提时�
 import os
 import re
 import json
-import shutil
 import logging
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -49,6 +46,7 @@ class PrecheckResult:
     target_candidates: List[Dict[str, Any]] = field(default_factory=list)
     target_map: Optional[Dict[str, str]] = None
     file_mapping: Optional[Dict[str, Any]] = None
+    unmatched_columns: List[list] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -71,16 +69,23 @@ def precheck_compute(
     template_override_path: Optional[str] = None,
     confirmed_target_map: Optional[Dict[str, str]] = None,
     in_worker: bool = False,
+    session_dir: Optional[str] = None,
+    skipped_missing_files: Optional[List[str]] = None,
 ) -> PrecheckResult:
-    """智算事前校验主入口
+    """智算事前校验主入口（compute_ingest 的薄封装）
+
+    整个校验只解析源文件一次：ingest 负责解密/解析/改名/兜底，
+    resolve_with_confirmations 负责纯内存的映射解算与待确认项收集。
 
     use_history: 训练时记录的"使用历史数据"开关
         - True/False: 显式开关，覆盖关键字检测
         - None     : 未训练标记(存量脚本)，回退到关键字扫描
+    session_dir: 传入时把解析产物（meta + sources）落盘，供人工确认轮复用，
+        确认时无需重传文件、无需重新解析。
     """
     result = PrecheckResult()
     # 前端只确认历史提示或未选择列时会提交空封装，不能当作映射已通过。
-    if isinstance(confirmed_mapping, dict) and 'file_mapping' in confirmed_mapping:
+    if isinstance(confirmed_mapping, dict) and 'file_mapping' in confirmed_mapping and not confirmed_mapping.get('unmatched_columns'):
         confirmed_mapping = confirmed_mapping.get('file_mapping') or None
 
     if not source_structure:
@@ -88,156 +93,136 @@ def precheck_compute(
         logger.info("[Precheck] 缺少 source_structure，跳过校验")
         return result
 
-    # 步骤 0：用户已确认的改名映射先落地
-    if confirmed_renames:
-        try:
-            from .source_auto_filler import apply_confirmed_renames
-            applied = apply_confirmed_renames(source_dir, confirmed_renames)
-            if applied:
-                result.auto_renamed.extend(applied)
-                logger.info(f"[Precheck] 应用用户确认改名: {applied}")
-        except Exception as e:
-            logger.warning(f"[Precheck] 应用 confirmed_renames 失败: {e}", exc_info=True)
+    payload = {
+        "source_dir": source_dir,
+        "source_structure": source_structure,
+        "manual_headers": manual_headers,
+        "expected_structure": expected_structure,
+        "tenant_id": tenant_id,
+        "ai_provider_name": ai_provider_name,
+        "salary_year": salary_year,
+        "salary_month": salary_month,
+        "confirmed_renames": confirmed_renames,
+        "confirmed_mapping": confirmed_mapping,
+        "confirmed_target_map": confirmed_target_map,
+        "script_content": script_content,
+        "use_history": use_history,
+        "template_override_path": template_override_path,
+        "session_dir": session_dir,
+        "skipped_missing_files": skipped_missing_files,
+    }
+    if in_worker:
+        # 外层已有总超时/内存护栏，直接解析避免嵌套进程和大表 pickle 往返。
+        return _ingest_and_resolve(payload, keep_preload=True, db_session=db_session)
 
-    # 步骤 0.5：列头+文件名组合评分自动改名（处理用户改名上传场景）
-    try:
-        from .source_auto_filler import auto_rename_uploaded_by_combined_score, ai_disambiguate_rename_candidates
-        renamed, ambiguous, uploaded_headers_map = auto_rename_uploaded_by_combined_score(
-            source_dir=source_dir,
-            source_structure=source_structure,
-            salary_year=salary_year,
-            salary_month=salary_month,
-        )
-        if renamed:
-            result.auto_renamed.extend(renamed)
-        if ambiguous:
-            # 程序无法决断 → 调 AI 给语义裁决，但仍交由前端弹窗确认
-            if ai_provider_name:
-                try:
-                    ambiguous = ai_disambiguate_rename_candidates(
-                        ambiguous=ambiguous,
-                        source_structure=source_structure,
-                        uploaded_headers_map=uploaded_headers_map,
-                        ai_provider_name=ai_provider_name,
-                    )
-                except Exception as ai_err:
-                    logger.warning(f"[Precheck] AI 改名裁决失败（不阻断）: {ai_err}", exc_info=True)
-            result.ok = False
-            result.rename_candidates = ambiguous
-            logger.warning(f"[Precheck] 改名候选需用户确认: {[c['uploaded'] for c in ambiguous]}")
-            return result
-    except Exception as e:
-        logger.warning(f"[Precheck] 自动改名评分异常: {e}", exc_info=True)
-
-    # 步骤 1：基础资料兜底
-    try:
-        from .source_auto_filler import auto_fill_missing_sources
-        filled, still_missing = auto_fill_missing_sources(
-            source_dir=source_dir,
-            source_structure=source_structure,
-            tenant_id=tenant_id,
-            db_session=db_session,
-        )
-        result.auto_filled = filled or []
-        if still_missing:
-            result.ok = False
-            result.missing_files = list(still_missing)
-            logger.warning(f"[Precheck] 缺失文件无法兜底: {still_missing}")
-    except Exception as e:
-        logger.warning(f"[Precheck] 基础资料兜底异常: {e}", exc_info=True)
-
-    # 步骤 2：confirmed_mapping 短路（用户已确认 AI 建议）
-    if confirmed_mapping:
-        try:
-            _apply_confirmed_mapping(source_dir, source_structure, confirmed_mapping)
-            # 确认映射只指导改写，必须验证完整性并缓存预加载数据供正式计算复用。
-        except Exception as e:
-            logger.error(f"[Precheck] 应用 confirmed_mapping 失败: {e}", exc_info=True)
-            result.ok = False
-            result.missing_columns.append({
-                "file": "(confirmed_mapping)",
-                "sheet": "",
-                "expected_columns": [],
-                "error": f"应用确认映射失败: {e}",
-            })
-            return result
-
-    # 步骤 3：表头匹配
-    if not result.missing_files:
-        try:
-            input_files = _collect_input_files(source_dir)
-            if input_files:
-                # 全量解析（多文件 Aspose 打开）在【独立子进程】执行：
-                # Aspose 持 GIL 会冻结主进程（其他请求全卡 → IIS 502 / 服务器假死），
-                # 日志实证：主进程跑几十个文件解析可卡 10-30 分钟。子进程内爆只炸自己。
-                from backend.utils.subprocess_runner import (
-                    run_in_subprocess, default_max_memory_mb, default_timeout,
-                )
-                args = (source_structure, input_files, manual_headers, expected_structure, ai_provider_name)
-                if in_worker:
-                    # 外层已有总超时/内存护栏，直接解析避免嵌套进程和大表 pickle 往返。
-                    ok, err, file_mapping, _pre = _header_match_subprocess(*args)
-                else:
-                    _r = run_in_subprocess(
-                        "backend.utils.compute_precheck:_header_match_subprocess", args,
-                        timeout=default_timeout("parse"), max_memory_mb=default_max_memory_mb())
-                    if _r.success:
-                        ok, err, file_mapping, _pre = _r.result
-                    else:
-                        reason = "超时" if _r.timed_out else ("内存超限" if _r.killed_by_memory else _r.error)
-                        ok, err, file_mapping, _pre = False, f"解析子进程失败（{reason}）", None, None
-                if ok and file_mapping:
-                    result.file_mapping = file_mapping
-                    # Internal-only attribute, excluded from dataclass to_dict/asdict.
-                    result._pre_loaded_source_data = _pre
-                else:
-                    raw_fallback = bool((_pre or {}).get('mapping_failed'))
-                    if raw_fallback:
-                        result._source_mapping_warning = err
-                        logger.warning('[Precheck] 映射未通过，将使用原文件继续计算: %s', err)
-                    else:
-                        result.ok = False
-                    missing = _extract_missing_columns(source_structure, input_files, err)
-                    result.missing_columns = missing
-                    logger.warning(f"[Precheck] 表头匹配失败: {err}")
-                    # 单次解析阶段已尝试 AI；直接复用列清单，不能再次解析全部 Excel/调用 AI。
-                    result.actual_paths = (_pre or {}).get('actual_paths', [])
-                    result.ai_suggestions = _suggest_structural_columns(missing, result.actual_paths)
-        except Exception as e:
-            logger.warning(f"[Precheck] 表头匹配异常: {e}", exc_info=True)
-            result.ok = False
-            result.missing_columns.append({"file": "", "sheet": "", "error": str(e)})
-
-    # 步骤 5：历史数据
-    _check_history(script_content, tenant_id, salary_year, salary_month, result, use_history)
-
-    # 步骤 6：目标模板表校验（②模板目标侧）——与运行时同一套 resolve_target_sheets 逻辑
-    _check_target_sheets(script_content, tenant_id, template_override_path, confirmed_target_map, result)
-
+    # 全量解析（多文件 Aspose 打开）在【独立子进程】执行：
+    # Aspose 持 GIL 会冻结主进程（其他请求全卡 → IIS 502 / 服务器假死），
+    # 日志实证：主进程跑几十个文件解析可卡 10-30 分钟。子进程内爆只炸自己。
+    from backend.utils.subprocess_runner import (
+        run_in_subprocess, default_max_memory_mb, default_timeout,
+    )
+    _r = run_in_subprocess(
+        "backend.utils.compute_precheck:_ingest_subprocess", (payload,),
+        timeout=default_timeout("parse"), max_memory_mb=default_max_memory_mb())
+    if _r.success:
+        return _r.result
+    reason = "超时" if _r.timed_out else ("内存超限" if _r.killed_by_memory else _r.error)
+    result.ok = False
+    result.missing_columns = [{"file": "", "sheet": "", "expected_columns": [],
+                              "error": f"解析子进程失败（{reason}）"}]
     return result
 
 
-def _header_match_subprocess(
-    source_structure: dict,
-    input_files: list,
-    manual_headers: Optional[dict],
-    expected_structure: Optional[dict],
-    ai_provider_name: Optional[str] = None,
-):
-    """模块级包装（subprocess_runner 定位入口）：全量解析 + 表头匹配在独立子进程执行。
+def _ingest_subprocess(payload: dict) -> PrecheckResult:
+    """模块级包装（subprocess_runner 定位入口）：解析 + 解算在独立子进程执行。
 
-    返回 (ok, err, file_mapping, pre_loaded_data)；参数/返回均可 pickle。
+    预加载数据不回传（避免把大表 pickle 进 API 进程），只落盘给计算进程用。
     """
-    from .fast_header_matcher import FastHeaderMatcher
-    matcher = FastHeaderMatcher()
-    return matcher.match_parse_and_prepare(
-        source_structure=source_structure,
-        input_files=input_files,
-        manual_headers=manual_headers,
-        output_dir=None,  # 校验阶段不写 fallback
-        expected_structure=expected_structure,
-        ai_provider_name=ai_provider_name,
+    return _ingest_and_resolve(payload, keep_preload=False)
+
+
+def _ingest_and_resolve(payload: dict, keep_preload: bool, db_session=None) -> PrecheckResult:
+    """解析一次 + 解算映射；有 session_dir 时把产物落盘供确认轮复用。"""
+    own_db = db_session is None
+    if own_db:
+        db_session = _open_db()
+    try:
+        return _ingest_and_resolve_inner(payload, keep_preload, db_session)
+    finally:
+        if own_db and db_session is not None:
+            try:
+                db_session.close()
+            except Exception:
+                pass
+
+
+def _ingest_and_resolve_inner(payload: dict, keep_preload: bool, db_session) -> PrecheckResult:
+    from .compute_ingest import (
+        ingest_source_dir, resolve_with_confirmations, build_preload, write_ingest,
     )
+
+    meta, parsed_sheets_map = ingest_source_dir(
+        source_dir=payload["source_dir"],
+        source_structure=payload["source_structure"],
+        manual_headers=payload.get("manual_headers"),
+        expected_structure=payload.get("expected_structure"),
+        tenant_id=payload.get("tenant_id"),
+        db_session=db_session,
+        ai_provider_name=payload.get("ai_provider_name"),
+        salary_year=payload.get("salary_year"),
+        salary_month=payload.get("salary_month"),
+        confirmed_renames=payload.get("confirmed_renames"),
+    )
+    result = resolve_with_confirmations(
+        meta,
+        confirmed_renames=payload.get("confirmed_renames"),
+        confirmed_mapping=payload.get("confirmed_mapping"),
+        confirmed_target_map=payload.get("confirmed_target_map"),
+        script_content=payload.get("script_content"),
+        tenant_id=payload.get("tenant_id"),
+        salary_year=payload.get("salary_year"),
+        salary_month=payload.get("salary_month"),
+        use_history=payload.get("use_history"),
+        template_override_path=payload.get("template_override_path"),
+        skipped_missing_files=payload.get("skipped_missing_files"),
+    )
+    session_dir = payload.get("session_dir")
+    wrote_session = False
+    if session_dir and parsed_sheets_map:
+        try:
+            write_ingest(session_dir, meta, parsed_sheets_map)
+            wrote_session = True
+        except Exception as e:
+            logger.warning(f"[Precheck] 写会话产物失败（退回重传路径）: {e}", exc_info=True)
+
+    # 会话产物已落盘时不再重复写一份预加载 pickle（同一批数据落两次盘），
+    # 计算进程按最终映射直接 build_preload。
+    if result.ok and result.file_mapping and not wrote_session:
+        try:
+            preload = build_preload(meta, parsed_sheets_map, result.file_mapping)
+        except Exception as e:
+            logger.error(f"[Precheck] 构建预加载数据失败: {e}", exc_info=True)
+            preload = None
+        if preload:
+            if keep_preload:
+                result._pre_loaded_source_data = preload
+            else:
+                from .compute_preload_cache import save_preload
+                save_preload(payload["source_dir"], preload, result.file_mapping,
+                             (payload.get("source_structure"), payload.get("manual_headers"),
+                              payload.get("expected_structure")))
+    return result
+
+
+def _open_db():
+    """子进程/线程内独立 DB 会话；失败时返回 None（基础资料兜底自动跳过）。"""
+    try:
+        from backend.database.connection import SessionLocal
+        return SessionLocal()
+    except Exception as e:
+        logger.warning(f"[Precheck] 打开数据库会话失败，跳过基础资料兜底: {e}")
+        return None
+
 
 
 def _extract_colmap(script_content: str) -> Optional[Dict[str, Any]]:
@@ -323,14 +308,6 @@ def _check_target_sheets(
 
 # ==================== 内部工具 ====================
 
-def _collect_input_files(source_dir: str) -> List[str]:
-    p = Path(source_dir)
-    files = []
-    for ext in ("*.xlsx", "*.xls", "*.xlsm"):
-        files.extend(str(f) for f in p.glob(ext) if not f.name.startswith("~"))
-    return files
-
-
 def _extract_missing_columns(
     source_structure: dict,
     input_files: List[str],
@@ -372,7 +349,8 @@ def _extract_missing_columns(
     return missing
 
 
-def _suggest_structural_columns(expected_entries: list, actual_paths: list) -> list:
+def _suggest_structural_columns(expected_entries: list, actual_paths: list,
+                                file_mapping=None, file_renames=None) -> list:
     """为确认界面提供保守的默认值，不改写文件，也不重复解析/请求 AI。"""
     def columns_index(columns):
         index = {}
@@ -392,9 +370,25 @@ def _suggest_structural_columns(expected_entries: list, actual_paths: list) -> l
     expected = {(entry['file'], entry['sheet']): columns_index(entry['expected_columns'])
                 for entry in expected_entries if entry.get('expected_columns')}
     choices = {}
+    claimed = {}
+    target_sources = {}
+    file_targets = dict(file_renames or {})
+    for filename, info in (file_mapping or {}).items():
+        file_targets[filename] = info.get('expected_file', filename)
+        for sheet, target_sheet in info.get('sheet_mapping', {}).items():
+            source = (filename, sheet)
+            target = (file_targets[filename], target_sheet)
+            claimed[source] = target
+            target_sources[target] = source
     for target, columns in expected.items():
         candidates = []
         for source, source_columns in actual.items():
+            if source in claimed and claimed[source] != target:
+                continue
+            if target in target_sources and target_sources[target] != source:
+                continue
+            if source[0] in file_targets and file_targets[source[0]] != target[0]:
+                continue
             common = columns.keys() & source_columns.keys()
             score = len(common) / max(len(columns), len(source_columns), 1)
             if score < 0.7 or (len(common) < 2 and score != 1):
@@ -422,52 +416,6 @@ def _suggest_structural_columns(expected_entries: list, actual_paths: list) -> l
                     'reason': '列结构匹配（表名可不同），请确认',
                 })
     return suggestions
-
-
-def _apply_confirmed_mapping(source_dir: str, source_structure: dict, confirmed_mapping: dict) -> None:
-    """按用户确认的列映射改写文件
-
-    confirmed_mapping 格式（与 FastHeaderMatcher.file_mapping 兼容）：
-    {
-      "<上传文件名>": {
-        "expected_file": "<训练文件名>",
-        "sheet_mapping": {"<上传 sheet>": "<训练 sheet>", ...},
-        "header_mapping": {"<上传列>": "<训练列>", ...}
-      }
-    }
-    """
-    from .fast_header_matcher import FastHeaderMatcher
-
-    # 兼容嵌套形式：{"file_mapping": {...}}
-    fm = confirmed_mapping.get("file_mapping") if isinstance(confirmed_mapping.get("file_mapping"), dict) else confirmed_mapping
-
-    # 透传 multi_sheet_source 给 rewrite_excel，避免重写时把多Sheet 文件压缩成单Sheet
-    try:
-        multi_sheet_source = FastHeaderMatcher._infer_multi_sheet_source(source_structure or {})
-    except Exception:
-        multi_sheet_source = False
-
-    for input_name, info in fm.items():
-        if not isinstance(info, dict):
-            continue
-        info.setdefault("needs_rewrite", True)
-        info.setdefault("input_file", input_name)
-        if not info.get("file_path"):
-            info["file_path"] = os.path.join(source_dir, input_name)
-        if multi_sheet_source:
-            info["multi_sheet_source"] = True
-        try:
-            rewritten = FastHeaderMatcher.rewrite_excel(info, source_dir)
-            expected = info.get("expected_file")
-            if expected and expected != input_name:
-                old = os.path.join(source_dir, input_name)
-                new = os.path.join(source_dir, expected)
-                if not os.path.isfile(rewritten):
-                    raise ValueError('映射文件未生成')
-                if os.path.exists(old) and os.path.abspath(old) != os.path.abspath(new):
-                    os.remove(old)  # 新文件已包含映射，不能再用旧文件覆盖它。
-        except Exception as e:
-            raise RuntimeError(f"改写文件 {input_name} 失败: {e}") from e
 
 
 def _ai_suggest_column_mapping(

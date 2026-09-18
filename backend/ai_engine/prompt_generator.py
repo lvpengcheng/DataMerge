@@ -894,11 +894,16 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
     @staticmethod
     def _sheet_evidence_to_text(sheet_info):
         import json
+        from backend.utils.desensitize import mask_ai_samples
         lines = []
         for field, label in [('column_schemas', '字段定义'), ('data_sample', '数据样例'),
                              ('formulas', '原始公式'), ('formula', '原始公式')]:
             if sheet_info.get(field):
-                lines.append(f"  {label}: " + json.dumps(sheet_info[field], ensure_ascii=False, default=str))
+                value = sheet_info[field]
+                if field == 'data_sample':
+                    headers = sheet_info.get('headers') or sheet_info.get('head_data') or {}
+                    value = mask_ai_samples(headers, value)
+                lines.append(f"  {label}: " + json.dumps(value, ensure_ascii=False, default=str))
         return lines
 
     def _get_headers_from_sheet(self, sheet_info: Dict[str, Any]) -> List[str]:

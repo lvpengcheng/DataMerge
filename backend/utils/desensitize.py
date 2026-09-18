@@ -1,10 +1,10 @@
-"""数据脱敏工具：智能组表功能专用。
+"""数据脱敏工具：智能组表、规则整理和智训共用。
 
 源文件样例（前 3 行）会随结构 json 一起传给 AI 帮助理解数据结构，
 其中可能包含姓名、身份证、公司名等敏感信息，必须在传给 AI 前脱敏。
 
-规则：按列名命中内置敏感词表 → 该列样例数据保格式脱敏
-（长度与数字/字母位不变，AI 依然能看懂格式）。
+规则：按列名命中内置敏感词表；规则整理和智训使用完全遮盖，
+智能组表保留原有的保格式脱敏策略。
 只脱敏传给 AI 的内容；沙箱执行使用全量真实数据（数据全程本地）。
 """
 
@@ -14,6 +14,11 @@ import unicodedata
 
 # 敏感词表：列名包含任一关键词即视为敏感列
 SENSITIVE_KEYWORDS = [
+    "名字", "中文名", "英文名", "联系人", "联系 人", "收件人", "负责人", "法人",
+    "员工名称", "客户名称", "供应商名称", "单位", "证号", "护照", "居住地", "籍贯",
+    "通讯地", "通信地", "联系地", "开户名", "户名", "统一社会信用代码", "税号",
+    "name", "company", "enterprise", "employer", "organization", "organisation",
+    "address", "passport", "identity", "idcard", "idnumber", "ssn", "phone", "mobile", "account",
     "公司", "企业", "单位名称", "姓名", "身份证", "证件号", "证件号码",
     "手机", "电话", "手机号", "手机号码", "电话号码",
     "邮箱", "邮件", "email", "E-mail", "地址", "住址", "居住地",
@@ -42,11 +47,35 @@ def _col_is_sensitive(col_name: str) -> bool:
     """按列名判断是否敏感列（命中任一关键词）。"""
     if not col_name:
         return False
-    low = col_name.lower()
+    low = re.sub(r'[\s_\-]+', '', str(col_name).lower())
     for kw in SENSITIVE_KEYWORDS:
-        if kw.lower() in low:
+        if re.sub(r'[\s_\-]+', '', kw.lower()) in low:
             return True
     return False
+
+
+def mask_ai_samples(head_data: dict, data_rows: list) -> list:
+    """AI 结构样本按字段关键词完全遮盖敏感值，不保留姓名/号码片段。
+
+    在各区域合并前调用，防止不同区域的列字母映射互相覆盖。
+    只创建样本副本，不修改解析器原数据或本地计算数据。
+    """
+    if isinstance(head_data, (list, tuple)):
+        from openpyxl.utils import get_column_letter
+        head_data = {name: get_column_letter(i) for i, name in enumerate(head_data, 1)}
+    sensitive = {key for name, letter in (head_data or {}).items()
+                 if _col_is_sensitive(name) for key in (name, letter)}
+    def mask(key, value):
+        return '[已脱敏]' if key in sensitive and value is not None and str(value).strip() else value
+
+    result = []
+    for row in data_rows or []:
+        if isinstance(row, dict):
+            result.append({key: mask(key, value) for key, value in row.items()})
+        else:
+            from openpyxl.utils import get_column_letter
+            result.append([mask(get_column_letter(i), value) for i, value in enumerate(row, 1)])
+    return result
 
 
 def _mask_keep_tail(s: str, keep_head: int, keep_tail: int = 0) -> str:

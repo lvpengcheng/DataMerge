@@ -47,6 +47,7 @@ def auto_fill_missing_sources(
     source_structure: dict,
     tenant_id: str,
     db_session: Session,
+    assume_present: Optional[set] = None,
 ) -> Tuple[List[dict], List[str]]:
     """自动补全缺失的源文件
 
@@ -55,6 +56,8 @@ def auto_fill_missing_sources(
         source_structure: 训练时记录的源文件结构（Script.source_structure）
         tenant_id: 当前租户 ID
         db_session: 数据库会话
+        assume_present: 视为"已由上传文件覆盖"的期望文件名（改名歧义待确认时，
+            候选目标不能被基础资料抢先覆盖，否则用户确认后会拿到过期的基础资料）
 
     Returns:
         (filled_list, missing_list)
@@ -70,7 +73,7 @@ def auto_fill_missing_sources(
         if f.is_file() and not f.name.startswith("~")
     }
 
-    missing = expected_files - uploaded_files
+    missing = expected_files - uploaded_files - set(assume_present or ())
     if not missing:
         return [], []
 
@@ -279,6 +282,7 @@ def auto_rename_uploaded_by_combined_score(
     source_structure: dict,
     salary_year: Optional[int] = None,
     salary_month: Optional[int] = None,
+    uploaded_signatures: Optional[Dict[str, dict]] = None,
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, object]], Dict[str, set]]:
     """对"上传文件名与训练期望不一致"的场景做组合评分匹配
 
@@ -362,7 +366,17 @@ def auto_rename_uploaded_by_combined_score(
             logger.warning(f"[Rename] 1:1 自动映射失败，回退打分匹配: {_ex}")
 
     # 解析每个上传文件的 Sheet + 列头；一次解析同时供规则评分和 AI 使用。
-    uploaded_signatures = {f.name: _read_uploaded_signature(str(f)) for f in extras}
+    # 调用方（compute_ingest）已经全量解析过时，直接复用其结果，不再打开 Excel。
+    _injected = uploaded_signatures or {}
+    uploaded_signatures = {}
+    for f in extras:
+        sig = _injected.get(f.name) or _read_uploaded_signature(str(f))
+        # 注入来源可能经过 JSON 序列化（set 变 list），统一回 set 供打分使用
+        uploaded_signatures[f.name] = {
+            "headers": set(sig.get("headers") or ()),
+            "sheet_names": set(sig.get("sheet_names") or ()),
+            "sheets": sig.get("sheets") or [],
+        }
     uploaded_headers = {
         name: signature["headers"] for name, signature in uploaded_signatures.items()
     }
