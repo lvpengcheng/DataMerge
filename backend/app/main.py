@@ -2863,6 +2863,8 @@ async def compare_excel(
             "session_id": session_id,
             "field_diff_summary": result.get("field_diff_samples", {}),
             "warning": result.get("warning"),
+            "key_coverage": result.get("key_coverage"),
+            "error": result.get("error"),
         }
 
         # 存入历史

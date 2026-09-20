@@ -2496,7 +2496,13 @@ const Tools = {
                 ${result.download_url ? `<div style="display:flex;align-items:center;">
                     <button class="btn btn-primary" onclick="Tools._fetchAndDownload('${result.download_url}', '差异对比.xlsx')">下载差异报告</button>
                 </div>` : ''}
-            </div>`;
+            </div>
+            ${result.error ? `<div style="margin-top:12px;padding:10px 12px;background:#f8d7da;border-radius:6px;color:#721c24;">
+                <b>对比未完成</b>：有 Sheet 未能对比（这些表没有参与统计，不代表"无差异"）。<br>${result.error}
+            </div>` : ''}
+            ${(result.key_coverage !== null && result.key_coverage !== undefined && result.key_coverage < 0.9) ? `<div style="margin-top:12px;padding:10px 12px;background:#fff3cd;border-radius:6px;color:#856404;">
+                主键有效覆盖率仅 ${(result.key_coverage * 100).toFixed(1)}%：空主键行按行序配对，行序错位时可能漏报差异，建议换用唯一性更高的主键。
+            </div>` : ''}`;
         document.getElementById('compare-summary').innerHTML = summaryHtml;
 
         let sheetHtml = '';
@@ -2507,10 +2513,13 @@ const Tools = {
             for (const [name, info] of Object.entries(perSheet)) {
                 const sPct = (Math.min(1, info.match_rate || 0) * 100).toFixed(1);
                 const sColor = (info.match_rate || 0) >= 0.95 ? '#4caf50' : (info.match_rate || 0) >= 0.8 ? '#ff9800' : '#f44336';
-                sheetHtml += `<div style="padding:12px;background:#fff;border:1px solid #e0e0e0;border-radius:8px;">
+                sheetHtml += `<div style="padding:12px;background:#fff;border:1px solid ${info.error ? '#f5c6cb' : '#e0e0e0'};border-radius:8px;">
                     <div style="font-weight:bold;margin-bottom:4px;">${name} ${info.missing ? '<span style="color:red;">(缺失)</span>' : ''}</div>
-                    <div style="font-size:20px;font-weight:bold;color:${sColor};">${sPct}%</div>
-                    <div style="color:#888;font-size:12px;">匹配 ${info.matched_cells || 0}/${info.total_cells || 0} 单元格</div>
+                    ${info.error
+                        ? `<div style="font-size:14px;font-weight:bold;color:#721c24;">未对比</div>
+                           <div style="color:#721c24;font-size:12px;">${info.error}</div>`
+                        : `<div style="font-size:20px;font-weight:bold;color:${sColor};">${sPct}%</div>
+                           <div style="color:#888;font-size:12px;">匹配 ${info.matched_cells || 0}/${info.total_cells || 0} 单元格</div>`}
                 </div>`;
             }
             sheetHtml += '</div>';

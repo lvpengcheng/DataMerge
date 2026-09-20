@@ -714,6 +714,86 @@ def _standardize_key_value(value) -> str:
     return _schema_text_value(value) or ""
 
 
+# 主键包含匹配打分：越精确越大，用于在多个同族列名中选出唯一候选
+_KEY_MATCH_EXACT = 1000        # 标准化后完全相同
+_KEY_MATCH_AFFIX = 800         # 仅差前缀/后缀（如用户填 "身份证件号码"，实际列名 "*身份证件号码"）
+_KEY_MATCH_CONTAINS = 500      # 列名包含用户输入（实际列名更具体，如 "ID NO. 身份证号码"）
+_KEY_MATCH_CONTAINED = 300     # 用户输入包含列名（列名更短，容易误命中）
+_KEY_MATCH_AMBIGUOUS_GAP = 50  # 最高分与次高分差距小于该值视为歧义，放弃匹配
+
+
+def _key_match_score(requested: str, column) -> int:
+    """给「用户输入的主键名」与「实际列名」的包含关系打分，0 表示不匹配。
+
+    空列名 / 空输入一律判为不匹配（空串在任意字符串中，必须显式排除，
+    否则空列名会被误命中并参与打分）。
+    """
+    if not requested:
+        return 0
+    column_name = "" if column is None else _standardize_column_name(column)
+    if not column_name:
+        return 0
+    if column_name == requested:
+        return _KEY_MATCH_EXACT
+    lower_requested = requested.lower()
+    lower_column = column_name.lower()
+    if lower_column.startswith(lower_requested) or lower_column.endswith(lower_requested):
+        return _KEY_MATCH_AFFIX + len(requested)
+    if lower_requested in lower_column:
+        return _KEY_MATCH_CONTAINS + len(requested)
+    if lower_column in lower_requested:
+        return _KEY_MATCH_CONTAINED + len(column_name)
+    return 0
+
+
+def _pick_key_columns_by_contains(requested: str, columns) -> List[str]:
+    """按包含匹配打分挑选候选列，返回 [最优] / [] / 歧义时的 [最优, 次优]。
+
+    调用方用返回值长度区分三种结果：空=没找到，1=唯一最优，2=歧义需人工确认。
+    """
+    scored = []
+    for col in columns:
+        score = _key_match_score(requested, col)
+        if score > 0:
+            scored.append((score, str(col)))
+    if not scored:
+        return []
+    # 分数相同时取列名更短的（额外修饰越少越可能是同一个键）
+    scored.sort(key=lambda item: (-item[0], len(item[1])))
+    if len(scored) > 1 and scored[0][0] - scored[1][0] < _KEY_MATCH_AMBIGUOUS_GAP:
+        return [scored[0][1], scored[1][1]]
+    return [scored[0][1]]
+
+
+def _resolve_declared_key_columns(expected_df: pd.DataFrame,
+                                  result_df: pd.DataFrame,
+                                  primary_keys: Optional[List[str]]) -> List[str]:
+    """按 _resolve_primary_keys 的规则解析显式指定的主键列（不做无主键兜底）。
+
+    供表头行回退判断使用：返回空列表即表示按当前表头行读出来的列名里
+    找不到用户指定的主键。
+    """
+    if not primary_keys:
+        return []
+    available_keys: List[str] = []
+    for key in primary_keys:
+        std_key = _standardize_column_name(key)
+        if key in expected_df.columns and key in result_df.columns:
+            available_keys.append(key)
+            continue
+        if std_key in expected_df.columns and std_key in result_df.columns:
+            available_keys.append(std_key)
+            continue
+        exp_candidates = _pick_key_columns_by_contains(std_key, expected_df.columns)
+        if len(exp_candidates) != 1:
+            continue
+        res_candidates = _pick_key_columns_by_contains(std_key, result_df.columns)
+        if len(res_candidates) != 1:
+            continue
+        available_keys.append(exp_candidates[0])
+    return available_keys
+
+
 def require_complete_comparison(result):
     """Infrastructure/read failures are never interpreted as zero differences."""
     if result.get("resource_failure"):
@@ -968,8 +1048,14 @@ def compare_excel_files(
         logger.info(f"表头行: expected@row{exp_header_row}, result@row{res_header_row}")
 
         # Aspose 一次读取：值 + 公式（result），仅值（expected）
-        result_df, result_formulas = _aspose_read_sheet_df_and_formulas(res_ws, header_row=res_header_row)
-        expected_df = _aspose_read_sheet_df(exp_ws, header_row=exp_header_row)
+        # 表头行以"能解析出指定主键"为准，侦测行不可信时自动换候选行
+        expected_df, result_df, result_formulas, header_note = _read_with_header_fallback(
+            primary_keys, expected_file, result_file, exp_ws.Name, res_ws.Name,
+            exp_ws, res_ws, exp_header_row, res_header_row,
+            res_formulas_reader=_aspose_read_sheet_df_and_formulas,
+        )
+        if header_note:
+            logger.warning(f"[单Sheet对比] {header_note}")
 
     # 标准化列名
     result_df.columns = _standardize_unique_columns(result_df.columns)
@@ -1018,18 +1104,12 @@ def _read_sheet_df_data_only(ws_data) -> pd.DataFrame:
 
 # ==================== Aspose 直读辅助函数 ====================
 
-def _detect_header_row(file_path: str, sheet_name: Optional[str] = None, worksheet=None) -> int:
-    """用 IntelligentExcelParser 智能识别表头所在行（1-indexed）。
+def _detect_header_region(file_path: str, sheet_name: Optional[str] = None, worksheet=None):
+    """解析表头区域，返回 (head_row_start, head_row_end)。
 
-    用途：当 Excel 顶部有 banner / 数字索引行时，第 1 行不是真正的表头。
-    返回 1 表示第 1 行就是表头（默认行为）。
-    多行表头时取最后一行（data_row_start - 1）。
-
-    Args:
-        file_path: Excel 文件路径
-        sheet_name: 指定 sheet（可选）。None 时返回第一个 sheet 的表头行
-    Returns:
-        表头行号（1-indexed），找不到时返回 1
+    多行表头时 head_row_start 是第一行（通常是真正的列名行），head_row_end 是最后一行
+    （常是"1.0/2.0/3.0"类型序号行或子表头）。两者都可能才是调用方要的行，
+    因此把整个区间返回给候选表头行选择逻辑。
     """
     try:
         from excel_parser import IntelligentExcelParser, _AsposeWorksheet
@@ -1051,17 +1131,120 @@ def _detect_header_row(file_path: str, sheet_name: Optional[str] = None, workshe
             if not sd.regions:
                 continue
             r = sd.regions[0]
-            # 多行表头时 head_row_end > head_row_start，取 head_row_end 作为最后一行表头
-            row = r.head_row_end if r.head_row_end > 0 else r.head_row_start
-            if row >= 1:
-                return row
-            return 1
-        return 1
+            start = r.head_row_start if r.head_row_start >= 1 else 1
+            end = r.head_row_end if r.head_row_end >= 1 else start
+            return start, end
+        return 1, 1
     except Exception as e:
         if worksheet is not None:
             raise ValueError(f"无法确认 {sheet_name} 的表头，停止对比") from e
         logger.warning(f"[表头侦测] 识别 {file_path} 的表头行失败，回退第1行: {e}")
-        return 1
+        return 1, 1
+
+
+def _header_row_candidates(file_path: str, sheet_name: Optional[str],
+                           worksheet, detected_row: int) -> List[int]:
+    """候选表头行（按优先级）：侦测行 → 表头区首行 → 第1行 → 侦测行前后各3行。
+
+    ``_detect_header_row`` 返回的是 multi-row header 的**最后**一行，
+    而真正的列名常常在区首或区首附近（如"第6行列名 + 第7行类型序号"）。
+    """
+    candidates = [detected_row]
+    try:
+        start, _ = _detect_header_region(file_path, sheet_name=sheet_name, worksheet=worksheet)
+        candidates.append(start)
+    except Exception:
+        pass
+    candidates.append(1)
+    candidates.extend(range(max(1, detected_row - 3), detected_row + 4))
+    ordered: List[int] = []
+    for row in candidates:
+        if row >= 1 and row not in ordered:
+            ordered.append(row)
+    return ordered
+
+
+def _read_with_header_fallback(primary_keys: Optional[List[str]],
+                               exp_file: str, res_file: str,
+                               exp_sheet_name: Optional[str], res_sheet_name: Optional[str],
+                               exp_ws, res_ws,
+                               exp_hdr_row: int, res_hdr_row: int,
+                               res_formulas_reader=None):
+    """在候选表头行中选出让「指定主键」真正命中的那一行，再读两侧 DataFrame。
+
+    表头行侦测（IntelligentExcelParser）会因版式差异给出错误行：既可能是多行表头的
+    **类型序号行**（"1.0/2.0/3.0"），也可能把区域截断导致主键列整列丢失。
+    只要用户指定了主键，就用"哪个候选行能解析出该主键"来决定表头行——
+    数据行没有主键列名，天然会被排除，不需要额外猜测。
+
+    Args:
+        primary_keys: 用户指定主键；为空表示走自动检测，只用侦测行
+        exp_file/res_file: 文件路径（交给解析器定位表头区域）
+        exp_sheet_name/res_sheet_name: sheet 名
+        exp_ws/res_ws: expected / result 的 Aspose worksheet
+        exp_hdr_row/res_hdr_row: 侦测到的表头行（1-indexed）
+        res_formulas_reader: 可选的 (worksheet, header_row) -> (df, formulas) 读取器
+    Returns:
+        (exp_df, res_df, res_formulas, header_note)
+        header_note 为 None 表示沿用侦测行，否则是换行说明（写入告警提示）。
+    """
+    def _read_side(reader, ws, header_row):
+        if reader is None:
+            return _aspose_read_sheet_df(ws, header_row=header_row), {}
+        return reader(ws, header_row=header_row)
+
+    exp_df, _ = _read_side(None, exp_ws, exp_hdr_row)
+    res_df, res_formulas = _read_side(res_formulas_reader, res_ws, res_hdr_row)
+
+    if not primary_keys:
+        return exp_df, res_df, res_formulas, None
+    if len(_resolve_declared_key_columns(exp_df, res_df, primary_keys)) == len(primary_keys):
+        return exp_df, res_df, res_formulas, None
+
+    exp_candidates = _header_row_candidates(exp_file, exp_sheet_name, exp_ws, exp_hdr_row)
+    res_candidates = _header_row_candidates(res_file, res_sheet_name, res_ws, res_hdr_row)
+    res_candidate_set = set(res_candidates)
+
+    exp_cache: Dict[int, pd.DataFrame] = {exp_hdr_row: exp_df}
+    res_cache: Dict[int, pd.DataFrame] = {res_hdr_row: res_df}
+    for row in exp_candidates:
+        if row not in exp_cache:
+            exp_cache[row], _ = _read_side(None, exp_ws, row)
+        for res_row in (row, 1, res_hdr_row):
+            if res_row not in res_candidate_set:
+                continue
+            if res_row not in res_cache:
+                res_cache[res_row], _ = _read_side(None, res_ws, res_row)
+            if len(_resolve_declared_key_columns(exp_cache[row], res_cache[res_row],
+                                                 primary_keys)) != len(primary_keys):
+                continue
+            # 命中主键：真正读一次（result 侧要带公式）
+            res_df, res_formulas = _read_side(res_formulas_reader, res_ws, res_row)
+            note = (f"表头行侦测为 expected@{exp_hdr_row}/result@{res_hdr_row} 时读不到主键 "
+                    f"{primary_keys}，已改用 expected@{row}/result@{res_row} 作为表头"
+                    f"（原读法列名: {list(exp_df.columns)[:8]}）")
+            logger.warning(f"[表头回退] {note}")
+            return exp_cache[row], res_df, res_formulas, note
+
+    logger.warning(f"[表头回退] 候选表头行 {exp_candidates} 均无法解析主键 {primary_keys}，维持原表头行")
+    return exp_df, res_df, res_formulas, None
+
+
+def _detect_header_row(file_path: str, sheet_name: Optional[str] = None, worksheet=None) -> int:
+    """用 IntelligentExcelParser 智能识别表头所在行（1-indexed）。
+
+    用途：当 Excel 顶部有 banner / 数字索引行时，第 1 行不是真正的表头。
+    返回 1 表示第 1 行就是表头（默认行为）。
+    多行表头时取最后一行（data_row_start - 1）。
+
+    Args:
+        file_path: Excel 文件路径
+        sheet_name: 指定 sheet（可选）。None 时返回第一个 sheet 的表头行
+    Returns:
+        表头行号（1-indexed），找不到时返回 1
+    """
+    _, head_row_end = _detect_header_region(file_path, sheet_name=sheet_name, worksheet=worksheet)
+    return head_row_end if head_row_end >= 1 else 1
 
 
 def _dedupe_headers(headers: List) -> List[str]:
@@ -1338,6 +1521,8 @@ def _compare_excel_files_multi_sheet_impl(
         agg_matched_cells = 0
         agg_unmatched_expected = 0
         agg_unmatched_result = 0
+        agg_key_coverage_weighted = 0.0
+        agg_compared_rows = 0
         agg_field_diff_samples = {}
 
         if output_file is None:
@@ -1385,8 +1570,15 @@ def _compare_excel_files_multi_sheet_impl(
                 exp_hdr_row = _detect_header_row(expected_file, sheet_name=exp_sheet_name, worksheet=exp_ws_map[exp_sheet_name])
                 res_hdr_row = _detect_header_row(result_file, sheet_name=res_sheet_name, worksheet=res_ws_map[res_sheet_name])
                 logger.info(f"[多Sheet对比] '{exp_sheet_name}' 表头行: expected@row{exp_hdr_row}, result@row{res_hdr_row}")
-                exp_df = _aspose_read_sheet_df(exp_ws_map[exp_sheet_name], header_row=exp_hdr_row)
-                res_df, res_formulas = _aspose_read_sheet_df_and_formulas(res_ws_map[res_sheet_name], header_row=res_hdr_row)
+                exp_df, res_df, res_formulas, header_note = _read_with_header_fallback(
+                    primary_keys, expected_file, result_file,
+                    exp_sheet_name, res_sheet_name,
+                    exp_ws_map[exp_sheet_name], res_ws_map[res_sheet_name],
+                    exp_hdr_row, res_hdr_row,
+                    res_formulas_reader=_aspose_read_sheet_df_and_formulas,
+                )
+                if header_note:
+                    formula_warning = f"{formula_warning} {header_note}".strip()
 
                 # 标准化列名
                 exp_df.columns = _standardize_unique_columns(exp_df.columns)
@@ -1415,6 +1607,9 @@ def _compare_excel_files_multi_sheet_impl(
             agg_matched_cells += sheet_result.get("matched_cells", 0)
             agg_unmatched_expected += sheet_result.get("unmatched_expected", 0)
             agg_unmatched_result += sheet_result.get("unmatched_result", 0)
+            compared_rows = int(sheet_result.get("compared_rows", 0))
+            agg_key_coverage_weighted += sheet_result.get("key_coverage", 0.0) * compared_rows
+            agg_compared_rows += compared_rows
 
             # field_diff_samples 带 sheet 前缀合并
             is_multi = len(exp_compare_sheets) > 1
@@ -1453,6 +1648,7 @@ def _compare_excel_files_multi_sheet_impl(
         "total_cells": agg_total_cells,
         "matched_cells": agg_matched_cells,
         "match_rate": agg_match_rate,
+        "key_coverage": (agg_key_coverage_weighted / agg_compared_rows) if agg_compared_rows else 0.0,
         "field_diff_samples": agg_field_diff_samples,
         "warning": formula_warning if formula_warning else None,
         # 多Sheet专属字段
@@ -1616,30 +1812,84 @@ def _compare_dataframes_core(
     compare_data_columns = common_columns - set(primary_keys) - {"匹配键"}
     for key in primary_keys:
         compare_data_columns.discard(f"标准化_{key}")
-    total_cells = len(expected_df) * len(compare_data_columns) + len(missing_in_result) * len(expected_df)
+    # total_cells 不在这里预估：整行全空占位行会被剔除、同键重复行会被编号配对，
+    # 预估分母会让匹配率被空行稀释（曾出现数据几乎一致却显示 35% 的情况）。
+    # 改为在对比循环里按实际参与对比的单元格累加。
+    total_cells = 0
 
     # 创建复合匹配键
     standardized_key_cols = [f"标准化_{k}" for k in primary_keys]
-    for df, label in [(expected_df, "预期"), (result_df, "生成")]:
+    for df in (expected_df, result_df):
         if all(col in df.columns for col in standardized_key_cols):
             df["匹配键"] = pd.Series(list(df[standardized_key_cols].itertuples(index=False, name=None)), index=df.index, dtype=object)
         else:
             df["匹配键"] = pd.Series(list(df[primary_keys].itertuples(index=False, name=None)), index=df.index, dtype=object)
 
-    for df, side in ((expected_df, "expected"), (result_df, "result")):
-        df["匹配键"] = pd.Series([
-            (side, index) if any(value == "" for value in key) else ("key", key)
-            for index, key in enumerate(df["匹配键"])], index=df.index, dtype=object)
+    # 整行全空的占位行不参与对比：模板常预留几千行空白行，两侧都空时既没有内容可比，
+    # 也不该按位置"配对成匹配"（那等于凭空宣告一致）。
+    # 判定条件 = 所有数据列都空 且 主键为空：主键为空的行只能靠行序配对，没有核对依据；
+    # 有主键的行即使数据列为空也必须保留。"空"要同时认 None/NaN 和空字符串。
+    def _is_missing(series: pd.Series) -> pd.Series:
+        """把 None/NaN 和空字符串统一判为空（标准化后的主键空值是空字符串而非 NaN）。"""
+        text = series.astype(str).str.strip()
+        return text.eq("") | text.str.lower().isin(["nan", "none", "nat"])
 
-    # P0: 检查匹配键是否有重复，防止 merge 产生笛卡尔积膨胀
+    def _blank_row_mask(df):
+        if not len(df):
+            return pd.Series(False, index=df.index)
+        present = [c for c in compare_data_columns if c in df.columns]
+        data_blank = (df[present].apply(_is_missing).all(axis=1)
+                      if present else pd.Series(True, index=df.index))
+        if all(col in df.columns for col in standardized_key_cols):
+            key_blank = df[standardized_key_cols].apply(_is_missing).all(axis=1)
+        else:
+            key_present = [c for c in primary_keys if c in df.columns]
+            key_blank = (df[key_present].apply(_is_missing).all(axis=1)
+                         if key_present else pd.Series(True, index=df.index))
+        return data_blank & key_blank
+
+    exp_blank, res_blank = _blank_row_mask(expected_df), _blank_row_mask(result_df)
+    if exp_blank.any() or res_blank.any():
+        logger.info(f"[对比] 跳过整行全空的占位行: 预期 {int(exp_blank.sum())} 行, "
+                    f"生成 {int(res_blank.sum())} 行")
+        expected_df = expected_df[~exp_blank].copy()
+        result_df = result_df[~res_blank].copy()
+
+    # 主键覆盖率：空主键行只能按位置配对，覆盖率低时必须让调用方知道对比可靠性下降
+    def _key_coverage(df):
+        if not len(df) or not standardized_key_cols:
+            return 0.0
+        if not all(col in df.columns for col in standardized_key_cols):
+            return 0.0
+        usable = (df[standardized_key_cols].astype(str).apply(
+            lambda column: column.str.strip() != "")).all(axis=1)
+        return float(usable.sum()) / len(df)
+
+    exp_key_coverage = _key_coverage(expected_df)
+    res_key_coverage = _key_coverage(result_df)
+    key_coverage = min(exp_key_coverage, res_key_coverage)
+    if key_coverage < 0.9:
+        logger.warning(f"[对比] 主键 {'+'.join(primary_keys)} 覆盖率仅 {key_coverage:.1%}"
+                       f"（预期 {exp_key_coverage:.1%} / 生成 {res_key_coverage:.1%}），"
+                       "空主键行按位置配对，结果可靠性与行序相关")
+
+    # 空主键行必须能在两侧配对（否则会刷出海量"整行缺失"假差异）
     exp_has_dup = expected_df["匹配键"].duplicated().any()
     res_has_dup = result_df["匹配键"].duplicated().any()
     if exp_has_dup or res_has_dup:
         logger.warning(f"[对比] 主键存在重复值（预期重复={exp_has_dup}, 生成重复={res_has_dup}），"
                        "添加组内序号避免 merge 膨胀")
-        for df in (expected_df, result_df):
-            occurrences = df.groupby("匹配键", sort=False).cumcount()
-            df["匹配键"] = pd.Series(list(zip(df["匹配键"], occurrences)), index=df.index, dtype=object)
+
+    for df in (expected_df, result_df):
+        # 组内序号：主键相同的行按出现次序编号，避免 merge 产生笛卡尔积膨胀
+        occurrences = df.groupby("匹配键", sort=False).cumcount()
+        # 空主键行退化成 ("empty", 序号) 按位置配对；有主键行是 ("key", 主键元组)。
+        # side（expected/result）绝不能进键，否则两侧同序号的空主键行永远配不上。
+        df["匹配键"] = pd.Series(
+            [("empty", occurrence) if any(str(value) == "" for value in key)
+             else ("key", key, occurrence)
+             for key, occurrence in zip(df["匹配键"], occurrences)],
+            index=df.index, dtype=object)
 
     merged_df = pd.merge(
         expected_df, result_df,
@@ -1664,7 +1914,7 @@ def _compare_dataframes_core(
             key_val = row.get(f"{std_key}_expected", "") or row.get(f"{std_key}_result", "")
             if not key_val:
                 key_val = row.get(f"{key}_expected", "") or row.get(f"{key}_result", "")
-            key_values.append(key_val)
+            key_values.append("" if key_val is None else key_val)
         while len(key_values) < 3:
             key_values.append("")
 
@@ -1710,6 +1960,7 @@ def _compare_dataframes_core(
                 expected_value = ""
             if pd.isna(result_value):
                 result_value = ""
+            total_cells += 1
 
             try:
                 if expected_value == "" or result_value == "":
@@ -1791,6 +2042,8 @@ def _compare_dataframes_core(
         "total_cells": total_cells,
         "matched_cells": matched_cells,
         "match_rate": match_rate,
+        "key_coverage": key_coverage,
+        "compared_rows": len(expected_df),
         "field_diff_samples": field_diff_samples
     }
 
@@ -1838,7 +2091,8 @@ def _resolve_primary_keys(
                             break
                     if matched_col:
                         break
-            # 再试包含关系匹配（用户输入 "身份证号码"，列名可能是 "ID NO. 身份证号码"）
+            # 再试包含关系匹配（用户输入 "身份证号码"，列名可能是 "ID NO. 身份证号码"，
+            # 或列名带必填星号 "身份证件号码" vs "*身份证件号码"）
             if not matched_col:
                 key_lower = std_key.lower()
                 exp_candidates = [c for c in expected_df.columns if key_lower and
@@ -1849,6 +2103,20 @@ def _resolve_primary_keys(
                     matched_col = exp_candidates[0]
                     if res_candidates[0] != matched_col:
                         result_df.rename(columns={res_candidates[0]: matched_col}, inplace=True)
+            # 最后按包含匹配打分选最优候选：处理 "身份证件类型/身份证件号码" 这类
+            # 同族列名（旧逻辑要求两边候选都恰好 1 个，会被同族列直接放弃）
+            if not matched_col:
+                exp_picked = _pick_key_columns_by_contains(std_key, expected_df.columns)
+                res_picked = _pick_key_columns_by_contains(std_key, result_df.columns)
+                if len(exp_picked) == 1 and len(res_picked) == 1:
+                    matched_col = exp_picked[0]
+                    if res_picked[0] != matched_col:
+                        # 两边列名不同但指向同一键，统一用 expected 的列名
+                        result_df.rename(columns={res_picked[0]: matched_col}, inplace=True)
+                    logger.info(f"[主键解析] 包含匹配（打分）成功: '{key}' → '{matched_col}'")
+                elif len(exp_picked) > 1 or len(res_picked) > 1:
+                    logger.warning(f"[主键解析] 主键 '{key}' 包含匹配存在多个同分候选，"
+                                   f"expected={exp_picked}, result={res_picked}，请改用完整列名")
             if matched_col:
                 available_keys.append(matched_col)
                 logger.info(f"[主键解析] 模糊匹配成功: '{key}' → '{matched_col}'")

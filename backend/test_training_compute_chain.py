@@ -172,7 +172,6 @@ def test_failed_full_source_loading_never_falls_back_to_another_parse(monkeypatc
     ({'工号': ['001'], '金额': [10]}, {'工号': [1], '金额': [10]}, ['工号']),
     ({'工号': ['a_b'], '月份': ['c'], '金额': [10]},
      {'工号': ['a'], '月份': ['b_c'], '金额': [10]}, ['工号', '月份']),
-    ({'工号': [None], '金额': [10]}, {'工号': [None], '金额': [10]}, ['工号']),
     ({'工号': ['1'], '金额': [10]}, {'工号': ['1'], '金额': [10.01]}, ['工号']),
     ({'工号': ['1'], '金额': ['123456789012345678']},
      {'工号': ['1'], '金额': ['123456789012345679']}, ['工号']),
@@ -184,6 +183,42 @@ def test_comparison_never_hides_identity_or_value_difference(tmp_path, expected,
     assert comparison['success'] is False
     assert comparison['total_differences'] > 0
     assert comparison['match_rate'] < 1
+
+
+def test_empty_primary_key_rows_pair_by_position(tmp_path):
+    """主键为空的行按出现次序配对：两侧同序号的空键行视为同一行。
+
+    这是有意为之：模板里大量行没有身份证件号码（外籍雇员等），若空键行一律视为
+    不匹配，会刷出成千上万条"整行仅预期有/仅生成有"，把真实差异淹掉。
+    代价是可靠性依赖行序，因此 core 必须同时给出 key_coverage 让调用方判断。
+    """
+    expected = pd.DataFrame({'工号': [None], '金额': [10]})
+    result = pd.DataFrame({'工号': [None], '金额': [10]})
+    comparison = _compare_dataframes_core(result, expected, ['工号'], str(tmp_path / 'diff.xlsx'))
+    assert comparison['total_differences'] == 0
+    assert comparison['unmatched_expected'] == 0 and comparison['unmatched_result'] == 0
+    assert comparison['key_coverage'] == 0.0
+
+    # 空键不能掩盖数值差异
+    mismatch = _compare_dataframes_core(pd.DataFrame({'工号': [None], '金额': [11]}),
+                                        pd.DataFrame({'工号': [None], '金额': [10]}),
+                                        ['工号'], str(tmp_path / 'diff2.xlsx'))
+    assert mismatch['total_differences'] == 1
+
+
+def test_fully_blank_placeholder_rows_are_not_compared(tmp_path):
+    """整行全空（含主键为空）的占位行不参与对比，也不得被当成"整行缺失"。
+
+    判定必须包含主键列：只有连主键都没有的行才算占位行，否则"有主键但数据列全空"
+    的行会被误删，或者反过来用大量无法按主键核对的空行把匹配率抬上去。
+    """
+    expected = pd.DataFrame({'工号': ['1', None, '2'], '金额': [10, None, None]})
+    result = pd.DataFrame({'工号': ['1', None, '2'], '金额': [10, None, None]})
+    comparison = _compare_dataframes_core(result, expected, ['工号'], str(tmp_path / 'diff.xlsx'))
+    # 第2行无主键且无数据→占位行，剔除；第3行有主键但数据列为空→保留
+    assert comparison['compared_rows'] == 2
+    assert comparison['total_differences'] == 0
+    assert comparison['key_coverage'] == 1.0
 
 
 def test_extra_rows_reduce_accuracy(tmp_path):
