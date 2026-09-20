@@ -249,8 +249,12 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
                 </tbody>
             </table>`;
 
-        const stableRows = allExpectedRows.filter(_isUnchangedMapping);
-        const changedRows = allExpectedRows.filter(row => !_isUnchangedMapping(row));
+        const _autoThresholdRaw = Number(data.column_auto_accept_threshold);
+        const _autoThreshold = Number.isFinite(_autoThresholdRaw) ? _autoThresholdRaw : 0.90;
+        const _isAutoAccepted = row => row.confidence != null &&
+            Number.isFinite(Number(row.confidence)) && Number(row.confidence) >= _autoThreshold;
+        const stableRows = allExpectedRows.filter(row => _isAutoAccepted(row) || _isUnchangedMapping(row));
+        const changedRows = allExpectedRows.filter(row => !_isAutoAccepted(row) && !_isUnchangedMapping(row));
         const aiTableHtml = `
             <div style="font-weight:bold;color:#b45309;margin:8px 0;">需重点确认：有变动或未匹配（${changedRows.length}）</div>
             ${changedRows.length ? renderMappingTable(changedRows) : '<div>没有需要重新匹配的列。</div>'}
@@ -359,21 +363,28 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
                         const scoreMap = {};
                         (tc.candidates || []).forEach(c => { scoreMap[c.sheet] = c.score; });
                         const topSheet = (tc.candidates && tc.candidates.length) ? tc.candidates[0].sheet : '';
-                        const selectedSheet = previousConfirmations?.confirmed_target_map?.[tc.key] ?? data.target_map?.[tc.key] ?? topSheet;
+                        const aiRec = tc.ai_recommended || '';
+                        const selectedSheet = previousConfirmations?.confirmed_target_map?.[tc.key] ??
+                            data.target_map?.[tc.key] ?? (aiRec || topSheet);
                         const sheetList = (tc.all_sheets && tc.all_sheets.length) ? tc.all_sheets : (tc.candidates || []).map(c => c.sheet);
                         const opts = [`<option value=""${selectedSheet === '' ? ' selected' : ''}>（不映射，跳过该表）</option>`]
                             .concat(sheetList.map(sn => {
                                 const sc = scoreMap[sn];
+                                const isAi = sn === aiRec;
                                 const isTop = sn === topSheet;
-                                const star = isTop ? '✨ ' : '';
+                                const star = isAi ? '✨ ' : (isTop ? '✨ ' : '');
                                 const scoreTxt = sc != null ? ` — 匹配度=${sc}` : '';
                                 return `<option value="${_escapeHtml(sn)}"${sn === selectedSheet ? ' selected' : ''}>${star}${_escapeHtml(sn)}${scoreTxt}</option>`;
                             }))
                             .join('');
+                        const aiHint = aiRec
+                            ? `<div style="font-size:11px;color:#2e7d32;margin-top:3px;">✨ AI 推荐：${_escapeHtml(aiRec)}${tc.ai_confidence != null ? `（置信度 ${Number(tc.ai_confidence).toFixed(2)}）` : ''}${tc.ai_reason ? ' — ' + _escapeHtml(tc.ai_reason) : ''}</div>`
+                            : '';
                         return `<tr>
                             <td style="padding:6px;border:1px solid #ffe0b2;font-family:monospace;font-size:12px;vertical-align:top;">${_escapeHtml(tc.key)}</td>
                             <td style="padding:4px;border:1px solid #ffe0b2;vertical-align:top;">
                                 <select data-target-key="${_escapeHtml(tc.key)}" style="width:100%;padding:4px;font-size:11px;font-family:monospace;">${opts}</select>
+                                ${aiHint}
                             </td>
                         </tr>`;
                     }).join('')}
@@ -521,6 +532,15 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
 
         const confirmBtn = document.getElementById('_pre_confirm');
         let tableMappingDirty = false;
+        let _autoRefreshTimer = null;
+        function _scheduleTableMappingRefresh() {
+            if (_autoRefreshTimer) clearTimeout(_autoRefreshTimer);
+            _autoRefreshTimer = setTimeout(() => {
+                if (!tableMappingDirty || !data.session_id || !confirmBtn || confirmBtn.disabled) return;
+                if (_markRenameDup()) return;
+                confirmBtn.click();
+            }, 700);
+        }
 
         // 缺失文件：勾选"跳过"即为显式决定；全部有决定后才放开确认按钮
         const skipBoxes = () => overlay.querySelectorAll('input[data-skip-missing]');
@@ -566,8 +586,9 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
             if (e.target.matches('select[data-rename-uploaded]')) {
                 tableMappingDirty = true;
                 document.getElementById('_pre_validation_error').textContent =
-                    '表对应关系已更改，请先应用并刷新字段。旧字段标记将在重新校验后更新；刷新不会启动计算。';
+                    '表对应关系已更改，正在自动刷新字段；刷新不会启动计算。';
                 _refreshConfirmState();
+                _scheduleTableMappingRefresh();
             }
             if (e.target.matches('select[data-target-key]')) {
                 document.getElementById('_pre_validation_error').textContent =

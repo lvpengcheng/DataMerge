@@ -1,6 +1,7 @@
 """Conservative schema matching; filenames are tie breakers, never substitutes for columns."""
 import re
 import unicodedata
+from .period_matching import period_candidate_allowed
 
 
 def suggest_file_relations(training, actual, resolved, year=None, month=None):
@@ -69,7 +70,7 @@ def structural_columns(matcher, training, actual):
     return mapping
 
 
-def match_structural_sources(matcher, training, actual):
+def match_structural_sources(matcher, training, actual, matching_context=None):
     """Only lock unique, complete schema matches, retaining unresolved tables for AI."""
     pending = set(range(len(training)))
     used = set()
@@ -81,6 +82,8 @@ def match_structural_sources(matcher, training, actual):
             choices = []
             for ai, a in enumerate(actual):
                 if ai in used or not matcher._is_candidate_allowed(t, a, actual):
+                    continue
+                if not period_candidate_allowed(t, a, matching_context):
                     continue
                 if file_targets.get(a['file_name'], t['file_name']) != t['file_name']:
                     continue
@@ -121,6 +124,8 @@ def match_structural_sources(matcher, training, actual):
             matches.append({'train_file': t['file_name'], 'train_sheet': t['sheet_name'],
                             'input_file': a['file_name'], 'input_file_path': a['file_path'],
                             'input_sheet': a['sheet_name'], 'col_mapping': columns,
+                            'column_confidence': {source: 1.0 for source in columns},
+                            'sheet_confidence': 1.0, 'file_confidence': 1.0,
                             'needs_rewrite': not matcher._is_fully_identical(t, a, columns)})
         if not accepted:
             break
@@ -133,7 +138,8 @@ def match_structural_sources(matcher, training, actual):
                 continue
             target_file = file_targets[a['file_name']]
             candidates = [t for t in training if t['file_name'] == target_file
-                          and matcher._is_candidate_allowed(t, a, actual)]
+                          and matcher._is_candidate_allowed(t, a, actual)
+                          and period_candidate_allowed(t, a, matching_context)]
             columns = [structural_columns(matcher, t['headers'], a['headers']) for t in candidates
                        if len(t['headers']) >= 3]
             columns = [c for c in columns if c]
@@ -144,6 +150,8 @@ def match_structural_sources(matcher, training, actual):
             matches.append({'train_file': target_file, 'train_sheet': a['sheet_name'],
                             'input_file': a['file_name'], 'input_file_path': a['file_path'],
                             'input_sheet': a['sheet_name'], 'col_mapping': columns[0],
+                            'column_confidence': {source: 1.0 for source in columns[0]},
+                            'sheet_confidence': 1.0, 'file_confidence': 1.0,
                             'needs_rewrite': any(k != v for k, v in columns[0].items())})
     result = {'success': not pending, 'determined': matches, 'match_method': 'structure',
               'mapping': {'file_mapping': matcher._build_file_mapping(matches)}}

@@ -13,6 +13,7 @@ import concurrent.futures
 from typing import Dict, List, Any, Tuple, Optional
 from difflib import SequenceMatcher
 from .data_helpers import assign_sheet_keys
+from .period_matching import period_candidate_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +111,8 @@ class FastHeaderMatcher:
         self,
         source_structure: Dict[str, Any],
         input_files: List[str],
-        manual_headers: Optional[Dict[str, Any]] = None
+        manual_headers: Optional[Dict[str, Any]] = None,
+        matching_context: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
         """主入口：表头匹配（headers_only + 并行）
 
@@ -153,7 +155,7 @@ class FastHeaderMatcher:
 
             # 步骤3: 对比表头
             logger.info("[匹配] ===== 步骤3: 对比表头 =====")
-            match_result = self._match_by_training_base(train_sheets, input_sheets)
+            match_result = self._match_by_training_base(train_sheets, input_sheets, matching_context)
 
             if not match_result["success"]:
                 logger.error(f"[匹配] ===== 匹配失败 =====")
@@ -281,7 +283,8 @@ class FastHeaderMatcher:
     def _match_by_training_base(
         self,
         train_sheets: List[Dict[str, Any]],
-        input_sheets: List[Dict[str, Any]]
+        input_sheets: List[Dict[str, Any]],
+        matching_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """以训练结构为基准，逐个训练Sheet在上传Sheet中找匹配"""
         used_input_indices = set()
@@ -337,9 +340,11 @@ class FastHeaderMatcher:
 
                 if not self._is_candidate_allowed(train_sheet, input_sheet, input_sheets):
                     continue
+                if not period_candidate_allowed(train_sheet, input_sheet, matching_context):
+                    continue
 
                 input_headers = input_sheet["headers"]
-                col_mapping, score = self._match_headers(
+                col_mapping, score, col_confidence = self._match_headers_with_confidence(
                     list(input_headers.keys()), list(train_headers.keys())
                 )
 
@@ -379,6 +384,9 @@ class FastHeaderMatcher:
                     "input_sheet": matched_input["sheet_name"],
                     "input_headers": matched_input["headers"],
                     "col_mapping": best_col_mapping,
+                    "column_confidence": col_confidence,
+                    "sheet_confidence": best_score,
+                    "file_confidence": best_score,
                     "score": best_score,
                     "needs_rewrite": needs_rewrite
                 })
@@ -428,7 +436,7 @@ class FastHeaderMatcher:
                         continue
                     if not train_cols_stable.issubset(input_cols_stable):
                         continue
-                    col_mapping, score = self._match_headers(
+                    col_mapping, score, col_confidence = self._match_headers_with_confidence(
                         list(input_sheet["headers"].keys()),
                         list(mr["train_headers"].keys())
                     )
@@ -447,6 +455,9 @@ class FastHeaderMatcher:
                         "input_sheet": input_sheet["sheet_name"],
                         "input_headers": input_sheet["headers"],
                         "col_mapping": col_mapping,
+                        "column_confidence": col_confidence,
+                        "sheet_confidence": score,
+                        "file_confidence": score,
                         "score": score,
                         "needs_rewrite": any(k != v for k, v in col_mapping.items()),
                     })
@@ -473,7 +484,7 @@ class FastHeaderMatcher:
                 if not template_cols_stable.issubset(input_cols_stable):
                     continue
 
-                col_mapping, score = self._match_headers(
+                col_mapping, score, col_confidence = self._match_headers_with_confidence(
                     list(input_sheet["headers"].keys()),
                     list(template_train["headers"].keys())
                 )
@@ -492,6 +503,9 @@ class FastHeaderMatcher:
                     "input_sheet": input_sheet["sheet_name"],
                     "input_headers": input_sheet["headers"],
                     "col_mapping": col_mapping,
+                    "column_confidence": col_confidence,
+                    "sheet_confidence": score,
+                    "file_confidence": score,
                     "score": score,
                     # 仅当列名映射不全恒等时才需要重写
                     "needs_rewrite": any(k != v for k, v in col_mapping.items()),
@@ -636,6 +650,26 @@ class FastHeaderMatcher:
             fm["sheet_mapping"][mr["input_sheet"]] = mr["train_sheet"]
             fm["header_mapping"].update(mr["col_mapping"])
             fm.setdefault('header_mapping_by_sheet', {})[mr['input_sheet']] = dict(mr['col_mapping'])
+            # 逐列 / Sheet / 文件置信度：用于智算预检决定是否弹出列确认。
+            _col_conf = mr.get('column_confidence')
+            if not isinstance(_col_conf, dict):
+                _col_conf = {source: 1.0 for source in (mr.get('col_mapping') or {})}
+            _conf_out = {}
+            for _source, _conf in _col_conf.items():
+                if _conf is None:
+                    _conf_out[str(_source)] = None
+                    continue
+                try:
+                    _conf_out[str(_source)] = float(_conf)
+                except (TypeError, ValueError):
+                    _conf_out[str(_source)] = None
+            fm.setdefault('header_confidence_by_sheet', {})[mr['input_sheet']] = _conf_out
+            _sheet_conf = mr.get('sheet_confidence', mr.get('score'))
+            if _sheet_conf is not None:
+                fm.setdefault('sheet_confidence', {})[mr['input_sheet']] = float(_sheet_conf)
+            _file_conf = mr.get('file_confidence', _sheet_conf)
+            if _file_conf is not None:
+                fm['file_confidence'] = max(float(fm.get('file_confidence') or 0.0), float(_file_conf))
 
             if mr["needs_rewrite"] or mr['input_sheet'] != mr['train_sheet']:
                 fm["needs_rewrite"] = True
@@ -643,6 +677,30 @@ class FastHeaderMatcher:
         return file_mapping
 
     # ==================== 表头匹配算法 ====================
+
+    def _match_headers_with_confidence(
+        self, input_headers: List[str], train_headers: List[str]
+    ) -> Tuple[Dict[str, str], float, Dict[str, float]]:
+        """返回列映射、整体 Sheet 分和逐列置信度。"""
+        mapping, score = self._match_headers(input_headers, train_headers)
+        confidence = {
+            str(source): self._column_confidence(str(source), str(target))
+            for source, target in (mapping or {}).items()
+        }
+        return mapping, score, confidence
+
+    def _column_confidence(self, source: str, target: str) -> float:
+        """单列匹配置信度：完全同名最高，归一化同名次之，其余用文本相似度。"""
+        from difflib import SequenceMatcher
+        source_s = str(source or '')
+        target_s = str(target or '')
+        if source_s == target_s:
+            return 1.0
+        norm = lambda value: ''.join(str(value or '').split()).casefold()
+        if norm(source_s) and norm(source_s) == norm(target_s):
+            return 0.98
+        ratio = SequenceMatcher(None, source_s, target_s).ratio()
+        return round(max(0.0, min(0.99, ratio)), 4)
 
     def _match_headers(
         self, input_headers: List[str], train_headers: List[str]
@@ -813,8 +871,8 @@ class FastHeaderMatcher:
         """
         from .structural_source_mapping import match_structural_sources
         if not train_sheets:
-            return self._match_by_training_base(train_sheets, input_sheets)
-        match_result = match_structural_sources(self, train_sheets, input_sheets)
+            return self._match_by_training_base(train_sheets, input_sheets, matching_context)
+        match_result = match_structural_sources(self, train_sheets, input_sheets, matching_context)
         determined = match_result.get('determined') or []
         if not match_result['success'] and ai_provider_name:
             from .ai_source_mapping import match_sources_with_ai
@@ -836,7 +894,8 @@ class FastHeaderMatcher:
                 elif isinstance(exc, json.JSONDecodeError):
                     reason = 'AI 推荐结果不是有效的 JSON'
                 elif isinstance(exc, ValueError):
-                    reason = 'AI 推荐包含无效或冲突的文件、Sheet、字段关系'
+                    reason = ('AI 推荐包含无效或冲突的文件、Sheet、字段关系：'
+                              + str(exc)[:200])
                 else:
                     reason = 'AI 推荐服务调用失败'
                 logger.warning('[源数据映射] provider=%s 推荐失败: %s (%s)',

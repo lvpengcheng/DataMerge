@@ -264,6 +264,7 @@ def _check_target_sheets(
     template_override_path: Optional[str],
     confirmed_target_map: Optional[Dict[str, str]],
     result: PrecheckResult,
+    ai_provider_name: Optional[str] = None,
 ) -> None:
     """校验模板里的目标表能否唯一对到训练固化的 _COL_MAP 键。
 
@@ -280,15 +281,28 @@ def _check_target_sheets(
     if not tpl:
         logger.info("[Precheck/Target] 未定位到模板，跳过目标表校验（运行时兜底/报错）")
         return
+    ambiguous_key_sigs = {}
+    ambiguous_sheet_vocab = {}
     try:
         import openpyxl
-        from .target_sheet_resolver import resolve_target_sheets
+        from .target_sheet_resolver import (
+            resolve_target_sheets, _key_signature, _sheet_header_vocab,
+        )
         wb = openpyxl.load_workbook(tpl, read_only=False, data_only=True)
         try:
             resolved, ambiguous, unresolved = resolve_target_sheets(
                 wb, col_map, manual_map=(confirmed_target_map or {})
             )
             all_sheets = [sn for sn in wb.sheetnames if not sn.startswith("源_")]
+            if ambiguous:
+                ambiguous_key_sigs = {
+                    str(k): [str(c) for c in _key_signature(col_map, k)]
+                    for k in ambiguous.keys()
+                }
+                ambiguous_sheet_vocab = {
+                    str(sn): sorted(str(v) for v in _sheet_header_vocab(wb[sn]))
+                    for sn in all_sheets
+                }
         finally:
             wb.close()
     except Exception as e:
@@ -301,13 +315,23 @@ def _check_target_sheets(
             {"key": k, "candidates": v, "all_sheets": all_sheets}
             for k, v in ambiguous.items()
         ]
+        if ai_provider_name:
+            try:
+                from .ai_target_sheet_mapping import suggest_target_sheet_mapping
+                ai_map = suggest_target_sheet_mapping(
+                    ambiguous, ambiguous_key_sigs, ambiguous_sheet_vocab, ai_provider_name)
+                for item in result.target_candidates:
+                    ai_item = ai_map.get(str(item.get("key")))
+                    if ai_item:
+                        item.update(ai_item)
+            except Exception as ai_exc:
+                logger.warning(f"[Precheck/Target] AI 目标表推荐失败（不阻断）: {ai_exc}")
         logger.warning(f"[Precheck/Target] 目标表歧义需人工确认: {list(ambiguous.keys())}")
     else:
         # 只记非同名映射（同名的运行时精确匹配即可），供计算注入 _target_sheet_manual_map
         result.target_map = {k: v for k, v in resolved.items() if v != k}
         if unresolved:
             logger.info(f"[Precheck/Target] 目标表本月无对应（运行时落空跳过）: {unresolved}")
-
 
 # ==================== 内部工具 ====================
 

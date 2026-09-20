@@ -5570,6 +5570,7 @@ def _compute_pending_payload(pc_result, session_id: Optional[str] = None) -> dic
         "file_mapping": pc_result.file_mapping,
         "unmatched_columns": pc_result.unmatched_columns,
         "target_map": pc_result.target_map,
+        "column_auto_accept_threshold": float(os.getenv("COLUMN_AUTO_ACCEPT_THRESHOLD", "0.90")),
     }
     if session_id:
         payload["session_id"] = session_id

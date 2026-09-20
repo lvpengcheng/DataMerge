@@ -65,7 +65,8 @@ def test_ai_only_receives_unresolved_tables_and_columns(monkeypatch):
     monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider', lambda _: object())
     def reply(provider, messages, **kwargs):
         prompt = messages[0]['content']
-        assert '已匹配' not in prompt and 'a.xlsx' not in prompt
+        assert "\"global_training\"" in prompt and "已匹配" in prompt
+        assert "\"global_actual\"" in prompt and "a.xlsx" in prompt
         assert '"missing_columns": ["金额"]' in prompt
         assert '"candidate_columns": ["Pay"]' in prompt
         return json.dumps({'mappings': [{'training_id': 1, 'actual_id': 1, 'columns': {'Pay': '金额'}}]})
@@ -117,9 +118,9 @@ def test_ai_receives_hierarchical_script_context_without_sample_literals(monkeyp
     monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider', lambda _: object())
     def reply(provider, messages, **kwargs):
         prompt = messages[0]['content']
-        assert '按层级推理' in prompt and 'join键' in prompt
-        assert '字段不得跨已选 Sheet 拼凑' in prompt and 'column_reasons' in prompt
-        assert '为何优于其他候选' in prompt and '不得编造' in prompt
+        assert '文件到文件' in prompt and 'Sheet 到 Sheet' in prompt
+        assert '本阶段不要处理列映射' in prompt and 'salary_year' in prompt
+        assert 'current_period_index' in prompt
         assert '工资模板.xlsx' in prompt and 'df' in prompt and 'Pay' in prompt
         assert 'private-row-name' not in prompt and 'private-token' not in prompt
         return json.dumps({'mappings': [{'training_id': 0, 'actual_id': 0,
@@ -333,3 +334,75 @@ def test_compute_provider_reads_current_config_over_stale_environment(tmp_path, 
     assert ns['_resolve_compute_ai_provider']() == 'deepseek'
     ns['_resolve_enabled_ai_provider'] = lambda name: None
     assert ns['_resolve_compute_ai_provider']() is None
+
+
+def test_two_stage_ai_mapping_uses_file_sheet_then_columns(monkeypatch):
+    from backend.ai_engine import ai_provider
+    from backend.utils.ai_source_mapping import match_sources_with_ai
+
+    training, actual = schemas()
+    calls = []
+    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider', lambda _: object())
+
+    def reply(provider, messages, **kwargs):
+        calls.append(messages[0]['content'])
+        if len(calls) == 1:
+            return json.dumps({'mappings': [{
+                'training_id': 0,
+                'actual_id': 0,
+                'actual_sheet': 'Payroll',
+                'file_confidence': 0.95,
+                'sheet_confidence': 0.93,
+                'file_reason': '两份文件均为工资明细',
+                'sheet_reason': 'Payroll 对应工资表',
+                'code_evidence': 'fill_template 使用 Pay 列',
+            }]}, ensure_ascii=False)
+        return json.dumps({'mappings': [{
+            'training_id': 0,
+            'actual_id': 0,
+            'columns': {'Employee ID': '工号', 'Pay': '金额'},
+            'column_confidence': {'Employee ID': 0.99, 'Pay': 0.92},
+            'column_reasons': {'Employee ID': '工号关联键', 'Pay': '工资金额'},
+        }]}, ensure_ascii=False)
+
+    monkeypatch.setattr(ai_provider, 'chat_with_timeout', reply)
+    result = match_sources_with_ai(FastHeaderMatcher(), training, actual, 'claude')
+    assert len(calls) == 2
+    assert '文件到文件' in calls[0] and '本阶段不要处理列映射' in calls[0]
+    assert 'column_confidence' not in calls[0]
+    assert 'actual_columns' in calls[1] and 'fixed_mapping' in calls[1]
+    mapping = result['mapping']['file_mapping']
+    assert mapping['new.xlsx']['sheet_mapping'] == {'Payroll': '工资'}
+    assert mapping['new.xlsx']['header_mapping'] == {'Employee ID': '工号', 'Pay': '金额'}
+    assert mapping['new.xlsx']['header_confidence_by_sheet']['Payroll']['Pay'] == 0.92
+
+
+def test_two_stage_keeps_file_sheet_when_column_stage_fails(monkeypatch):
+    from backend.ai_engine import ai_provider
+    from backend.utils.ai_source_mapping import match_sources_with_ai
+
+    training, actual = schemas()
+    calls = []
+    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider', lambda _: object())
+
+    def reply(provider, messages, **kwargs):
+        calls.append(messages[0]['content'])
+        if len(calls) == 1:
+            return json.dumps({'mappings': [{
+                'training_id': 0,
+                'actual_id': 0,
+                'actual_sheet': 'Payroll',
+                'file_confidence': 0.95,
+                'sheet_confidence': 0.93,
+                'file_reason': '文件角色一致',
+                'sheet_reason': 'Sheet 结构一致',
+                'code_evidence': '未发现直接代码依据',
+            }]}, ensure_ascii=False)
+        return '{}'
+
+    monkeypatch.setattr(ai_provider, 'chat_with_timeout', reply)
+    result = match_sources_with_ai(FastHeaderMatcher(), training, actual, 'claude')
+    mapping = result['mapping']['file_mapping']['new.xlsx']
+    assert mapping['sheet_mapping'] == {'Payroll': '工资'}
+    assert mapping['header_mapping'] == {}
+    assert mapping['header_mapping_by_sheet'] == {'Payroll': {}}

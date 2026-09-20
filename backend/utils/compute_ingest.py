@@ -26,6 +26,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+
+def _column_auto_accept_threshold() -> float:
+    """列级自动确认阈值：达到该值的列映射不再进入人工确认界面。"""
+    raw = os.getenv("COLUMN_AUTO_ACCEPT_THRESHOLD", "0.90")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 0.90
+    return min(1.0, max(0.0, value))
+
+
+
 # 解析逻辑或产物结构变化时 +1，旧会话产物自动失效
 INGEST_VERSION = 4
 
@@ -236,7 +248,9 @@ def ingest_source_dir(
         sheet['original_sheet_name'] = sheet['sheet_name']
 
     # 文件名、Sheet 名改变不应先触发 AI。完整结构能唯一确定时直接复用。
-    structural = matcher.match_headers_only(meta.train_sheets, input_sheets)
+    structural = matcher.match_headers_only(
+        meta.train_sheets, input_sheets, None,
+        {'salary_year': salary_year, 'salary_month': salary_month})
     structural_files = {info['expected_file'] for info in
                         (structural.get('mapping') or {}).get('file_mapping', {}).values()}
     if not structural['success']:
@@ -345,6 +359,36 @@ def resolve_with_confirmations(
     _raw_renames = confirmed_renames or {}
     _decided_files = {str(k) for k in _raw_renames.keys() if k}
     confirmed_renames = {str(k): str(v) for k, v in _raw_renames.items() if k and str(v).strip()}
+    # 文件层必须一一对应：多个上传文件选择同一个训练文件时直接阻断，不能进入匹配。
+    _target_to_uploads = {}
+    for _upload, _target in confirmed_renames.items():
+        _target_to_uploads.setdefault(_target, []).append(_upload)
+    _dup_file_targets = {target: uploads for target, uploads in _target_to_uploads.items()
+                         if len(uploads) > 1}
+    if _dup_file_targets:
+        result.ok = False
+        _dup_uploads = {upload for uploads in _dup_file_targets.values() for upload in uploads}
+        _existing_rename = {str(c.get('uploaded')): c for c in (meta.rename_candidates or [])
+                            if c.get('uploaded')}
+        result.rename_candidates = []
+        for _upload in sorted(_dup_uploads):
+            _candidate = dict(_existing_rename.get(_upload) or {
+                'uploaded': _upload, 'candidates': [],
+            })
+            _candidate['candidates'] = list(_candidate.get('candidates') or [])
+            result.rename_candidates.append(_candidate)
+        _dup_desc = '；'.join(f"{target} ← {','.join(uploads)}"
+                             for target, uploads in _dup_file_targets.items())
+        result.mapping_notice = f'多个上传文件不能映射到同一个训练文件：{_dup_desc}'
+        result.missing_columns = [{
+            'file': '', 'sheet': '', 'expected_columns': [], 'error': result.mapping_notice,
+        }]
+        result.actual_paths = _actual_paths(meta.input_sheets)
+        if not skip_history_check:
+            _check_history(script_content, tenant_id, salary_year, salary_month, result, use_history)
+        _check_target_sheets(script_content, tenant_id, template_override_path,
+                             confirmed_target_map, result, meta.ai_provider_name)
+        return result
     # 明确选了"不映射"的文件：撤掉试探改名，别背着用户按最高分改
     for _skip_name in _decided_files - set(confirmed_renames):
         effective_renames.pop(_skip_name, None)
@@ -374,7 +418,7 @@ def resolve_with_confirmations(
             if not skip_history_check:
                 _check_history(script_content, tenant_id, salary_year, salary_month, result, use_history)
             _check_target_sheets(script_content, tenant_id, template_override_path,
-                                 confirmed_target_map, result)
+                                 confirmed_target_map, result, meta.ai_provider_name)
             return result
     locked_targets = {(info['expected_file'], sheet) for info in locked.values()
                       for sheet in info['sheet_mapping'].values()}
@@ -408,6 +452,8 @@ def resolve_with_confirmations(
              'target_columns': {name: list(info.get('headers') or {}) for name, info in
                                 (meta.expected_structure or {}).get('sheets', {}).items()
                                 if isinstance(info, dict)},
+             'salary_year': salary_year,
+             'salary_month': salary_month,
              'original_file_names': meta.auto_renamed})
     else:
         match_result = {"success": True, "mapping": {"file_mapping": {}}}
@@ -441,26 +487,91 @@ def resolve_with_confirmations(
         # A high similarity score is not full column coverage. Surface the few
         # unresolved columns now, rather than discarding all mappings next round.
         skipped_columns = {tuple(item) for item in result.unmatched_columns}
-        mapped_columns = {}
-        for info in composed.values():
-            for source_sheet, target_sheet in info.get('sheet_mapping', {}).items():
+        threshold = _column_auto_accept_threshold()
+        train_cols_by_key = {
+            (sheet['file_name'], sheet['sheet_name']): list(sheet.get('headers') or {})
+            for sheet in meta.train_sheets
+        }
+        low_confidence_issues = []
+        for input_file, info in composed.items():
+            # 人工确认过的映射不再做置信度拦截。
+            if info.get('confirmed'):
+                continue
+            expected_file = info.get('expected_file')
+            for source_sheet, target_sheet in (info.get('sheet_mapping') or {}).items():
+                key = (expected_file, target_sheet)
+                target_columns = train_cols_by_key.get(key) or []
+                if not target_columns:
+                    continue
                 columns = (info.get('header_mapping_by_sheet') or {}).get(
                     source_sheet, info.get('header_mapping') or {})
-                mapped_columns.setdefault((info['expected_file'], target_sheet), set()).update(columns.values())
-        for sheet in meta.train_sheets:
-            key = (sheet['file_name'], sheet['sheet_name'])
-            if key not in covered:
-                continue
-            missing = [col for col in sheet['headers'] if col not in mapped_columns.get(key, set())
-                       and (*key, col) not in skipped_columns]
-            if missing:
-                missing_columns.append({'file': key[0], 'sheet': key[1], 'expected_columns': missing})
+                reverse = {}
+                for source_col, target_col in columns.items():
+                    reverse.setdefault(target_col, source_col)
+                conf_map = (info.get('header_confidence_by_sheet') or {}).get(source_sheet) or {}
+                for target_col in target_columns:
+                    if (*key, target_col) in skipped_columns:
+                        continue
+                    source_col = reverse.get(target_col)
+                    expected_path = f"{expected_file} > {target_sheet} > {target_col}"
+                    if source_col is None:
+                        low_confidence_issues.append({
+                            'expected_path': expected_path,
+                            'suggested_path': '',
+                            'confidence': 0.0,
+                            'reason': f'训练列 {target_col} 未匹配到上传列，请确认或选择无匹配',
+                        })
+                        continue
+                    raw_conf = conf_map.get(source_col)
+                    if raw_conf is None:
+                        low_confidence_issues.append({
+                            'expected_path': expected_path,
+                            'suggested_path': f"{input_file} > {source_sheet} > {source_col}",
+                            'confidence': 0.0,
+                            'reason': f'列 {source_col} -> {target_col} 缺少置信度，请确认',
+                        })
+                        continue
+                    try:
+                        conf = float(raw_conf)
+                    except (TypeError, ValueError):
+                        conf = 0.0
+                    if conf < threshold:
+                        low_confidence_issues.append({
+                            'expected_path': expected_path,
+                            'suggested_path': f"{input_file} > {source_sheet} > {source_col}",
+                            'confidence': conf,
+                            'reason': f'列 {source_col} -> {target_col} 置信度 {conf:.2f} 低于阈值 {threshold:.2f}，请确认',
+                        })
+
+        # 低置信列才进入 missing_columns；高置信列自动通过，不弹列确认。
+        low_by_key = {}
+        for issue in low_confidence_issues:
+            parts = str(issue.get('expected_path') or '').split(' > ', 2)
+            if len(parts) == 3:
+                low_by_key.setdefault((parts[0], parts[1]), []).append(parts[2])
+        for (file_name, sheet_name), cols in low_by_key.items():
+            missing_columns.append({'file': file_name, 'sheet': sheet_name, 'expected_columns': cols})
+        if low_confidence_issues:
+            result.mapping_requires_confirmation = True
+
         if missing_columns:
             result.ok = False
             result.actual_paths = _actual_paths(meta.input_sheets)
             result.missing_columns = missing_columns
-            result.ai_suggestions = _suggest_structural_columns(
-                result.missing_columns, result.actual_paths, composed, effective_renames)
+            suggestion_index = {issue.get('expected_path'): dict(issue) for issue in low_confidence_issues}
+            for item in (match_result.get('ai_suggestions') or []):
+                expected_path = str(item.get('expected_path') or '')
+                if expected_path in suggestion_index:
+                    merged = dict(suggestion_index[expected_path])
+                    merged.update({k: v for k, v in item.items()
+                                   if v not in (None, '')})
+                    suggestion_index[expected_path] = merged
+            for item in _suggest_structural_columns(
+                    result.missing_columns, result.actual_paths, composed, effective_renames):
+                expected_path = str(item.get('expected_path') or '')
+                if expected_path and expected_path not in suggestion_index:
+                    suggestion_index[expected_path] = item
+            result.ai_suggestions = list(suggestion_index.values())
     elif result.unmatched_columns and not train_remaining:
         result.file_mapping = {}
         result.rename_candidates = [c for c in result.rename_candidates
@@ -481,12 +592,25 @@ def resolve_with_confirmations(
         result.ok = False
         result.mapping_requires_confirmation = True
         result.actual_paths = _actual_paths(meta.input_sheets)
-        result.ai_suggestions.extend(match_result.get('ai_suggestions') or [])
+        # AI 已经给出高置信列时，列层自动通过；只有低置信/未知置信列进入人工确认。
+        _threshold = _column_auto_accept_threshold()
+        _existing = {str(item.get('expected_path') or ''): item for item in (result.ai_suggestions or [])}
+        for item in (match_result.get('ai_suggestions') or []):
+            raw_conf = item.get('confidence')
+            try:
+                conf = float(raw_conf) if raw_conf is not None else None
+            except (TypeError, ValueError):
+                conf = None
+            if conf is None or conf < _threshold:
+                expected_path = str(item.get('expected_path') or '')
+                if expected_path and expected_path not in _existing:
+                    _existing[expected_path] = item
+        result.ai_suggestions = list(_existing.values())
 
     if not skip_history_check:
         _check_history(script_content, tenant_id, salary_year, salary_month, result, use_history)
     _check_target_sheets(script_content, tenant_id, template_override_path,
-                         confirmed_target_map, result)
+                         confirmed_target_map, result, meta.ai_provider_name)
     return result
 
 
@@ -594,7 +718,10 @@ def _build_virtual_sheets(
 
 
 def _compose_file_mapping(match_fm: Dict[str, Any], xlate: Dict[tuple, dict]) -> Dict[str, Any]:
-    """把"虚拟坐标下的匹配结果"复合回真实文件/sheet/列，供 build_preload 直接使用。"""
+    """把"虚拟坐标下的匹配结果"复合回真实文件/sheet/列，供 build_preload 直接使用。
+
+    同时保留匹配阶段产生的逐列/Sheet/文件置信度，供预检层判断是否需要列人工确认。
+    """
     out: Dict[str, Any] = {}
     for _v_file, info in (match_fm or {}).items():
         if not isinstance(info, dict):
@@ -606,33 +733,60 @@ def _compose_file_mapping(match_fm: Dict[str, Any], xlate: Dict[tuple, dict]) ->
             "sheet_mapping": {},
             "header_mapping": {},
             "header_mapping_by_sheet": {},
+            "header_confidence_by_sheet": {},
+            "sheet_confidence": {},
+            "file_confidence": None,
             "needs_rewrite": False,
             "file_path": file_path,
         })
+        _file_conf = info.get('file_confidence')
+        if _file_conf is not None:
+            try:
+                entry["file_confidence"] = max(float(entry.get("file_confidence") or 0.0), float(_file_conf))
+            except (TypeError, ValueError):
+                pass
         for v_sheet, train_sheet in (info.get("sheet_mapping") or {}).items():
             m_headers = (info.get('header_mapping_by_sheet') or {}).get(
                 v_sheet, info.get('header_mapping') or {})
+            m_col_conf = (info.get('header_confidence_by_sheet') or {}).get(v_sheet) or {}
+            m_sheet_conf = (info.get('sheet_confidence') or {}).get(v_sheet)
             tr = xlate.get((file_path, v_sheet))
             if tr is None:
                 # 没有翻译记录说明该 sheet 未经虚拟改名，直接透传
                 entry["sheet_mapping"][v_sheet] = train_sheet
                 entry["header_mapping"].update(m_headers)
                 entry['header_mapping_by_sheet'][v_sheet] = dict(m_headers)
+                entry['header_confidence_by_sheet'][v_sheet] = {
+                    str(col): float(conf) for col, conf in m_col_conf.items()
+                    if conf is not None
+                }
+                if m_sheet_conf is not None:
+                    entry['sheet_confidence'][v_sheet] = float(m_sheet_conf)
                 continue
-            entry["sheet_mapping"][tr["actual_sheet"]] = train_sheet
-            scoped = entry['header_mapping_by_sheet'].setdefault(tr['actual_sheet'], {})
+            actual_sheet = tr["actual_sheet"]
+            entry["sheet_mapping"][actual_sheet] = train_sheet
+            scoped = entry['header_mapping_by_sheet'].setdefault(actual_sheet, {})
+            scoped_conf = entry['header_confidence_by_sheet'].setdefault(actual_sheet, {})
             for actual_col, v_col in tr["header_map"].items():
                 # 只登记真正匹配到的训练列；多余源列仍可保留在 DataFrame，
                 # 但不能出现在人工确认表中伪装成训练期望列。
                 if v_col not in m_headers:
                     continue
-                entry["header_mapping"][actual_col] = m_headers.get(v_col, v_col)
-                scoped[actual_col] = m_headers.get(v_col, v_col)
+                target_col = m_headers.get(v_col, v_col)
+                entry["header_mapping"][actual_col] = target_col
+                scoped[actual_col] = target_col
+                raw_conf = m_col_conf.get(v_col)
+                if raw_conf is not None:
+                    try:
+                        scoped_conf[str(actual_col)] = float(raw_conf)
+                    except (TypeError, ValueError):
+                        pass
+            if m_sheet_conf is not None:
+                entry['sheet_confidence'][actual_sheet] = float(m_sheet_conf)
     for entry in out.values():
         entry["needs_rewrite"] = (any(k != v for k, v in entry['sheet_mapping'].items()) or
             any(k != v for columns in entry['header_mapping_by_sheet'].values() for k, v in columns.items()))
     return out
-
 
 def _actual_paths(input_sheets: List[Dict[str, Any]]) -> List[str]:
     return [f"{s['file_name']} > {s['sheet_name']} > {col}"
