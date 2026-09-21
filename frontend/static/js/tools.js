@@ -255,6 +255,7 @@ const Tools = {
         });
         input.addEventListener('change', () => this._addIntegrateFiles(input.files));
         document.getElementById('btn-integrate-analyze').addEventListener('click', () => this._analyzeIntegrate());
+        document.getElementById('int-parse-all-sheets')?.addEventListener('change', () => this._renderIntegrateList());
         const btnNew = document.getElementById('btn-int-new-scheme');
         if (btnNew) btnNew.addEventListener('click', () => this._intShowWork('create'));
         const btnImport = document.getElementById('btn-int-import-scheme');
@@ -365,6 +366,8 @@ const Tools = {
         _integrateFiles = [];
         _integrateAnalysis = null;
         _integrateSchemes = [];
+        const allSheets = document.getElementById('int-parse-all-sheets');
+        if (allSheets) allSheets.checked = false;
         this._renderIntegrateList();
         const cfg = document.getElementById('integrate-config');
         if (cfg) { cfg.style.display = 'none'; cfg.innerHTML = ''; }
@@ -488,7 +491,9 @@ const Tools = {
             _integrateFiles.splice(parseInt(e.target.dataset.i, 10), 1);
             this._renderIntegrateList();
         }));
-        document.getElementById('btn-integrate-analyze').disabled = (_integrateFiles.length < 2);
+        const allSheets = !!document.getElementById('int-parse-all-sheets')?.checked;
+        document.getElementById('btn-integrate-analyze').disabled = allSheets
+            ? (_integrateFiles.length < 1) : (_integrateFiles.length < 2);
     },
 
     _setIntegrateStatus(text, kind) {
@@ -498,7 +503,11 @@ const Tools = {
     },
 
     async _analyzeIntegrate() {
-        if (_integrateFiles.length < 2) { this._setIntegrateStatus('请至少上传 2 个文件', 'error'); return; }
+        const parseAllSheets = !!document.getElementById('int-parse-all-sheets')?.checked;
+        if ((!parseAllSheets && _integrateFiles.length < 2) || _integrateFiles.length < 1) {
+            this._setIntegrateStatus(parseAllSheets ? '请至少上传 1 个文件' : '请至少上传 2 个文件', 'error');
+            return;
+        }
         const btn = document.getElementById('btn-integrate-analyze');
         btn.disabled = true;
         this._setIntegrateStatus('解析中...');
@@ -506,6 +515,7 @@ const Tools = {
             const fd = new FormData();
             _integrateFiles.forEach(f => fd.append('files', f));
             fd.append('tenant_id', '__tools_integrate__');
+            fd.append('parse_all_sheets', parseAllSheets ? 'true' : 'false');
             const resp = await AUTH.authFetch('/api/tools/integrate/analyze', { method: 'POST', body: fd });
             if (!resp.ok) {
                 const msg = await _alertErr(resp, '解析失败');
@@ -517,7 +527,8 @@ const Tools = {
             if (_intMode === 'apply') {
                 this._setIntegrateStatus('解析完成，请检查列头范围后点击「应用方案」', 'ok');
             } else {
-                this._setIntegrateStatus('解析完成，可按需要重新定义列头范围', 'ok');
+                const tableCount = (_integrateAnalysis.files || []).length;
+                this._setIntegrateStatus(`解析完成，共识别 ${tableCount} 张表，可按需要重新定义列头范围`, 'ok');
                 if (_intMode === 'edit') await this._intPrefillForEdit();
             }
         } catch (e) {

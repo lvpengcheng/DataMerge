@@ -211,18 +211,20 @@
                         <span id="int-work-title" style="font-weight:600;"></span>
                     </div>
                     <div class="desc">
-                        导入 2 张 Excel（一张作为主表/模板），把对照表选定列的<strong>值</strong>按关联键回填到主表对应列（覆盖），
+                        导入多张 Excel，或解析同一 Excel 内的多张可见 Sheet（一张作为主表/模板），把对照表选定列的<strong>值</strong>按关联键回填到主表对应列（覆盖），
                         可选对比选定列生成差异。输出保留主表整个工作簿（其他 sheet、未涉及列的公式原样保留），仅变更激活页的覆盖列。
                     </div>
                     <div id="int-apply-reasons" style="display:none;margin:10px 0;padding:10px 12px;background:#fdecec;border:1px solid #f5b5b5;border-radius:6px;color:#a3271f;"></div>
                     <div class="upload-zone" id="integrate-upload-zone">
-                        <div>点击或拖拽 Excel 文件到此处（≥2 个：1 主表 + 至少 1 对照表）</div>
+                        <div>点击或拖拽 Excel 文件到此处（多文件模式需 ≥2 个；全部 Sheet 模式可只上传 1 个）</div>
                         <div style="font-size:12px;margin-top:6px;">支持 .xlsx / .xls / .xlsm，主表在下一步选定</div>
                         <input id="integrate-file-input" type="file" accept=".xlsx,.xls,.xlsm" multiple style="display:none;">
                     </div>
                     <div class="split-file-list" id="integrate-file-list"></div>
                     <div class="actions">
                         <button class="btn btn-primary" id="btn-integrate-analyze" disabled>解析字段</button>
+                        <label style="font-size:13px;margin-left:8px;"><input type="checkbox" id="int-parse-all-sheets" style="width:auto;"> 解析全部 Sheet</label>
+                        <span style="font-size:12px;color:#888;">仅解析可见 Sheet，隐藏 Sheet 自动跳过</span>
                         <span class="status" id="integrate-status"></span>
                     </div>
 
@@ -510,6 +512,6 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260722a"></script>
-    <script src="/static/js/tools.js?v=20260921-union-main-text"></script>
+    <script src="/static/js/tools.js?v=20260921-all-sheets"></script>
 </body>
 </html>

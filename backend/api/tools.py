@@ -210,13 +210,27 @@ def _parse_file_to_df_impl(
         manual_headers = {sheet_name: list(manual_header_range)}
     results = parser.parse_excel_file(
         path, read_formulas=False, calculate_formulas=calculate_formulas,
-        active_sheet_only=True, best_region_only=False,
+        active_sheet_only=not bool(sheet_name), best_region_only=False,
+        skip_hidden_sheets=False if sheet_name else True,
         manual_headers=manual_headers,
     )
+    if sheet_name:
+        results = [sd for sd in (results or []) if sd.sheet_name == sheet_name]
     if not results or not results[0].regions:
         return {"sheet": "", "columns": [], "df": pd.DataFrame(),
                 "header_start": 0, "header_end": 0}
     return _regions_to_df(results[0])
+
+
+def _parse_file_all_sheets_impl(path: str, calculate_formulas: bool = False):
+    """解析工作簿内全部可见 Sheet；隐藏 Sheet 明确跳过。"""
+    from excel_parser import IntelligentExcelParser
+    parser = IntelligentExcelParser()
+    results = parser.parse_excel_file(
+        path, read_formulas=False, calculate_formulas=calculate_formulas,
+        active_sheet_only=False, best_region_only=False, skip_hidden_sheets=True,
+    )
+    return [_regions_to_df(sd) for sd in (results or []) if sd.regions]
 
 
 def _parse_file_to_df(path: str, manual_header_range=None, sheet_name: str = None):
@@ -262,6 +276,23 @@ async def _parse_file_to_df_fresh(
     logger.error(f"[parse] 一次性子进程解析失败（{reason}）: {path}")
     return {"sheet": "", "columns": [], "df": pd.DataFrame(),
             "header_start": 0, "header_end": 0, "error": str(reason)}
+
+
+async def _parse_file_all_sheets_fresh(path: str, calculate_formulas: bool = False):
+    """一次性子进程解析全部可见 Sheet。"""
+    from backend.utils.subprocess_runner import (
+        run_in_fresh_subprocess_async, default_max_memory_mb, default_timeout,
+    )
+    r = await run_in_fresh_subprocess_async(
+        "backend.api.tools:_parse_file_all_sheets_impl",
+        (str(path), calculate_formulas),
+        timeout=default_timeout("parse"), max_memory_mb=default_max_memory_mb(),
+    )
+    if r.success:
+        return r.result or []
+    reason = "超时" if r.timed_out else ("内存超限" if r.killed_by_memory else r.error)
+    logger.error(f"[parse] 全部 Sheet 解析失败（{reason}）: {path}")
+    raise ValueError(str(reason))
 
 
 def _merge_execute_impl(session_dir: str, request_data: dict, template_path: str = None) -> dict:
@@ -874,9 +905,12 @@ def _parse_file_full_impl(path: str, manual_header_range=None, sheet_name: str =
         manual_headers = {sheet_name: list(manual_header_range)}
     results = parser.parse_excel_file(
         path, read_formulas=False, calculate_formulas=True,
-        active_sheet_only=True, best_region_only=True,
+        active_sheet_only=not bool(sheet_name), best_region_only=True,
+        skip_hidden_sheets=False if sheet_name else True,
         manual_headers=manual_headers,
     )
+    if sheet_name:
+        results = [sd for sd in (results or []) if sd.sheet_name == sheet_name]
     if not results or not results[0].regions:
         return {"sheet": "", "columns": [], "df": pd.DataFrame(),
                 "head_data": {}, "header_start": 0, "header_end": 0,
@@ -891,6 +925,11 @@ def _parse_file_full_impl(path: str, manual_header_range=None, sheet_name: str =
         ordered = [h for h in head.keys() if h in df.columns]
         if ordered:
             df = df[ordered]
+    elif head:
+        # 空主模板仍然有完整表头。若这里保留 pandas 默认的 0 列 DataFrame，
+        # 执行前校验会把所有关联键/目标列误判为不存在，union_source_keys 也就
+        # 无法把来源表的主键和数据追加进空模板。
+        df = pd.DataFrame(columns=list(head.keys()))
     return {
         "sheet": sd.sheet_name,
         "columns": list(head.keys()),
@@ -946,7 +985,8 @@ async def _parse_file_full_fresh(path: str, manual_header_range=None, sheet_name
     return empty
 
 
-def _integrate_file_meta(name: str, info: dict, manual: bool = False) -> dict:
+def _integrate_file_meta(name: str, info: dict, manual: bool = False,
+                         physical_file: str = None, sheet_explicit: bool = False) -> dict:
     """把解析结果转换成可持久化的整合会话元数据。"""
     from ..utils.merge_engine import compute_header_fingerprint, guess_key_column
     from ..utils.integrate_engine import guess_name_column, guess_id_column
@@ -955,7 +995,9 @@ def _integrate_file_meta(name: str, info: dict, manual: bool = False) -> dict:
     df = info.get("df")
     return {
         "name": name,
+        "physical_file": physical_file or name,
         "sheet": info.get("sheet") or "",
+        "sheet_explicit": bool(sheet_explicit),
         "columns": cols,
         "fingerprint": compute_header_fingerprint(cols),
         "suggested_key": guess_key_column(cols, df) or (cols[0] if cols else ""),
@@ -967,17 +1009,33 @@ def _integrate_file_meta(name: str, info: dict, manual: bool = False) -> dict:
     }
 
 
+def _integrate_sheet_table_name(file_name: str, sheet_name: str, used=None) -> str:
+    """为“文件 + Sheet”生成可作为公式前缀及 Windows 输出文件名的稳定虚拟表名。"""
+    path = Path(file_name)
+    sheet = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(sheet_name or "Sheet")).strip(" .") or "Sheet"
+    base = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", path.stem).strip(" .") or "Workbook"
+    suffix = path.suffix if path.suffix.lower() in EXCEL_EXTS else ".xlsx"
+    candidate = f"{base}__{sheet}{suffix}"
+    used_names = set(used or [])
+    n = 2
+    while candidate in used_names:
+        candidate = f"{base}__{sheet}_{n}{suffix}"
+        n += 1
+    return candidate
+
+
 @router.post("/integrate/analyze")
 async def integrate_analyze(
     files: List[UploadFile] = File(...),
     tenant_id: Optional[str] = Form(None),
+    parse_all_sheets: bool = Form(False),
     current_user=Depends(get_current_user),
 ):
     """多表整合对比第一步：上传【≥2 个】文件（1 主表 + 至少 1 对照表）→ 解析激活页
     → 返回各文件列（带来源）+ 列头指纹 + 猜键/猜姓名/猜身份证列。不在此处调用 AI。
     主表由用户在后续步骤从上传文件里选定（不在此处固定）。
     """
-    if not files or len(files) < 2:
+    if not files or (not parse_all_sheets and len(files) < 2):
         raise HTTPException(status_code=400, detail="请至少上传 2 个文件（1 主表 + 至少 1 对照表）")
 
     session_id = uuid.uuid4().hex
@@ -994,23 +1052,40 @@ async def integrate_analyze(
             dest = sdir / name
             await save_upload_file(uf, dest)
             # 第一阶段只识别列头/少量缓存值：不计算公式、不原地重写上传文件。
-            # 最终 execute 仍使用 _parse_file_full_impl(calculate_formulas=True)，结果语义不变。
             async with get_excel_work_semaphore():
-                info = await _parse_file_to_df_fresh(
-                    str(dest), calculate_formulas=False)
-            if not info.get("columns"):
-                reason = info.get("error") or "激活工作表未识别到有效数据区域或列头"
+                if parse_all_sheets:
+                    infos = await _parse_file_all_sheets_fresh(str(dest), calculate_formulas=False)
+                else:
+                    infos = [await _parse_file_to_df_fresh(str(dest), calculate_formulas=False)]
+            valid_infos = [info for info in infos if info.get("columns")]
+            if not valid_infos:
+                reason = (infos[0].get("error") if infos else None) or "未识别到有效数据区域或列头"
                 raise HTTPException(status_code=400, detail=f"{name}: 解析失败：{reason}")
-            files_meta.append(_integrate_file_meta(name, info))
+            for info in valid_infos:
+                table_name = (_integrate_sheet_table_name(
+                    name, info.get("sheet"), {m["name"] for m in files_meta})
+                    if parse_all_sheets else name)
+                files_meta.append(_integrate_file_meta(
+                    table_name, info, physical_file=name,
+                    sheet_explicit=parse_all_sheets))
+
+        if len(files_meta) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="至少需要解析出 2 张可见且含有效列头的 Sheet（1 主表 + 至少 1 对照表）",
+            )
 
         (sdir / "_meta.json").write_text(json.dumps({
             "files": files_meta,
+            "parse_all_sheets": bool(parse_all_sheets),
             "header_ranges": {
                 f["name"]: [f["header_start"], f["header_end"]] for f in files_meta
             },
         }, ensure_ascii=False), encoding="utf-8")
         matched_schemes = _match_integrate_schemes(current_user, files_meta)
-        return {"session_id": session_id, "files": files_meta, "matched_schemes": matched_schemes}
+        return {"session_id": session_id, "files": files_meta,
+                "parse_all_sheets": bool(parse_all_sheets),
+                "matched_schemes": matched_schemes}
     except HTTPException:
         shutil.rmtree(sdir, ignore_errors=True)
         raise
@@ -1050,7 +1125,8 @@ async def integrate_reparse_headers(
             raise HTTPException(status_code=400, detail=f"{name}: 表头起止行必须是正整数")
         if start < 1 or end < start or end - start > 20:
             raise HTTPException(status_code=400, detail=f"{name}: 表头范围无效（需满足 1 ≤ 起始行 ≤ 结束行，且最多 21 行）")
-        path = sdir / name
+        physical_file = old.get("physical_file") or name
+        path = sdir / physical_file
         if not path.exists() or path.suffix.lower() not in EXCEL_EXTS:
             raise HTTPException(status_code=400, detail=f"文件不存在: {name}")
         async with get_excel_work_semaphore():
@@ -1059,7 +1135,9 @@ async def integrate_reparse_headers(
                 calculate_formulas=False)
         if not info.get("columns"):
             raise HTTPException(status_code=400, detail=f"{name}: 指定的第 {start}-{end} 行未解析出有效列头")
-        new_meta.append(_integrate_file_meta(name, info, manual=True))
+        new_meta.append(_integrate_file_meta(
+            name, info, manual=True, physical_file=physical_file,
+            sheet_explicit=bool(old.get("sheet_explicit"))))
 
     meta["files"] = new_meta
     meta["header_ranges"] = {
@@ -1211,27 +1289,34 @@ def _integrate_execute_impl(session_dir: str, request_data: dict) -> dict:
 
     sdir = Path(session_dir)
     main_file = request_data["main_file"]
-    main_path = sdir / main_file
     meta_path = sdir / "_meta.json"
     meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
     meta_by_file = {f.get("name"): f for f in meta.get("files", [])}
     header_ranges = meta.get("header_ranges") or {}
+    main_meta = meta_by_file.get(main_file) or {}
+    main_path = sdir / (main_meta.get("physical_file") or main_file)
 
     def header_args(file_name: str):
         rng = header_ranges.get(file_name)
         file_meta = meta_by_file.get(file_name) or {}
-        sheet = file_meta.get("sheet")
-        return (rng, sheet) if rng and file_meta.get("header_manual") else (None, None)
+        explicit_sheet = bool(file_meta.get("sheet_explicit"))
+        sheet = file_meta.get("sheet") if (explicit_sheet or file_meta.get("header_manual")) else None
+        # “解析全部 Sheet”模式的虚拟表必须复用分析阶段识别出的表头范围；
+        # 否则同一物理工作簿在执行阶段重新探测时可能得到不同的多行表头。
+        use_saved_range = explicit_sheet or bool(file_meta.get("header_manual"))
+        return (rng if rng and use_saved_range else None, sheet)
 
     main_rng, main_sheet = header_args(main_file)
     main_info = _parse_file_full_impl(str(main_path), main_rng, main_sheet)
     parsed = {main_file: {"df": main_info["df"], "sheet": main_info["sheet"]}}
-    for fp_path in sorted(sdir.iterdir()):
-        if fp_path.suffix.lower() not in EXCEL_EXTS or fp_path.name == main_file:
+    for table_meta in meta.get("files", []):
+        table_name = table_meta.get("name")
+        if not table_name or table_name == main_file:
             continue
-        rng, sheet = header_args(fp_path.name)
-        info = _parse_file_to_df_impl(str(fp_path), rng, sheet)
-        parsed[fp_path.name] = {"df": info["df"], "sheet": info["sheet"]}
+        physical_path = sdir / (table_meta.get("physical_file") or table_name)
+        rng, sheet = header_args(table_name)
+        info = _parse_file_to_df_impl(str(physical_path), rng, sheet)
+        parsed[table_name] = {"df": info["df"], "sheet": info["sheet"]}
 
     errs = _validate_integrate_columns(
         parsed, request_data["key_map"], request_data.get("overwrite_pairs", []),
@@ -1270,7 +1355,7 @@ def _integrate_execute_impl(session_dir: str, request_data: dict) -> dict:
 
     if request_data.get("output_mode") == 2 and request_data.get("compare_pairs"):
         # apply_integration 已 CalculateFormula + Save；此处读取的就是最终计算缓存值。
-        final_info = _parse_file_full_impl(str(out_path))
+        final_info = _parse_file_full_impl(str(out_path), sheet_name=main_info["sheet"])
         diff_rows = compute_diffs(
             final_info["df"], source_indexes,
             a_key_col=request_data["key_map"].get(main_file),
@@ -1294,7 +1379,10 @@ async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(g
     if not sdir.exists():
         raise HTTPException(status_code=400, detail="会话已过期，请重新上传分析")
 
-    main_path = sdir / req.main_file
+    meta_path = sdir / "_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+    selected = next((f for f in meta.get("files", []) if f.get("name") == req.main_file), None)
+    main_path = sdir / ((selected or {}).get("physical_file") or req.main_file)
     if not main_path.exists():
         raise HTTPException(status_code=400, detail=f"主表文件不存在: {req.main_file}")
 

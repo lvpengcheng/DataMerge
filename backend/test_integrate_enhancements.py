@@ -5,7 +5,11 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill
 
 from backend.api.tools import (
+    _integrate_execute_impl,
+    _integrate_sheet_table_name,
     _match_scheme_config,
+    _parse_file_all_sheets_impl,
+    _parse_file_full_impl,
     _required_cols_by_role,
     _resolved_scheme_config,
     _suggest_column_map,
@@ -170,6 +174,95 @@ def test_writer_keeps_identity_number_exact_and_formats_it_as_text(tmp_path):
     assert result["B2"].value == identity
     assert result["B2"].number_format == "@"
     assert result["B2"].data_type == "s"
+
+
+def test_parse_all_sheets_skips_hidden_sheets(tmp_path):
+    source = tmp_path / "multi.xlsx"
+    book = Workbook()
+    first = book.active
+    first.title = "Main"
+    first.append(["ID", "Amount"])
+    first.append(["A1", 1])
+    second = book.create_sheet("Source")
+    second.append(["ID", "Amount"])
+    second.append(["A1", 2])
+    hidden = book.create_sheet("Hidden")
+    hidden.append(["ID", "Secret"])
+    hidden.append(["A1", 99])
+    hidden.sheet_state = "hidden"
+    book.save(source)
+
+    infos = _parse_file_all_sheets_impl(str(source), calculate_formulas=False)
+    assert [info["sheet"] for info in infos] == ["Main", "Source"]
+    assert _integrate_sheet_table_name("multi.xlsx", "A/B:*?") == "multi__A_B_.xlsx"
+
+
+def test_full_parser_keeps_columns_for_header_only_main_template(tmp_path):
+    source = tmp_path / "empty-main.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Main"
+    sheet.append(["ID", "Amount"])
+    book.save(source)
+
+    info = _parse_file_full_impl(str(source), [1, 1], "Main")
+
+    assert info["columns"] == ["ID", "Amount"]
+    assert list(info["df"].columns) == ["ID", "Amount"]
+    assert info["df"].empty
+
+
+def test_integrate_exec_supports_two_visible_sheets_in_one_workbook(tmp_path):
+    source = tmp_path / "multi.xlsx"
+    book = Workbook()
+    main = book.active
+    main.title = "Main"
+    main.append(["ID", "Amount"])
+    main.append(["E0", 5])
+    other = book.create_sheet("Source")
+    other.append(["ID", "Amount"])
+    other.append(["E0", 3])
+    other.append(["A1", 7])
+    hidden = book.create_sheet("Hidden")
+    hidden.append(["ID", "Amount"])
+    hidden.append(["H1", 100])
+    hidden.sheet_state = "hidden"
+    book.save(source)
+
+    main_table = "multi__Main.xlsx"
+    source_table = "multi__Source.xlsx"
+    meta = {
+        "parse_all_sheets": True,
+        "files": [
+            {"name": main_table, "physical_file": "multi.xlsx", "sheet": "Main",
+             "sheet_explicit": True, "columns": ["ID", "Amount"],
+             "header_start": 1, "header_end": 1, "header_manual": False},
+            {"name": source_table, "physical_file": "multi.xlsx", "sheet": "Source",
+             "sheet_explicit": True, "columns": ["ID", "Amount"],
+             "header_start": 1, "header_end": 1, "header_manual": False},
+        ],
+        "header_ranges": {main_table: [1, 1], source_table: [1, 1]},
+    }
+    (tmp_path / "_meta.json").write_text(
+        __import__("json").dumps(meta), encoding="utf-8")
+
+    stat = _integrate_execute_impl(str(tmp_path), {
+        "main_file": main_table,
+        "key_map": {main_table: "ID", source_table: "ID"},
+        "overwrite_pairs": [{
+            "a_col": "Amount", "source_file": source_table,
+            "source_expr": f"{main_table}.Amount+Amount",
+        }],
+        "compare_pairs": [], "output_mode": 1,
+        "normalize_keys": True, "date_key_mode": "off",
+        "union_source_keys": True, "diff_order": "id_name",
+    })
+    assert stat["added_rows"] == 1
+    result_path = tmp_path / f"整合结果_{main_table}"
+    result_book = load_workbook(result_path, data_only=True)
+    assert result_book["Hidden"].sheet_state == "hidden"
+    rows = list(result_book["Main"].iter_rows(min_row=2, max_col=2, values_only=True))
+    assert rows == [("A1", 7), ("E0", 8)]
 
 
 def _scheme_config():
