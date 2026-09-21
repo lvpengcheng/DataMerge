@@ -592,19 +592,13 @@ def resolve_with_confirmations(
         result.ok = False
         result.mapping_requires_confirmation = True
         result.actual_paths = _actual_paths(meta.input_sheets)
-        # AI 已经给出高置信列时，列层自动通过；只有低置信/未知置信列进入人工确认。
-        _threshold = _column_auto_accept_threshold()
+        # 只要使用了 AI（或 AI 不可用时的结构兜底），本次整理出的完整关系都要
+        # 交给操作员做一次最终审核。置信度只用于界面分组，不再用于跳过人工确认。
         _existing = {str(item.get('expected_path') or ''): item for item in (result.ai_suggestions or [])}
         for item in (match_result.get('ai_suggestions') or []):
-            raw_conf = item.get('confidence')
-            try:
-                conf = float(raw_conf) if raw_conf is not None else None
-            except (TypeError, ValueError):
-                conf = None
-            if conf is None or conf < _threshold:
-                expected_path = str(item.get('expected_path') or '')
-                if expected_path and expected_path not in _existing:
-                    _existing[expected_path] = item
+            expected_path = str(item.get('expected_path') or '')
+            if expected_path:
+                _existing[expected_path] = item
         result.ai_suggestions = list(_existing.values())
 
     if not skip_history_check:

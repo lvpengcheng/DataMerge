@@ -66,6 +66,102 @@ def test_refresh_confirmation_never_dispatches_calculation(tmp_path, monkeypatch
     assert calls == [True]
 
 
+def test_final_confirmation_bypasses_precheck_and_dispatches(tmp_path, monkeypatch):
+    """最终人工审核是放行动作：即使预检仍有提示，也必须进入计算。"""
+    import ast
+    import asyncio
+    from pathlib import Path
+    from backend.utils import compute_ingest
+    from backend.utils.compute_precheck import PrecheckResult
+
+    source = Path(__file__).parent / 'app' / 'main.py'
+    tree = ast.parse(source.read_text(encoding='utf-8'))
+    endpoint = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef)
+                    and n.name == 'compute_session_confirm')
+    endpoint.decorator_list = []
+    endpoint.returns = None
+    for arg in endpoint.args.args:
+        arg.annotation = None
+    endpoint.args.defaults = [ast.Constant(None) for _ in endpoint.args.defaults]
+    pending_calls = []
+    dispatch_calls = []
+    async def dispatch(*args, **kwargs):
+        dispatch_calls.append(True)
+        return {'task_id': 'started'}
+    namespace = {
+        'asyncio': asyncio,
+        '_resolve_compute_ai_provider': lambda: 'deepseek',
+        '_get_compute_session': lambda *args: {'temp_dir': str(tmp_path), 'params': {}},
+        '_compute_pending_payload': lambda *args: pending_calls.append(True) or {'error_type': 'precheck_failed'},
+        '_dispatch_compute_task': dispatch,
+        'logger': __import__('logging').getLogger(__name__),
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[endpoint], type_ignores=[])),
+                 str(source), 'exec'), namespace)
+    monkeypatch.setattr(compute_ingest, 'ingest_ready', lambda *args: True)
+    from types import SimpleNamespace
+    monkeypatch.setattr(compute_ingest, 'read_meta',
+                        lambda *args: SimpleNamespace(ai_provider_name='claude'))
+    monkeypatch.setattr(compute_ingest, 'resolve_with_confirmations',
+                        lambda *args, **kwargs: PrecheckResult(ok=False,
+                            missing_columns=[{'error': '字段关系不完整'}]))
+
+    result = asyncio.run(namespace['compute_session_confirm'](
+        's1', {'mapping_finalized': True, 'confirmed_mapping': {'file_mapping': {}}}))
+    assert result == {'task_id': 'started'}
+    assert pending_calls == []
+    assert dispatch_calls == [True]
+
+
+def test_runtime_template_remap_honors_final_manual_target_mapping():
+    """运行时临时改名必须反转最终人工关系，不能再次按相同表头重新猜顺序。"""
+    import ast
+    import logging
+    from pathlib import Path
+
+    source = Path(__file__).parent / 'app' / 'main.py'
+    tree = ast.parse(source.read_text(encoding='utf-8'))
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                and n.name == '_build_sheet_remap')
+    namespace = {
+        'logger': logging.getLogger(__name__),
+        '_xlsx_sheet_headers': lambda path: (
+            {'当月1': {'工号', '金额'}, '当月2': {'工号', '金额'}}
+            if path == 'train.xlsx' else
+            {'202608(1)': {'工号', '金额'}, '202608(2)': {'工号', '金额'}}),
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])),
+                 str(source), 'exec'), namespace)
+
+    remap = namespace['_build_sheet_remap'](
+        'train.xlsx', 'upload.xlsx',
+        {'当月1': '202608(2)', '当月2': '202608(1)'})
+
+    assert remap == {'202608(2)': '当月1', '202608(1)': '当月2'}
+
+
+def test_runtime_template_remap_does_not_autofill_manually_skipped_target():
+    """人工选择“不映射”后，该目标表不能被旧兼容逻辑自动补回。"""
+    import ast
+    import logging
+    from pathlib import Path
+
+    source = Path(__file__).parent / 'app' / 'main.py'
+    tree = ast.parse(source.read_text(encoding='utf-8'))
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                and n.name == '_build_sheet_remap')
+    namespace = {
+        'logger': logging.getLogger(__name__),
+        '_xlsx_sheet_headers': lambda path: (
+            {'当月1': {'工号'}} if path == 'train.xlsx' else {'202608': {'工号'}}),
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])),
+                 str(source), 'exec'), namespace)
+
+    assert namespace['_build_sheet_remap'](
+        'train.xlsx', 'upload.xlsx', {'当月1': ''}) == {}
+
+
 def test_structure_defaults_for_renamed_sheet_with_partial_columns():
     from backend.utils.compute_precheck import _suggest_structural_columns
     expected = [{'file': 'old.xlsx', 'sheet': '训练表',

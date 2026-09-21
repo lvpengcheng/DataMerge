@@ -4269,23 +4269,54 @@ def _xlsx_sheet_headers(path: str) -> dict:
     return out
 
 
-def _build_sheet_remap(train_path: str, upload_path: str) -> dict:
-    """训练模板 vs 上传模板，按表头相似度给"上传 sheet 名 → 训练 sheet 名"的映射。
+def _build_sheet_remap(train_path: str, upload_path: str, manual_map: dict = None) -> dict:
+    """生成"上传 sheet 名 → 训练 sheet 名"的临时改名映射。
 
-    - 上传里已与训练同名的 sheet 不动。
-    - 训练里缺失的 sheet 名，到上传里"未被占用且表头 Jaccard 最高(>=0.5)"的 sheet 配对。
+    ``manual_map`` 是前端最终确认的反方向关系
+    ``{训练目标表: 本次模板 sheet}``，必须优先采用；空值表示人工明确跳过。
+    只有未被人工决定的训练表，才允许按表头 Jaccard 自动补全。
     返回 {上传sheet名: 训练sheet名}，仅含需要改名的。
     """
     train = _xlsx_sheet_headers(train_path)
     up = _xlsx_sheet_headers(upload_path)
     if not train or not up:
         return {}
-    train_names = set(train.keys())
-    up_names = set(up.keys())
+    train_names = list(train.keys())
+    up_names = list(up.keys())
+    train_name_set = set(train_names)
+    up_name_set = set(up_names)
+    manual = {str(k): str(v or '').strip() for k, v in (manual_map or {}).items() if k}
+    decided_train = set(manual.keys())
+    manual_actuals = {v for v in manual.values() if v in up_name_set}
     remap = {}
-    used_up = set(n for n in up_names if n in train_names)  # 已同名的占用
+    # 未被人工指定为来源的同名 sheet 先占位；人工选择始终高于同名和结构猜测。
+    used_up = {n for n in up_names
+               if n in train_name_set and n not in decided_train and n not in manual_actuals}
+
+    # 与 resolve_target_sheets 一样按训练模板顺序处理，若人工误把同一实际 sheet
+    # 指给多个目标表，仅第一项生效，后续项视为已人工决定但无法采用，不再自动改写。
+    for tname in train_names + [k for k in manual.keys() if k not in train_name_set]:
+        if tname not in manual:
+            continue
+        uname = manual[tname]
+        if not uname:  # 空值 = 人工明确跳过
+            continue
+        if uname not in up_name_set:
+            logger.warning('[sheet重映射] 人工指定的模板 sheet 不存在，按跳过处理: %s → %s',
+                           tname, uname)
+            continue
+        if uname in used_up:
+            logger.warning('[sheet重映射] 人工指定的模板 sheet 已被其他目标占用，按跳过处理: %s → %s',
+                           tname, uname)
+            continue
+        used_up.add(uname)
+        if uname != tname:
+            remap[uname] = tname
+
     for tname in train_names:
-        if tname in up_names:
+        if tname in decided_train:
+            continue  # 人工已表态（含空值），不得再次自动猜测覆盖
+        if tname in up_name_set and tname not in manual_actuals:
             continue  # 训练这张在上传里同名存在，无需改
         best, best_score = None, 0.0
         tset = train[tname]
@@ -4590,6 +4621,7 @@ async def run_compute_task(
     template_override_path: Optional[str] = None,
     target_sheet_manual_map=None,
     unmatched_columns=None,
+    mapping_finalized: bool = False,
 ):
     """独立的计算任务函数，由 submit 端点触发后台运行。
 
@@ -4873,9 +4905,25 @@ async def run_compute_task(
                                         ai_provider_name=_resolve_compute_ai_provider()))
                         _single_parse_ok = True
                     except Exception as _sp_err:
-                        if pre_validated_mapping:
+                        if pre_validated_mapping and not mapping_finalized:
                             raise ValueError(f'最终确认映射无法应用，已停止计算: {_sp_err}') from _sp_err
-                        logger.warning(f"[compute/task] 单次解析优化失败: {_sp_err}，回退到多次解析流程", exc_info=True)
+                        if pre_validated_mapping and mapping_finalized:
+                            # 人工最终确认具有最高优先级。构建预加载数据失败时保留原始
+                            # 上传目录给脚本自行读取，不能在验证阶段再次阻断。
+                            logger.warning(
+                                "[compute/task] 最终人工映射预加载失败，按原始源文件继续: %s",
+                                _sp_err, exc_info=True)
+                            file_mapping = pre_validated_mapping
+                            pre_loaded_source_data = None
+                            match_success, match_error = True, str(_sp_err)
+                            _single_parse_ok = True
+                            buffer.push(task_id, json.dumps({
+                                "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                "level": "warning",
+                                "message": f"最终人工映射未能完整构建预加载数据，已放行并使用原始源文件继续: {_sp_err}",
+                            }, ensure_ascii=False))
+                        else:
+                            logger.warning(f"[compute/task] 单次解析优化失败: {_sp_err}，回退到多次解析流程", exc_info=True)
 
                     # ===== 回退：原有多次解析流程 =====
                     if not _single_parse_ok:
@@ -5017,7 +5065,15 @@ async def run_compute_task(
 
                             missing_keys = expected_keys - set(pre_loaded_source_data.keys())
                             if missing_keys:
-                                raise ValueError(f"预加载数据缺少训练所需表: {sorted(missing_keys)}")
+                                if mapping_finalized:
+                                    logger.warning("[compute/task] 人工最终映射缺少训练表，放行计算: %s", sorted(missing_keys))
+                                    buffer.push(task_id, json.dumps({
+                                        "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                        "level": "warning",
+                                        "message": f"人工最终映射缺少部分训练表，已按当前数据继续: {sorted(missing_keys)}",
+                                    }, ensure_ascii=False))
+                                else:
+                                    raise ValueError(f"预加载数据缺少训练所需表: {sorted(missing_keys)}")
 
                         log_msg = {
                             "type": "log",
@@ -5034,18 +5090,46 @@ async def run_compute_task(
                         else:
                             raise ValueError(f"源数据表头匹配失败: {match_error}")
         except Exception as e:
-            raise ValueError(f"源数据映射未通过，停止计算以避免使用错误表: {e}") from e
+            if mapping_finalized:
+                logger.warning("[compute/task] 人工最终映射处理异常，使用原始源文件放行: %s", e, exc_info=True)
+                pre_loaded_source_data = None
+                buffer.push(task_id, json.dumps({
+                    "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                    "level": "warning",
+                    "message": f"人工最终映射处理存在异常，已跳过验证并使用原始源文件继续: {e}",
+                }, ensure_ascii=False))
+            else:
+                raise ValueError(f"源数据映射未通过，停止计算以避免使用错误表: {e}") from e
 
         # 直接读 Excel 的定制脚本也必须使用人工确认后的文件/Sheet/列。
         # 从最终 DataFrame 生成独立执行目录，上传文件保持不变。
         execution_source_dir = str(source_dir)
         if pre_validated_mapping and any(info.get('confirmed') for info in pre_validated_mapping.values()):
             if not pre_loaded_source_data:
-                raise ValueError('人工映射缺少最终源数据，停止计算')
-            from backend.utils.confirmed_source_mapping import write_execution_sources
-            execution_source_dir = await asyncio.to_thread(
-                write_execution_sources, temp_dir / 'confirmed_source', pre_validated_mapping,
-                pre_loaded_source_data, source_structure, expected_structure)
+                if mapping_finalized:
+                    logger.warning('[compute/task] 人工映射缺少最终源数据，使用原始源文件继续计算')
+                    buffer.push(task_id, json.dumps({
+                        "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "level": "warning", "message": "人工映射缺少部分最终源数据，已跳过验证并继续计算",
+                    }, ensure_ascii=False))
+                else:
+                    raise ValueError('人工映射缺少最终源数据，停止计算')
+            else:
+                from backend.utils.confirmed_source_mapping import write_execution_sources
+                try:
+                    execution_source_dir = await asyncio.to_thread(
+                        write_execution_sources, temp_dir / 'confirmed_source', pre_validated_mapping,
+                        pre_loaded_source_data, source_structure, expected_structure)
+                except Exception as exc:
+                    if not mapping_finalized:
+                        raise
+                    logger.warning('[compute/task] 人工映射执行目录生成失败，使用原始源文件继续: %s',
+                                   exc, exc_info=True)
+                    buffer.push(task_id, json.dumps({
+                        "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "level": "warning",
+                        "message": f"人工映射执行目录生成失败，已使用原始源文件继续: {exc}",
+                    }, ensure_ascii=False))
 
         # 保存脚本
         script_path = temp_dir / f"{script_id}.py"
@@ -5224,13 +5308,22 @@ async def run_compute_task(
             try:
                 _train_tpl = _extract_template_path(script_content)
                 if _train_tpl and os.path.exists(_train_tpl):
-                    _remap = _build_sheet_remap(_train_tpl, template_override_path)  # {上传名:训练名}
+                    # target_sheet_manual_map 是最终审核关系 {训练目标表: 本次模板 sheet}；
+                    # 临时改名必须由它反转得到，不能再按表头重新猜测覆盖人工选择。
+                    _remap = _build_sheet_remap(
+                        _train_tpl, template_override_path, target_sheet_manual_map)  # {上传名:训练名}
                     if _remap and _rename_xlsx_sheets(template_override_path, _remap):
                         _sheet_reverse_map = {v: k for k, v in _remap.items()}  # {训练名:上传名}
                         logger.info(f"[sheet重映射] 改名进：{_remap}")
+                        _mapping_source = '最终审核关系' if target_sheet_manual_map else '表头自动匹配'
                         buffer.push(task_id, json.dumps({
                             "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
-                            "level": "info", "message": f"模板 sheet 已临时对齐训练名以便填充：{_remap}"
+                            "level": "info",
+                            "message": (
+                                f"模板 Sheet 已按{_mapping_source}临时对齐训练名。"
+                                f"最终关系（训练目标表→本次模板 Sheet）：{target_sheet_manual_map or {}}；"
+                                f"临时改名（本次模板 Sheet→训练名）：{_remap}"
+                            )
                         }, ensure_ascii=False))
             except Exception as _rm_e:
                 logger.warning(f"[sheet重映射] 改名进失败（按原名继续）：{_rm_e}")
@@ -5555,6 +5648,7 @@ def _get_compute_session(session_id: str, accessible_tenants: list) -> Optional[
 
 def _compute_pending_payload(pc_result, session_id: Optional[str] = None) -> dict:
     """预检未通过时返回给前端的全部待确认项（改名 / 列名 / 目标表 / 历史一次性给全）。"""
+    import os
     payload = {
         "error_type": "precheck_failed",
         "missing_files": pc_result.missing_files,
@@ -5610,6 +5704,7 @@ async def _dispatch_compute_task(sess: dict, pc_result, confirmed_target_map=Non
         "unmatched_columns": pc_result.unmatched_columns,
         "precheck_auto_filled": pc_result.auto_filled,
         "source_mapping_warning": getattr(pc_result, "_source_mapping_warning", None),
+        "mapping_finalized": bool(p.get("mapping_finalized")),
         "template_override_path": p.get("template_override_path"),
         # 自动解析出的非同名映射 + 用户人工指定（人工优先覆盖）。两者必须合并：
         # 只传人工那几个键会让其余按月改名的表在运行时重新猜，整表静默漏填。
@@ -5697,6 +5792,7 @@ async def compute_submit(
     confirmed_target_map: Optional[str] = Form(None),
     skipped_missing_files: Optional[str] = Form(None),
     skip_history_check: Optional[bool] = Form(False),
+    mapping_finalized: Optional[bool] = Form(False),
     current_user=Depends(get_current_user),
     accessible_tenants: list = Depends(get_operable_tenants),
 ):
@@ -5865,10 +5961,19 @@ async def compute_submit(
                     "confirmed_mapping": _confirmed, "confirmed_renames": _confirmed_renames,
                     "confirmed_target_map": _confirmed_target_map, "skipped_missing_files": _skipped_missing,
                     "skip_history_check": skip_history_check,
+                    "mapping_finalized": bool(mapping_finalized),
                     "ai_provider_name": _pre_payload["ai_provider_name"],
                 })
 
-                if (not pc_result.ok) or (pc_result.history_warnings and not skip_history_check):
+                if mapping_finalized and ((not pc_result.ok) or
+                                          (pc_result.history_warnings and not skip_history_check)):
+                    logger.warning('[compute/submit] 最终映射仍有预检提示，按人工确认结果放行计算')
+                    pc_result._source_mapping_warning = (
+                        getattr(pc_result, 'mapping_notice', None) or
+                        '人工已确认最终匹配关系，预检提示不再阻断计算。')
+
+                if (not mapping_finalized) and (
+                        (not pc_result.ok) or (pc_result.history_warnings and not skip_history_check)):
                     # 不再删临时目录：上传文件与解析产物留在会话里，确认轮只发 JSON
                     logger.info(f"[compute/submit] 预检待确认，会话保留: {_session['session_id']}")
                     return _compute_pending_payload(pc_result, _session["session_id"])
@@ -5928,6 +6033,10 @@ async def compute_session_confirm(
     """
     body = payload or {}
     refresh_only = body.get('refresh_only') is True
+    # Final confirmation is a one-way gate: after the operator approves the
+    # complete mapping, this submission starts calculation and never opens
+    # another mapping dialog because of precheck warnings.
+    mapping_finalized = body.get('mapping_finalized') is True
     sess = _get_compute_session(session_id, accessible_tenants)
     from backend.utils.compute_ingest import ingest_ready, read_meta, resolve_with_confirmations
     if not sess or not ingest_ready(sess["temp_dir"]):
@@ -5974,7 +6083,17 @@ async def compute_session_confirm(
         skipped_missing_files=_skipped_missing,
     ))
 
-    if refresh_only or (not pc_result.ok) or (pc_result.history_warnings and not _skip_history):
+    if mapping_finalized and ((not pc_result.ok) or (pc_result.history_warnings and not _skip_history)):
+        logger.warning('[compute/confirm] 最终映射仍有预检提示，按人工确认结果放行计算: %s', session_id)
+        pc_result._source_mapping_warning = (
+            getattr(pc_result, 'mapping_notice', None) or
+            '人工已确认最终匹配关系，预检提示不再阻断计算。')
+
+    if mapping_finalized:
+        sess['params']['mapping_finalized'] = True
+
+    if refresh_only or ((not mapping_finalized) and (
+            (not pc_result.ok) or (pc_result.history_warnings and not _skip_history))):
         logger.info(f"[compute/confirm] 仍有待确认项，会话保留: {session_id}")
         pending = _compute_pending_payload(pc_result, session_id)
         pending['mapping_refreshed'] = refresh_only

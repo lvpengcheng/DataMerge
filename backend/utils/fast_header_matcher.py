@@ -869,19 +869,57 @@ class FastHeaderMatcher:
         失败时在返回值里带 diagnostics（mapping_failed / actual_paths），
         供上层生成手动选择下拉，不需要再解析文件。
         """
-        from .structural_source_mapping import match_structural_sources
+        from .structural_source_mapping import match_structural_sources, normalized_header
         if not train_sheets:
             return self._match_by_training_base(train_sheets, input_sheets, matching_context)
-        match_result = match_structural_sources(self, train_sheets, input_sheets, matching_context)
-        determined = match_result.get('determined') or []
-        if not match_result['success'] and ai_provider_name:
+        structural_result = match_structural_sources(self, train_sheets, input_sheets, matching_context)
+        determined = structural_result.get('determined') or []
+
+        same_structure_determined = []
+        for match in determined:
+            training = next((item for item in train_sheets
+                             if (item['file_name'], item['sheet_name']) ==
+                             (match['train_file'], match['train_sheet'])), None)
+            actual = next((item for item in input_sheets
+                           if (item['file_name'], item['sheet_name']) ==
+                           (match['input_file'], match['input_sheet'])), None)
+            if training is None or actual is None:
+                continue
+            training_columns = {normalized_header(name) for name in training.get('headers', {})}
+            actual_columns = {normalized_header(name) for name in actual.get('headers', {})}
+            if training_columns == actual_columns:
+                same_structure_determined.append(match)
+
+        # Equal column sets and equal table counts are sufficient. File and Sheet
+        # names are only identities around the schema, so renaming them must not
+        # trigger AI or an audit dialog when the actual table structure is unchanged.
+        same_structure = (
+            structural_result.get('success')
+            and len(train_sheets) == len(input_sheets) == len(same_structure_determined)
+        )
+        if same_structure:
+            structural_result['match_method'] = 'structure'
+            structural_result['structure_identical'] = True
+            return structural_result
+
+        match_result = structural_result
+        training_file_names = {str(item.get('file_name') or '') for item in train_sheets}
+        actual_file_names = {str(item.get('file_name') or '') for item in input_sheets}
+        training_sheet_names = {str(item.get('sheet_name') or '') for item in train_sheets}
+        actual_sheet_names = {str(item.get('sheet_name') or '') for item in input_sheets}
+        file_names_changed = training_file_names != actual_file_names
+        sheet_names_changed = training_sheet_names != actual_sheet_names
+        requires_ai_review = file_names_changed and sheet_names_changed
+
+        if ai_provider_name and requires_ai_review:
             from .ai_source_mapping import match_sources_with_ai
-            logger.info('[源数据映射] 快速匹配失败，尝试一次 AI 语义匹配')
+            logger.info('[源数据映射] 列结构、文件名和 Sheet 名均与智训不同，尝试 AI 语义匹配')
             try:
                 match_result = match_sources_with_ai(self, train_sheets, input_sheets, ai_provider_name,
-                                                    match_result.get('determined'), matching_context)
+                                                    same_structure_determined, matching_context)
                 match_result['match_method'] = 'ai'
                 match_result['needs_confirmation'] = True
+                match_result['structure_identical'] = False
                 logger.info('[源数据映射] AI 映射完整性校验通过，继续构建源数据')
             except Exception as exc:
                 import json

@@ -54,8 +54,10 @@ def test_low_confidence_column_only_is_confirmed(monkeypatch):
     assert result.mapping_requires_confirmation
     assert result.missing_columns == [
         {'file': 'train.xlsx', 'sheet': '工资', 'expected_columns': ['金额']}]
-    assert [item['expected_path'] for item in result.ai_suggestions] == [
-        'train.xlsx > 工资 > 金额'] and result.ai_suggestions[0]['confidence'] == 0.70
+    assert {item['expected_path'] for item in result.ai_suggestions} == {
+        'train.xlsx > 工资 > 金额', 'train.xlsx > 工资 > 工号'}
+    assert next(item for item in result.ai_suggestions
+                if item['expected_path'].endswith('金额'))['confidence'] == 0.70
 
 
 def test_high_confidence_columns_do_not_require_column_confirmation(monkeypatch):
@@ -63,11 +65,12 @@ def test_high_confidence_columns_do_not_require_column_confirmation(monkeypatch)
     monkeypatch.setattr(FastHeaderMatcher, 'match_headers_only',
                         lambda self, *args, **kwargs: _ai_mapping(0.96))
     result = resolve_with_confirmations(_meta(), skip_history_check=True)
-    # AI 文件/Sheet 层仍需要确认，但列层没有低置信项。
+    # AI 文件/Sheet 层仍需要确认；完整 AI 结果都进入一次性审核弹窗。
     assert not result.ok
     assert result.mapping_requires_confirmation
     assert result.missing_columns == []
-    assert result.ai_suggestions == []
+    assert {item['expected_path'] for item in result.ai_suggestions} == {
+        'train.xlsx > 工资 > 金额', 'train.xlsx > 工资 > 工号'}
 
 def test_invalid_ai_entry_does_not_discard_valid_entries(monkeypatch):
     import json

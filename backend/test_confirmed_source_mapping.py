@@ -226,7 +226,8 @@ def test_all_pending_categories_are_collected_even_if_source_mapping_invalid(tmp
     def history(*args):
         args[-2].history_warnings = ['缺少历史数据']
     def target(*args):
-        args[-1].target_candidates = [{'key': '结果', 'candidates': []}]
+        # 最后一项是 AI provider，PrecheckResult 位于倒数第二项。
+        args[-2].target_candidates = [{'key': '结果', 'candidates': []}]
     monkeypatch.setattr(pre, '_check_history', history)
     monkeypatch.setattr(pre, '_check_target_sheets', target)
     result = resolve_with_confirmations(meta, confirmed_mapping=mapping)

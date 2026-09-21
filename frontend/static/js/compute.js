@@ -165,8 +165,8 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
             ? serverActualPaths
             : Array.from(new Set(aiSuggestions.map(s => s.suggested_path).filter(Boolean)));
 
-        // AI 建议表格：AI 建议 + 未被 AI 建议的期望列（AI 只返回高置信建议，漏掉的列
-        // 也要列出供手动选择，否则用户想手动指定也选不到）
+        // AI 建议表格：完整 AI 建议 + 未被 AI 建议的期望列。所有结果都进入本次
+        // 最终审核；置信度只影响分组展示，不会绕过人工确认。
         const sugExpected = new Set(aiSuggestions.map(s => s.expected_path).filter(Boolean));
         const extraRows = expectedPaths
             .filter(p => !sugExpected.has(p))
@@ -259,7 +259,7 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
             <div style="font-weight:bold;color:#b45309;margin:8px 0;">需重点确认：有变动或未匹配（${changedRows.length}）</div>
             ${changedRows.length ? renderMappingTable(changedRows) : '<div>没有需要重新匹配的列。</div>'}
             <details style="margin-top:12px;">
-                <summary style="cursor:pointer;color:#2e7d32;">完全一致的匹配（置信度 1，共 ${stableRows.length} 项，点击展开）</summary>
+                <summary style="cursor:pointer;color:#2e7d32;">高置信或未变化的匹配（共 ${stableRows.length} 项，点击展开审核）</summary>
                 ${renderMappingTable(stableRows)}
             </details>`;
 
@@ -442,14 +442,20 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
             </div>`;
 
         const canRetry = missingFiles.length === 0;
+        const reviewTitle = data.mapping_requires_confirmation
+            ? (data.mapping_refreshed ? '匹配关系最终审核' : 'AI 匹配结果审核')
+            : '计算前确认';
+        const reviewIntro = data.mapping_requires_confirmation
+            ? '系统检测到本次源文件结构与智训时不一致，已自动整理并生成 AI 匹配建议。请完成本次最终审核；确认后将锁定该结果并直接计算。'
+            : '系统检测到计算前仍有事项需要确认，请核对后继续。';
         // 改名候选场景下，要求至少为一个上传文件选了目标，才允许重试
         const overlay = document.getElementById('_compute_precheck_overlay') || document.createElement('div');
         overlay.id = '_compute_precheck_overlay';
         overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:9999;display:flex;align-items:center;justify-content:center;';
         overlay.innerHTML = `
             <div style="background:#fff;border-radius:10px;padding:24px;width:780px;max-width:96vw;max-height:90vh;display:flex;flex-direction:column;box-shadow:0 4px 20px rgba(0,0,0,0.2);">
-                <h3 style="margin:0 0 6px;font-size:17px;">${previousConfirmations ? '确认结果：仍有待处理项' : '计算前确认'}</h3>
-                <p style="margin:0 0 14px;font-size:13px;color:#666;">系统检测到部分文件/列与训练时不一致。请查看并确认后再继续。</p>
+                <h3 style="margin:0 0 6px;font-size:17px;">${reviewTitle}</h3>
+                <p style="margin:0 0 14px;font-size:13px;color:#666;">${reviewIntro}</p>
                 <div id="_pre_validation_error" style="color:#b71c1c;font-size:13px;margin-bottom:10px;white-space:pre-wrap;">${_escapeHtml((data.mapping_refreshed ? '已按最新表关系刷新，请检查源字段后继续。\n' : '') + _precheckSummary(data))}</div>
                 <div style="overflow:auto;flex:1;padding-right:4px;">
                     ${missingFilesHtml}
@@ -556,7 +562,7 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
             confirmBtn.style.cursor = pending > 0 ? 'not-allowed' : 'pointer';
             confirmBtn.textContent = pending > 0
                 ? '请先补齐或勾选跳过缺失文件'
-                : (tableMappingDirty ? '应用表关系并刷新字段' : '确认并继续计算');
+                : (tableMappingDirty ? '应用表关系并刷新字段' : '确认匹配并开始计算');
         }
         overlay.onchange = (e) => {
             if (!e.target?.matches) return;
@@ -716,6 +722,8 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
                 const out = {
                     confirmed_mapping: { file_mapping: fileMapping, unmatched_columns: _collectUnmatchedColumns(overlay, allExpectedRows) },
                     skip_history_check: skipHistory,
+                    // 最终审核完成后锁定本次映射；服务端不得再次返回匹配弹窗。
+                    mapping_finalized: true,
                 };
                 if (Object.keys(confirmedRenames).length > 0) {
                     out.confirmed_renames = confirmedRenames;
@@ -1402,6 +1410,7 @@ function _mergeConfirmations(prev, dialogResult) {
             (merged.skipped_missing_files || []).concat(dialogResult.skipped_missing_files)));
     }
     if (dialogResult.skip_history_check) merged.skip_history_check = true;
+    if (dialogResult.mapping_finalized) merged.mapping_finalized = true;
     return merged;
 }
 
@@ -1421,6 +1430,7 @@ function _applyConfirmationsToFormData(formData, confirmations) {
         formData.set('skipped_missing_files', JSON.stringify(confirmations.skipped_missing_files));
     }
     if (confirmations.skip_history_check) formData.set('skip_history_check', 'true');
+    if (confirmations.mapping_finalized) formData.set('mapping_finalized', 'true');
 }
 
 async function startCompute() {

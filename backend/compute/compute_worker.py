@@ -114,6 +114,7 @@ def main():
             source_mapping_warning=p.get("source_mapping_warning"),
             template_override_path=p.get("template_override_path"),
             target_sheet_manual_map=p.get("target_sheet_manual_map"),
+            mapping_finalized=bool(p.get("mapping_finalized")),
         ))
     except Exception as e:
         err = json.dumps({"type": "error", "message": f"计算执行失败: {e}"},

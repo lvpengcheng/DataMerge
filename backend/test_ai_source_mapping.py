@@ -78,19 +78,59 @@ def test_ai_only_receives_unresolved_tables_and_columns(monkeypatch):
 
 
 @pytest.mark.parametrize('headers', [
-    {'工号': 'C', '金额': 'A', '备注': 'B'},
+    {'工号': 'C', '金额': 'A'},
     {' 工号 ': 'A', '金 额': 'B'},
 ])
-def test_renamed_file_and_sheet_use_structure_without_ai(monkeypatch, headers):
+def test_renamed_file_and_sheet_use_same_structure_without_ai(monkeypatch, headers):
     from backend.ai_engine import ai_provider
     training, actual = schemas()
     actual[0]['headers'] = headers
     monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider',
-                        lambda *_: pytest.fail('complete unique structure must not call AI'))
+                        lambda *_: pytest.fail('same column structure must not call AI'))
     result = FastHeaderMatcher().match_headers_only(training, actual, 'claude')
     assert result['success'] and result['match_method'] == 'structure'
     assert not result.get('needs_confirmation')
     assert result['mapping']['file_mapping']['new.xlsx']['sheet_mapping'] == {'Payroll': '工资'}
+
+
+def test_exact_training_structure_skips_ai(monkeypatch):
+    from backend.ai_engine import ai_provider
+    training, _ = schemas()
+    actual = [dict(training[0], file_path='/input/old.xlsx')]
+    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider',
+                        lambda *_: pytest.fail('exact training structure must calculate directly'))
+    result = FastHeaderMatcher().match_headers_only(training, actual, 'claude')
+    assert result['success'] and result['match_method'] == 'structure'
+    assert result['structure_identical'] and not result.get('needs_confirmation')
+
+
+def test_ai_popup_requires_structure_file_and_sheet_names_all_changed(monkeypatch):
+    from backend.ai_engine import ai_provider
+    training, actual = schemas()
+    calls = []
+    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider', lambda *_: object())
+    monkeypatch.setattr(ai_provider, 'chat_with_timeout', lambda *args, **kwargs:
+                        calls.append(1) or json.dumps({'mappings': [{
+                            'training_id': 0, 'actual_id': 0,
+                            'columns': {'Employee ID': '工号', 'Pay': '金额'},
+                        }]}))
+    result = FastHeaderMatcher().match_headers_only(training, actual, 'claude')
+    assert result['success'] and result['match_method'] == 'ai'
+    assert result['needs_confirmation'] and calls == [1]
+
+
+@pytest.mark.parametrize('keep_identity', ['file', 'sheet'])
+def test_structure_change_does_not_call_ai_when_one_identity_is_unchanged(monkeypatch, keep_identity):
+    from backend.ai_engine import ai_provider
+    training, actual = schemas()
+    if keep_identity == 'file':
+        actual[0]['file_name'] = training[0]['file_name']
+    else:
+        actual[0]['sheet_name'] = training[0]['sheet_name']
+    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider',
+                        lambda *_: pytest.fail('AI requires both file and Sheet names to change'))
+    result = FastHeaderMatcher().match_headers_only(training, actual, 'claude')
+    assert not result['success'] and result.get('match_method') != 'ai'
 
 
 def test_identical_schemas_with_ambiguous_names_do_not_pick_first():
@@ -101,7 +141,7 @@ def test_identical_schemas_with_ambiguous_names_do_not_pick_first():
     assert not result['success'] and not result['mapping']['file_mapping']
 
 
-def test_business_word_similarity_requires_semantic_review(monkeypatch):
+def test_structure_change_with_same_file_and_sheet_does_not_open_ai_review(monkeypatch):
     from backend.ai_engine import ai_provider
     training = [{'file_name': '工资.xlsx', 'sheet_name': 'S', 'headers': {'本月个人缴费金额': 'A'}}]
     actual = [dict(training[0], file_path='/input/工资.xlsx', headers={'本月单位缴费金额': 'A'})]
@@ -109,7 +149,7 @@ def test_business_word_similarity_requires_semantic_review(monkeypatch):
     monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider', lambda _: object())
     monkeypatch.setattr(ai_provider, 'chat_with_timeout', lambda *a, **k: calls.append(1) or '{"mappings":[]}')
     result = FastHeaderMatcher().match_headers_only(training, actual, 'claude')
-    assert not result['success'] and calls == [1]
+    assert not result['success'] and calls == []
 
 
 def test_ai_receives_hierarchical_script_context_without_sample_literals(monkeypatch):
@@ -140,7 +180,7 @@ def test_ai_receives_hierarchical_script_context_without_sample_literals(monkeyp
     assert suggestion['recommendation_source'] == 'ai'
 
 
-def test_structure_resolves_stale_name_candidates_without_confirmation(monkeypatch):
+def test_same_structure_resolves_stale_name_candidates_without_confirmation(monkeypatch):
     from backend.utils import compute_precheck as pre
     from backend.utils.compute_ingest import IngestMeta, resolve_with_confirmations
     training, actual = schemas()
@@ -151,7 +191,8 @@ def test_structure_resolves_stale_name_candidates_without_confirmation(monkeypat
             'candidates': [{'expected': 'old.xlsx', 'score': .5}]}])
     monkeypatch.setattr(pre, '_check_target_sheets', lambda *a: None)
     result = resolve_with_confirmations(meta, skip_history_check=True)
-    assert result.ok and not result.rename_candidates and not result.missing_files
+    assert result.ok and not result.mapping_requires_confirmation
+    assert not result.rename_candidates and not result.missing_files
     assert result.file_mapping['new.xlsx']['expected_file'] == 'old.xlsx'
 
 
