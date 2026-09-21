@@ -1144,6 +1144,7 @@ class IntegrateExecuteRequest(BaseModel):
     diff_order: str = "id_name"          # id_name | name_id
     normalize_keys: bool = True
     date_key_mode: str = "yearmonthday"  # 日期关联键归一 off|yearmonthday|yearmonth|month|day（默认按年月日）
+    union_source_keys: bool = False       # 把所有对照表主键并集追加到主表
 
 
 def _validate_integrate_columns(parsed, key_map, overwrite_pairs, compare_pairs, main_file):
@@ -1188,8 +1189,6 @@ def _validate_integrate_columns(parsed, key_map, overwrite_pairs, compare_pairs,
             refs.append(expr)
         cross_refs = []
         for _fn in parsed.keys():
-            if _fn == main_file:
-                continue
             _fcols = _cols(_fn)
             cross_refs += [f"{_fn}.{_c}" for _c in _fcols]
         refs += [c for c in cross_refs if c in expr]
@@ -1207,7 +1206,7 @@ def _validate_integrate_columns(parsed, key_map, overwrite_pairs, compare_pairs,
 
 def _integrate_execute_impl(session_dir: str, request_data: dict) -> dict:
     """一次性子进程执行完整整合、公式重算和可选差异表生成。"""
-    from backend.utils.integrate_engine import build_source_indexes, compute_diffs
+    from backend.utils.integrate_engine import build_source_indexes, collect_source_keys, compute_diffs
     from backend.utils.integrate_writer import apply_integration, append_diff_sheet
 
     sdir = Path(session_dir)
@@ -1248,17 +1247,25 @@ def _integrate_execute_impl(session_dir: str, request_data: dict) -> dict:
         parsed, request_data["key_map"], main_file,
         normalize_keys=request_data.get("normalize_keys", True),
         date_key_mode=request_data.get("date_key_mode", "off"),
+        include_main=bool(request_data.get("union_source_keys")),
     )
+    seed_keys = collect_source_keys(
+        parsed, request_data["key_map"], main_file,
+        normalize_keys=request_data.get("normalize_keys", True),
+        date_key_mode=request_data.get("date_key_mode", "off"),
+    ) if request_data.get("union_source_keys") else None
     out_path = sdir / f"整合结果_{main_file}"
     stat = apply_integration(
         main_path=str(main_path), out_path=str(out_path),
         sheet_name=main_info["sheet"], head_data=main_info["head_data"],
         a_key_col=request_data["key_map"].get(main_file),
-        data_row_start=main_info["data_row_start"], data_row_end=main_info["data_row_end"],
+        data_row_start=(main_info["data_row_start"] or (main_info.get("header_end", 0) + 1)),
+        data_row_end=main_info["data_row_end"],
         overwrite_pairs=request_data.get("overwrite_pairs", []), source_indexes=source_indexes,
         normalize_keys=request_data.get("normalize_keys", True), diff_rows=None,
         diff_order=request_data.get("diff_order", "id_name"),
         date_key_mode=request_data.get("date_key_mode", "off"),
+        seed_keys=seed_keys,
     )
 
     if request_data.get("output_mode") == 2 and request_data.get("compare_pairs"):
@@ -1316,6 +1323,7 @@ async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(g
             "X-Integrate-Matched": str(stat.get("matched_rows", 0)),
             "X-Integrate-Cells": str(stat.get("overwritten_cells", 0)),
             "X-Integrate-Diffs": str(stat.get("diff_rows", 0)),
+            "X-Integrate-Added": str(stat.get("added_rows", 0)),
         }
         return FileResponse(
             str(out_path),
@@ -1729,6 +1737,7 @@ class IntegrateSchemeSaveRequest(BaseModel):
     output_mode: int = 1
     normalize_keys: bool = True
     date_key_mode: str = "yearmonthday"
+    union_source_keys: bool = False
     scheme_id: Optional[int] = None      # 传则为"修改已有方案"，不传为"新建"
 
 
@@ -1809,6 +1818,7 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
         "diff_order": req.diff_order, "output_mode": req.output_mode,
         "normalize_keys": req.normalize_keys,
         "date_key_mode": req.date_key_mode,
+        "union_source_keys": req.union_source_keys,
         "header_ranges_by_role": {
             str(role_of_file[f]): (meta.get("header_ranges") or {}).get(f)
             for f in role_of_file if (meta.get("header_ranges") or {}).get(f)

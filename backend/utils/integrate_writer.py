@@ -24,6 +24,9 @@ from .source_sheet_writer import is_long_digit_text
 
 logger = logging.getLogger(__name__)
 
+_TEXT_ID_HINTS = ("身份证", "证件", "银行卡", "银行账号", "卡号", "账号",
+                  "工号", "员工编号", "人员编号", "手机号", "电话号码", "idcard", "id card")
+
 
 def _col_idx(letter: str) -> int:
     """列字母(A/B/AA…) → 0-based 列索引。"""
@@ -42,7 +45,12 @@ def _read_cell_str(cell) -> str:
     return "" if v is None else str(v)
 
 
-def _put_value(cell, value):
+def _is_identifier_column(column_name: str) -> bool:
+    name = str(column_name or "").strip().lower()
+    return any(hint in name for hint in _TEXT_ID_HINTS)
+
+
+def _put_value(cell, value, force_text: bool = False):
     """写值到单元格（只写值，替换任何原公式）。长数字文本设 '@' 文本格式防科学计数。"""
     if value is CLEAR_CELL:
         # None 在本模块一直表示“不写，保留原值”，因此用独立哨兵值
@@ -59,7 +67,10 @@ def _put_value(cell, value):
         return
     # 长数字文本（身份证/银行卡/手机号）→ 文本格式
     s = str(value)
-    if is_long_digit_text(s) or (isinstance(value, str) and value.isdigit() and len(value) >= 12):
+    if force_text and isinstance(value, float) and value.is_integer():
+        # 上游若把长编号读成浮点，至少展开成普通整数文本，不能把科学计数法带入结果。
+        s = format(value, ".0f")
+    if force_text or is_long_digit_text(s) or (isinstance(value, str) and value.isdigit() and len(value) >= 12):
         try:
             style = cell.GetStyle()
             style.Custom = "@"
@@ -91,6 +102,7 @@ def _apply_integration_impl(
     diff_rows: Optional[List[dict]] = None,
     diff_order: str = "id_name",
     date_key_mode: str = "off",
+    seed_keys: Optional[List[dict]] = None,
 ) -> Dict[str, Any]:
     """（子进程执行体）原地回填主表并（可选）追加差异 sheet，另存到 out_path。
 
@@ -116,11 +128,76 @@ def _apply_integration_impl(
         raise ValueError(f"主表关联键列 '{a_key_col}' 不在表头中")
     key_ci = _col_idx(head_data[a_key_col])
     a_col_idx = {ac: _col_idx(head_data[ac]) for ac in {p.get("a_col") for p in (overwrite_pairs or [])} if ac in head_data}
+    table_col_indices = sorted({_col_idx(letter) for letter in head_data.values()})
 
     overwritten = 0
     matched = 0
     ds = max(1, int(data_row_start or 1))
     de = int(data_row_end or ds - 1)
+
+    # “主键捏合”模式：保留主表已有记录，把所有对照表中尚不存在的关联键追加到
+    # 数据区末尾。插行开启 UpdateReference，避免主表汇总公式及其它 sheet 的引用错位；
+    # 有既有数据行时复制最后一行的格式/逐行公式，空主表则优先复制表头下方预留样板行。
+    added_rows = 0
+    if seed_keys:
+        existing = set()
+        if de >= ds:
+            for row1 in range(ds, de + 1):
+                raw = _read_cell_str(cells[row1 - 1, key_ci])
+                normalized = normalize_key(raw, normalize_keys, date_key_mode)
+                if normalized:
+                    existing.add(normalized)
+        missing = []
+        for item in seed_keys:
+            normalized = str((item or {}).get("normalized") or "")
+            if not normalized or normalized in existing:
+                continue
+            existing.add(normalized)
+            missing.append(item)
+
+        if missing:
+            from Aspose.Cells import InsertOptions  # type: ignore
+
+            had_data = de >= ds
+            # 有数据时插在“最后一条既有记录之前”（仍属于原 SUM 范围内部），Excel/Aspose
+            # 才会同步扩展本表及跨 sheet 汇总引用；插在数据区末行之后不会扩展 SUM。
+            insert_at = (de - 1) if had_data else (ds - 1)  # 0-based
+            old_max_row = int(getattr(cells, "MaxDataRow", -1))
+            # 空主表的表头下方可能是预留的空白样板行，也可能直接是“合计”行。
+            # 仅整行确实为空时才把它当样板，避免把合计文字/公式复制成每条新增记录。
+            blank_template_row = None
+            if not had_data and old_max_row >= insert_at:
+                if all(_read_cell_str(cells[insert_at, ci]).strip() == "" for ci in table_col_indices):
+                    blank_template_row = insert_at
+            options = InsertOptions()
+            options.UpdateReference = True
+            cells.InsertRows(insert_at, len(missing), options)
+
+            sample_row = (insert_at + len(missing)) if had_data else (
+                blank_template_row + len(missing) if blank_template_row is not None else None)
+            for offset, item in enumerate(missing):
+                dest = insert_at + offset
+                if sample_row is not None and sample_row != dest:
+                    try:
+                        cells.CopyRow(cells, sample_row, dest)
+                        if had_data:
+                            # CopyRow 用来继承样式和逐行公式；普通常量属于上一条业务记录，
+                            # 必须清掉，避免未配置覆盖的列残留上一人的值。
+                            for ci in table_col_indices:
+                                copied = cells[dest, ci]
+                                try:
+                                    has_formula = bool(copied.Formula)
+                                except Exception:
+                                    has_formula = False
+                                if not has_formula:
+                                    copied.Value = None
+                    except Exception as copy_error:
+                        logger.warning(f"[integrate] 复制新增行样式失败（继续写值）: {copy_error}")
+                _put_value(cells[dest, key_ci], item.get("value"),
+                           force_text=_is_identifier_column(a_key_col))
+            added_rows = len(missing)
+            de = (de + added_rows) if had_data else (ds + added_rows - 1)
+
     for row1 in range(ds, de + 1):
         r0 = row1 - 1
         raw_key = _read_cell_str(cells[r0, key_ci])
@@ -135,7 +212,7 @@ def _apply_integration_impl(
             ci = a_col_idx.get(ac)
             if ci is None:
                 continue
-            _put_value(cells[r0, ci], v)
+            _put_value(cells[r0, ci], v, force_text=_is_identifier_column(ac))
             overwritten += 1
 
     # 追加差异 sheet（输出方式2）
@@ -161,8 +238,9 @@ def _apply_integration_impl(
         wb.Dispose()
     except Exception:
         pass
-    logger.info(f"[integrate] 回填完成: 命中 {matched} 行, 覆盖 {overwritten} 格, 差异 {n_diff} 行 → {out_path}")
-    return {"overwritten_cells": overwritten, "matched_rows": matched, "diff_rows": n_diff}
+    logger.info(f"[integrate] 回填完成: 新增 {added_rows} 行, 命中 {matched} 行, 覆盖 {overwritten} 格, 差异 {n_diff} 行 → {out_path}")
+    return {"overwritten_cells": overwritten, "matched_rows": matched,
+            "added_rows": added_rows, "diff_rows": n_diff}
 
 
 def apply_integration(
@@ -179,6 +257,7 @@ def apply_integration(
     diff_rows: Optional[List[dict]] = None,
     diff_order: str = "id_name",
     date_key_mode: str = "off",
+    seed_keys: Optional[List[dict]] = None,
 ) -> Dict[str, Any]:
     """原地回填主表并（可选）追加差异 sheet，另存到 out_path（在【独立子进程】执行）。
 
@@ -199,6 +278,7 @@ def apply_integration(
             "diff_rows": diff_rows,
             "diff_order": diff_order,
             "date_key_mode": date_key_mode,
+            "seed_keys": seed_keys,
         },
         timeout=default_timeout("write"), max_memory_mb=default_max_memory_mb(),
     )

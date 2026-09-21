@@ -758,6 +758,10 @@ const Tools = {
 
             <h3 style="margin-top:16px;">③ 关联键（每个文件）</h3>
             <div id="int-key-map"></div>
+            <div class="form-group" style="margin-top:8px;padding:9px 10px;background:#f4f8ff;border:1px solid #dce8f8;border-radius:6px;">
+                <label style="font-size:13px;"><input type="checkbox" id="int-union-source-keys" style="width:auto;"> 主键捏合：将所有对照表的关联键并入主表</label>
+                <span style="color:#777;font-size:12px;margin-left:8px;">主表为空也可生成数据行；相同主键只生成一行，主表已有行不会删除。</span>
+            </div>
             <div class="form-group" style="margin-top:6px;">
                 <label style="font-size:13px;">日期关联键归一：</label>
                 <select id="int-date-mode">
@@ -831,6 +835,8 @@ const Tools = {
             this._intRenderPicker('ow');   // 换主表 → 重列基准字段（清空已选）
             this._intRenderPicker('cmp');
         });
+        document.getElementById('int-union-source-keys')?.addEventListener('change', (e) =>
+            this._intSyncUnionMainTerms(!!e.target.checked));
         document.getElementById('int-ow-match').addEventListener('click', () =>
             this._intMatchSection('ow', document.getElementById('int-ow-ai').checked));
         document.getElementById('int-cmp-match').addEventListener('click', () =>
@@ -931,6 +937,11 @@ const Tools = {
         if (cfg.id_col) { const e = document.getElementById('int-id-col'); if (e) e.value = cfg.id_col; }
         if (cfg.diff_order) { const e = document.getElementById('int-diff-order'); if (e) e.value = cfg.diff_order; }
         if (cfg.date_key_mode) { const e = document.getElementById('int-date-mode'); if (e) e.value = cfg.date_key_mode; }
+        const unionKeys = document.getElementById('int-union-source-keys');
+        if (unionKeys) {
+            unionKeys.checked = !!cfg.union_source_keys;
+            this._intSyncUnionMainTerms(unionKeys.checked);
+        }
     },
 
     // 保存方案：asNew=true 为「另存为」（不带 scheme_id，按修改后的配置新建方案，原方案不动）
@@ -959,6 +970,7 @@ const Tools = {
             output_mode: parseInt(document.querySelector('input[name="int-output-mode"]:checked').value, 10),
             normalize_keys: true,
             date_key_mode: document.getElementById('int-date-mode')?.value || 'off',
+            union_source_keys: !!document.getElementById('int-union-source-keys')?.checked,
         };
         // 另存为不带 scheme_id（走新建分支）；保存修改才带
         if (!asNew && _intMode === 'edit' && _intEditingSchemeId) payload.scheme_id = _intEditingSchemeId;
@@ -1067,7 +1079,7 @@ const Tools = {
         (this._intColsOf(source.file) || []).forEach(col => {
             if (col) refs.set(col, `${source.file}.${col}`);
         });
-        this._intNonMainFiles().forEach(file => (file.columns || []).forEach(col => {
+        this._intFiles().forEach(file => (file.columns || []).forEach(col => {
             if (col) refs.set(`${file.name}.${col}`, `${file.name}.${col}`);
         }));
         const names = [...refs.keys()].sort((a, b) => b.length - a.length);
@@ -1103,7 +1115,7 @@ const Tools = {
     _intAllCols(file) {
         const cols = [];
         (this._intColsOf(file) || []).forEach(c => { if (c) cols.push(c); });
-        this._intNonMainFiles().forEach(f => {
+        this._intFiles().forEach(f => {
             if (f.name === file) return;
             (f.columns || []).forEach(c => { if (c) cols.push(`${f.name}.${c}`); });
         });
@@ -1165,10 +1177,10 @@ const Tools = {
         while (out !== prev) {
             prev = out;
             out = out.replace(/\(\)/g, '')          // 空括号
-                     .replace(/^[+\-*/]+/, '')       // 首部悬空运算符
-                     .replace(/[+\-*/]+$/, '')       // 尾部悬空运算符
-                     .replace(/\(\s*[+*/]/g, '(')     // 左括号后紧跟 +*/（保留一元 -）
-                     .replace(/[+\-*/]\)/g, ')');     // 右括号前的悬空运算符
+                     .replace(/^[+\-*/&]+/, '')       // 首部悬空运算符
+                     .replace(/[+\-*/&]+$/, '')       // 尾部悬空运算符
+                     .replace(/\(\s*[+*/&]/g, '(')    // 左括号后紧跟 +*/&（保留一元 -）
+                     .replace(/[+\-*/&]\)/g, ')');    // 右括号前的悬空运算符
         }
         return out.trim();
     },
@@ -1176,6 +1188,35 @@ const Tools = {
     // 公式里列名的集合签名（排序后拼接）：用于判定键盘编辑是否动了列名。
     _intColSig(expr, file) {
         return this._intTokenize(expr, file).filter(t => t.t === 'col').map(t => t.v).sort().join('');
+    },
+
+    // 捏合模式下，模板原值是联合计算的第一个来源。切换开关时直接把它写进可见公式，
+    // 让保存方案、人工审核和实际执行使用完全相同的表达式；关闭时再移除该 token。
+    _intSyncUnionMainTerms(enabled) {
+        const main = this._intMainFile();
+        const defaultFile = this._intNonMainFiles()[0]?.name || '';
+        if (!main || !defaultFile) return;
+        ['ow', 'cmp'].forEach(kind => {
+            document.querySelectorAll(`#int-${kind}-list-rows tr`).forEach(tr => {
+                let picks = [];
+                try { picks = JSON.parse(tr.dataset.src || '[]'); } catch (_) {}
+                if (picks.length !== 1) return;
+                const expr = this._intUnifiedExpr(picks[0]);
+                if (!expr) return;
+                const token = `${main}.${tr.dataset.aCol}`;
+                const present = this._intTokenize(expr, defaultFile)
+                    .some(t => t.t === 'col' && t.v === token);
+                let next = expr;
+                if (enabled && !present) {
+                    const joiner = expr.includes('&') ? '&' : '+';
+                    next = `${token}${joiner}(${expr})`;
+                } else if (!enabled && present) {
+                    next = this._intFxRemoveCol(expr, token, defaultFile);
+                }
+                tr.dataset.src = JSON.stringify(next ? [{file: defaultFile, expr: next}] : []);
+                this._intUpdateSrcCell(tr);
+            });
+        });
     },
 
     // 弹窗内将旧方案按当前首张对照表转换引用。
@@ -1192,19 +1233,22 @@ const Tools = {
     _intOpenSrcPicker(kind, tr) {
         let selected = [];
         try { selected = JSON.parse(tr.dataset.src || '[]'); } catch (_) {}
-        const files = this._intNonMainFiles();
+        const includeMain = !!document.getElementById('int-union-source-keys')?.checked;
+        const files = includeMain ? this._intFiles() : this._intNonMainFiles();
+        const main = this._intMainFile();
         const file = files[0]?.name || '';
+        const defaultFile = this._intNonMainFiles()[0]?.name || file;
         // 旧多来源是“首个非空”回退，不能默默转换成相加。
         const preset = selected.length === 1 ? this._intUnifiedExpr(selected[0]) : '';
         const body = `
-            <p style="font-size:12px;color:#888;">勾选各表字段，在下方公式框中设置跨表计算。默认以 + 连接；文本请用 &amp; 拼接，例如：姓名 &amp; " / " &amp; 部门。文本取同一主键首个非空值，数值运算仍跨行求和。</p>
+            <p style="font-size:12px;color:#888;">勾选各表字段，在下方公式框中设置跨表计算。${includeMain ? '捏合模式会自动保留并加入模板目标列原值；' : ''}默认以 + 连接；文本请用 &amp; 拼接，例如：姓名 &amp; " / " &amp; 部门。文本取同一主键首个非空值，数值运算仍跨行求和。</p>
             ${selected.length > 1 ? '<p style="color:#b36b00;">旧方案含多个优先级来源，请重新选择字段并确认联合公式；取消将保留旧方案。</p>' : ''}
             ${files.map(f => `<div style="margin-bottom:12px;">
-                <strong>${_escape(f.name)}</strong>
+                <strong>${f.name === main ? '[模板原值] ' : ''}${_escape(f.name)}</strong>
                 <div style="display:flex;flex-wrap:wrap;gap:4px 14px;">
                 ${(f.columns || []).map(c => {
-                    const token = f.name === file ? c : f.name + '.' + c;
-                    const checked = this._intTokenize(preset, file).some(t => t.t === 'col' && t.v === token);
+                    const token = f.name === defaultFile ? c : f.name + '.' + c;
+                    const checked = this._intTokenize(preset, defaultFile).some(t => t.t === 'col' && t.v === token);
                     return `<label><input type="checkbox" class="int-srcpick-cb" data-token="${_escape(token)}" ${checked ? 'checked' : ''} style="width:auto;"> ${_escape(c)}</label>`;
                 }).join('')}</div></div>`).join('')}
             <label for="int-unified-fx">联合公式：</label>
@@ -1212,10 +1256,10 @@ const Tools = {
             <div id="int-unified-error" style="color:#d32f2f;font-size:12px;"></div>`;
         this.openModal(`为「${tr.dataset.aCol || ''}」选择对照列 / 公式`, body, () => {
             const expr = document.getElementById('int-unified-fx').value.trim();
-            const chk = this._intCheckFx(file, expr);
+            const chk = this._intCheckFx(defaultFile, expr);
             if (expr && !chk.ok) { alert('公式无法识别：' + chk.rest); return; }
             if (!expr && selected.length > 1) { alert('请确认新的联合公式，或取消保留旧方案'); return; }
-            tr.dataset.src = JSON.stringify(expr ? [{file, expr}] : []);
+            tr.dataset.src = JSON.stringify(expr ? [{file: defaultFile, expr}] : []);
             this._intUpdateSrcCell(tr);
             this.closeModal();
         }, {wide: true});
@@ -1223,20 +1267,20 @@ const Tools = {
         const error = document.getElementById('int-unified-error');
         const checkboxes = [...document.querySelectorAll('#modal-body .int-srcpick-cb')];
         const sync = () => {
-            const tokens = this._intTokenize(fx.value, file).filter(t => t.t === 'col').map(t => t.v);
+            const tokens = this._intTokenize(fx.value, defaultFile).filter(t => t.t === 'col').map(t => t.v);
             checkboxes.forEach(cb => { cb.checked = tokens.includes(cb.dataset.token); });
-            const chk = this._intCheckFx(file, fx.value);
+            const chk = this._intCheckFx(defaultFile, fx.value);
             error.textContent = chk.ok ? '' : '公式无法识别：' + chk.rest;
         };
         checkboxes.forEach(cb => cb.addEventListener('change', () => {
-            fx.value = cb.checked ? this._intFxAddCol(fx.value, cb.dataset.token, file)
-                : this._intFxRemoveCol(fx.value, cb.dataset.token, file);
+            fx.value = cb.checked ? this._intFxAddCol(fx.value, cb.dataset.token, defaultFile)
+                : this._intFxRemoveCol(fx.value, cb.dataset.token, defaultFile);
             sync();
         }));
         fx.addEventListener('input', sync);
     },
 
-    // 智能匹配：对已勾选的基准列匹配对照列——命中自动选（单个），没命中留空让人工选
+    // 智能匹配：同一基准列可同时命中多张对照表，默认用 + 组成一个跨表联合公式。
     async _intMatchSection(kind, useAi) {
         const rows = [...document.querySelectorAll(`#int-${kind}-list-rows tr`)];
         const st = document.getElementById(`int-${kind}-status`);
@@ -1251,24 +1295,38 @@ const Tools = {
             });
             if (!resp.ok) { await _alertErr(resp, '匹配失败'); st.textContent = '匹配失败'; st.className = 'status error'; return; }
             const data = await resp.json();
-            const bestByA = {};
-            (data.pairs || []).forEach(p => { if (!(p.a_col in bestByA)) bestByA[p.a_col] = p; });
-            let hit = 0, kept = 0, miss = 0;
+            const matchesByA = {};
+            (data.pairs || []).forEach(p => {
+                const items = matchesByA[p.a_col] = matchesByA[p.a_col] || [];
+                if (!items.some(x => x.source_file === p.source_file && x.source_col === p.source_col)) items.push(p);
+            });
+            const defaultFile = this._intNonMainFiles()[0]?.name || '';
+            let hit = 0, matchedCols = 0, kept = 0, miss = 0;
             rows.forEach(tr => {
                 let cur = [];
                 try { cur = JSON.parse(tr.dataset.src || '[]'); } catch (_) {}
                 if (cur.length) { kept++; return; }   // 已手动选择 → 以手动为准，不被 AI 覆盖
-                const m = bestByA[tr.dataset.aCol];    // 未选的行才用 AI/精确匹配填充
-                if (m) { tr.dataset.src = JSON.stringify([{ file: m.source_file, expr: m.source_col }]); hit++; }
+                const matches = matchesByA[tr.dataset.aCol] || []; // 未选的行才用 AI/精确匹配填充
+                if (matches.length) {
+                    const tokens = matches.map(m => m.source_file === defaultFile
+                        ? m.source_col : `${m.source_file}.${m.source_col}`);
+                    if (document.getElementById('int-union-source-keys')?.checked) {
+                        tokens.unshift(`${this._intMainFile()}.${tr.dataset.aCol}`);
+                    }
+                    tr.dataset.src = JSON.stringify([{ file: defaultFile || matches[0].source_file, expr: tokens.join('+') }]);
+                    hit++; matchedCols += matches.length;
+                }
                 else { tr.dataset.src = '[]'; miss++; }   // 匹配不到 → 留空，人工点选
                 this._intUpdateSrcCell(tr);
             });
-            st.textContent = `AI匹配填充 ${hit} 个，保留已选 ${kept} 个${miss ? `，${miss} 个未匹配请手动选` : ''}`;
+            st.textContent = `智能匹配填充 ${hit} 个目标字段（共 ${matchedCols} 个来源列），保留已选 ${kept} 个${miss ? `，${miss} 个未匹配请手动选` : ''}`;
             st.className = 'status ok';
         } catch (e) { st.textContent = '失败: ' + e.message; st.className = 'status error'; }
     },
 
     _readSectionPairs(kind) {
+        this._intSyncUnionMainTerms(
+            !!document.getElementById('int-union-source-keys')?.checked);
         const out = [];
         document.querySelectorAll(`#int-${kind}-list-rows tr`).forEach(tr => {
             let picks = [];
@@ -1299,6 +1357,7 @@ const Tools = {
             diff_order: document.getElementById('int-diff-order')?.value || 'id_name',
             normalize_keys: true,
             date_key_mode: document.getElementById('int-date-mode')?.value || 'off',
+            union_source_keys: !!document.getElementById('int-union-source-keys')?.checked,
         };
         const st = document.getElementById('int-exec-status');
         const btn = document.getElementById('int-execute');
@@ -1322,7 +1381,7 @@ const Tools = {
             a.href = url; a.download = '整合结果_' + main;
             document.body.appendChild(a); a.click(); a.remove();
             URL.revokeObjectURL(url);
-            const info = `命中${resp.headers.get('X-Integrate-Matched') || 0}行 覆盖${resp.headers.get('X-Integrate-Cells') || 0}格 差异${resp.headers.get('X-Integrate-Diffs') || 0}行`;
+            const info = `新增${resp.headers.get('X-Integrate-Added') || 0}行 命中${resp.headers.get('X-Integrate-Matched') || 0}行 覆盖${resp.headers.get('X-Integrate-Cells') || 0}格 差异${resp.headers.get('X-Integrate-Diffs') || 0}行`;
             st.textContent = '已生成下载（' + info + '）'; st.className = 'status ok';
             this._setIntegrateStatus('已生成下载（' + info + '）', 'ok');
         } catch (e) {

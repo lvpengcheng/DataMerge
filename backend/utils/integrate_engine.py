@@ -27,6 +27,12 @@ logger = logging.getLogger(__name__)
 CLEAR_CELL = object()
 
 
+def _is_long_identifier(value) -> bool:
+    """身份证/银行卡等长整数标识；即使解析成 Python int 也必须按文本处理。"""
+    text = str(value or "").strip().upper()
+    return len(text) >= 12 and (text.isdigit() or (text.endswith("X") and text[:-1].isdigit()))
+
+
 # 姓名 / 身份证 列名关键词（用于差异 sheet 定位；可被前端人工覆盖）
 _NAME_HINTS = ["姓名", "员工姓名", "人员姓名", "name", "中文姓名"]
 _ID_HINTS = ["身份证号码", "身份证号", "身份证", "证件号码", "证件号", "idcard", "id card"]
@@ -79,8 +85,9 @@ def build_key_index(df, key_col: str, normalize_keys: bool = True,
 
 def build_source_indexes(parsed: Dict[str, dict], key_map: Dict[str, str],
                          main_file: str, normalize_keys: bool = True,
-                         date_key_mode: str = "off") -> Dict[str, dict]:
-    """为除主表外的每张对照表建键索引。
+                         date_key_mode: str = "off",
+                         include_main: bool = False) -> Dict[str, dict]:
+    """为各文件建立键索引；默认排除主表，捏合计算时可把主表也作为公式来源。
 
     Args:
         parsed: {file: {"df": DataFrame, ...}}
@@ -92,11 +99,38 @@ def build_source_indexes(parsed: Dict[str, dict], key_map: Dict[str, str],
     """
     out: Dict[str, dict] = {}
     for f, fd in parsed.items():
-        if f == main_file:
+        if f == main_file and not include_main:
             continue
         df = fd.get("df")
         cols = list(df.columns) if df is not None else []
         out[f] = {"cols": cols, "rows": build_key_index(df, key_map.get(f), normalize_keys, date_key_mode)}
+    return out
+
+
+def collect_source_keys(parsed: Dict[str, dict], key_map: Dict[str, str],
+                        main_file: str, normalize_keys: bool = True,
+                        date_key_mode: str = "off") -> List[dict]:
+    """按对照表顺序收集关联键并去重，供“主键捏合”模式向主表追加行。
+
+    返回 ``[{"normalized": 归一化键, "value": 首次出现的原值}, ...]``。同一个键
+    即使出现在多张表或同表多行也只生成一条主表记录；保留首次出现的原值用于写回，
+    后续跨表公式仍通过 normalized 键同时读取各张对照表的数据。
+    """
+    out: List[dict] = []
+    seen = set()
+    for file_name, file_data in (parsed or {}).items():
+        if file_name == main_file:
+            continue
+        df = (file_data or {}).get("df")
+        key_col = (key_map or {}).get(file_name)
+        if df is None or not key_col or key_col not in getattr(df, "columns", []):
+            continue
+        for value in df[key_col].tolist():
+            normalized = normalize_key(value, normalize_keys, date_key_mode)
+            if normalized == "" or normalized in seen:
+                continue
+            seen.add(normalized)
+            out.append({"normalized": normalized, "value": value})
     return out
 
 
@@ -323,7 +357,9 @@ def eval_source_expr(expr, rows: List[dict], cols: List[str]):
             if first_non_empty is None:
                 first_non_empty = v
             n = _to_num(v)
-            if n is None:
+            if _is_long_identifier(v):
+                all_num = False
+            elif n is None:
                 all_num = False
             else:
                 nums.append(n)
@@ -388,7 +424,9 @@ def eval_source_expr_cross(expr: str, default_file: str,
             if first is None:
                 first = v
             n = _to_num(v)
-            if n is None:
+            if _is_long_identifier(v):
+                all_num = False
+            elif n is None:
                 all_num = False
             else:
                 nums.append(n)
@@ -459,6 +497,18 @@ def eval_source_expr_cross(expr: str, default_file: str,
                 return None
             return _s if all_num else first
         return None
+
+    # 智能匹配默认用 + 联合多张表。身份证/银行卡等标识虽然只含数字，但语义是文本：
+    # 相同键在模板及多张表中重复出现时取第一个非空原值，绝不能做浮点加法。
+    non_empty_first = [t[3][1] for t in cols if t[3][3] and t[3][1] not in (None, "")]
+    only_plus = all(t[0] != "op" or t[1] in "+()" for t in toks)
+    if non_empty_first and only_plus and all(_is_long_identifier(v) for v in non_empty_first):
+        return non_empty_first[0]
+    available_cols = [t for t in cols if t[3][3]]
+    if non_empty_first and only_plus and available_cols and all(not t[3][2] for t in available_cols):
+        # 普通文本误用智能匹配默认的 + 时按“模板优先、其次对照表”取首个非空；
+        # 明确需要拼接仍须使用 &，避免姓名/部门等被数值公式转换成 0。
+        return non_empty_first[0]
 
     # 3) 公式：列按数值代入（文本列按 0）；数字字面量（如 字段+30 里的 30、
     #    含小数点/科学计数 eE）原样保留进表达式；缺失引用按 0。
