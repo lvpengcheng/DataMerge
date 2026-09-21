@@ -198,7 +198,7 @@ def test_pending_response_includes_final_mapping():
 
 def test_session_confirmation_keeps_prior_rounds_and_explicit_skips(tmp_path):
     from backend.utils.confirmed_source_mapping import save_confirmation_state
-    meta, _, mapping = fixture_data(tmp_path)
+    meta, parsed, mapping = fixture_data(tmp_path)
     first = copy.deepcopy(mapping)
     del first['uploaded.xlsx']['sheet_mapping']['当月补贴']
     del first['uploaded.xlsx']['header_mapping_by_sheet']['当月补贴']
@@ -219,6 +219,46 @@ def test_session_confirmation_keeps_prior_rounds_and_explicit_skips(tmp_path):
     assert apply_confirmed_mapping(meta, {}, state['confirmed_mapping'])
 
 
+def test_sheet_only_confirmation_survives_session_merge(tmp_path):
+    """只选择源 Sheet、尚未选择列时，Sheet 关系也必须持久化到最终映射。"""
+    from backend.utils.confirmed_source_mapping import save_confirmation_state
+    state = save_confirmation_state(tmp_path, {'confirmed_mapping': {'file_mapping': {
+        '智算上传.xlsx': {
+            'expected_file': '智训源.xlsx',
+            'sheet_mapping': {'202609': '工资表'},
+            'header_mapping_by_sheet': {'202609': {}},
+        },
+    }}})
+    info = state['confirmed_mapping']['file_mapping']['智算上传.xlsx']
+    assert info['sheet_mapping'] == {'202609': '工资表'}
+    assert info['header_mapping_by_sheet'] == {'202609': {}}
+
+
+def test_incomplete_manual_columns_still_build_confirmed_source_sheet(tmp_path, monkeypatch):
+    """最终放行时列未补齐也不能丢掉已经人工确认的源 Sheet。"""
+    import backend.utils.compute_precheck as pre
+    meta, parsed, _ = fixture_data(tmp_path)
+    confirmed = {'uploaded.xlsx': {
+        'expected_file': 'trained.xlsx',
+        'sheet_mapping': {'当月工资': '工资表'},
+        'header_mapping_by_sheet': {'当月工资': {}},
+    }}
+    monkeypatch.setattr(FastHeaderMatcher, 'match_headers_only',
+                        lambda *args: pytest.fail('人工指定的 Sheet 不应被重新自动匹配'))
+    monkeypatch.setattr(pre, '_check_target_sheets', lambda *args: None)
+
+    result = resolve_with_confirmations(
+        meta, confirmed_mapping=confirmed, skip_history_check=True)
+
+    assert not result.ok
+    info = result.file_mapping['uploaded.xlsx']
+    assert info['file_path'] == str(tmp_path / 'uploaded.xlsx')
+    assert info['sheet_mapping'] == {'当月工资': '工资表'}
+    source_data = build_preload(meta, parsed, result.file_mapping)
+    assert '工资表' in source_data
+    assert source_data['工资表']['df']['工号'].tolist() == ['001']
+
+
 def test_all_pending_categories_are_collected_even_if_source_mapping_invalid(tmp_path, monkeypatch):
     import backend.utils.compute_precheck as pre
     meta, _, mapping = fixture_data(tmp_path)
@@ -232,7 +272,12 @@ def test_all_pending_categories_are_collected_even_if_source_mapping_invalid(tmp
     monkeypatch.setattr(pre, '_check_target_sheets', target)
     result = resolve_with_confirmations(meta, confirmed_mapping=mapping)
     assert not result.ok and result.history_warnings and result.target_candidates
-    assert result.file_mapping == mapping
+    info = result.file_mapping['uploaded.xlsx']
+    assert info['expected_file'] == mapping['uploaded.xlsx']['expected_file']
+    assert info['sheet_mapping'] == mapping['uploaded.xlsx']['sheet_mapping']
+    assert info['header_mapping_by_sheet'] == mapping['uploaded.xlsx']['header_mapping_by_sheet']
+    assert info['file_path'] == str(tmp_path / 'uploaded.xlsx')
+    assert info['needs_rewrite'] is True
 
 
 def test_explicit_unmatched_column_continues_without_fabricating_values(tmp_path, monkeypatch):
@@ -264,7 +309,7 @@ def test_explicit_unmatched_column_continues_without_fabricating_values(tmp_path
 def test_entire_sheet_or_all_columns_can_be_confirmed_unmatched(tmp_path, monkeypatch, all_sheets):
     import backend.utils.compute_precheck as pre
     from backend.utils.confirmed_source_mapping import fully_unmatched_sheets, merge_confirmation_state
-    meta, _, mapping = fixture_data(tmp_path)
+    meta, parsed, mapping = fixture_data(tmp_path)
     skipped = [[s['file_name'], s['sheet_name'], c] for s in meta.train_sheets
                if all_sheets or s['sheet_name'] == '工资表' for c in s['headers']]
     state = merge_confirmation_state({'confirmed_mapping': {'file_mapping': mapping}},
@@ -274,4 +319,51 @@ def test_entire_sheet_or_all_columns_can_be_confirmed_unmatched(tmp_path, monkey
     result = resolve_with_confirmations(meta, confirmed_mapping=state['confirmed_mapping'], skip_history_check=True)
     assert result.ok and not result.missing_columns
     assert len(fully_unmatched_sheets(meta.source_structure, result.unmatched_columns)) == (2 if all_sheets else 1)
-    assert bool(result.file_mapping) != all_sheets
+    # “所有列无匹配”只清空列关系，不能删除已人工确认的源 Sheet。
+    assert result.file_mapping
+    expected_sheets = {'当月工资': '工资表', '当月补贴': '补贴表'}
+    assert result.file_mapping['uploaded.xlsx']['sheet_mapping'] == expected_sheets
+    if all_sheets:
+        data = build_preload(meta, parsed, result.file_mapping)
+        assert set(data) == {'工资表', '补贴表'}
+        assert '本月金额' in data['工资表']['df'].columns
+
+
+def test_fallback_rewrite_uses_training_file_sheet_and_column_names(tmp_path, monkeypatch):
+    """预加载降级重写后，旧脚本读取到的仍应是智训侧名称。"""
+    from types import SimpleNamespace
+    from excel_parser import IntelligentExcelParser
+
+    parsed = [
+        SimpleNamespace(
+            sheet_name='未匹配附表',
+            regions=[SimpleNamespace(head_data={'说明': 'A'}, data=[{'A': '不应写入'}])],
+        ),
+        SimpleNamespace(
+            sheet_name='202609工资',
+            regions=[SimpleNamespace(
+                head_data={'员工编号': 'A', '本月工资': 'B'},
+                data=[{'A': '001', 'B': 100}],
+            )],
+        ),
+    ]
+    monkeypatch.setattr(IntelligentExcelParser, 'parse_excel_file', lambda *args, **kwargs: parsed)
+    mapping = {
+        'expected_file': '智训源.xlsx',
+        'file_path': str(tmp_path / '智算上传.xlsx'),
+        'sheet_mapping': {'202609工资': '工资表'},
+        'header_mapping_by_sheet': {
+            '202609工资': {'员工编号': '工号', '本月工资': '工资'},
+        },
+    }
+
+    (tmp_path / 'mapped').mkdir()
+    result = Path(FastHeaderMatcher.rewrite_excel(mapping, str(tmp_path / 'mapped')))
+    wb = openpyxl.load_workbook(result, data_only=True)
+    try:
+        assert result.name == '智训源.xlsx'
+        assert wb.sheetnames == ['工资表']
+        assert [wb['工资表']['A1'].value, wb['工资表']['B1'].value] == ['工号', '工资']
+        assert [wb['工资表']['A2'].value, wb['工资表']['B2'].value] == ['001', 100]
+    finally:
+        wb.close()

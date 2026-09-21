@@ -8,24 +8,57 @@ def merge_confirmation_state(previous, incoming):
     result = {key: deepcopy(value) for key, value in (previous or {}).items() if key in (
         'confirmed_mapping', 'confirmed_renames', 'confirmed_target_map', 'skipped_missing_files', 'skip_history_check')}
     incoming = incoming or {}
+    def files_of(mapping):
+        mapping = mapping or {}
+        return mapping.get('file_mapping', mapping)
+
     def flatten(mapping):
         rows = {}
-        for filename, info in (mapping or {}).get('file_mapping', mapping or {}).items():
+        for filename, info in files_of(mapping).items():
             for sheet, target in (info.get('sheet_mapping') or {}).items():
                 columns = (info.get('header_mapping_by_sheet') or {}).get(sheet, info.get('header_mapping') or {})
                 for column, target_column in columns.items():
                     rows[(info.get('expected_file', filename), target, target_column)] = (filename, sheet, column)
         return rows
+
+    def flatten_sheets(mapping):
+        sheets = {}
+        for filename, info in files_of(mapping).items():
+            for sheet, target in (info.get('sheet_mapping') or {}).items():
+                sheets[(info.get('expected_file', filename), target)] = (filename, sheet)
+        return sheets
+
     if incoming.get('confirmed_mapping') is not None:
-        rows = flatten(result.get('confirmed_mapping'))
+        previous_rows = flatten(result.get('confirmed_mapping'))
+        rows = dict(previous_rows)
+        sheets = flatten_sheets(result.get('confirmed_mapping'))
+        updated_sheets = flatten_sheets(incoming['confirmed_mapping'])
+        # Sheet 下拉框是独立的人工决定，不能因为该 Sheet 暂时没有已选列而丢失。
+        # 若用户更换了来源 Sheet，清除旧来源遗留的列关系，再由本轮列选择补入。
+        for target, source in updated_sheets.items():
+            if sheets.get(target) != source:
+                rows = {key: value for key, value in rows.items()
+                        if key[:2] != target or value[:2] == source}
+            sheets[target] = source
         updated = flatten(incoming['confirmed_mapping'])
         skipped = {tuple(item) for item in (result.get('confirmed_mapping') or {}).get('unmatched_columns', [])}
         skipped.update(tuple(item) for item in incoming['confirmed_mapping'].get('unmatched_columns', []))
         skipped.difference_update(updated)
         rows.update(updated)
+        for (target_file, target_sheet, _), (filename, sheet, _) in updated.items():
+            sheets[(target_file, target_sheet)] = (filename, sheet)
         for key in skipped:
             rows.pop(key, None)
+        # Sheet 选择与列选择相互独立：即使该 Sheet 的全部训练列都明确为“无匹配”，
+        # 也只清空列映射，不能删除用户已经确认的 Sheet 对应关系。
         files = {}
+        for (target_file, target_sheet), (filename, sheet) in sheets.items():
+            info = files.setdefault(filename, {'expected_file': target_file, 'sheet_mapping': {},
+                                               'header_mapping_by_sheet': {}})
+            if info['expected_file'] != target_file or info['sheet_mapping'].get(sheet, target_sheet) != target_sheet:
+                raise ValueError(f'同一来源被分配给不同训练表: {filename}/{sheet}')
+            info['sheet_mapping'][sheet] = target_sheet
+            info['header_mapping_by_sheet'].setdefault(sheet, {})
         for (target_file, target_sheet, target_column), (filename, sheet, column) in rows.items():
             info = files.setdefault(filename, {'expected_file': target_file, 'sheet_mapping': {},
                                                'header_mapping_by_sheet': {}})
@@ -114,7 +147,10 @@ def apply_confirmed_mapping(meta, automatic, confirmed):
             entry['confirmed'] = True
             entry['needs_rewrite'] = True
             # 未选择的源列不进入训练表，避免同名旧列覆盖选中的新列。
-            entry.setdefault('selected_columns_by_sheet', {})[sheet] = list(headers)
+            # 全部训练列都明确“无匹配”时仍保留这个已确认的源 Sheet，并写入其
+            # 原始列/数据；None 表示不裁剪源列，仅不执行列名映射。
+            entry.setdefault('selected_columns_by_sheet', {})[sheet] = (
+                list(headers) if headers else None)
     return result
 
 

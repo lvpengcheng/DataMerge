@@ -780,7 +780,10 @@ class FastHeaderMatcher:
         # 多Sheet 训练场景：训练侧标记 multi_sheet_source=True，或当前 sheet_mapping
         # 含 >=2 项，需要全量读所有 sheet 重写。否则 active_sheet_only=True 会只保留
         # 一个 sheet，导致下游 source_data 缺失。
-        multi_sheet = bool(mapping_info.get("multi_sheet_source")) or len(sheet_mapping) >= 2
+        # 只要已有最终 Sheet 映射，就必须扫描整个工作簿；即使只映射一张，它也未必
+        # 是当前活动 Sheet。输出时仅保留映射中出现的 Sheet，避免把智算原名作为额外
+        # ``源_*`` 带入结果。
+        multi_sheet = bool(mapping_info.get("multi_sheet_source")) or bool(sheet_mapping)
 
         # 对需要重写的文件做一次全量解析（带数据）
         logger.info(
@@ -803,12 +806,16 @@ class FastHeaderMatcher:
         # 使用 write_only 模式，内存更低、写入更快
         wb = openpyxl.Workbook(write_only=True)
 
+        written_sheets = 0
         for sheet_data in parsed_data:
+            if sheet_mapping and sheet_data.sheet_name not in sheet_mapping:
+                continue
             header_mapping = (mapping_info.get('header_mapping_by_sheet') or {}).get(
                 sheet_data.sheet_name, mapping_info.get('header_mapping') or {})
             selected_columns = (mapping_info.get('selected_columns_by_sheet') or {}).get(sheet_data.sheet_name)
             target_sheet_name = sheet_mapping.get(sheet_data.sheet_name, sheet_data.sheet_name)
             ws = wb.create_sheet(title=target_sheet_name)
+            written_sheets += 1
 
             for region in sheet_data.regions:
                 # 构建映射后的列顺序: [(映射后列名, 原始列字母), ...]
@@ -825,9 +832,12 @@ class FastHeaderMatcher:
                 for data_row in region.data:
                     ws.append([data_row.get(col_letter) for _, col_letter in col_order])
 
+        if not written_sheets:
+            wb.close()
+            raise ValueError(f"最终映射中的 Sheet 在上传文件中不存在: {sorted(sheet_mapping)}")
         wb.save(output_path)
         wb.close()
-        logger.info(f"[匹配] 生成映射文件(write_only): {output_path} ({len(parsed_data)}个sheet)")
+        logger.info(f"[匹配] 生成映射文件(write_only): {output_path} ({written_sheets}个sheet)")
         return output_path
 
     # ==================== 单次解析的三段：解析 / 匹配 / 构建 ====================

@@ -5006,6 +5006,16 @@ async def run_compute_task(
                         # 输出映射日志
                         for input_file_name, mapping_info in file_mapping.items():
                             expected_file = mapping_info.get("expected_file")
+                            _sheet_pairs = mapping_info.get('sheet_mapping') or {}
+                            if _sheet_pairs:
+                                buffer.push(task_id, json.dumps({
+                                    "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                    "level": "info",
+                                    "message": (
+                                        f"源 Sheet 最终关系（智算上传名→智训名）: "
+                                        f"{input_file_name}: {_sheet_pairs}"
+                                    ),
+                                }, ensure_ascii=False))
                             if mapping_info.get("needs_rewrite"):
                                 logger.info(f"[compute/task] 生成映射文件: {input_file_name} → {expected_file}")
                                 log_msg = {
@@ -5104,14 +5114,46 @@ async def run_compute_task(
         # 直接读 Excel 的定制脚本也必须使用人工确认后的文件/Sheet/列。
         # 从最终 DataFrame 生成独立执行目录，上传文件保持不变。
         execution_source_dir = str(source_dir)
-        if pre_validated_mapping and any(info.get('confirmed') for info in pre_validated_mapping.values()):
+        if pre_validated_mapping and (
+                mapping_finalized or any(info.get('confirmed') for info in pre_validated_mapping.values())):
             if not pre_loaded_source_data:
                 if mapping_finalized:
-                    logger.warning('[compute/task] 人工映射缺少最终源数据，使用原始源文件继续计算')
-                    buffer.push(task_id, json.dumps({
-                        "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
-                        "level": "warning", "message": "人工映射缺少部分最终源数据，已跳过验证并继续计算",
-                    }, ensure_ascii=False))
+                    # 不能直接把原始上传目录交给脚本，否则脚本会按智算上传名生成
+                    # ``源_*`` Sheet。即使预加载构建失败，也先按最终关系重写执行副本。
+                    try:
+                        from backend.utils.fast_header_matcher import FastHeaderMatcher
+                        _fallback_dir = temp_dir / 'confirmed_source_fallback'
+                        if _fallback_dir.exists():
+                            shutil.rmtree(_fallback_dir, ignore_errors=True)
+                        _fallback_dir.mkdir(parents=True, exist_ok=True)
+                        _produced = []
+                        for _actual_file, _mapping_info in pre_validated_mapping.items():
+                            if not (_mapping_info.get('sheet_mapping') or {}):
+                                continue
+                            _mapped_path = Path(FastHeaderMatcher.rewrite_excel(
+                                _mapping_info, str(_fallback_dir)))
+                            if not _mapped_path.is_file():
+                                raise ValueError(
+                                    f'未能生成映射执行文件: {_actual_file} → '
+                                    f'{_mapping_info.get("expected_file") or _actual_file}')
+                            _produced.append(_mapped_path)
+                        if not _produced:
+                            raise ValueError('最终映射中没有可生成的源文件')
+                        execution_source_dir = str(_fallback_dir)
+                        logger.warning('[compute/task] 预加载不可用，已按最终映射重写执行源文件后继续')
+                        buffer.push(task_id, json.dumps({
+                            "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                            "level": "warning",
+                            "message": "预加载源数据不完整，已按最终匹配关系将源文件及 Sheet 改为智训名称后继续计算",
+                        }, ensure_ascii=False))
+                    except Exception as exc:
+                        logger.warning('[compute/task] 最终映射执行副本生成失败，使用原始源文件继续: %s',
+                                       exc, exc_info=True)
+                        buffer.push(task_id, json.dumps({
+                            "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                            "level": "warning",
+                            "message": f"最终映射执行副本生成失败，已放行并使用原始源文件继续: {exc}",
+                        }, ensure_ascii=False))
                 else:
                     raise ValueError('人工映射缺少最终源数据，停止计算')
             else:

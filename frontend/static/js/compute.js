@@ -183,11 +183,21 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
             if (!sourceGroups.has(key)) sourceGroups.set(key, []);
             sourceGroups.get(key).push(row);
         });
+        const confirmedSourceSheets = new Map();
+        const rememberSourceSheets = mapping => Object.entries(mapping || {}).forEach(([file, info]) => {
+            Object.entries(info.sheet_mapping || {}).forEach(([sheet, target]) => {
+                confirmedSourceSheets.set(
+                    JSON.stringify([info.expected_file || file, target]),
+                    JSON.stringify([file, sheet]));
+            });
+        });
+        rememberSourceSheets(data.file_mapping);
+        rememberSourceSheets(previousConfirmations?.confirmed_mapping?.file_mapping);
         const sourceSheetHtml = [...sourceGroups].map(([key, rows]) => {
             const suggested = new Set(rows.map(row => {
                 const p = _splitPath(row.suggested_path); return p ? JSON.stringify([p.file, p.sheet]) : null;
             }).filter(Boolean));
-            const chosen = suggested.size === 1 ? [...suggested][0] : '';
+            const chosen = confirmedSourceSheets.get(key) || (suggested.size === 1 ? [...suggested][0] : '');
             const [expectedFile, expectedSheet] = JSON.parse(key);
             const reasons = [...new Set(rows.map(row => row.sheet_reason || row.reason).filter(Boolean))].slice(0, 2);
             const recommendation = chosen
@@ -783,6 +793,26 @@ function _collectConfirmedTargetMap(overlay) {
     return result;
 }
 
+/** 收集独立的源 Sheet 人工关系，不能只依赖列下拉框反推。 */
+function _collectSourceSheetMappings(overlay) {
+    const result = {};
+    overlay.querySelectorAll('select[data-source-sheet-key]').forEach(sel => {
+        if (!sel.value) return;
+        const [expectedFile, expectedSheet] = JSON.parse(sel.dataset.sourceSheetKey || '[]');
+        const [actualFile, actualSheet] = JSON.parse(sel.value || '[]');
+        if (!expectedFile || !expectedSheet || !actualFile || !actualSheet) return;
+        const entry = result[actualFile] ||= {
+            expected_file: expectedFile, sheet_mapping: {}, header_mapping_by_sheet: {},
+        };
+        if (entry.expected_file !== expectedFile) {
+            throw new Error(`上传文件「${actualFile}」被选给了不同训练文件，请统一选择。`);
+        }
+        entry.sheet_mapping[actualSheet] = expectedSheet;
+        entry.header_mapping_by_sheet[actualSheet] ||= {};
+    });
+    return result;
+}
+
 /**
  * 把 AI 建议表格的用户选择转换成 FastHeaderMatcher.file_mapping 结构。
  * 输出格式：
@@ -807,11 +837,17 @@ function _mergeFileMappings(previous, incoming) {
         Object.entries(info.sheet_mapping || {}).forEach(([sheet, targetSheet]) => {
             const columns = (info.header_mapping_by_sheet || {})[sheet] || info.header_mapping || {};
             const targets = new Set(Object.values(columns));
+            const sheetOnlyDecision = Object.keys(columns).length === 0;
             // 删除同一目标列的旧来源，避免旧选择在另一文件/Sheet 下残留。
             Object.entries(result).forEach(([oldFile, old]) => {
                 if (old.expected_file !== targetFile) return;
                 Object.entries(old.sheet_mapping || {}).forEach(([oldSheet, oldTarget]) => {
                     if (oldTarget !== targetSheet) return;
+                    if (sheetOnlyDecision && (oldFile !== file || oldSheet !== sheet)) {
+                        delete old.sheet_mapping[oldSheet];
+                        delete (old.header_mapping_by_sheet || {})[oldSheet];
+                        return;
+                    }
                     const scoped = Object.assign({}, (old.header_mapping_by_sheet || {})[oldSheet] || old.header_mapping || {});
                     Object.keys(scoped).forEach(col => { if (targets.has(scoped[col])) delete scoped[col]; });
                     (old.header_mapping_by_sheet ||= {})[oldSheet] = scoped;
@@ -964,7 +1000,10 @@ function _buildFileMappingFromAiSelections(overlay, aiSuggestions, originalFileM
         if (columns[act.col] && columns[act.col] !== exp.col) throw new Error(`来源列「${sel.value}」被重复选择。`);
         columns[act.col] = exp.col;
     });
-    return _mergeFileMappings(_withoutUnmatchedMappings(originalFileMapping, _collectUnmatchedColumns(overlay, aiSuggestions)), selected);
+    const retained = _withoutUnmatchedMappings(
+        originalFileMapping, _collectUnmatchedColumns(overlay, aiSuggestions));
+    const withSheets = _mergeFileMappings(retained, _collectSourceSheetMappings(overlay));
+    return _mergeFileMappings(withSheets, selected);
 }
 
 function _splitPath(path) {

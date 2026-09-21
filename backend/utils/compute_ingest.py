@@ -408,7 +408,19 @@ def resolve_with_confirmations(
             locked = apply_confirmed_mapping(meta, {}, confirmed_mapping)
         except ValueError as exc:
             result.ok = False
-            result.file_mapping = (confirmed_mapping or {}).get('file_mapping', confirmed_mapping)
+            # 即使列关系尚不完整，也要保留已经人工指定的文件/Sheet，并补齐真实
+            # file_path。最终审核放行后，计算进程才能按该关系生成对应的 ``源_*``。
+            from copy import deepcopy
+            result.file_mapping = deepcopy(
+                (confirmed_mapping or {}).get('file_mapping', confirmed_mapping) or {})
+            _actual_by_pair = {(s['file_name'], s['sheet_name']): s for s in meta.input_sheets}
+            for _filename, _info in result.file_mapping.items():
+                _mapped_sheets = list((_info.get('sheet_mapping') or {}).keys())
+                _source = next((_actual_by_pair.get((_filename, sn)) for sn in _mapped_sheets
+                                if _actual_by_pair.get((_filename, sn)) is not None), None)
+                if _source is not None:
+                    _info['file_path'] = _source['file_path']
+                    _info['needs_rewrite'] = True
             result.actual_paths = _actual_paths(meta.input_sheets)
             result.missing_columns = _extract_missing_columns(
                 meta.source_structure, [s['file_path'] for s in meta.input_sheets], str(exc))
