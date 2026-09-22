@@ -18,6 +18,19 @@ from .period_matching import period_candidate_allowed
 logger = logging.getLogger(__name__)
 
 
+def _source_structure_ai_threshold() -> float:
+    """整体源结构低于此分数时才允许进入 AI 语义匹配。"""
+    raw = os.environ.get(
+        'SOURCE_STRUCTURE_AI_THRESHOLD',
+        os.environ.get('HEADER_MATCH_THRESHOLD', '0.85'),
+    )
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 0.85
+    return min(1.0, max(0.0, value))
+
+
 def fallback_headers_openpyxl(file_path: str) -> Dict[str, List[str]]:
     """Aspose 解析失败时用 openpyxl 提取各 sheet 第一行作为表头（兜底）。
 
@@ -285,8 +298,12 @@ class FastHeaderMatcher:
         train_sheets: List[Dict[str, Any]],
         input_sheets: List[Dict[str, Any]],
         matching_context: Optional[Dict[str, Any]] = None,
+        acceptance_threshold: Optional[float] = None,
     ) -> Dict[str, Any]:
         """以训练结构为基准，逐个训练Sheet在上传Sheet中找匹配"""
+        from .structural_source_mapping import source_identity_rank
+        if acceptance_threshold is None:
+            acceptance_threshold = self.similarity_threshold
         used_input_indices = set()
         match_results = []
         errors = []
@@ -331,6 +348,7 @@ class FastHeaderMatcher:
             logger.info(f"[匹配] 正在匹配训练Sheet: {train_file}/{train_sheet_name} ({len(train_col_names)}列)")
 
             best_score = 0
+            best_rank = None
             best_input_idx = None
             best_col_mapping = None
 
@@ -348,18 +366,16 @@ class FastHeaderMatcher:
                     list(input_headers.keys()), list(train_headers.keys())
                 )
 
-                # 如果文件名完全匹配且分数过得去，加权
-                if input_sheet['file_name'] == train_file:
-                    score += 0.1
-
                 logger.info(f"[匹配]   vs {input_sheet['file_name']}/{input_sheet['sheet_name']}: 得分={score:.2f}")
 
-                if score > best_score:
+                rank = (float(score), *source_identity_rank(train_sheet, input_sheet))
+                if best_rank is None or rank > best_rank:
+                    best_rank = rank
                     best_score = score
                     best_input_idx = input_idx
                     best_col_mapping = col_mapping
 
-            if best_score >= self.similarity_threshold and best_input_idx is not None:
+            if best_score >= acceptance_threshold and best_input_idx is not None:
                 matched_input = input_sheets[best_input_idx]
                 used_input_indices.add(best_input_idx)
 
@@ -512,7 +528,97 @@ class FastHeaderMatcher:
                 })
 
         file_mapping = self._build_file_mapping(match_results)
-        return {"success": True, "mapping": {"file_mapping": file_mapping}}
+        return {"success": True, "determined": match_results,
+                "mapping": {"file_mapping": file_mapping}}
+
+    def _overall_structure_similarity(
+        self,
+        train_sheets: List[Dict[str, Any]],
+        input_sheets: List[Dict[str, Any]],
+        matching_context: Optional[Dict[str, Any]] = None,
+    ) -> float:
+        """计算训练与本次源集合的一对一整体结构覆盖率。
+
+        每个训练 Sheet 按其有效列数加权；文件名和 Sheet 名仅用于同分排序，
+        不计入结构分。这样名称全部改变但表头一致时仍为 1.0，缺表、缺列则
+        按其占整体训练结构的比例扣分。
+        """
+        if not train_sheets:
+            return 1.0
+        from .structural_source_mapping import source_identity_rank
+        edges = []
+        weights = {}
+        for ti, training in enumerate(train_sheets):
+            stable_headers = [
+                h for h in (training.get('headers') or {})
+                if self._is_valid_header(h) and not self._is_data_like_header(h)
+            ]
+            weights[ti] = max(1, len(stable_headers))
+            for ai, actual in enumerate(input_sheets):
+                if not self._is_candidate_allowed(training, actual, input_sheets):
+                    continue
+                if not period_candidate_allowed(training, actual, matching_context):
+                    continue
+                _, score = self._match_headers(
+                    list((actual.get('headers') or {}).keys()),
+                    list((training.get('headers') or {}).keys()),
+                )
+                rank = (float(score), *source_identity_rank(training, actual))
+                edges.append((rank, ti, ai))
+
+        used_training, used_actual = set(), set()
+        file_targets, target_files = {}, {}
+        matched_weight = 0.0
+        for rank, ti, ai in sorted(edges, reverse=True):
+            if rank[0] <= 0 or ti in used_training or ai in used_actual:
+                continue
+            training, actual = train_sheets[ti], input_sheets[ai]
+            actual_file = actual.get('file_name')
+            training_file = training.get('file_name')
+            if file_targets.get(actual_file, training_file) != training_file:
+                continue
+            if target_files.get(training_file, actual_file) != actual_file:
+                continue
+            used_training.add(ti)
+            used_actual.add(ai)
+            file_targets[actual_file] = training_file
+            target_files[training_file] = actual_file
+            matched_weight += rank[0] * weights[ti]
+        total_weight = sum(weights.values())
+        return round(matched_weight / total_weight, 6) if total_weight else 1.0
+
+    def _structure_candidates_ambiguous(
+        self,
+        train_sheets: List[Dict[str, Any]],
+        input_sheets: List[Dict[str, Any]],
+        matching_context: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """结构同分时不允许程序随意取第一项；保留给人工确认，但不调用 AI。"""
+        from .structural_source_mapping import source_identity_rank, ranked_choice_is_unique
+        pair_ranks = {}
+        for ti, training in enumerate(train_sheets):
+            for ai, actual in enumerate(input_sheets):
+                if not self._is_candidate_allowed(training, actual, input_sheets):
+                    continue
+                if not period_candidate_allowed(training, actual, matching_context):
+                    continue
+                _, score = self._match_headers(
+                    list((actual.get('headers') or {}).keys()),
+                    list((training.get('headers') or {}).keys()),
+                )
+                pair_ranks[ti, ai] = (
+                    float(score), *source_identity_rank(training, actual))
+        for ti in range(len(train_sheets)):
+            ranks = [rank for (row_ti, _), rank in pair_ranks.items()
+                     if row_ti == ti and rank[0] > 0]
+            if ranks and not ranked_choice_is_unique(ranks):
+                return True
+        for ai in range(len(input_sheets)):
+            ranks = [rank for (_, row_ai), rank in pair_ranks.items()
+                     if row_ai == ai and rank[0] > 0]
+            if ranks and not ranked_choice_is_unique(ranks):
+                return True
+        return False
 
     @staticmethod
     def _is_candidate_allowed(training, actual, all_actual):
@@ -907,26 +1013,53 @@ class FastHeaderMatcher:
             structural_result.get('success')
             and len(train_sheets) == len(input_sheets) == len(same_structure_determined)
         )
-        if same_structure:
+        structure_score = self._overall_structure_similarity(
+            train_sheets, input_sheets, matching_context)
+        structural_result['structure_score'] = structure_score
+        structural_result['structure_threshold'] = _source_structure_ai_threshold()
+
+        # 确定性结构规则已经完整覆盖时，无论是否多出源列、文件名或 Sheet 名是否
+        # 改变，都直接采用程序结果，绝不再进入 AI。
+        if structural_result.get('success'):
             structural_result['match_method'] = 'structure'
-            structural_result['structure_identical'] = True
+            structural_result['structure_identical'] = same_structure
             return structural_result
 
         match_result = structural_result
-        training_file_names = {str(item.get('file_name') or '') for item in train_sheets}
-        actual_file_names = {str(item.get('file_name') or '') for item in input_sheets}
-        training_sheet_names = {str(item.get('sheet_name') or '') for item in train_sheets}
-        actual_sheet_names = {str(item.get('sheet_name') or '') for item in input_sheets}
-        file_names_changed = training_file_names != actual_file_names
-        sheet_names_changed = training_sheet_names != actual_sheet_names
-        requires_ai_review = file_names_changed and sheet_names_changed
+        structure_threshold = structural_result['structure_threshold']
+
+        # 整体结构达到 .env 阈值时，继续用代码评分完成近似映射；即使程序仍有
+        # 个别未解决项，也只交给现有人工校验，不允许调用 AI。
+        structure_ambiguous = self._structure_candidates_ambiguous(
+            train_sheets, input_sheets, matching_context)
+        if structure_score >= structure_threshold:
+            if structure_ambiguous:
+                logger.info(
+                    '[源数据映射] 整体结构分 %.4f >= 阈值 %.4f，但存在同分候选；仅将歧义子集交给 AI',
+                    structure_score, structure_threshold)
+            else:
+                programmatic = self._match_by_training_base(
+                    train_sheets, input_sheets, matching_context,
+                    acceptance_threshold=structure_threshold,
+                )
+                programmatic['structure_score'] = structure_score
+                programmatic['structure_threshold'] = structure_threshold
+                programmatic['structure_identical'] = False
+                programmatic['match_method'] = 'structure_threshold'
+                match_result = programmatic
+                logger.info(
+                    '[源数据映射] 整体结构分 %.4f >= 阈值 %.4f，采用程序匹配，不调用 AI',
+                    structure_score, structure_threshold)
+        requires_ai_review = structure_score < structure_threshold or structure_ambiguous
 
         if ai_provider_name and requires_ai_review:
             from .ai_source_mapping import match_sources_with_ai
-            logger.info('[源数据映射] 列结构、文件名和 Sheet 名均与智训不同，尝试 AI 语义匹配')
+            logger.info(
+                '[源数据映射] 整体结构分 %.4f < 阈值 %.4f，尝试 AI 语义匹配',
+                structure_score, structure_threshold)
             try:
                 match_result = match_sources_with_ai(self, train_sheets, input_sheets, ai_provider_name,
-                                                    same_structure_determined, matching_context)
+                                                    determined, matching_context)
                 match_result['match_method'] = 'ai'
                 match_result['needs_confirmation'] = True
                 match_result['structure_identical'] = False
@@ -950,6 +1083,8 @@ class FastHeaderMatcher:
                                ai_provider_name, reason, type(exc).__name__)
                 match_result = {'success': False, 'ai_failure_reason': reason,
                                 'error': f"{match_result['error']}；AI 匹配未通过: {exc}"}
+        match_result.setdefault('structure_score', structure_score)
+        match_result.setdefault('structure_threshold', structure_threshold)
         if not match_result['success']:
             # Missing optional sheets must not erase already resolved sources.
             if determined:

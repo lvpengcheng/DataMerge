@@ -26,7 +26,7 @@ def test_ai_fallback_reuses_parse_and_loads_validated_mapping(monkeypatch):
     monkeypatch.setattr(ai_provider, 'chat_with_timeout', reply)
     def load(mapping, *args, **kwargs):
         assert mapping['new.xlsx']['sheet_mapping'] == {'Payroll': '工资'}
-        assert mapping['new.xlsx']['header_mapping']['Pay'] == '金额'
+        assert mapping['new.xlsx']['header_mapping'] == {}
         return {'工资': {'validated': True}}
     monkeypatch.setattr(matcher, '_build_pre_loaded_from_memory', load)
     result = matcher.match_parse_and_prepare({'files': {}}, ['new.xlsx'], ai_provider_name='claude')
@@ -59,14 +59,17 @@ def test_ai_only_receives_unresolved_tables_and_columns(monkeypatch):
         {'file_name': 'b.xlsx', 'sheet_name': '工资', 'headers': {'ID': 'A', '金额': 'B'}}]
     actual = [dict(training[0], file_path='/a.xlsx'),
               {'file_name': 'b.xlsx', 'sheet_name': 'Payroll', 'file_path': '/b.xlsx',
-               'headers': {'ID': 'A', 'Pay': 'B'}}]
+               'headers': {'ID': 'A', 'Pay': 'B'},
+               'source_origin': 'tenant_base', 'source_asset_name': '租户工资基础'}]
     determined = [{'train_file': 'a.xlsx', 'train_sheet': '已匹配',
                   'input_file': 'a.xlsx', 'input_sheet': '已匹配', 'col_mapping': {'ID': 'ID'}}]
     monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider', lambda _: object())
     def reply(provider, messages, **kwargs):
         prompt = messages[0]['content']
-        assert "\"global_training\"" in prompt and "已匹配" in prompt
-        assert "\"global_actual\"" in prompt and "a.xlsx" in prompt
+        assert "\"global_training\"" in prompt and '"file": "a.xlsx"' not in prompt
+        assert "\"global_actual\"" in prompt and '"sheet": "已匹配"' not in prompt
+        assert '"file": "b.xlsx"' in prompt and '"sheet": "Payroll"' in prompt
+        assert '"origin": "tenant_base"' in prompt and '租户工资基础' in prompt
         assert '"missing_columns": ["金额"]' in prompt
         assert '"candidate_columns": ["Pay"]' in prompt
         return json.dumps({'mappings': [{'training_id': 1, 'actual_id': 1, 'columns': {'Pay': '金额'}}]})
@@ -74,7 +77,60 @@ def test_ai_only_receives_unresolved_tables_and_columns(monkeypatch):
     result = match_sources_with_ai(FastHeaderMatcher(), training, actual, 'claude', determined)
     mapping = result['mapping']['file_mapping']
     assert mapping['a.xlsx']['header_mapping'] == {'ID': 'ID'}
-    assert mapping['b.xlsx']['header_mapping'] == {'ID': 'ID', 'Pay': '金额'}
+    assert mapping['b.xlsx']['header_mapping'] == {'ID': 'ID'}
+
+
+def test_matcher_sends_only_program_unresolved_tables_to_ai(monkeypatch):
+    from backend.ai_engine import ai_provider
+    training = [
+        {'file_name': 'fixed.xlsx', 'sheet_name': '固定', 'headers': {'ID': 'A'}},
+        {'file_name': 'changed.xlsx', 'sheet_name': '工资', 'headers': {'工号': 'A', '金额': 'B'}},
+    ]
+    actual = [
+        {'file_name': 'fixed.xlsx', 'file_path': '/fixed.xlsx',
+         'sheet_name': '固定', 'headers': {'ID': 'A'}},
+        {'file_name': 'changed.xlsx', 'file_path': '/changed.xlsx',
+         'sheet_name': 'Payroll', 'headers': {'Employee ID': 'A', 'Pay': 'B'}},
+    ]
+    monkeypatch.setenv('SOURCE_STRUCTURE_AI_THRESHOLD', '0.85')
+    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider', lambda _: object())
+
+    def reply(provider, messages, **kwargs):
+        prompt = messages[0]['content']
+        assert 'fixed.xlsx' not in prompt and '"sheet": "固定"' not in prompt
+        assert 'changed.xlsx' in prompt and 'Payroll' in prompt
+        return json.dumps({'mappings': [{
+            'training_id': 1, 'actual_id': 1,
+            'columns': {'Employee ID': '工号', 'Pay': '金额'},
+        }]})
+
+    monkeypatch.setattr(ai_provider, 'chat_with_timeout', reply)
+    result = FastHeaderMatcher().match_headers_only(training, actual, 'claude')
+
+    assert result['success'] and result['match_method'] == 'ai'
+    assert set(result['mapping']['file_mapping']) == {'fixed.xlsx', 'changed.xlsx'}
+
+
+def test_refresh_only_resolution_never_calls_ai(monkeypatch):
+    from backend.ai_engine import ai_provider
+    from backend.utils import compute_precheck as pre
+    from backend.utils.compute_ingest import IngestMeta, resolve_with_confirmations
+    training, actual = schemas()
+    meta = IngestMeta(
+        train_sheets=training, input_sheets=actual, ai_provider_name='claude',
+        source_structure={'files': {
+            'old.xlsx': {'sheets': {'工资': {'headers': training[0]['headers']}}},
+        }},
+    )
+    monkeypatch.setattr(pre, '_check_target_sheets', lambda *a: None)
+    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider',
+                        lambda *_: pytest.fail('字段刷新只允许程序匹配，不能调用 AI'))
+
+    result = resolve_with_confirmations(
+        meta, skip_history_check=True, allow_ai_matching=False)
+
+    assert not result.ok
+    assert result.file_mapping is None
 
 
 @pytest.mark.parametrize('headers', [
@@ -104,6 +160,91 @@ def test_exact_training_structure_skips_ai(monkeypatch):
     assert result['structure_identical'] and not result.get('needs_confirmation')
 
 
+def test_complete_program_structure_with_extra_columns_skips_ai(monkeypatch):
+    from backend.ai_engine import ai_provider
+    training, _ = schemas()
+    actual = [{
+        'file_name': 'renamed.xlsx', 'file_path': '/input/renamed.xlsx',
+        'sheet_name': 'RenamedSheet',
+        'headers': {'工号': 'A', '金额': 'B', '备注': 'C'},
+    }]
+    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider',
+                        lambda *_: pytest.fail('完整结构已由程序匹配，不应调用 AI'))
+
+    result = FastHeaderMatcher().match_headers_only(training, actual, 'claude')
+
+    assert result['success'] and result['match_method'] == 'structure'
+    assert result['structure_score'] == 1.0
+    assert not result['structure_identical']
+    assert not result.get('needs_confirmation')
+
+
+def test_identical_structures_are_disambiguated_by_period_prefixed_business_filename(monkeypatch):
+    from backend.ai_engine import ai_provider
+    headers = {'工号': 'A', '姓名': 'B', '金额': 'C'}
+    training = [
+        {'file_name': '上海工资.xlsx', 'sheet_name': '工资', 'headers': headers},
+        {'file_name': '北京工资.xlsx', 'sheet_name': '工资', 'headers': headers},
+    ]
+    actual = [
+        {'file_name': '202609北京工资.xlsx', 'file_path': '/202609北京工资.xlsx',
+         'sheet_name': 'Data', 'headers': headers},
+        {'file_name': '202609上海工资.xlsx', 'file_path': '/202609上海工资.xlsx',
+         'sheet_name': 'Data', 'headers': headers},
+    ]
+    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider',
+                        lambda *_: pytest.fail('结构相同但业务文件名可唯一消歧，不应调用 AI'))
+
+    result = FastHeaderMatcher().match_headers_only(training, actual, 'claude')
+
+    assert result['success'] and result['match_method'] == 'structure'
+    mapping = result['mapping']['file_mapping']
+    assert mapping['202609上海工资.xlsx']['expected_file'] == '上海工资.xlsx'
+    assert mapping['202609北京工资.xlsx']['expected_file'] == '北京工资.xlsx'
+    assert not result.get('needs_confirmation')
+
+
+def test_high_overall_structure_score_uses_program_not_ai(monkeypatch):
+    from backend.ai_engine import ai_provider
+    monkeypatch.setenv('SOURCE_STRUCTURE_AI_THRESHOLD', '0.85')
+    headers = {f'字段{i}': chr(65 + i) for i in range(10)}
+    training = [{'file_name': 'train.xlsx', 'sheet_name': '训练表', 'headers': headers}]
+    actual_headers = dict(list(headers.items())[:9])
+    actual_headers['新增字段'] = 'K'
+    actual = [{'file_name': 'renamed.xlsx', 'file_path': '/input/renamed.xlsx',
+               'sheet_name': 'Actual', 'headers': actual_headers}]
+    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider',
+                        lambda *_: pytest.fail('整体结构达到阈值，不应调用 AI'))
+
+    result = FastHeaderMatcher().match_headers_only(training, actual, 'claude')
+
+    assert result['success'] and result['match_method'] == 'structure_threshold'
+    assert result['structure_score'] == 0.9
+    assert result['structure_threshold'] == 0.85
+    assert not result.get('needs_confirmation')
+
+
+def test_low_overall_structure_score_calls_ai_even_when_names_match(monkeypatch):
+    from backend.ai_engine import ai_provider
+    monkeypatch.setenv('SOURCE_STRUCTURE_AI_THRESHOLD', '0.85')
+    training, actual = schemas()
+    actual[0]['file_name'] = training[0]['file_name']
+    actual[0]['sheet_name'] = training[0]['sheet_name']
+    calls = []
+    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider', lambda _: object())
+    monkeypatch.setattr(ai_provider, 'chat_with_timeout', lambda *a, **k: calls.append(1) or json.dumps({
+        'mappings': [{'training_id': 0, 'actual_id': 0,
+                      'columns': {'Employee ID': '工号', 'Pay': '金额'}}],
+    }))
+
+    result = FastHeaderMatcher().match_headers_only(training, actual, 'claude')
+
+    assert calls == [1]
+    assert result['success'] and result['match_method'] == 'ai'
+    assert result['structure_score'] < result['structure_threshold']
+    assert result['needs_confirmation']
+
+
 def test_ai_popup_requires_structure_file_and_sheet_names_all_changed(monkeypatch):
     from backend.ai_engine import ai_provider
     training, actual = schemas()
@@ -120,17 +261,21 @@ def test_ai_popup_requires_structure_file_and_sheet_names_all_changed(monkeypatc
 
 
 @pytest.mark.parametrize('keep_identity', ['file', 'sheet'])
-def test_structure_change_does_not_call_ai_when_one_identity_is_unchanged(monkeypatch, keep_identity):
+def test_low_structure_score_calls_ai_regardless_of_unchanged_identity(monkeypatch, keep_identity):
     from backend.ai_engine import ai_provider
     training, actual = schemas()
     if keep_identity == 'file':
         actual[0]['file_name'] = training[0]['file_name']
     else:
         actual[0]['sheet_name'] = training[0]['sheet_name']
-    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider',
-                        lambda *_: pytest.fail('AI requires both file and Sheet names to change'))
+    calls = []
+    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider', lambda _: object())
+    monkeypatch.setattr(ai_provider, 'chat_with_timeout', lambda *a, **k: calls.append(1) or json.dumps({
+        'mappings': [{'training_id': 0, 'actual_id': 0,
+                      'columns': {'Employee ID': '工号', 'Pay': '金额'}}],
+    }))
     result = FastHeaderMatcher().match_headers_only(training, actual, 'claude')
-    assert not result['success'] and result.get('match_method') != 'ai'
+    assert result['success'] and result['needs_confirmation'] and calls == [1]
 
 
 def test_identical_schemas_with_ambiguous_names_do_not_pick_first():
@@ -141,7 +286,30 @@ def test_identical_schemas_with_ambiguous_names_do_not_pick_first():
     assert not result['success'] and not result['mapping']['file_mapping']
 
 
-def test_structure_change_with_same_file_and_sheet_does_not_open_ai_review(monkeypatch):
+def test_identical_structure_ambiguity_sends_only_ambiguous_candidates_to_ai(monkeypatch):
+    from backend.ai_engine import ai_provider
+    training, actual = schemas()
+    actual[0]['headers'] = training[0]['headers']
+    actual.append(dict(actual[0], file_name='another.xlsx', file_path='/input/another.xlsx'))
+    calls = []
+    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider', lambda _: object())
+
+    def reply(provider, messages, **kwargs):
+        calls.append(messages[0]['content'])
+        return json.dumps({'mappings': [{
+            'training_id': 0, 'actual_id': 1,
+            'columns': {'工号': '工号', '金额': '金额'},
+        }]})
+
+    monkeypatch.setattr(ai_provider, 'chat_with_timeout', reply)
+    result = FastHeaderMatcher().match_headers_only(training, actual, 'claude')
+
+    assert calls and 'new.xlsx' in calls[0] and 'another.xlsx' in calls[0]
+    assert result['success'] and result['match_method'] == 'ai'
+    assert set(result['mapping']['file_mapping']) == {'another.xlsx'}
+
+
+def test_low_structure_score_with_same_file_and_sheet_opens_ai_review(monkeypatch):
     from backend.ai_engine import ai_provider
     training = [{'file_name': '工资.xlsx', 'sheet_name': 'S', 'headers': {'本月个人缴费金额': 'A'}}]
     actual = [dict(training[0], file_path='/input/工资.xlsx', headers={'本月单位缴费金额': 'A'})]
@@ -149,7 +317,8 @@ def test_structure_change_with_same_file_and_sheet_does_not_open_ai_review(monke
     monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider', lambda _: object())
     monkeypatch.setattr(ai_provider, 'chat_with_timeout', lambda *a, **k: calls.append(1) or '{"mappings":[]}')
     result = FastHeaderMatcher().match_headers_only(training, actual, 'claude')
-    assert not result['success'] and calls == []
+    assert not result['success'] and calls == [1]
+    assert result['structure_score'] < result['structure_threshold']
 
 
 def test_ai_receives_hierarchical_script_context_without_sample_literals(monkeypatch):
@@ -173,10 +342,9 @@ def test_ai_receives_hierarchical_script_context_without_sample_literals(monkeyp
         'script_content': 'TOKEN = "private-token"\nTEMPLATE_NAME = "工资模板.xlsx"\ndef fill_template(df):\n    employee = "private-row-name"\n    return df["Pay"]',
         'template_name': '工资模板.xlsx', 'target_sheets': ['结果']})
     assert result['success'] and result['needs_confirmation']
-    suggestion = result['ai_suggestions'][0]
-    assert suggestion['reason'] == 'Employee ID 与工号均为员工关联键'
-    assert 'Payroll 对应工资明细表' in suggestion['sheet_reason']
-    assert 'fill_template' in suggestion['sheet_reason']
+    suggestion = result['source_sheet_reviews'][0]
+    assert 'Payroll 对应工资明细表' in suggestion['reason']
+    assert 'fill_template' in suggestion['reason']
     assert suggestion['recommendation_source'] == 'ai'
 
 
@@ -237,6 +405,231 @@ def test_ingest_does_not_rename_or_call_ai_when_structure_is_complete(monkeypatc
     assert path.exists() and not (tmp_path / 'old.xlsx').exists()
 
 
+def test_ingest_adds_base_files_before_building_final_ai_candidates(monkeypatch, tmp_path):
+    """模糊上传不能占住所有训练角色；基础文件应先进入 AI/人工候选全集。"""
+    from backend.utils import source_auto_filler as filler
+    from backend.utils.compute_ingest import ingest_source_dir
+
+    uploaded = tmp_path / 'new.xlsx'
+    uploaded.touch()
+    structure = {'files': {
+        'base.xlsx': {'sheets': {'基础': {'headers': {'工号': 'A'}}}},
+        'business.xlsx': {'sheets': {'业务': {'headers': {'金额': 'A'}}}},
+    }}
+    parse_calls = []
+
+    def parse_inputs(self, paths, manual_headers=None, multi_sheet_source=False):
+        names = [__import__('os').path.basename(path) for path in paths]
+        parse_calls.append(names)
+        rows = []
+        for path, name in zip(paths, names):
+            if name == 'base.xlsx':
+                rows.append({'file_name': name, 'file_path': path,
+                             'sheet_name': '基础', 'headers': {'工号': 'A'}})
+            else:
+                rows.append({'file_name': name, 'file_path': path,
+                             'sheet_name': 'Current', 'headers': {'Value': 'A'}})
+        return rows, {}
+
+    def fill(**kwargs):
+        # new.xlsx 对两个训练文件都只是模糊候选，不能因此阻止基础补全。
+        assert kwargs['assume_present'] == set()
+        base = tmp_path / 'base.xlsx'
+        base.touch()
+        return ([{'file_name': 'base.xlsx', 'stored_file_name': 'base.xlsx',
+                  'source': '租户', 'asset_name': '基础资料', 'asset_id': 1}],
+                ['business.xlsx'])
+
+    monkeypatch.setattr(FastHeaderMatcher, 'parse_inputs', parse_inputs)
+    monkeypatch.setattr(filler, 'auto_fill_missing_sources', fill)
+
+    meta, _ = ingest_source_dir(
+        str(tmp_path), structure, tenant_id='tenant-a', db_session=object())
+
+    assert parse_calls == [['new.xlsx'], ['base.xlsx']]
+    assert {row['file_name'] for row in meta.input_sheets} == {'new.xlsx', 'base.xlsx'}
+    assert meta.auto_filled[0]['file_name'] == 'base.xlsx'
+    assert meta.missing_files == ['business.xlsx']
+    assert len(meta.rename_candidates) == 1
+    assert meta.rename_candidates[0]['uploaded'] == 'new.xlsx'
+    assert [item['expected'] for item in meta.rename_candidates[0]['candidates']] == ['business.xlsx']
+
+
+def test_ingest_current_upload_precedes_same_named_base_asset(monkeypatch, tmp_path):
+    from backend.utils import source_auto_filler as filler
+    from backend.utils.compute_ingest import ingest_source_dir
+
+    (tmp_path / 'current-upload.xlsx').touch()
+    structure = {'files': {
+        'base.xlsx': {'sheets': {'基础': {'headers': {'工号': 'A'}}}},
+    }}
+    parse_calls = []
+
+    def fill(**kwargs):
+        assert kwargs['assume_present'] == {'base.xlsx'}
+        return [], []
+
+    def parse_inputs(self, paths, manual_headers=None, multi_sheet_source=False):
+        names = [__import__('os').path.basename(path) for path in paths]
+        parse_calls.append(names)
+        rows = []
+        for path, name in zip(paths, names):
+            rows.append({
+                'file_name': name, 'file_path': path,
+                'sheet_name': '临时表', 'headers': {'工号': 'A'},
+            })
+        return rows, {}
+
+    monkeypatch.setattr(filler, 'auto_fill_missing_sources', fill)
+    monkeypatch.setattr(FastHeaderMatcher, 'parse_inputs', parse_inputs)
+
+    meta, _ = ingest_source_dir(
+        str(tmp_path), structure, tenant_id='tenant-a', db_session=object())
+
+    assert parse_calls == [['current-upload.xlsx']]
+    assert {row['file_name'] for row in meta.input_sheets} == {'current-upload.xlsx'}
+    assert meta.auto_filled == []
+
+
+def test_ingest_fills_base_before_any_ai_matching(monkeypatch, tmp_path):
+    from backend.utils import source_auto_filler as filler
+    from backend.utils.compute_ingest import ingest_source_dir
+
+    uploaded = tmp_path / 'current-upload.xlsx'
+    uploaded.touch()
+    structure = {'files': {
+        'base.xlsx': {'sheets': {'基础': {'headers': {'工号': 'A', '金额': 'B'}}}},
+    }}
+    uploaded_sheet = {'file_name': uploaded.name, 'file_path': str(uploaded),
+                      'sheet_name': 'Current', 'headers': {'Employee ID': 'A', 'Pay': 'B'}}
+    match_calls = []
+
+    def parse_inputs(self, paths, manual_headers=None, multi_sheet_source=False):
+        name = __import__('os').path.basename(paths[0])
+        if name == uploaded.name:
+            return [dict(uploaded_sheet)], {}
+        return [{'file_name': 'base.xlsx', 'file_path': paths[0],
+                 'sheet_name': '基础', 'headers': {'工号': 'A', '金额': 'B'}}], {}
+
+    def match(self, training, inputs, provider=None, context=None):
+        match_calls.append(provider)
+        assert provider is None, '基础资料补入前不能调用 AI'
+        if any(item['file_name'] == 'base.xlsx' for item in inputs):
+            return {'success': True,
+                    'mapping': {'file_mapping': {
+                        'base.xlsx': {'expected_file': 'base.xlsx',
+                                      'sheet_mapping': {'基础': '基础'}},
+                    }}}
+        return {'success': False, 'error': 'structure changed',
+                'mapping': {'file_mapping': {}}}
+
+    def fill(**kwargs):
+        assert kwargs['assume_present'] == set()
+        base = tmp_path / 'base.xlsx'
+        base.touch()
+        return ([{'file_name': 'base.xlsx', 'stored_file_name': 'base.xlsx',
+                  'source': '租户', 'asset_name': '租户基础文件', 'asset_id': 1}], [])
+
+    monkeypatch.setattr(FastHeaderMatcher, 'parse_inputs', parse_inputs)
+    monkeypatch.setattr(FastHeaderMatcher, 'match_headers_only', match)
+    monkeypatch.setattr(filler, 'auto_fill_missing_sources', fill)
+
+    meta, _ = ingest_source_dir(
+        str(tmp_path), structure, tenant_id='tenant-a', db_session=object(),
+        ai_provider_name='deepseek')
+
+    assert match_calls == [None, None, None]
+    assert meta.auto_filled[0]['file_name'] == 'base.xlsx'
+    assert {row['file_name'] for row in meta.input_sheets} == {uploaded.name, 'base.xlsx'}
+    base_sheet = next(row for row in meta.input_sheets if row['file_name'] == 'base.xlsx')
+    assert base_sheet['source_origin'] == 'tenant_base'
+    assert base_sheet['source_asset_name'] == '租户基础文件'
+    assert meta.auto_filled_mapping['base.xlsx']['auto_filled'] is True
+
+
+def test_initial_ingest_defers_base_fill_until_manual_mapping(monkeypatch, tmp_path):
+    from backend.utils import source_auto_filler as filler
+    from backend.utils.compute_ingest import ingest_source_dir
+
+    uploaded = tmp_path / 'upload.xlsx'
+    uploaded.touch()
+    structure = {'files': {
+        'train.xlsx': {'sheets': {'工资': {'headers': {'工号': 'A'}}}},
+    }}
+    monkeypatch.setattr(FastHeaderMatcher, 'parse_inputs', lambda self, *args, **kwargs: ([{
+        'file_name': 'upload.xlsx', 'file_path': str(uploaded),
+        'sheet_name': 'Data', 'headers': {'ID': 'A'},
+    }], {}))
+    monkeypatch.setattr(FastHeaderMatcher, 'match_headers_only', lambda *args, **kwargs: {
+        'success': False, 'error': 'unresolved', 'mapping': {'file_mapping': {}},
+    })
+    monkeypatch.setattr(filler, 'auto_fill_missing_sources',
+                        lambda **kwargs: pytest.fail('首轮人工匹配前不应读取基础资料'))
+
+    meta, _ = ingest_source_dir(
+        str(tmp_path), structure, tenant_id='tenant-a', db_session=object(),
+        defer_base_fill=True)
+
+    assert meta.auto_filled == []
+    assert meta.missing_files == []
+    assert [row['file_name'] for row in meta.input_sheets] == ['upload.xlsx']
+
+
+def test_auto_filled_sources_are_locked_out_of_ai_and_manual_candidates(monkeypatch):
+    from backend.ai_engine import ai_provider
+    from backend.utils import compute_precheck as pre
+    from backend.utils.compute_ingest import IngestMeta, resolve_with_confirmations
+
+    training = [
+        {'file_name': 'base.xlsx', 'sheet_name': '基础', 'headers': {'工号': 'A'}},
+        {'file_name': 'business.xlsx', 'sheet_name': '业务', 'headers': {'金额': 'A'}},
+    ]
+    actual = [
+        {'file_name': 'base.xlsx', 'file_path': '/base.xlsx', 'sheet_name': '基础',
+         'headers': {'工号': 'A'}, 'source_origin': 'tenant_base'},
+        {'file_name': 'upload.xlsx', 'file_path': '/upload.xlsx', 'sheet_name': 'Data',
+         'headers': {'Amount': 'A'}, 'source_origin': 'upload'},
+    ]
+    base_mapping = {'base.xlsx': {
+        'expected_file': 'base.xlsx', 'sheet_mapping': {'基础': '基础'},
+        'header_mapping': {'工号': '工号'},
+        'header_mapping_by_sheet': {'基础': {'工号': '工号'}},
+        'header_confidence_by_sheet': {'基础': {'工号': 1.0}},
+        'file_path': '/base.xlsx', 'auto_filled': True,
+    }}
+    meta = IngestMeta(
+        train_sheets=training, input_sheets=actual, ai_provider_name='claude',
+        auto_filled=[{'file_name': 'base.xlsx', 'stored_file_name': 'base.xlsx', 'source': '租户'}],
+        auto_filled_mapping=base_mapping,
+        source_structure={'files': {
+            'base.xlsx': {'sheets': {'基础': {'headers': {'工号': 'A'}}}},
+            'business.xlsx': {'sheets': {'业务': {'headers': {'金额': 'A'}}}},
+        }},
+    )
+    monkeypatch.setattr(pre, '_check_target_sheets', lambda *a: None)
+    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider', lambda _: object())
+
+    def reply(provider, messages, **kwargs):
+        prompt = messages[0]['content']
+        assert 'base.xlsx' not in prompt
+        assert 'upload.xlsx' in prompt
+        return json.dumps({'mappings': [{
+            'training_id': 0, 'actual_id': 0, 'columns': {'Amount': '金额'},
+        }]})
+
+    monkeypatch.setattr(ai_provider, 'chat_with_timeout', reply)
+    result = resolve_with_confirmations(meta, skip_history_check=True)
+
+    assert result.actual_sources == [{
+        'file': 'upload.xlsx', 'sheet': 'Data',
+        'original_file': 'upload.xlsx', 'original_sheet': 'Data',
+        'origin': 'upload', 'asset_name': None,
+    }]
+    assert result.actual_paths == ['upload.xlsx > Data > Amount']
+    assert result.file_mapping['base.xlsx']['auto_filled'] is True
+    assert result.file_mapping['base.xlsx']['sheet_mapping'] == {'基础': '基础'}
+
+
 def test_extra_template_instance_is_kept_in_resolved_workbook():
     training = [{'file_name': 'a.xlsx', 'sheet_name': '原表',
                  'headers': {'工号': 'A', '金额': 'B', '月份': 'C'}}]
@@ -294,16 +687,17 @@ def test_confirmed_filename_does_not_leak_virtual_names_into_ai(monkeypatch):
     assert all(s['suggested_path'].startswith('new.xlsx > Payroll > ') for s in result.ai_suggestions)
 
 
-def test_ai_partial_columns_survive_instead_of_discarding_all_recommendations(monkeypatch):
+def test_ai_columns_are_ignored_and_file_sheet_match_survives(monkeypatch):
     from backend.ai_engine import ai_provider
     training, actual = schemas()
     monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider', lambda _: object())
     monkeypatch.setattr(ai_provider, 'chat_with_timeout', lambda *a, **k: json.dumps({
         'mappings': [{'training_id': 0, 'actual_id': 0, 'columns': {'Employee ID': '工号'}}]}))
     result = FastHeaderMatcher().match_headers_only(training, actual, 'claude')
-    assert not result['success'] and result['needs_confirmation']
-    assert result['mapping']['file_mapping']['new.xlsx']['header_mapping'] == {'Employee ID': '工号'}
-    assert result['ai_suggestions'][0]['suggested_path'] == 'new.xlsx > Payroll > Employee ID'
+    assert result['success'] and result['needs_confirmation']
+    assert result['mapping']['file_mapping']['new.xlsx']['header_mapping'] == {}
+    assert result['ai_suggestions'] == []
+    assert result['source_sheet_reviews'][0]['suggested_sheet'] == 'Payroll'
 
 
 def test_xls_conversion_retains_original_display_name_and_does_not_overwrite(tmp_path, monkeypatch):
@@ -377,7 +771,7 @@ def test_compute_provider_reads_current_config_over_stale_environment(tmp_path, 
     assert ns['_resolve_compute_ai_provider']() is None
 
 
-def test_two_stage_ai_mapping_uses_file_sheet_then_columns(monkeypatch):
+def test_ai_mapping_stops_after_file_and_sheet_stage(monkeypatch):
     from backend.ai_engine import ai_provider
     from backend.utils.ai_source_mapping import match_sources_with_ai
 
@@ -408,14 +802,13 @@ def test_two_stage_ai_mapping_uses_file_sheet_then_columns(monkeypatch):
 
     monkeypatch.setattr(ai_provider, 'chat_with_timeout', reply)
     result = match_sources_with_ai(FastHeaderMatcher(), training, actual, 'claude')
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert '文件到文件' in calls[0] and '本阶段不要处理列映射' in calls[0]
     assert 'column_confidence' not in calls[0]
-    assert 'actual_columns' in calls[1] and 'fixed_mapping' in calls[1]
     mapping = result['mapping']['file_mapping']
     assert mapping['new.xlsx']['sheet_mapping'] == {'Payroll': '工资'}
-    assert mapping['new.xlsx']['header_mapping'] == {'Employee ID': '工号', 'Pay': '金额'}
-    assert mapping['new.xlsx']['header_confidence_by_sheet']['Payroll']['Pay'] == 0.92
+    assert mapping['new.xlsx']['header_mapping'] == {}
+    assert result['source_sheet_reviews'][0]['suggested_sheet'] == 'Payroll'
 
 
 def test_two_stage_keeps_file_sheet_when_column_stage_fails(monkeypatch):

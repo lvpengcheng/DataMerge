@@ -91,7 +91,8 @@ def test_final_confirmation_bypasses_precheck_and_dispatches(tmp_path, monkeypat
     namespace = {
         'asyncio': asyncio,
         '_resolve_compute_ai_provider': lambda: 'deepseek',
-        '_get_compute_session': lambda *args: {'temp_dir': str(tmp_path), 'params': {}},
+        '_get_compute_session': lambda *args: {'temp_dir': str(tmp_path), 'params': {
+            'post_match_base_fill_completed': True}},
         '_compute_pending_payload': lambda *args: pending_calls.append(True) or {'error_type': 'precheck_failed'},
         '_dispatch_compute_task': dispatch,
         'logger': __import__('logging').getLogger(__name__),
@@ -102,9 +103,10 @@ def test_final_confirmation_bypasses_precheck_and_dispatches(tmp_path, monkeypat
     from types import SimpleNamespace
     monkeypatch.setattr(compute_ingest, 'read_meta',
                         lambda *args: SimpleNamespace(ai_provider_name='claude'))
-    monkeypatch.setattr(compute_ingest, 'resolve_with_confirmations',
-                        lambda *args, **kwargs: PrecheckResult(ok=False,
-                            missing_columns=[{'error': '字段关系不完整'}]))
+    def resolve_final(*args, **kwargs):
+        assert kwargs['allow_ai_matching'] is False
+        return PrecheckResult(ok=False, missing_columns=[{'error': '文件或 Sheet 关系不完整'}])
+    monkeypatch.setattr(compute_ingest, 'resolve_with_confirmations', resolve_final)
 
     result = asyncio.run(namespace['compute_session_confirm'](
         's1', {'mapping_finalized': True, 'confirmed_mapping': {'file_mapping': {}}}))
@@ -257,3 +259,12 @@ def test_confirmed_mapping_is_composed_in_memory_without_rewriting_files(tmp_pat
     assert composed['new.xlsx']['needs_rewrite'] is True  # 列改名在内存里生效
     assert original.read_bytes() == b'old headers'  # 源文件一个字节都没动
     assert not (tmp_path / 'expected.xlsx').exists()
+
+
+def test_final_manual_source_mapping_never_falls_back_to_raw_uploads():
+    from pathlib import Path
+    source = (Path(__file__).parent / 'app' / 'main.py').read_text(encoding='utf-8')
+    assert '源数据自动映射未通过，使用原文件继续计算' not in source
+    assert '最终人工映射未能完整构建预加载数据，已放行并使用原始源文件继续' not in source
+    assert '已按人工最终匹配关系生成执行副本，文件名和 Sheet 名已对齐智训结构' in source
+    assert 'None if (bool(p.get("mapping_finalized")) and pc_result.file_mapping)' in source

@@ -39,6 +39,8 @@ class PrecheckResult:
     rename_candidates: List[Dict[str, Any]] = field(default_factory=list)
     missing_columns: List[Dict[str, Any]] = field(default_factory=list)
     ai_suggestions: List[Dict[str, Any]] = field(default_factory=list)
+    # 智算只人工确认文件/Sheet；列不进入 AI 或人工审核。
+    source_sheet_reviews: List[Dict[str, Any]] = field(default_factory=list)
     mapping_requires_confirmation: bool = False
     mapping_notice: str = ''
     # 上传文件的实际列路径全集（file > sheet > col），供前端手动选择下拉全量列出
@@ -74,6 +76,7 @@ def precheck_compute(
     in_worker: bool = False,
     session_dir: Optional[str] = None,
     skipped_missing_files: Optional[List[str]] = None,
+    defer_base_fill: bool = False,
 ) -> PrecheckResult:
     """智算事前校验主入口（compute_ingest 的薄封装）
 
@@ -113,6 +116,7 @@ def precheck_compute(
         "template_override_path": template_override_path,
         "session_dir": session_dir,
         "skipped_missing_files": skipped_missing_files,
+        "defer_base_fill": defer_base_fill,
     }
     if in_worker:
         # 外层已有总超时/内存护栏，直接解析避免嵌套进程和大表 pickle 往返。
@@ -175,6 +179,8 @@ def _ingest_and_resolve_inner(payload: dict, keep_preload: bool, db_session) -> 
         salary_year=payload.get("salary_year"),
         salary_month=payload.get("salary_month"),
         confirmed_renames=payload.get("confirmed_renames"),
+        confirmed_mapping=payload.get("confirmed_mapping"),
+        defer_base_fill=bool(payload.get("defer_base_fill")),
     )
     result = resolve_with_confirmations(
         meta,
@@ -188,6 +194,7 @@ def _ingest_and_resolve_inner(payload: dict, keep_preload: bool, db_session) -> 
         use_history=payload.get("use_history"),
         template_override_path=payload.get("template_override_path"),
         skipped_missing_files=payload.get("skipped_missing_files"),
+        allow_ai_matching=not bool(payload.get("mapping_finalized")),
     )
     session_dir = payload.get("session_dir")
     wrote_session = False

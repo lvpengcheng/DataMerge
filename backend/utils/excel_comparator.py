@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List
 import platform
 import shutil
+import tempfile
 import zipfile
 from xml.etree import ElementTree as ET
 
@@ -1449,6 +1450,7 @@ def _compare_excel_files_multi_sheet_impl(
     primary_keys: Optional[List[str]] = None,
     skip_source_filter: bool = False,
     result_calculated: bool = False,
+    calculate_expected_formulas: bool = False,
 ) -> Dict[str, Any]:
     """（子进程执行体）对比两个 Excel 文件的所有 Sheet 差异（多Sheet版本）。
 
@@ -1462,6 +1464,30 @@ def _compare_excel_files_multi_sheet_impl(
     from Aspose.Cells import Workbook as AsposeWorkbook
 
     logger.info("[多Sheet对比] 开始...")
+
+    # 在副本上计算基准文件，确保智训样本/用户上传原件不被 Aspose Save 改写。
+    # 递归只进入一次：副本算好后将开关置 False，复用下方完全相同的读取与对比链路。
+    if calculate_expected_formulas:
+        with tempfile.TemporaryDirectory(prefix="compare-expected-calc-") as temp_dir:
+            expected_copy = Path(temp_dir) / Path(expected_file).name
+            shutil.copy2(str(expected_file), str(expected_copy))
+            try:
+                _aspose_calc_impl(str(expected_copy))
+            except Exception as _expected_calc_e:
+                logger.error(
+                    "[多Sheet对比] 基准文件公式计算失败: %s - %s",
+                    expected_file, _expected_calc_e,
+                )
+                raise ValueError("基准文件公式计算失败，不能确认对比结果") from _expected_calc_e
+            return _compare_excel_files_multi_sheet_impl(
+                result_file=result_file,
+                expected_file=str(expected_copy),
+                output_file=output_file,
+                primary_keys=primary_keys,
+                skip_source_filter=skip_source_filter,
+                result_calculated=result_calculated,
+                calculate_expected_formulas=False,
+            )
 
     # 【第1次打开 result】Aspose 计算公式（expected 不需要，外部已计算）。
     # 直接调 _aspose_calc_impl 而非 calculate_excel_formulas：本函数已在子进程内，
@@ -1665,6 +1691,7 @@ def compare_excel_files_multi_sheet(
     primary_keys: Optional[List[str]] = None,
     skip_source_filter: bool = False,
     result_calculated: bool = False,
+    calculate_expected_formulas: bool = False,
 ) -> Dict[str, Any]:
     """对比两个 Excel 文件的所有 Sheet 差异（多Sheet版本）。
 
@@ -1691,6 +1718,7 @@ def compare_excel_files_multi_sheet(
             "primary_keys": primary_keys,
             "skip_source_filter": skip_source_filter,
             "result_calculated": result_calculated,
+            "calculate_expected_formulas": calculate_expected_formulas,
         },
         timeout=default_timeout("write"),   # 对比+生成差异文件，给足 600s
         max_memory_mb=default_max_memory_mb(),
@@ -1963,17 +1991,25 @@ def _compare_dataframes_core(
             total_cells += 1
 
             try:
-                if expected_value == "" or result_value == "":
-                    raise ValueError("空值按文本对比，不等同零")
-                expected_num = Decimal(str(expected_value))
-                result_num = Decimal(str(result_value))
+                expected_blank = expected_value == ""
+                result_blank = result_value == ""
+                if expected_blank and result_blank:
+                    raise ValueError("双方均为空，交由文本分支判定相同")
+
+                # 一侧为空、另一侧为数值时仍属于数值差异。空值不能与 0 判为相同，
+                # 但非空侧必须保留数字类型，不能因为另一侧为空就降级成字符串并误报
+                # “文本不同”。差额计算时仅临时把空值视为 0。
+                expected_num = Decimal(0) if expected_blank else Decimal(str(expected_value).strip())
+                result_num = Decimal(0) if result_blank else Decimal(str(result_value).strip())
                 if not expected_num.is_finite() or not result_num.is_finite():
                     raise ValueError("非有限数字")
                 difference = result_num - expected_num
 
-                if abs(difference) > numeric_tolerance:
+                numeric_blank_mismatch = expected_blank != result_blank
+                if numeric_blank_mismatch or abs(difference) > numeric_tolerance:
                     total_differences += 1
-                    diff_rate_str = f"{(difference / expected_num * 100):.2f}%" if expected_num != 0 else "N/A"
+                    diff_rate_str = (f"{(difference / expected_num * 100):.2f}%"
+                                     if not expected_blank and expected_num != 0 else "N/A")
 
                     if col not in field_diff_samples:
                         field_diff_samples[col] = {"formula": result_formulas.get(col, ""), "count": 1, "samples": []}
@@ -1981,10 +2017,15 @@ def _compare_dataframes_core(
                         field_diff_samples[col]["count"] += 1
                     # 保存前3个差异样本（供根因分类使用）
                     if len(field_diff_samples[col]["samples"]) < 3:
-                        field_diff_samples[col]["samples"].append({"actual": str(result_num), "expected": str(expected_num)})
+                        field_diff_samples[col]["samples"].append({
+                            "actual": "" if result_blank else str(result_num),
+                            "expected": "" if expected_blank else str(expected_num),
+                        })
 
                     for c, v in [(1, key_values[0]), (2, key_values[1]), (3, key_values[2]),
-                                 (4, col), (5, expected_num), (6, result_num),
+                                 (4, col),
+                                 (5, "" if expected_blank else expected_num),
+                                 (6, "" if result_blank else result_num),
                                  (7, difference), (8, diff_rate_str), (9, "匹配成功")]:
                         ws.cell(row=row_idx, column=c, value=v)
 

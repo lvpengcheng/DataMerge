@@ -1163,7 +1163,9 @@ class TrainingEngine:
                     result_file=output_path,
                     expected_file=expected_file,
                     output_file=comparison_output_file,
-                    primary_keys=comparison_primary_keys, result_calculated=True
+                    primary_keys=comparison_primary_keys,
+                    result_calculated=True,
+                    calculate_expected_formulas=True,
                 )
 
                 # 计算匹配分数（基于单元格匹配数量）
@@ -1986,7 +1988,9 @@ class TrainingEngine:
                         result_file=str(output_file),
                         expected_file=expected_file,
                         output_file=comparison_output_file,
-                        primary_keys=comparison_primary_keys, result_calculated=True
+                        primary_keys=comparison_primary_keys,
+                        result_calculated=True,
+                        calculate_expected_formulas=True,
                     )
 
                     # 保存差异对比Excel到training_logs，然后删除临时文件

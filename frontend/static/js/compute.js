@@ -65,19 +65,19 @@ function _promptFilePasswords(encryptedFiles) {
 }
 
 /**
- * 事前校验失败弹窗：展示缺失文件 / 缺失列 / AI 建议 / 历史警告，
- * 让用户调整列映射并确认是否仍计算。
- * @param {object} data - 后端 422 返回体: {missing_files, missing_columns, ai_suggestions, history_warnings, auto_filled, file_mapping}
+ * 事前校验失败弹窗：展示缺失文件、文件/Sheet 建议与历史警告。
+ * 智算源数据不在此进行列匹配。
  * @returns {Promise<{confirmed_mapping?: object, skip_history_check?: boolean}|null>}
  */
 function _precheckSummary(data) {
     const reasons = [];
     if (data.mapping_notice) reasons.push(data.mapping_notice);
-    if (data.mapping_requires_confirmation) reasons.push('结构匹配未能确定全部来源，已结合脚本生成 AI 推荐，请确认文件、Sheet 和字段关系');
-    const columns = (data.missing_columns || []).reduce((n, row) => n + (row.expected_columns || []).length, 0);
-    if (columns) reasons.push(`待确认 ${columns} 列；没有对应列可保留“无匹配”继续。`);
+    if (data.mapping_requires_confirmation) reasons.push('结构匹配未能确定全部来源，请确认文件和 Sheet 对应关系');
+    if ((data.source_sheet_reviews || []).length) reasons.push(`源 Sheet ${(data.source_sheet_reviews || []).length} 项待确认`);
     if ((data.missing_files || []).length) reasons.push(`缺失文件 ${data.missing_files.length} 个`);
-    if ((data.rename_candidates || []).length) reasons.push(`文件来源 ${data.rename_candidates.length} 项待确认`);
+    if (!(data.source_sheet_reviews || []).length && (data.rename_candidates || []).length) {
+        reasons.push(`文件来源 ${data.rename_candidates.length} 项待确认`);
+    }
     if ((data.target_candidates || []).length) reasons.push(`目标 Sheet ${data.target_candidates.length} 项待确认`);
     if ((data.history_warnings || []).length) reasons.push(`历史数据提示 ${data.history_warnings.length} 项`);
     const error = (data.missing_columns || []).find(row => row.error)?.error;
@@ -108,31 +108,51 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
     }
     data = {...data, target_candidates: choices.target_candidates, rename_candidates: choices.rename_candidates};
     return new Promise((resolve) => {
-        // Labels describe the original upload; option values retain stable server identities.
+        // Labels describe upload/base provenance; option values retain stable server identities.
         const sourceIdentities = new Map((data.actual_sources || []).map(source =>
             [JSON.stringify([source.file, source.sheet]), source]));
         const sourceFileNames = new Map((data.actual_sources || []).map(source =>
             [source.file, source.original_file || source.file]));
         const sourceFileLabel = file => sourceFileNames.get(file) || file;
+        const sourceOriginLabel = source => ({
+            upload: '本次上传',
+            tenant_base: '租户基础',
+            global_base: '全局基础',
+            base: '基础数据',
+        })[source?.origin] || '本次上传';
         const sourceSheetLabel = value => {
             const [file, sheet] = JSON.parse(value);
             const source = sourceIdentities.get(value);
-            return `${source?.original_file || sourceFileLabel(file)} > ${source?.original_sheet || sheet}`;
+            return `[${sourceOriginLabel(source)}] ${source?.original_file || sourceFileLabel(file)} > ${source?.original_sheet || sheet}`;
         };
         const sourceColumnLabel = path => {
             const parsed = _splitPath(path);
             return parsed ? `${sourceSheetLabel(JSON.stringify([parsed.file, parsed.sheet]))} > ${parsed.col}` : path;
         };
         const missingFiles = data.missing_files || [];
-        const missingColumns = data.missing_columns || [];
+        const missingColumns = (data.missing_columns || []).filter(item => item.error);
+        const sourceSheetReviews = data.source_sheet_reviews || [];
+        const reviewFileMapping = Object.prototype.hasOwnProperty.call(data, 'review_file_mapping')
+            ? (data.review_file_mapping || {})
+            : (data.file_mapping || {});
         const suggestionMap = new Map((data.ai_suggestions || []).map(row => [row.expected_path, {...row}]));
-        // 重新确认时优先回显已选择的来源，不能用新一轮默认建议覆盖它。
-        Object.entries(data.file_mapping || {}).forEach(([file, info]) => {
+        const reviewExpectedPaths = new Set(suggestionMap.keys());
+        missingColumns.forEach(item => {
+            if (item.error || !item.expected_columns) return;
+            (item.expected_columns || []).forEach(col =>
+                reviewExpectedPaths.add(`${item.file} > ${item.sheet} > ${col}`));
+        });
+        (data.unmatched_columns || []).forEach(([file, sheet, column]) =>
+            reviewExpectedPaths.add(`${file} > ${sheet} > ${column}`));
+        // 只回显待审核子集。完整 file_mapping 包含基础补全和程序唯一匹配，不能
+        // 从它反推出弹窗内容，否则已经锁定的 Sheet/列会重复进入人工确认。
+        Object.entries(reviewFileMapping).forEach(([file, info]) => {
             Object.entries(info.sheet_mapping || {}).forEach(([sheet, targetSheet]) => {
                 const columns = (info.header_mapping_by_sheet || {})[sheet] || info.header_mapping || {};
                 Object.entries(columns).forEach(([column, targetColumn]) => {
                     const expected_path = `${info.expected_file || file} > ${targetSheet} > ${targetColumn}`;
                     const suggested_path = `${file} > ${sheet} > ${column}`;
+                    if (!reviewExpectedPaths.has(expected_path)) return;
                     suggestionMap.set(expected_path, {...suggestionMap.get(expected_path), expected_path, suggested_path,
                         confidence: expected_path === suggested_path ? 1 : null,
                         reason: suggestionMap.get(expected_path)?.reason || '已选择的匹配，可继续调整'});
@@ -171,10 +191,11 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
         const extraRows = expectedPaths
             .filter(p => !sugExpected.has(p))
             .map(p => ({ expected_path: p, confidence: null, reason: '无 AI 建议（可手动选择）' }));
-        const allExpectedRows = _constrainSourceSheetSuggestions([...aiSuggestions, ...extraRows], data.file_mapping);
+        const allExpectedRows = _constrainSourceSheetSuggestions([...aiSuggestions, ...extraRows], reviewFileMapping);
         const sourceSheets = [...new Set(actualPaths.map(path => {
             const p = _splitPath(path); return p ? JSON.stringify([p.file, p.sheet]) : null;
-        }).filter(Boolean))];
+        }).filter(Boolean).concat((data.actual_sources || []).map(source =>
+            JSON.stringify([source.file, source.sheet]))))];
         const sourceGroups = new Map();
         allExpectedRows.forEach(row => {
             const p = _splitPath(row.expected_path);
@@ -182,6 +203,19 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
             const key = JSON.stringify([p.file, p.sheet]);
             if (!sourceGroups.has(key)) sourceGroups.set(key, []);
             sourceGroups.get(key).push(row);
+        });
+        // 文件/Sheet 审核是独立层级，不依赖任何列建议。
+        sourceSheetReviews.forEach(review => {
+            if (!review.expected_file || !review.expected_sheet) return;
+            const key = JSON.stringify([review.expected_file, review.expected_sheet]);
+            if (!sourceGroups.has(key)) sourceGroups.set(key, []);
+            sourceGroups.get(key).push({
+                suggested_path: review.suggested_file && review.suggested_sheet
+                    ? `${review.suggested_file} > ${review.suggested_sheet} > __sheet__` : null,
+                reason: review.reason,
+                sheet_reason: review.reason,
+                recommendation_source: review.recommendation_source || 'ai',
+            });
         });
         const confirmedSourceSheets = new Map();
         const rememberSourceSheets = mapping => Object.entries(mapping || {}).forEach(([file, info]) => {
@@ -191,32 +225,38 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
                     JSON.stringify([file, sheet]));
             });
         });
-        rememberSourceSheets(data.file_mapping);
+        rememberSourceSheets(reviewFileMapping);
         rememberSourceSheets(previousConfirmations?.confirmed_mapping?.file_mapping);
-        const sourceSheetHtml = [...sourceGroups].map(([key, rows]) => {
-            const suggested = new Set(rows.map(row => {
-                const p = _splitPath(row.suggested_path); return p ? JSON.stringify([p.file, p.sheet]) : null;
-            }).filter(Boolean));
-            const chosen = confirmedSourceSheets.get(key) || (suggested.size === 1 ? [...suggested][0] : '');
-            const [expectedFile, expectedSheet] = JSON.parse(key);
-            const reasons = [...new Set(rows.map(row => row.sheet_reason || row.reason).filter(Boolean))].slice(0, 2);
-            const recommendation = chosen
-                ? `<div style="font-size:11px;color:#2e7d32;"><b>${rows.some(row => row.recommendation_source === 'ai') ? '✨ AI 推荐' : '✓ 初始对应'}：${_escapeHtml(sourceSheetLabel(chosen))}</b></div>
-                   ${reasons.map(reason => `<div style="font-size:11px;color:#666;margin-top:4px;overflow-wrap:anywhere;">${_escapeHtml(String(reason).slice(0, 300))}</div>`).join('')}`
-                : '<span style="font-size:11px;color:#e65100;">尚未确定唯一来源，请选择对应 Sheet；没有对应表可保留无匹配。</span>';
+        const expectedTargets = [...sourceGroups.keys()];
+        const actualToExpected = new Map();
+        confirmedSourceSheets.forEach((actual, expected) => actualToExpected.set(actual, expected));
+        const aiByActual = new Map();
+        sourceSheetReviews.forEach(review => {
+            if (review.suggested_file && review.suggested_sheet && review.expected_file && review.expected_sheet) {
+                aiByActual.set(JSON.stringify([review.suggested_file, review.suggested_sheet]), review);
+            }
+        });
+        // 以“上传文件 + Sheet”为粒度：同一 Excel 的每个 Sheet 各自一个匹配项。
+        const sourceSheetHtml = sourceSheets.map(actualKey => {
+            const [actualFile, actualSheet] = JSON.parse(actualKey);
+            const review = aiByActual.get(actualKey);
+            const aiExpected = review ? JSON.stringify([review.expected_file, review.expected_sheet]) : '';
+            const chosen = actualToExpected.get(actualKey) || aiExpected;
+            const options = [`<option value=""${chosen ? '' : ' selected'}>（不参与本次计算）</option>`]
+                .concat(expectedTargets.map(expectedKey => {
+                    const [file, targetSheet] = JSON.parse(expectedKey);
+                    const star = expectedKey === aiExpected ? '✨ ' : '';
+                    return `<option value="${_escapeHtml(expectedKey)}"${expectedKey === chosen ? ' selected' : ''}>${star}${_escapeHtml(file)} > ${_escapeHtml(targetSheet)}</option>`;
+                })).join('');
             return `<tr>
-                <td style="padding:6px;border:1px solid #ffe0b2;vertical-align:top;overflow-wrap:anywhere;">
-                    <div style="font-family:monospace;font-size:12px;">${_escapeHtml(expectedFile)}</div>
-                    <div style="font-size:12px;color:#5d4037;margin-top:4px;">Sheet：<b>${_escapeHtml(expectedSheet)}</b></div>
+                <td style="padding:8px;border:1px solid #ffe0b2;vertical-align:top;overflow-wrap:anywhere;">
+                    <div style="font-family:monospace;font-size:12px;"><b>${_escapeHtml(sourceFileLabel(actualFile))}</b></div>
+                    <div style="font-size:12px;color:#5d4037;margin-top:4px;">Sheet：<b>${_escapeHtml(actualSheet)}</b></div>
                 </td>
-                <td style="padding:4px;border:1px solid #ffe0b2;vertical-align:top;">
-                    <select data-source-sheet-key="${_escapeHtml(key)}" aria-label="${_escapeHtml(expectedFile + ' > ' + expectedSheet + ' 对应的上传 Sheet')}" style="width:100%;min-width:0;padding:4px;font-size:11px;font-family:monospace;">
-                        <option value="">（无匹配，可跳过）</option>
-                        ${sourceSheets.map(value => `<option value="${_escapeHtml(value)}"${value === chosen ? ' selected' : ''}>${_escapeHtml(sourceSheetLabel(value))}</option>`).join('')}
-                    </select>
-                    <div data-source-sheet-detail style="font-size:11px;color:#5d4037;padding:5px 2px;white-space:normal;overflow-wrap:anywhere;">${chosen ? _escapeHtml(sourceSheetLabel(chosen)) : '请选择原始上传文件中的 Sheet'}</div>
+                <td colspan="2" style="padding:6px;border:1px solid #ffe0b2;vertical-align:top;">
+                    <select data-upload-source-key="${_escapeHtml(actualKey)}" style="width:100%;padding:5px;font-size:11px;font-family:monospace;">${options}</select>
+                    ${review?.reason ? `<div style="font-size:11px;color:#666;margin-top:4px;">${_escapeHtml(String(review.reason).slice(0, 300))}</div>` : ''}
                 </td>
-                <td style="padding:6px;border:1px solid #ffe0b2;vertical-align:top;overflow-wrap:anywhere;">${recommendation}</td>
             </tr>`;
         }).join('');
         const renderMappingTable = rows => rows.length === 0
@@ -308,7 +348,8 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
             </div>`;
 
         // 改名候选块（模糊场景，需要用户选择）
-        const hasRenameCandidates = renameCandidates.length > 0;
+        // 已有“上传文件 → 智训文件/Sheet”统一选择框时，不再重复显示旧文件改名框。
+        const hasRenameCandidates = renameCandidates.length > 0 && sourceSheets.length === 0;
         const renameCandidatesHtml = !hasRenameCandidates ? '' : `
             <div style="margin-bottom:14px;padding:10px 12px;border:1px solid #ffe0b2;background:#fff3e0;border-radius:6px;">
                 <div style="font-weight:bold;color:#e65100;margin-bottom:6px;">⚠ 上传文件名与训练期望不一致，请确认对应关系</div>
@@ -405,7 +446,7 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
         // 缺失列块
         const missingColsHtml = missingColumns.length === 0 ? '' : `
             <div style="margin-bottom:14px;padding:10px 12px;border:1px solid #ffe0b2;background:#fff3e0;border-radius:6px;">
-                <div style="font-weight:bold;color:#e65100;margin-bottom:6px;">待确认列（允许无匹配）</div>
+                <div style="font-weight:bold;color:#e65100;margin-bottom:6px;">匹配校验提示</div>
                 <details><summary style="cursor:pointer;font-size:12px;color:#666;">展开详情（${missingColumns.length} 项）</summary>
                 <ul style="margin:6px 0 0;padding-left:20px;font-size:11px;color:#5d4037;max-height:120px;overflow:auto;">
                     ${missingColumns.map(c => `<li>${_escapeHtml(c.file)} > ${_escapeHtml(c.sheet)} ${c.error ? '：' + _escapeHtml(c.error) : ''}</li>`).join('')}
@@ -429,34 +470,27 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
         // AI 建议块
         const aiSuggestionsHtml = `
             <div style="margin-bottom:14px;">
-                ${sourceGroups.size ? `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid #ffe0b2;background:#fff3e0;border-radius:6px;">
-                    <div style="font-weight:bold;color:#e65100;margin-bottom:6px;">⚠ 源 Sheet 对应关系，请确认读取来源</div>
-                    <div style="font-size:12px;color:#5d4037;margin-bottom:8px;">左侧是训练期望名称，中间显示原始上传文件名和实际 Sheet 名，两者可以不同。下拉框下方展示完整来源；先确认文件，再确认 Sheet，最后核对字段。</div>
+                ${sourceSheets.length ? `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid #ffe0b2;background:#fff3e0;border-radius:6px;">
+                    <div style="font-weight:bold;color:#e65100;margin-bottom:6px;">⚠ 上传文件对应关系，请确认智训来源</div>
+                    <div style="font-size:12px;color:#5d4037;margin-bottom:8px;">左侧按“上传文件 + Sheet”逐项显示；同一 Excel 的每个 Sheet 分别选择对应的智训文件和 Sheet。确认后系统按智训名称生成执行副本并参与后续计算，不做列匹配。</div>
                     <div style="overflow-x:auto;">
                         <table style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:12px;">
                             <thead><tr style="background:#fff8e1;">
-                                <th style="width:27%;padding:6px;border:1px solid #ffe0b2;text-align:left;">训练期望源表</th>
-                                <th style="width:38%;padding:6px;border:1px solid #ffe0b2;text-align:left;">对应上传文件 / Sheet</th>
-                                <th style="padding:6px;border:1px solid #ffe0b2;text-align:left;">推荐依据（供核对）</th>
+                                <th style="width:30%;padding:6px;border:1px solid #ffe0b2;text-align:left;">本次上传文件</th>
+                                <th colspan="2" style="padding:6px;border:1px solid #ffe0b2;text-align:left;">对应智训文件 / Sheet</th>
                             </tr></thead>
                             <tbody>${sourceSheetHtml}</tbody>
                         </table>
                     </div>
                 </div>` : ''}
-                <div style="font-weight:bold;font-size:13px;margin-bottom:6px;color:#333;">源数据列匹配确认（优先检查变动项）</div>
-                <div style="font-size:12px;color:#666;margin-bottom:6px;">目标 Sheet 决定结果写入位置；这里决定读取哪个源文件的字段。源字段重复仍需单独处理。</div>
-                <div style="max-height:280px;overflow:auto;border:1px solid #e0e0e0;border-radius:4px;">${aiTableHtml}</div>
-                <div style="font-size:11px;color:#999;margin-top:4px;">
-                    格式：<code>文件名 > Sheet名 > 列名</code>。Sheet 名可能包含 banner 后缀（如 <code>数据-合同工</code>）。
-                </div>
             </div>`;
 
         const canRetry = missingFiles.length === 0;
         const reviewTitle = data.mapping_requires_confirmation
-            ? (data.mapping_refreshed ? '匹配关系最终审核' : 'AI 匹配结果审核')
+            ? (data.mapping_refreshed ? '文件与 Sheet 最终审核' : '文件与 Sheet 匹配审核')
             : '计算前确认';
         const reviewIntro = data.mapping_requires_confirmation
-            ? '系统检测到本次源文件结构与智训时不一致，已自动整理并生成 AI 匹配建议。请完成本次最终审核；确认后将锁定该结果并直接计算。'
+            ? '系统仅对无法由程序确定的文件和 Sheet 给出 AI 建议。确认后将按智训名称生成执行源文件并直接计算，不再进行列匹配。'
             : '系统检测到计算前仍有事项需要确认，请核对后继续。';
         // 改名候选场景下，要求至少为一个上传文件选了目标，才允许重试
         const overlay = document.getElementById('_compute_precheck_overlay') || document.createElement('div');
@@ -480,7 +514,7 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
                 <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px;border-top:1px solid #eee;padding-top:12px;">
                     <button id="_pre_cancel" style="padding:8px 20px;border:1px solid #ddd;border-radius:4px;background:#fff;cursor:pointer;">取消</button>
                     <button id="_pre_confirm" ${canRetry ? '' : 'disabled'} style="padding:8px 20px;border:none;border-radius:4px;background:${canRetry ? '#1976d2' : '#bdbdbd'};color:#fff;cursor:${canRetry ? 'pointer' : 'not-allowed'};">
-                        ${canRetry ? (hasRenameCandidates ? '按已选映射重试' : '按当前映射重试') : '请先补齐或勾选跳过缺失文件'}
+                        ${canRetry ? (hasRenameCandidates ? '按已选文件关系继续' : '确认文件与 Sheet 并开始计算') : '请先补齐或勾选跳过缺失文件'}
                     </button>
                 </div>
             </div>`;
@@ -489,7 +523,7 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
         // ===== 重复匹配检测：一个上传列被多个训练期望列选中 → 红色框实时标记 =====
         const aiSelects = () => overlay.querySelectorAll('select[data-ai-idx]');
         function _syncSourceSheetOptions() {
-            const selections = [...overlay.querySelectorAll('select[data-source-sheet-key]')];
+            const selections = [...overlay.querySelectorAll('select[data-source-sheet-key],select[data-upload-source-key]')];
             for (const sel of selections) {
                 for (const option of sel.options) {
                     option.disabled = !!option.value && option.value !== sel.value &&
@@ -565,8 +599,13 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
             .map(cb => cb.dataset.skipMissing);
         function _refreshConfirmState() {
             if (!confirmBtn) return;
+            const selectedExpectedFiles = new Set([...overlay.querySelectorAll('select[data-upload-source-key]')]
+                .map(sel => {
+                    if (!sel.value) return '';
+                    try { return JSON.parse(sel.value)[0] || ''; } catch (_) { return ''; }
+                }).filter(Boolean));
             const pending = Array.from(skipBoxes()).filter(cb => !cb.checked &&
-                !allExpectedRows.some(row => _splitPath(row.expected_path)?.file === cb.dataset.skipMissing)).length;
+                !selectedExpectedFiles.has(cb.dataset.skipMissing)).length;
             confirmBtn.disabled = pending > 0;
             confirmBtn.style.background = pending > 0 ? '#bdbdbd' : '#1976d2';
             confirmBtn.style.cursor = pending > 0 ? 'not-allowed' : 'pointer';
@@ -576,6 +615,12 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
         }
         overlay.onchange = (e) => {
             if (!e.target?.matches) return;
+            if (e.target.matches('select[data-upload-source-key]')) {
+                _syncSourceSheetOptions();
+                _refreshConfirmState();
+                document.getElementById('_pre_validation_error').textContent =
+                    '已更新上传文件与智训文件/Sheet 的对应关系；确认后将直接生成执行副本，不会进行列匹配或再次调用 AI。';
+            }
             if (e.target.matches('select[data-source-sheet-key]')) {
                 const detail = e.target.parentElement?.querySelector('[data-source-sheet-detail]');
                 if (detail) detail.textContent = e.target.value ? sourceSheetLabel(e.target.value) : '未选择源 Sheet';
@@ -602,7 +647,7 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
             if (e.target.matches('select[data-rename-uploaded]')) {
                 tableMappingDirty = true;
                 document.getElementById('_pre_validation_error').textContent =
-                    '表对应关系已更改，正在自动刷新字段；刷新不会启动计算。';
+                    '表对应关系已更改，正在按新结构一次性刷新字段；不会调用 AI，也不会启动计算。';
                 _refreshConfirmState();
                 _scheduleTableMappingRefresh();
             }
@@ -719,7 +764,7 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
                     .map(([, target]) => target));
                 let fileMapping;
                 try {
-                    fileMapping = _buildFileMappingFromAiSelections(overlay, allExpectedRows, data.file_mapping);
+                    fileMapping = _buildFileMappingFromAiSelections(overlay, allExpectedRows, reviewFileMapping);
                 } catch (error) {
                     alert(error.message);
                     return;
@@ -796,8 +841,22 @@ function _collectConfirmedTargetMap(overlay) {
 /** 收集独立的源 Sheet 人工关系，不能只依赖列下拉框反推。 */
 function _collectSourceSheetMappings(overlay) {
     const result = {};
+    overlay.querySelectorAll('select[data-upload-source-key]').forEach(sel => {
+        if (!sel.dataset?.uploadSourceKey || !sel.value) return;
+        const [actualFile, actualSheet] = JSON.parse(sel.dataset.uploadSourceKey || '[]');
+        const [expectedFile, expectedSheet] = JSON.parse(sel.value || '[]');
+        if (!expectedFile || !expectedSheet || !actualFile || !actualSheet) return;
+        const entry = result[actualFile] ||= {
+            expected_file: expectedFile, sheet_mapping: {}, header_mapping_by_sheet: {},
+        };
+        if (entry.expected_file !== expectedFile) {
+            throw new Error(`同一个上传文件「${actualFile}」不能对应多个智训文件，请统一选择。`);
+        }
+        entry.sheet_mapping[actualSheet] = expectedSheet;
+        entry.header_mapping_by_sheet[actualSheet] = {};
+    });
     overlay.querySelectorAll('select[data-source-sheet-key]').forEach(sel => {
-        if (!sel.value) return;
+        if (!sel.dataset?.sourceSheetKey || !sel.value) return;
         const [expectedFile, expectedSheet] = JSON.parse(sel.dataset.sourceSheetKey || '[]');
         const [actualFile, actualSheet] = JSON.parse(sel.value || '[]');
         if (!expectedFile || !expectedSheet || !actualFile || !actualSheet) return;
@@ -837,13 +896,14 @@ function _mergeFileMappings(previous, incoming) {
         Object.entries(info.sheet_mapping || {}).forEach(([sheet, targetSheet]) => {
             const columns = (info.header_mapping_by_sheet || {})[sheet] || info.header_mapping || {};
             const targets = new Set(Object.values(columns));
-            const sheetOnlyDecision = Object.keys(columns).length === 0;
             // 删除同一目标列的旧来源，避免旧选择在另一文件/Sheet 下残留。
             Object.entries(result).forEach(([oldFile, old]) => {
                 if (old.expected_file !== targetFile) return;
                 Object.entries(old.sheet_mapping || {}).forEach(([oldSheet, oldTarget]) => {
                     if (oldTarget !== targetSheet) return;
-                    if (sheetOnlyDecision && (oldFile !== file || oldSheet !== sheet)) {
+                    // 更换来源 Sheet 是对整个目标 Sheet 的原子替换。旧 Sheet 的
+                    // 任何列都不能残留，否则会形成跨 Sheet 重复映射并循环刷新。
+                    if (oldFile !== file || oldSheet !== sheet) {
                         delete old.sheet_mapping[oldSheet];
                         delete (old.header_mapping_by_sheet || {})[oldSheet];
                         return;

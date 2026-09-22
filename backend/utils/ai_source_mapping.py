@@ -101,8 +101,18 @@ def _call_ai_json(provider_name: str, prompt: str) -> dict:
 
 
 def _build_stage1_prompt(candidates, training, actual, matching_context):
+    unresolved_training_ids = {
+        item.get('training_id') for item in candidates
+        if isinstance(item, dict) and type(item.get('training_id')) is int
+    }
+    unresolved_actual_ids = {
+        choice.get('actual_id')
+        for item in candidates if isinstance(item, dict)
+        for choice in (item.get('candidates') or []) if isinstance(choice, dict)
+        if type(choice.get('actual_id')) is int
+    }
     return (
-        '你是 Excel 源数据映射专家。你的唯一任务：在训练数据源和本次上传数据源之间，建立文件到文件、Sheet 到 Sheet 的一级和二级匹配关系。'
+        '你是 Excel 源数据映射专家。你的唯一任务：在训练数据源和本次可用数据源（本次上传 + 自动补入的基础资料）之间，建立文件到文件、Sheet 到 Sheet 的一级和二级匹配关系。'
         '本阶段不要处理列映射。'
         '\n一、层级原则：文件是第一层，Sheet 是第二层，列是第三层；必须先确定文件，再在对应文件内确定 Sheet；不允许跨文件拼凑 Sheet。'
         '一个上传文件只能对应一个训练文件，一个训练文件只能对应一个上传文件；一个上传文件内的所有 Sheet 只能映射到同一个训练文件下的 Sheet。'
@@ -111,10 +121,13 @@ def _build_stage1_prompt(candidates, training, actual, matching_context):
         '硬约束包括：工资年月对应的本月/上月角色、用户已确认关系、代码中明确引用的源文件/源 Sheet、名称中的 YYYYMM/地区/机构/人员类别。'
         '结构证据包括：表头结构、列数量、关键列、join key、主键、筛选字段、代码从该 Sheet 读取的列。'
         '名称相似只能作为辅助，不能替代结构和代码证据。'
+        'global_actual 和 candidates 中的 origin 表示来源：upload=本次上传、tenant_base=租户基础资料、global_base=全局基础资料。'
+        '程序只会为本次上传尚未被确定性结构规则覆盖的训练角色补入基础资料；当候选在结构和语义上等价时，必须按 upload、tenant_base、global_base 的顺序优先。'
+        '但来源优先级不能替代结构与代码证据，不能把无关的本次上传强行匹配到训练角色。'
         '\n三、月份角色硬约束：本次工资年月由 salary_year/salary_month 给出；训练名称含本月/当月/本期/当期时，必须对应 salary_year+salary_month 的 YYYYMM；'
         '训练名称含上月/前月/上期/前期时，必须对应前一个月的 YYYYMM；不能把 202607 和 202608 反向匹配。上传名称没有 YYYYMM 时不要仅凭月份猜测。'
         '\n四、输入结构：salary_year、salary_month、current_period_index、global_training、global_actual、training、script_context。'
-        'global_training 是本次全部训练结构，global_actual 是本次全部上传结构，仅用于理解整体业务和排除歧义；'
+        'global_training 和 global_actual 只包含程序尚未明确的训练表与可用源表；已经确定的文件和 Sheet 不会发送给你，也不得重新判断；'
         'training 的每一项是一个待匹配训练表，candidates 是允许选择的 actual 候选，actual_id 是唯一候选标识。'
         '\n五、输出要求：严格只输出 JSON，不要输出解释文字、Markdown、代码块标记。格式：'
         '{"mappings":[{"training_id":0,"actual_id":0,"actual_sheet":"上传Sheet名","file_confidence":0.0-1.0,"sheet_confidence":0.0-1.0,'
@@ -128,15 +141,17 @@ def _build_stage1_prompt(candidates, training, actual, matching_context):
             'global_training': [
                 {'training_id': ti, 'file': t['file_name'], 'sheet': t['sheet_name'],
                  'columns': list(t['headers'].keys())}
-                for ti, t in enumerate(training)
+                for ti, t in enumerate(training) if ti in unresolved_training_ids
             ],
             'global_actual': [
                 {'actual_id': ai, 'file': a['file_name'],
                  'original_file': a.get('original_file_name', a['file_name']),
+                 'origin': a.get('source_origin', 'upload'),
+                 'asset_name': a.get('source_asset_name'),
                  'sheet': a['sheet_name'],
                  'original_sheet': a.get('original_sheet_name', a['sheet_name']),
                  'columns': list(a['headers'].keys())}
-                for ai, a in enumerate(actual)
+                for ai, a in enumerate(actual) if ai in unresolved_actual_ids
             ],
             'training': candidates,
             'script_context': _script_matching_context(matching_context, training, actual),
@@ -209,20 +224,25 @@ def _build_stage2_prompt(pairs, training, actual, fixed, matching_context):
             'training_sheet': training[ti]['sheet_name'],
             'actual_file': actual[ai]['file_name'],
             'actual_sheet': actual[ai]['sheet_name'],
+            'origin': actual[ai].get('source_origin', 'upload'),
+            'asset_name': actual[ai].get('source_asset_name'),
             'training_columns': list(training[ti]['headers'].keys()),
             'actual_columns': list(actual[ai]['headers'].keys()),
             'fixed_mapping': dict(fixed.get((ti, ai)) or {}),
         })
+    unresolved_training_ids = {pair['training_id'] for pair in pairs}
+    unresolved_actual_ids = {pair['actual_id'] for pair in pairs}
     global_training = [
         {'training_id': ti, 'file': t['file_name'], 'sheet': t['sheet_name'],
          'columns': list(t['headers'].keys())}
-        for ti, t in enumerate(training)
+        for ti, t in enumerate(training) if ti in unresolved_training_ids
     ]
     global_actual = [
         {'actual_id': ai, 'file': a['file_name'], 'original_file': a.get('original_file_name', a['file_name']),
+         'origin': a.get('source_origin', 'upload'), 'asset_name': a.get('source_asset_name'),
          'sheet': a['sheet_name'], 'original_sheet': a.get('original_sheet_name', a['sheet_name']),
          'columns': list(a['headers'].keys())}
-        for ai, a in enumerate(actual)
+        for ai, a in enumerate(actual) if ai in unresolved_actual_ids
     ]
     return (
         '你是 Excel 字段匹配专家。文件关系和 Sheet 关系已经确定，不要修改。你的唯一任务：在每个已确认的 Sheet 对内部，把训练需要的列映射到上传文件的列。'
@@ -230,8 +250,8 @@ def _build_stage2_prompt(pairs, training, actual, fixed, matching_context):
         '一个训练列最多对应一个上传列，一个上传列最多对应一个训练列；fixed_mapping 不可修改；找不到就放到 unresolved_columns，不要编造。'
         '\n二、匹配优先级：完全同名 confidence=1.0；去空格/大小写/全半角后同名 confidence>=0.98；同义名、业务别名结合代码用途、单位、join key、筛选条件判断；结构位置只能辅助；无法确定不要输出。'
         '注意区分应发/实发、个人/单位、上月/本月、金额/比例、税前/税后、收入/扣除。'
-        '\n三、全局上下文：global_training 和 global_actual 是本次全部训练结构、上传结构。'
-        '它们只用于理解业务角色和排除跨表歧义，不能作为跨 Sheet 拼凑字段的理由。实际列匹配仍然只能使用当前 match 的 training_columns 和 actual_columns。'
+        '\n三、全局上下文：global_training 和 global_actual 只包含程序尚未明确的训练表与源表。'
+        '已确定关系不参与本阶段，也不得重新判断；当前内容只用于排除剩余表之间的歧义，不能作为跨 Sheet 拼凑字段的理由。实际列匹配仍然只能使用当前 match 的 training_columns 和 actual_columns。'
         '\n四、输出要求：严格只输出 JSON，不要输出解释文字、Markdown、代码块标记。格式：'
         '{"mappings":[{"training_id":0,"actual_id":0,"columns":{"上传列名":"训练列名"},'
         '"column_confidence":{"上传列名":0.0-1.0},"column_reasons":{"上传列名":"匹配依据"},'
@@ -300,16 +320,20 @@ def _is_stage1_entries(entries):
 
 def _complete_two_stage_entries(entries, training, actual, fixed, matching_context, provider_name):
     pairs = _parse_stage1_to_pairs(entries, training, actual, fixed, matching_context)
-    if not pairs:
-        return []
-    stage2_prompt = _build_stage2_prompt(pairs, training, actual, fixed, matching_context)
-    logger.info('[源数据映射] 一阶段文件/Sheet 匹配成功 %s 对，开始二阶段列匹配', len(pairs))
-    if os.getenv('LOG_AI_SOURCE_MATCH_PROMPT', 'false').strip().lower() in ('true', '1', 'yes', 'on'):
-        logger.info('[源数据映射] AI 二阶段提示词完整内容 START\n%s\n[源数据映射] AI 二阶段提示词完整内容 END', stage2_prompt)
-        logger.info('[源数据映射] AI 二阶段提示词长度: %s 字符', len(stage2_prompt))
-    response = _call_ai_json(provider_name, stage2_prompt)
-    stage2_entries = response.get('mappings') if isinstance(response, dict) else None
-    return _parse_stage2_entries(stage2_entries, pairs, training, actual, fixed)
+    # 智算的 AI 仅负责文件/Sheet 身份判断。列关系不再发送给 AI，也不要求
+    # 操作员确认；这里只保留代码能够百分百确定的同名列，供旧执行结构兼容。
+    completed = []
+    for pair in pairs:
+        ti, ai = pair['training_id'], pair['actual_id']
+        columns = dict(fixed.get((ti, ai)) or {})
+        completed.append({
+            **pair,
+            'columns': columns,
+            'column_confidence': {name: 1.0 for name in columns},
+            'column_reasons': {},
+        })
+    logger.info('[源数据映射] AI 文件/Sheet 匹配完成 %s 对；已跳过 AI 列匹配', len(completed))
+    return completed
 
 
 def match_sources_with_ai(matcher, training, actual, provider_name, determined=None, matching_context=None):
@@ -351,6 +375,8 @@ def match_sources_with_ai(matcher, training, actual, provider_name, determined=N
             choices.append({'actual_id': ai, 'file': a['file_name'], 'sheet': a['sheet_name'],
                 'original_file': a.get('original_file_name', a['file_name']),
                 'original_sheet': a.get('original_sheet_name', a['sheet_name']),
+                'origin': a.get('source_origin', 'upload'),
+                'asset_name': a.get('source_asset_name'),
                 'matched_column_count': len(same),
                 'matched_columns': list(same),
                 'missing_columns': [c for c in t['headers'] if c not in same],
@@ -389,17 +415,14 @@ def match_sources_with_ai(matcher, training, actual, provider_name, determined=N
                 raise ValueError('AI 修改了已确定映射或选择了无效候选')
             if ti in _used_t or ai in _used_a:
                 raise ValueError('AI 表映射重复或引用不存在的表')
-            columns = entry.get('columns')
-            if not isinstance(columns, dict):
-                raise ValueError('AI 列映射格式无效')
+            # 无论供应商是否额外返回 columns，都不采纳 AI 列语义判断。
+            columns = dict(fixed[ti, ai])
             if (any(not isinstance(k, str) for k in columns)
                     or any(not isinstance(v, str) for v in columns.values())
                     or not set(columns).issubset(actual[ai]['headers'])
                     or not set(columns.values()).issubset(training[ti]['headers'])):
                 raise ValueError('AI 列映射引用不存在的字段')
-            if any(k in fixed[ti, ai] and v != fixed[ti, ai][k] for k, v in columns.items()):
-                raise ValueError('AI 覆盖了已确定列')
-            merged_columns = {**fixed[ti, ai], **columns}
+            merged_columns = columns
             if len(set(merged_columns.values())) != len(merged_columns):
                 raise ValueError('AI 列映射与原有列重名')
             if not matcher._is_candidate_allowed(training[ti], actual[ai], actual):
@@ -444,25 +467,22 @@ def match_sources_with_ai(matcher, training, actual, provider_name, determined=N
         return detail[:500] if isinstance(detail, str) and detail.strip() else sheet_reason(entry)
 
     result['ai_suggestions'] = []
+    result['source_sheet_reviews'] = []
     for e in entries:
-        raw_col_conf = e.get('column_confidence') if isinstance(e.get('column_confidence'), dict) else {}
-        for source, target in e['columns'].items():
-            _conf = raw_col_conf.get(source)
-            if _conf is None:
-                _conf = e.get('sheet_confidence')
-            if _conf is None:
-                _conf = e.get('file_confidence')
-            try:
-                _conf = float(_conf) if _conf is not None else None
-            except (TypeError, ValueError):
-                _conf = None
-            result['ai_suggestions'].append({
-                'expected_path': f"{training[e['training_id']]['file_name']} > {training[e['training_id']]['sheet_name']} > {target}",
-                'suggested_path': f"{actual[e['actual_id']]['file_name']} > {actual[e['actual_id']]['sheet_name']} > {source}",
-                'confidence': _conf,
-                'reason': column_reason(e, source), 'sheet_reason': sheet_reason(e),
-                'recommendation_source': 'ai',
-            })
+        confidence = e.get('sheet_confidence', e.get('file_confidence'))
+        try:
+            confidence = float(confidence) if confidence is not None else None
+        except (TypeError, ValueError):
+            confidence = None
+        result['source_sheet_reviews'].append({
+            'expected_file': training[e['training_id']]['file_name'],
+            'expected_sheet': training[e['training_id']]['sheet_name'],
+            'suggested_file': actual[e['actual_id']]['file_name'],
+            'suggested_sheet': actual[e['actual_id']]['sheet_name'],
+            'confidence': confidence,
+            'reason': sheet_reason(e),
+            'recommendation_source': 'ai',
+        })
     return result
 
 
@@ -522,9 +542,10 @@ def validate_mapping(matcher, training, actual, response, allow_partial=False):
                         'sheet_confidence': sheet_confidence,
                         'file_confidence': file_confidence,
                         'needs_rewrite': True})
-    complete = len(entries) == len(training) and all(
-        set(item['columns'].values()) == set(training[item['training_id']]['headers']) for item in entries)
+    # 新链路的完整性只检查训练文件/Sheet 是否全部得到唯一来源；列覆盖率不再
+    # 决定智算能否启动。
+    complete = len(entries) == len(training)
     result = {'success': complete, 'mapping': {'file_mapping': matcher._build_file_mapping(matches)}}
     if not complete:
-        result['error'] = 'AI 仅确定部分来源或字段，已保留有效推荐，其余需要确认'
+        result['error'] = 'AI 仅确定部分文件或 Sheet，已保留有效推荐，其余需要确认'
     return result

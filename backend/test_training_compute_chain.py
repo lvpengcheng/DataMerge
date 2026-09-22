@@ -19,6 +19,53 @@ from backend.utils.source_selector import find_source_sheet
 from backend.utils.script_entry import invoke_script_main
 
 
+def test_precheck_combines_db_headers_with_local_training_structure(tmp_path):
+    """DB 字段不齐时按字段读取本地智训结构，不能因已有表头配置而停止回退。"""
+    import json
+
+    source = Path(__file__).parent / 'app' / 'main.py'
+    node = next(n for n in ast.parse(source.read_text(encoding='utf-8')).body
+                if isinstance(n, ast.FunctionDef)
+                and n.name == '_load_script_info_for_precheck')
+    scripts_dir = tmp_path / 'scripts'
+    scripts_dir.mkdir()
+    local_structure = {'files': {'基础.xlsx': {'sheets': {
+        'Sheet1': {'headers': {'工号': 'A'}},
+    }}}}
+    (scripts_dir / '7_info.json').write_text(json.dumps({
+        'source_structure': local_structure,
+        'manual_headers': {'local.xlsx': {'Sheet1': [1, 1]}},
+    }, ensure_ascii=False), encoding='utf-8')
+
+    row = SimpleNamespace(
+        manual_headers={'db.xlsx': {'Sheet1': [2, 2]}},
+        source_structure=None, expected_structure=None,
+        config={}, source_session=None,
+    )
+    query = MagicMock()
+    query.filter_by.return_value.first.return_value = row
+    db = MagicMock()
+    db.query.return_value = query
+    storage = SimpleNamespace(
+        get_tenant_dir=lambda tenant_id: tmp_path,
+        get_active_script=lambda tenant_id: None,
+    )
+    namespace = {
+        'SessionLocal': lambda: db,
+        'db_models': SimpleNamespace(Script=object()),
+        'storage_manager': storage,
+        'json': json,
+        'logger': logging.getLogger('test-precheck-info'),
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])),
+                 str(source), 'exec'), namespace)
+
+    info = namespace['_load_script_info_for_precheck']('tenant-a', '7')
+
+    assert info['manual_headers'] == row.manual_headers
+    assert info['source_structure'] == local_structure
+
+
 def test_output_selection_never_uses_mtime_to_guess_business_result(tmp_path):
     from backend.utils.result_selection import pick_result_output
     template = tmp_path / 'template.xlsx'
@@ -185,6 +232,24 @@ def test_comparison_never_hides_identity_or_value_difference(tmp_path, expected,
     assert comparison['match_rate'] < 1
 
 
+def test_blank_vs_numeric_text_keeps_numeric_value_and_difference_type(tmp_path):
+    """空值不能等同 0，但另一侧的数值文本不能被误判为普通文本。"""
+    output = tmp_path / 'diff.xlsx'
+    comparison = _compare_dataframes_core(
+        pd.DataFrame({'工号': ['1'], '金额': ['206.83']}),
+        pd.DataFrame({'工号': ['1'], '金额': [None]}),
+        ['工号'], str(output),
+    )
+
+    assert comparison['total_differences'] == 1
+    report = openpyxl.load_workbook(output, data_only=True)['差异对比']
+    assert report['E2'].value in (None, '')
+    assert report['F2'].value == 206.83
+    assert report['F2'].data_type == 'n'
+    assert report['G2'].value == 206.83
+    assert report['G2'].data_type == 'n'
+
+
 def test_empty_primary_key_rows_pair_by_position(tmp_path):
     """主键为空的行按出现次序配对：两侧同序号的空键行视为同一行。
 
@@ -291,6 +356,28 @@ def test_expected_formula_saved_values_are_preserved_and_headers_reuse_workbooks
     assert expected.read_bytes() == original
 
 
+def test_standalone_comparison_calculates_formula_on_expected_side_as_numeric(tmp_path):
+    """独立数据对比中，左侧公式无缓存时也应按计算值进行数值比较。"""
+    from backend.utils.excel_comparator import _compare_excel_files_multi_sheet_impl
+
+    expected, result = tmp_path / 'formula-side.xlsx', tmp_path / 'value-side.xlsx'
+    workbook(expected, {'数据': [('001', '=10+5')]})
+    workbook(result, {'数据': [('001', 16)]})
+    diff = tmp_path / 'diff.xlsx'
+
+    comparison = _compare_excel_files_multi_sheet_impl(
+        str(result), str(expected), str(diff), ['工号'],
+        result_calculated=True, calculate_expected_formulas=True,
+    )
+
+    assert comparison['total_differences'] == 1
+    report = openpyxl.load_workbook(diff, data_only=True)['数据']
+    assert report['E2'].value == 15
+    assert report['F2'].value == 16
+    assert report['G2'].value == 1
+    assert report['G2'].data_type == 'n'
+
+
 @pytest.mark.parametrize('result_sheet', ['考勤', '源_工资', '工资备份'])
 def test_wrong_sheet_name_is_not_matched_by_index(tmp_path, result_sheet):
     from backend.utils.excel_comparator import _compare_excel_files_multi_sheet_impl
@@ -330,7 +417,7 @@ def load_chat_iteration():
     return namespace[node.name]
 
 
-def test_chat_training_chain_uses_selected_parameters_and_cached_formulas(tmp_path, monkeypatch):
+def test_chat_training_chain_uses_selected_parameters_and_calculated_formulas(tmp_path, monkeypatch):
     from backend.sandbox.code_sandbox import CodeSandbox
     # Run sandbox core directly; native worker isolation has separate real-process tests.
     import io
@@ -364,6 +451,26 @@ def main(input_folder, output_folder, salary_month=1):
         out.close()
     finally:
         shutil.rmtree(Path(result['output_dir']).parent, ignore_errors=True)
+
+
+@pytest.mark.parametrize('relative_path, expected_calls', [
+    ('api/training_chat.py', 1),
+    ('ai_engine/training_engine.py', 2),
+])
+def test_all_training_comparisons_calculate_expected_formulas(relative_path, expected_calls):
+    """智训的所有新旧入口都必须按两侧公式的计算结果进行比较。"""
+    path = Path(__file__).parent / relative_path
+    tree = ast.parse(path.read_text(encoding='utf-8'))
+    calls = [node for node in ast.walk(tree)
+             if isinstance(node, ast.Call)
+             and getattr(node.func, 'id', None) == 'compare_excel_files_multi_sheet']
+
+    assert len(calls) == expected_calls
+    for call in calls:
+        keyword = next((item for item in call.keywords
+                        if item.arg == 'calculate_expected_formulas'), None)
+        assert keyword is not None
+        assert isinstance(keyword.value, ast.Constant) and keyword.value.value is True
 
 
 def test_header_mapping_cannot_silently_drop_columns():

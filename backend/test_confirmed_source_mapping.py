@@ -76,7 +76,9 @@ def test_partial_match_preserved_when_another_sheet_is_absent(tmp_path, monkeypa
     result = resolve_with_confirmations(meta, skip_history_check=True)
     assert not result.ok
     assert result.file_mapping['uploaded.xlsx']['sheet_mapping'] == {'当月工资': '工资表'}
-    assert [(x['file'], x['sheet']) for x in result.missing_columns] == [('trained.xlsx', '补贴表')]
+    assert result.missing_columns == []
+    assert [(x['expected_file'], x['expected_sheet']) for x in result.source_sheet_reviews] == [
+        ('trained.xlsx', '补贴表')]
 
 
 def test_month_number_mapping_preserves_fixed_aliases_and_skips_compensation(tmp_path):
@@ -196,6 +198,75 @@ def test_pending_response_includes_final_mapping():
     assert payload['session_id'] == 'session'
 
 
+def test_pending_response_separates_final_mapping_from_review_subset():
+    import ast
+    from typing import Optional
+    from backend.utils.compute_precheck import PrecheckResult
+    tree = ast.parse((Path(__file__).parent / 'app/main.py').read_text(encoding='utf-8'))
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_compute_pending_payload')
+    ns = {'Optional': Optional}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), '<pending>', 'exec'), ns)
+    result = PrecheckResult(
+        ok=False,
+        missing_columns=[{'file': 'review.xlsx', 'sheet': '待确认', 'expected_columns': ['金额']}],
+        actual_paths=['base.xlsx > 基础 > 工号', 'upload.xlsx > Data > Amount'],
+        actual_sources=[
+            {'file': 'base.xlsx', 'sheet': '基础'},
+            {'file': 'upload.xlsx', 'sheet': 'Data'},
+        ],
+        file_mapping={
+            'base.xlsx': {
+                'expected_file': 'base.xlsx', 'sheet_mapping': {'基础': '基础'},
+                'header_mapping_by_sheet': {'基础': {'工号': '工号'}},
+            },
+            'upload.xlsx': {
+                'expected_file': 'review.xlsx', 'sheet_mapping': {'Data': '待确认'},
+                'header_mapping_by_sheet': {'Data': {'Amount': '金额'}},
+            },
+        },
+    )
+
+    payload = ns['_compute_pending_payload'](result, 'session')
+
+    assert set(payload['file_mapping']) == {'base.xlsx', 'upload.xlsx'}
+    assert set(payload['review_file_mapping']) == {'upload.xlsx'}
+    assert payload['actual_paths'] == ['upload.xlsx > Data > Amount']
+    assert payload['actual_sources'] == [{'file': 'upload.xlsx', 'sheet': 'Data'}]
+
+
+def test_sheet_review_payload_never_carries_column_mapping():
+    import ast
+    from typing import Optional
+    from backend.utils.compute_precheck import PrecheckResult
+    tree = ast.parse((Path(__file__).parent / 'app/main.py').read_text(encoding='utf-8'))
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_compute_pending_payload')
+    ns = {'Optional': Optional}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), '<pending>', 'exec'), ns)
+    result = PrecheckResult(
+        ok=False,
+        source_sheet_reviews=[{
+            'expected_file': 'train.xlsx', 'expected_sheet': '工资',
+            'suggested_file': 'upload.xlsx', 'suggested_sheet': 'Payroll',
+        }],
+        actual_paths=['upload.xlsx > Payroll > ID'],
+        actual_sources=[{'file': 'upload.xlsx', 'sheet': 'Payroll'}],
+        file_mapping={'upload.xlsx': {
+            'expected_file': 'train.xlsx',
+            'sheet_mapping': {'Payroll': '工资'},
+            'header_mapping': {'ID': '工号'},
+            'header_mapping_by_sheet': {'Payroll': {'ID': '工号'}},
+        }},
+    )
+
+    payload = ns['_compute_pending_payload'](result, 'session')
+
+    review = payload['review_file_mapping']['upload.xlsx']
+    assert review['sheet_mapping'] == {'Payroll': '工资'}
+    assert review['header_mapping'] == {}
+    assert review['header_mapping_by_sheet'] == {'Payroll': {}}
+    assert review['selected_columns_by_sheet'] == {'Payroll': None}
+
+
 def test_session_confirmation_keeps_prior_rounds_and_explicit_skips(tmp_path):
     from backend.utils.confirmed_source_mapping import save_confirmation_state
     meta, parsed, mapping = fixture_data(tmp_path)
@@ -243,8 +314,6 @@ def test_incomplete_manual_columns_still_build_confirmed_source_sheet(tmp_path, 
         'sheet_mapping': {'当月工资': '工资表'},
         'header_mapping_by_sheet': {'当月工资': {}},
     }}
-    monkeypatch.setattr(FastHeaderMatcher, 'match_headers_only',
-                        lambda *args: pytest.fail('人工指定的 Sheet 不应被重新自动匹配'))
     monkeypatch.setattr(pre, '_check_target_sheets', lambda *args: None)
 
     result = resolve_with_confirmations(

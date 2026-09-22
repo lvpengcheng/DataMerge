@@ -1,7 +1,67 @@
 """Conservative schema matching; filenames are tie breakers, never substitutes for columns."""
 import re
 import unicodedata
+from difflib import SequenceMatcher
 from .period_matching import period_candidate_allowed
+
+
+_EXCEL_SUFFIX = re.compile(r'\.(?:xlsx|xlsm|xls)$', re.IGNORECASE)
+_PERIOD_TOKEN = re.compile(
+    r'(?<!\d)20\d{2}(?:\s*[年./_-]?\s*)(?:0?[1-9]|1[0-2])\s*月?(?!\d)')
+_IDENTITY_NOISE = re.compile(r'[\s\-_.·—（）()【】\[\]]+')
+_IDENTITY_LEAD = 0.08
+
+
+def normalized_source_identity(value, *, filename=False):
+    """用于文件/Sheet 业务名称关联；移除扩展名、工资月份和分隔符。"""
+    text = unicodedata.normalize('NFKC', str(value or '')).casefold().strip()
+    if filename:
+        text = _EXCEL_SUFFIX.sub('', text)
+    text = _PERIOD_TOKEN.sub('', text)
+    return _IDENTITY_NOISE.sub('', text)
+
+
+def source_identity_similarity(left, right, *, filename=False):
+    left = normalized_source_identity(left, filename=filename)
+    right = normalized_source_identity(right, filename=filename)
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    score = SequenceMatcher(None, left, right).ratio()
+    # 很弱的偶然字符重合不能用来拆解同结构歧义。
+    return round(score, 6) if score >= 0.45 else 0.0
+
+
+def source_identity_rank(training, actual):
+    """结构同分时：先比较业务文件名，再比较 Sheet 名。"""
+    file_score = max(
+        source_identity_similarity(training.get('file_name'), actual.get(name), filename=True)
+        for name in ('file_name', 'original_file_name') if actual.get(name)
+    )
+    sheet_score = max(
+        source_identity_similarity(training.get('sheet_name'), actual.get(name))
+        for name in ('sheet_name', 'original_sheet_name') if actual.get(name)
+    )
+    return file_score, sheet_score
+
+
+def ranked_choice_is_unique(ranks):
+    """结构分相同时，名称关联必须有明确领先，不能因微小相似度误配。"""
+    ranks = sorted(ranks, reverse=True)
+    if len(ranks) <= 1:
+        return True
+    top, second = ranks[0], ranks[1]
+    identity_offset = 0
+    if len(top) >= 3:
+        if top[0] != second[0]:
+            return True
+        identity_offset = 1
+    if top[identity_offset] != second[identity_offset]:
+        return top[identity_offset] - second[identity_offset] >= _IDENTITY_LEAD
+    if len(top) > identity_offset + 1 and top[identity_offset + 1] != second[identity_offset + 1]:
+        return top[identity_offset + 1] - second[identity_offset + 1] >= _IDENTITY_LEAD
+    return False
 
 
 def suggest_file_relations(training, actual, resolved, year=None, month=None):
@@ -92,13 +152,13 @@ def match_structural_sources(matcher, training, actual, matching_context=None):
                 columns = structural_columns(matcher, t['headers'], a['headers'])
                 if columns is None:
                     continue
-                rank = (a['file_name'] == t['file_name'], a['sheet_name'] == t['sheet_name'])
+                rank = source_identity_rank(t, a)
                 choices.append((rank, ai, columns))
             if not choices:
                 continue
             best = max(item[0] for item in choices)
             winners = [item for item in choices if item[0] == best]
-            if len(winners) == 1:
+            if len(winners) == 1 and ranked_choice_is_unique([item[0] for item in choices]):
                 proposals[ti] = winners[0]
         accepted = []
         for ti, (rank, ai, columns) in proposals.items():

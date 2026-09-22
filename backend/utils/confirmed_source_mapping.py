@@ -116,6 +116,7 @@ def apply_confirmed_mapping(meta, automatic, confirmed):
             destinations.add(destination)
             headers = dict((info.get('header_mapping_by_sheet') or {}).get(
                 sheet, info.get('header_mapping') or {}))
+            sheet_only = not headers
             for col, target_col in headers.items():
                 if col not in source['headers'] or target_col not in target['headers']:
                     raise ValueError(f'人工映射的列不存在: {filename}/{sheet}/{col} → {target_col}')
@@ -127,7 +128,7 @@ def apply_confirmed_mapping(meta, automatic, confirmed):
                 raise ValueError(f'多个来源列指向同一训练列: {filename}/{sheet}')
             missing = {c for c in target['headers'] if c not in headers.values()
                        and (target_file, target_sheet, c) not in skipped}
-            if missing:
+            if missing and not sheet_only:
                 raise ValueError(f'请完成 {target_file}/{target_sheet} 的列匹配: {", ".join(sorted(missing))}')
             # 清除自动匹配占用的目标，不能让自动推断覆盖人工选择。
             for old_name, old in list(result.items()):
@@ -150,7 +151,7 @@ def apply_confirmed_mapping(meta, automatic, confirmed):
             # 全部训练列都明确“无匹配”时仍保留这个已确认的源 Sheet，并写入其
             # 原始列/数据；None 表示不裁剪源列，仅不执行列名映射。
             entry.setdefault('selected_columns_by_sheet', {})[sheet] = (
-                list(headers) if headers else None)
+                None if sheet_only else list(headers))
     return result
 
 

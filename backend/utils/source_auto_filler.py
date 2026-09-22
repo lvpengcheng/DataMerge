@@ -61,7 +61,8 @@ def auto_fill_missing_sources(
 
     Returns:
         (filled_list, missing_list)
-        - filled_list: [{"file_name": "xx.xlsx", "source": "tenant/global", "asset_name": "xx"}]
+        - filled_list: [{"file_name": "训练期望名.xls", "stored_file_name": "实际落盘名.xlsx",
+                         "source": "tenant/global", "asset_name": "xx"}]
         - missing_list: ["缺失文件名1.xlsx", ...]
     """
     if not source_structure or "files" not in source_structure:
@@ -96,12 +97,30 @@ def auto_fill_missing_sources(
         if asset:
             # 复制文件到 source_dir
             src_path = asset.file_path
-            dst_path = os.path.join(source_dir, file_name)
+            # 基础资料上传阶段可能已把旧 .xls 转成 .xlsx。不能把 xlsx 内容用
+            # .xls 后缀落盘，否则后续解析器会按错误格式打开；文件角色仍保留
+            # 训练期望名，实际落盘名只修正扩展名。
+            src_suffix = Path(src_path).suffix.lower()
+            expected_path = Path(file_name)
+            expected_suffix = expected_path.suffix.lower()
+            dst_name = file_name
+            if (src_suffix in (".xlsx", ".xls", ".xlsm")
+                    and expected_suffix in (".xlsx", ".xls", ".xlsm")
+                    and src_suffix != expected_suffix):
+                dst_name = expected_path.with_suffix(src_suffix).name
+            dst_path = os.path.join(source_dir, dst_name)
 
             if os.path.exists(src_path):
+                # 用户上传永远优先，扩展名修正后若目标已经存在，绝不能用基础资料覆盖。
+                if os.path.exists(dst_path):
+                    logger.info(
+                        f"[AutoFill] 跳过 '{file_name}'：本次上传已存在 '{dst_name}'")
+                    missing_list.append(file_name)
+                    continue
                 shutil.copy2(src_path, dst_path)
                 filled_list.append({
                     "file_name": file_name,
+                    "stored_file_name": dst_name,
                     "source": source_scope,
                     "asset_name": asset.name,
                     "asset_id": asset.id,
@@ -153,10 +172,12 @@ def _find_matching_asset(
 ) -> Tuple[Optional[object], Optional[str]]:
     """按优先级查找匹配的基础资料
 
+    严格按资料范围优先：先穷尽租户基础资料，再考虑全局基础资料。
+
     匹配顺序：
     1. 租户级 - 文件名匹配
-    2. 全局级 - 文件名匹配
-    3. 租户级 - 表头结构匹配
+    2. 租户级 - 表头结构匹配
+    3. 全局级 - 文件名匹配
     4. 全局级 - 表头结构匹配
 
     Returns:
@@ -167,25 +188,23 @@ def _find_matching_asset(
     if match:
         return match, "租户"
 
-    # 2. 全局级文件名匹配
+    # 2. 表头结构匹配（需要 source_structure 中的 headers）
+    expected_headers = _extract_headers(file_structure)
+    if expected_headers:
+        match = _match_by_headers(expected_headers, tenant_assets)
+        if match:
+            return match, "租户"
+
+    # 3. 全局级文件名匹配
     match = _match_by_filename(expected_name, global_assets)
     if match:
         return match, "全局"
 
-    # 3. 表头结构匹配（需要 source_structure 中的 headers）
-    expected_headers = _extract_headers(file_structure)
-    if not expected_headers:
-        return None, None
-
-    # 4. 租户级表头匹配
-    match = _match_by_headers(expected_headers, tenant_assets)
-    if match:
-        return match, "租户"
-
-    # 5. 全局级表头匹配
-    match = _match_by_headers(expected_headers, global_assets)
-    if match:
-        return match, "全局"
+    # 4. 全局级表头匹配
+    if expected_headers:
+        match = _match_by_headers(expected_headers, global_assets)
+        if match:
+            return match, "全局"
 
     return None, None
 

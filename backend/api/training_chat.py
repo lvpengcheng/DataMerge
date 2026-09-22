@@ -973,7 +973,12 @@ def _run_single_iteration(
         comparison_primary_keys = extract_primary_keys_from_rules(rules_content) if rules_content else None
         logger.info(f"[对比] rules_content长度={len(rules_content) if rules_content else 0}, 提取到主键={comparison_primary_keys}")
 
-        comparison = compare_excel_files_multi_sheet(result_file, expected_file, diff_output, primary_keys=comparison_primary_keys, result_calculated=True)
+        comparison = compare_excel_files_multi_sheet(
+            result_file, expected_file, diff_output,
+            primary_keys=comparison_primary_keys,
+            result_calculated=True,
+            calculate_expected_formulas=True,
+        )
         from backend.utils.excel_comparator import require_complete_comparison
         require_complete_comparison(comparison)
 

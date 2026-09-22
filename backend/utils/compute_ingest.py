@@ -4,8 +4,7 @@
 
 1. **一次解析**：`ingest_source_dir` 内只调用 `FastHeaderMatcher.parse_inputs` 一次，
    每个上传文件仅被 Aspose 打开 1 次；改名评分复用同一份表头，不再单独开文件。
-2. **一次确认**：改名候选、低置信列名、目标表歧义在同一轮里全部收集返回，
-   不再"遇到改名歧义就 return"从而逼用户走三轮。
+2. **一次确认**：只确认上传文件、源 Sheet 与目标表歧义；源列不进入 AI 或人工匹配。
 3. **确认轮不碰 Excel**：解析结果落 `_ingest_sources.pkl`（大），表头层元数据落
    `_ingest_meta.pkl`（小）。人工确认后只读 meta，在内存里重算映射（毫秒级，
    不占 Excel 闸门），确认通过后由计算进程读 sources.pkl 构建预加载数据。
@@ -20,6 +19,7 @@ import json
 import pickle
 import logging
 import tempfile
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -27,19 +27,8 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
-def _column_auto_accept_threshold() -> float:
-    """列级自动确认阈值：达到该值的列映射不再进入人工确认界面。"""
-    raw = os.getenv("COLUMN_AUTO_ACCEPT_THRESHOLD", "0.90")
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        value = 0.90
-    return min(1.0, max(0.0, value))
-
-
-
 # 解析逻辑或产物结构变化时 +1，旧会话产物自动失效
-INGEST_VERSION = 4
+INGEST_VERSION = 9
 
 _META_NAME = "_ingest_meta.pkl"
 _SOURCES_NAME = "_ingest_sources.pkl"
@@ -69,6 +58,8 @@ class IngestMeta:
     auto_renamed: List[Dict[str, Any]] = field(default_factory=list)
     rename_candidates: List[Dict[str, Any]] = field(default_factory=list)
     auto_filled: List[Dict[str, Any]] = field(default_factory=list)
+    # 基础资料补全后由确定性结构规则直接锁定的映射；不再进入 AI/人工候选。
+    auto_filled_mapping: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     missing_files: List[str] = field(default_factory=list)
     parse_error: Optional[str] = None
 
@@ -83,16 +74,6 @@ class IngestMeta:
                 if best.get("expected"):
                     probe[uploaded] = best["expected"]
         return probe
-
-    def candidate_targets(self) -> set:
-        """所有改名候选可能占用的期望文件名（不能被基础资料抢先覆盖）。"""
-        names = set()
-        for cand in self.rename_candidates or []:
-            for c in cand.get("candidates") or []:
-                if c.get("expected"):
-                    names.add(c["expected"])
-        return names
-
 
 # ==================== 加密 / 格式预处理 ====================
 
@@ -207,6 +188,8 @@ def ingest_source_dir(
     salary_year: Optional[int] = None,
     salary_month: Optional[int] = None,
     confirmed_renames: Optional[Dict[str, str]] = None,
+    confirmed_mapping: Optional[Dict[str, Any]] = None,
+    defer_base_fill: bool = False,
 ) -> Tuple[IngestMeta, Dict[tuple, Any]]:
     """解析一次源目录，产出表头层元数据 + 内存解析结果。
 
@@ -228,7 +211,7 @@ def ingest_source_dir(
     meta.multi_sheet_source = bool(FastHeaderMatcher._infer_multi_sheet_source(structure))
     meta.train_sheets = matcher._build_training_sheets(structure)
 
-    # 步骤 1：唯一一次全量解析（每文件 1 次 Aspose）
+    # 步骤 1：先且只解析本次上传文件。基础资料不能在上传关系尚未判断前抢占角色。
     input_files = collect_input_files(source_dir)
     parsed_sheets_map: Dict[tuple, Any] = {}
     input_sheets: List[Dict[str, Any]] = []
@@ -246,45 +229,131 @@ def ingest_source_dir(
     for sheet in input_sheets:
         sheet['original_file_name'] = original_names.get(sheet['file_name'], sheet['file_name'])
         sheet['original_sheet_name'] = sheet['sheet_name']
+        sheet['source_origin'] = 'upload'
 
-    # 文件名、Sheet 名改变不应先触发 AI。完整结构能唯一确定时直接复用。
+    # 先且只用确定性的结构规则判断本次上传已经覆盖的训练角色。这里禁止调用 AI：
+    # 首轮只整理上传关系；人工确认后才允许基础资料补全未覆盖角色。
+    matching_context = {'salary_year': salary_year, 'salary_month': salary_month}
     structural = matcher.match_headers_only(
-        meta.train_sheets, input_sheets, None,
-        {'salary_year': salary_year, 'salary_month': salary_month})
-    structural_files = {info['expected_file'] for info in
-                        (structural.get('mapping') or {}).get('file_mapping', {}).values()}
+        meta.train_sheets, input_sheets, None, matching_context)
+    coverage_mapping = dict((structural.get('mapping') or {}).get('file_mapping') or {})
+
+    structural_files = {info['expected_file'] for info in coverage_mapping.values()
+                        if info.get('expected_file')}
+    provisional_auto_renamed = []
+    provisional_candidates = []
     if not structural['success']:
         from .structural_source_mapping import suggest_file_relations
-        meta.auto_renamed, meta.rename_candidates = suggest_file_relations(
-            meta.train_sheets, input_sheets,
-            (structural.get('mapping') or {}).get('file_mapping') or {}, salary_year, salary_month)
+        provisional_auto_renamed, provisional_candidates = suggest_file_relations(
+            meta.train_sheets, input_sheets, coverage_mapping, salary_year, salary_month)
+    meta.auto_renamed = list(provisional_auto_renamed)
+    meta.rename_candidates = list(provisional_candidates)
 
-    # 步骤 3：基础资料兜底；改名候选可能占用的期望名不参与兜底（避免覆盖用户文件）
-    if db_session is not None and tenant_id:
+    # 步骤 3：基础资料兜底。
+    # 严格顺序：本次上传 > 租户基础资料 > 全局基础资料。只有确定性的结构匹配、
+    # 月份角色自动关系或人工确认关系才能声明训练角色已覆盖；模糊候选不能阻止补全。
+    if (not defer_base_fill) and db_session is not None and tenant_id:
         try:
             from .source_auto_filler import auto_fill_missing_sources
+            _confirmed_raw = ((confirmed_mapping or {}).get(
+                'file_mapping', confirmed_mapping or {}) or {})
+            _confirmed_sheets: Dict[str, set] = {}
+            for filename, info in _confirmed_raw.items():
+                if not isinstance(info, dict):
+                    continue
+                target_file = str(info.get('expected_file') or filename)
+                _confirmed_sheets.setdefault(target_file, set()).update(
+                    str(sheet) for sheet in (info.get('sheet_mapping') or {}).values())
+            # 只有训练文件的全部 Sheet 都已由上传关系覆盖，才阻止基础资料补入；
+            # 只匹配了其中一个 Sheet 时，仍允许基础资料补齐该文件的其他 Sheet。
+            _confirmed_files = set()
+            for target_file, covered_sheets in _confirmed_sheets.items():
+                expected_sheets = set(((structure.get('files') or {}).get(target_file) or {})
+                                      .get('sheets', {}).keys())
+                if expected_sheets and expected_sheets <= covered_sheets:
+                    _confirmed_files.add(target_file)
             filled, still_missing = auto_fill_missing_sources(
                 source_dir=source_dir,
                 source_structure=structure,
                 tenant_id=tenant_id,
                 db_session=db_session,
-                assume_present=(meta.candidate_targets() | structural_files |
-                                {r['to'] for r in meta.auto_renamed} |
-                                {v for v in (confirmed_renames or {}).values() if v}),
+                assume_present=(structural_files |
+                                {r['to'] for r in provisional_auto_renamed} |
+                                {v for v in (confirmed_renames or {}).values() if v} |
+                                _confirmed_files),
             )
-            meta.auto_filled = filled or []
+            meta.auto_filled = list(filled or [])
             meta.missing_files = list(still_missing or [])
             # 步骤 3.1：只解析新补进来的文件（增量，不重解析已有文件）
-            new_paths = [str(Path(source_dir) / f["file_name"]) for f in meta.auto_filled]
+            new_paths = [str(Path(source_dir) /
+                             (f.get("stored_file_name") or f["file_name"]))
+                         for f in (filled or [])]
             new_paths = [p for p in new_paths if os.path.exists(p)]
             if new_paths:
                 extra_sheets, extra_map = matcher.parse_inputs(
                     new_paths, manual_headers, multi_sheet_source=meta.multi_sheet_source)
+                filled_by_name = {
+                    (item.get('stored_file_name') or item.get('file_name')): item
+                    for item in (filled or [])
+                }
+                for sheet in extra_sheets:
+                    fill_info = filled_by_name.get(sheet.get('file_name')) or {}
+                    source_scope = fill_info.get('source')
+                    sheet['original_file_name'] = sheet.get('file_name')
+                    sheet['original_sheet_name'] = sheet.get('sheet_name')
+                    sheet['source_origin'] = (
+                        'tenant_base' if source_scope == '租户'
+                        else 'global_base' if source_scope == '全局'
+                        else 'base'
+                    )
+                    sheet['source_asset_name'] = fill_info.get('asset_name')
                 input_sheets.extend(extra_sheets)
                 parsed_sheets_map.update(extra_map)
                 meta.signatures = _signatures_from_sheets(input_sheets)
         except Exception as e:
             logger.warning(f"[Ingest] 基础资料兜底异常: {e}", exc_info=True)
+    elif defer_base_fill:
+        meta.missing_files = []
+        logger.info('[Ingest] 首轮仅匹配本次上传文件，基础资料补全延后到人工确认之后')
+
+    # 基础资料现在已经在 input_sheets 中。基于完整源集合重新整理文件关系，
+    # 后续 AI 和人工弹窗由此看到“本次上传 + 自动补全”的全部文件与 Sheet。
+    final_structural = matcher.match_headers_only(
+        meta.train_sheets, input_sheets, None, matching_context)
+    if final_structural.get('success'):
+        meta.auto_renamed = []
+        meta.rename_candidates = []
+    else:
+        from .structural_source_mapping import suggest_file_relations
+        meta.auto_renamed, meta.rename_candidates = suggest_file_relations(
+            meta.train_sheets, input_sheets,
+            (final_structural.get('mapping') or {}).get('file_mapping') or {},
+            salary_year, salary_month)
+
+    # 每个基础资料文件的训练角色在补全时已经确定。用代码单独完成其结构映射并
+    # 锁定，避免它与本次上传一起进入 AI 候选或人工 Sheet/字段选择框。逐文件
+    # 匹配也能避免多个基础文件结构相似时互相形成歧义。
+    for filled_info in meta.auto_filled:
+        actual_name = filled_info.get('stored_file_name') or filled_info.get('file_name')
+        expected_name = filled_info.get('file_name')
+        base_actual = [s for s in input_sheets if s.get('file_name') == actual_name]
+        base_training = [s for s in meta.train_sheets if s.get('file_name') == expected_name]
+        if not base_actual or not base_training:
+            continue
+        base_result = matcher.match_headers_only(
+            base_training, base_actual, None, matching_context)
+        base_mapping = (base_result.get('mapping') or {}).get('file_mapping') or {}
+        if base_result.get('success') and actual_name in base_mapping:
+            locked_info = deepcopy(base_mapping[actual_name])
+            locked_info['auto_filled'] = True
+            locked_info['source_origin'] = base_actual[0].get('source_origin', 'base')
+            meta.auto_filled_mapping[actual_name] = locked_info
+        else:
+            # 理论上基础资料与训练结构一致；若资产本身已失效，保留日志但绝不把
+            # 它推入 AI/人工候选，防止用户被要求再次确认一个“已补全”的文件。
+            logger.warning(
+                "[Ingest] 基础资料已补入但无法按训练结构锁定，已从 AI/人工候选排除: %s → %s",
+                actual_name, expected_name)
 
     meta.input_sheets = input_sheets
     meta.sheet_summary = _summaries_from_map(parsed_sheets_map)
@@ -311,6 +380,7 @@ def resolve_with_confirmations(
     template_override_path: Optional[str] = None,
     skip_history_check: bool = False,
     skipped_missing_files: Optional[List[str]] = None,
+    allow_ai_matching: bool = True,
 ):
     """在表头层解算最终映射，收集全部待确认项。首轮与确认轮共用这段代码。
 
@@ -321,16 +391,22 @@ def resolve_with_confirmations(
     Returns: PrecheckResult（额外挂 `_effective_renames`，供上层记录实际采用的改名）
     """
     from .compute_precheck import (
-        PrecheckResult, _extract_missing_columns, _suggest_structural_columns,
+        PrecheckResult,
         _check_target_sheets, _check_history,
     )
     from .fast_header_matcher import FastHeaderMatcher
+    active_ai_provider = meta.ai_provider_name if allow_ai_matching else None
 
     result = PrecheckResult()
+    interactive_input_sheets = [
+        s for s in meta.input_sheets if s.get('source_origin', 'upload') == 'upload'
+    ]
     result.actual_sources = [{'file': s['file_name'], 'sheet': s['sheet_name'],
                               'original_file': s.get('original_file_name', s['file_name']),
-                              'original_sheet': s.get('original_sheet_name', s['sheet_name'])}
-                             for s in meta.input_sheets]
+                              'original_sheet': s.get('original_sheet_name', s['sheet_name']),
+                              'origin': s.get('source_origin', 'upload'),
+                              'asset_name': s.get('source_asset_name')}
+                             for s in interactive_input_sheets]
     from .confirmed_source_mapping import fully_unmatched_sheets
     result.unmatched_columns = list((confirmed_mapping or {}).get('unmatched_columns', []))
     unmatched_sheets = fully_unmatched_sheets(meta.source_structure, result.unmatched_columns)
@@ -383,11 +459,11 @@ def resolve_with_confirmations(
         result.missing_columns = [{
             'file': '', 'sheet': '', 'expected_columns': [], 'error': result.mapping_notice,
         }]
-        result.actual_paths = _actual_paths(meta.input_sheets)
+        result.actual_paths = _actual_paths(interactive_input_sheets)
         if not skip_history_check:
             _check_history(script_content, tenant_id, salary_year, salary_month, result, use_history)
         _check_target_sheets(script_content, tenant_id, template_override_path,
-                             confirmed_target_map, result, meta.ai_provider_name)
+                             confirmed_target_map, result, active_ai_provider)
         return result
     # 明确选了"不映射"的文件：撤掉试探改名，别背着用户按最高分改
     for _skip_name in _decided_files - set(confirmed_renames):
@@ -401,16 +477,16 @@ def resolve_with_confirmations(
     result._effective_renames = effective_renames
 
     # 先固定人工选择，仅剩余表参与自动匹配，避免再次推断覆盖确认结果。
-    locked = {}
+    auto_filled_locked = deepcopy(meta.auto_filled_mapping or {})
+    locked = deepcopy(auto_filled_locked)
     if confirmed_mapping:
         from .confirmed_source_mapping import apply_confirmed_mapping
         try:
-            locked = apply_confirmed_mapping(meta, {}, confirmed_mapping)
+            locked = apply_confirmed_mapping(meta, locked, confirmed_mapping)
         except ValueError as exc:
             result.ok = False
             # 即使列关系尚不完整，也要保留已经人工指定的文件/Sheet，并补齐真实
             # file_path。最终审核放行后，计算进程才能按该关系生成对应的 ``源_*``。
-            from copy import deepcopy
             result.file_mapping = deepcopy(
                 (confirmed_mapping or {}).get('file_mapping', confirmed_mapping) or {})
             _actual_by_pair = {(s['file_name'], s['sheet_name']): s for s in meta.input_sheets}
@@ -421,16 +497,16 @@ def resolve_with_confirmations(
                 if _source is not None:
                     _info['file_path'] = _source['file_path']
                     _info['needs_rewrite'] = True
-            result.actual_paths = _actual_paths(meta.input_sheets)
-            result.missing_columns = _extract_missing_columns(
-                meta.source_structure, [s['file_path'] for s in meta.input_sheets], str(exc))
-            result.ai_suggestions = _suggest_structural_columns(
-                result.missing_columns, result.actual_paths, result.file_mapping, confirmed_renames)
+            result.actual_paths = _actual_paths(interactive_input_sheets)
+            result.missing_columns = [{
+                'file': '', 'sheet': '', 'expected_columns': [], 'error': str(exc),
+            }]
+            result.ai_suggestions = []
             # 一次展示剩余的所有类别，避免修完源列后下一轮才出现目标表/历史确认。
             if not skip_history_check:
                 _check_history(script_content, tenant_id, salary_year, salary_month, result, use_history)
             _check_target_sheets(script_content, tenant_id, template_override_path,
-                                 confirmed_target_map, result, meta.ai_provider_name)
+                                 confirmed_target_map, result, active_ai_provider)
             return result
     locked_targets = {(info['expected_file'], sheet) for info in locked.values()
                       for sheet in info['sheet_mapping'].values()}
@@ -439,7 +515,7 @@ def resolve_with_confirmations(
     train_remaining = [s for s in meta.train_sheets
                        if (s['file_name'], s['sheet_name']) not in locked_targets
                        and s['file_name'] not in _skipped_files]
-    input_remaining = [s for s in meta.input_sheets
+    input_remaining = [s for s in interactive_input_sheets
                        if (s['file_name'], s['sheet_name']) not in locked_inputs]
     effective_renames.update({filename: info['expected_file'] for filename, info in locked.items()})
     virtual_sheets, xlate = _build_virtual_sheets(input_remaining, effective_renames, None)
@@ -457,7 +533,7 @@ def resolve_with_confirmations(
         match_result = {"success": False, "error": "上传的文件无法读取或为空"}
     elif train_remaining:
         match_result = FastHeaderMatcher().match_headers_only(
-            train_remaining, virtual_sheets, meta.ai_provider_name,
+            train_remaining, virtual_sheets, active_ai_provider,
             {'script_content': script_content or '',
              'template_name': os.path.basename(template_override_path or ''),
              'target_sheets': list((meta.expected_structure or {}).get('sheets', {})),
@@ -469,15 +545,17 @@ def resolve_with_confirmations(
              'original_file_names': meta.auto_renamed})
     else:
         match_result = {"success": True, "mapping": {"file_mapping": {}}}
-    composed = _compose_file_mapping(
-        (match_result.get("mapping") or {}).get("file_mapping") or {}, xlate)
+    composed = deepcopy(auto_filled_locked)
+    composed.update(_compose_file_mapping(
+        (match_result.get("mapping") or {}).get("file_mapping") or {}, xlate))
     if 'AI 匹配未通过' in (match_result.get('error') or ''):
         result.mapping_notice = ((match_result.get('ai_failure_reason') or 'AI 推荐未通过校验')
                                  + '；已保留程序匹配结果，其余来源请确认。')
     elif not match_result.get('success') and match_result.get('match_method') == 'ai':
-        result.mapping_notice = 'AI 已保留能够确定的匹配；剩余缺失或不确定的来源、字段请确认。'
-    if locked:
+        result.mapping_notice = 'AI 已保留能够确定的文件和 Sheet；其余来源请确认。'
+    if confirmed_mapping:
         composed = apply_confirmed_mapping(meta, composed, confirmed_mapping)
+    if locked:
         # 文件/Sheet 已被明确指定后，同文件的改名候选不再重复询问。
         result.rename_candidates = [c for c in result.rename_candidates if c.get('uploaded') not in locked]
         mapped_files = {info['expected_file'] for info in composed.values()}
@@ -494,96 +572,17 @@ def resolve_with_confirmations(
                    for sheet in info.get('sheet_mapping', {}).values()}
         remaining = [s for s in meta.train_sheets
                      if (s['file_name'], s['sheet_name']) not in covered | unmatched_sheets and s['file_name'] not in _skipped_files]
-        missing_columns = [{'file': s['file_name'], 'sheet': s['sheet_name'],
-                            'expected_columns': list(s['headers'])} for s in remaining]
-        # A high similarity score is not full column coverage. Surface the few
-        # unresolved columns now, rather than discarding all mappings next round.
-        skipped_columns = {tuple(item) for item in result.unmatched_columns}
-        threshold = _column_auto_accept_threshold()
-        train_cols_by_key = {
-            (sheet['file_name'], sheet['sheet_name']): list(sheet.get('headers') or {})
-            for sheet in meta.train_sheets
-        }
-        low_confidence_issues = []
-        for input_file, info in composed.items():
-            # 人工确认过的映射不再做置信度拦截。
-            if info.get('confirmed'):
-                continue
-            expected_file = info.get('expected_file')
-            for source_sheet, target_sheet in (info.get('sheet_mapping') or {}).items():
-                key = (expected_file, target_sheet)
-                target_columns = train_cols_by_key.get(key) or []
-                if not target_columns:
-                    continue
-                columns = (info.get('header_mapping_by_sheet') or {}).get(
-                    source_sheet, info.get('header_mapping') or {})
-                reverse = {}
-                for source_col, target_col in columns.items():
-                    reverse.setdefault(target_col, source_col)
-                conf_map = (info.get('header_confidence_by_sheet') or {}).get(source_sheet) or {}
-                for target_col in target_columns:
-                    if (*key, target_col) in skipped_columns:
-                        continue
-                    source_col = reverse.get(target_col)
-                    expected_path = f"{expected_file} > {target_sheet} > {target_col}"
-                    if source_col is None:
-                        low_confidence_issues.append({
-                            'expected_path': expected_path,
-                            'suggested_path': '',
-                            'confidence': 0.0,
-                            'reason': f'训练列 {target_col} 未匹配到上传列，请确认或选择无匹配',
-                        })
-                        continue
-                    raw_conf = conf_map.get(source_col)
-                    if raw_conf is None:
-                        low_confidence_issues.append({
-                            'expected_path': expected_path,
-                            'suggested_path': f"{input_file} > {source_sheet} > {source_col}",
-                            'confidence': 0.0,
-                            'reason': f'列 {source_col} -> {target_col} 缺少置信度，请确认',
-                        })
-                        continue
-                    try:
-                        conf = float(raw_conf)
-                    except (TypeError, ValueError):
-                        conf = 0.0
-                    if conf < threshold:
-                        low_confidence_issues.append({
-                            'expected_path': expected_path,
-                            'suggested_path': f"{input_file} > {source_sheet} > {source_col}",
-                            'confidence': conf,
-                            'reason': f'列 {source_col} -> {target_col} 置信度 {conf:.2f} 低于阈值 {threshold:.2f}，请确认',
-                        })
-
-        # 低置信列才进入 missing_columns；高置信列自动通过，不弹列确认。
-        low_by_key = {}
-        for issue in low_confidence_issues:
-            parts = str(issue.get('expected_path') or '').split(' > ', 2)
-            if len(parts) == 3:
-                low_by_key.setdefault((parts[0], parts[1]), []).append(parts[2])
-        for (file_name, sheet_name), cols in low_by_key.items():
-            missing_columns.append({'file': file_name, 'sheet': sheet_name, 'expected_columns': cols})
-        if low_confidence_issues:
-            result.mapping_requires_confirmation = True
-
-        if missing_columns:
+        # 智算只审核文件/Sheet。列差异由训练脚本按改名后的源文件处理，不再
+        # 转成 missing_columns，也不再触发列级 AI/人工确认。
+        if remaining:
             result.ok = False
-            result.actual_paths = _actual_paths(meta.input_sheets)
-            result.missing_columns = missing_columns
-            suggestion_index = {issue.get('expected_path'): dict(issue) for issue in low_confidence_issues}
-            for item in (match_result.get('ai_suggestions') or []):
-                expected_path = str(item.get('expected_path') or '')
-                if expected_path in suggestion_index:
-                    merged = dict(suggestion_index[expected_path])
-                    merged.update({k: v for k, v in item.items()
-                                   if v not in (None, '')})
-                    suggestion_index[expected_path] = merged
-            for item in _suggest_structural_columns(
-                    result.missing_columns, result.actual_paths, composed, effective_renames):
-                expected_path = str(item.get('expected_path') or '')
-                if expected_path and expected_path not in suggestion_index:
-                    suggestion_index[expected_path] = item
-            result.ai_suggestions = list(suggestion_index.values())
+            result.actual_paths = _actual_paths(interactive_input_sheets)
+            result.source_sheet_reviews = [{
+                'expected_file': s['file_name'], 'expected_sheet': s['sheet_name'],
+                'suggested_file': '', 'suggested_sheet': '', 'confidence': None,
+                'reason': '程序和 AI 均未确定来源，请选择对应文件/Sheet；若基础资料也没有则报告缺失文件。',
+                'recommendation_source': 'manual',
+            } for s in remaining]
     elif result.unmatched_columns and not train_remaining:
         result.file_mapping = {}
         result.rename_candidates = [c for c in result.rename_candidates
@@ -593,30 +592,32 @@ def resolve_with_confirmations(
         # 未确定的来源必须先确认，不能静默把未匹配文件交给脚本猜测。
         diagnostics = match_result.get("diagnostics") or {}
         result.ok = False
-        result.actual_paths = diagnostics.get("actual_paths") or _actual_paths(meta.input_sheets)
-        missing = _extract_missing_columns(
-            meta.source_structure, [s["file_path"] for s in meta.input_sheets],
-            match_result.get("error"))
-        result.missing_columns = missing
-        result.ai_suggestions = _suggest_structural_columns(missing, result.actual_paths)
+        result.actual_paths = diagnostics.get("actual_paths") or _actual_paths(interactive_input_sheets)
+        result.source_sheet_reviews = [{
+            'expected_file': s['file_name'], 'expected_sheet': s['sheet_name'],
+            'suggested_file': '', 'suggested_sheet': '', 'confidence': None,
+            'reason': match_result.get('error') or '无法自动确定来源，请选择对应文件/Sheet。',
+            'recommendation_source': 'manual',
+        } for s in train_remaining]
 
     if match_result.get('needs_confirmation'):
         result.ok = False
         result.mapping_requires_confirmation = True
-        result.actual_paths = _actual_paths(meta.input_sheets)
-        # 只要使用了 AI（或 AI 不可用时的结构兜底），本次整理出的完整关系都要
-        # 交给操作员做一次最终审核。置信度只用于界面分组，不再用于跳过人工确认。
-        _existing = {str(item.get('expected_path') or ''): item for item in (result.ai_suggestions or [])}
-        for item in (match_result.get('ai_suggestions') or []):
-            expected_path = str(item.get('expected_path') or '')
-            if expected_path:
-                _existing[expected_path] = item
-        result.ai_suggestions = list(_existing.values())
+        result.actual_paths = _actual_paths(interactive_input_sheets)
+        # AI 仅输出文件/Sheet 推荐；禁止在此重新生成列建议。
+        _existing = {(str(item.get('expected_file')), str(item.get('expected_sheet'))): item
+                     for item in result.source_sheet_reviews or []}
+        for item in (match_result.get('source_sheet_reviews') or []):
+            key = (str(item.get('expected_file')), str(item.get('expected_sheet')))
+            _existing[key] = item
+        result.source_sheet_reviews = list(_existing.values())
+        result.ai_suggestions = []
+        result.missing_columns = []
 
     if not skip_history_check:
         _check_history(script_content, tenant_id, salary_year, salary_month, result, use_history)
     _check_target_sheets(script_content, tenant_id, template_override_path,
-                         confirmed_target_map, result, meta.ai_provider_name)
+                         confirmed_target_map, result, active_ai_provider)
     return result
 
 

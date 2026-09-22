@@ -2,7 +2,7 @@ const fs = require('fs');
 const vm = require('vm');
 const assert = require('node:assert/strict');
 const path = require('path');
-const ctx = {document: {addEventListener() {}}};
+const ctx = {document: {addEventListener() {}}, setTimeout, clearTimeout};
 vm.createContext(ctx);
 vm.runInContext(fs.readFileSync(path.join(__dirname, '../frontend/static/js/compute.js'), 'utf8'), ctx);
 const plain = x => JSON.parse(JSON.stringify(x));
@@ -57,7 +57,8 @@ assert.deepEqual(plain(noRows), plain(merged));
 const remapped = ctx._mergeFileMappings(first, mapping('b.xlsx', '本月', '工资表', {'编号':'工号', '新金额':'工资'}));
 assert.deepEqual(Object.keys(remapped), ['b.xlsx']);
 assert.equal(first['a.xlsx'].header_mapping_by_sheet.工资.金额, '工资');
-assert.throws(() => ctx._mergeFileMappings(first, mapping('b.xlsx', '本月', '工资表', {'新金额':'工资'})), /不同上传 Sheet/);
+const sheetOnlyRemap = ctx._mergeFileMappings(first, mapping('b.xlsx', '本月', '工资表', {'新金额':'工资'}));
+assert.equal(sheetOnlyRemap['a.xlsx'], undefined, '更换源 Sheet 时旧来源必须整体移除');
 const rows = [{expected_path:'trained.xlsx > 工资表 > 工号'}, {expected_path:'trained.xlsx > 工资表 > 工资'}];
 const overlay = {querySelectorAll: selector => selector.includes('data-ai-idx') ? [
     {dataset:{aiIdx:'0'}, value:'b.xlsx > 本月 > 编号'},
@@ -136,7 +137,7 @@ console.log('PASS: multi-round selections, sheet-scoped columns, remap replaceme
     }};
     ctx._readComputeSubmitJson = async () => ({session_id:'session-1', mapping_refreshed:true});
     refreshOverlay.onchange({target});
-    assert.equal(doc.getElementById('_pre_confirm').textContent, '确认并继续计算', '只改目标不重新推断源字段');
+    assert.equal(doc.getElementById('_pre_confirm').textContent, '确认匹配并开始计算', '只改目标不重新推断源字段');
     assert.equal(sent, undefined);
     refreshOverlay.onchange({target:fileChoice});
     assert.equal(doc.getElementById('_pre_confirm').textContent, '应用表关系并刷新字段');
@@ -161,12 +162,13 @@ console.log('PASS: multi-round selections, sheet-scoped columns, remap replaceme
     ctx._showPrecheckDialog({
         actual_sources:[{file:'source.xlsx', sheet:'原始工资表', original_file:'原始上传.xls', original_sheet:'原始工资表'}],
         actual_paths:['source.xlsx > 原始工资表 > 工号'],
+        source_sheet_reviews:[{expected_file:'训练名称.xlsx', expected_sheet:'训练Sheet',
+            suggested_file:'source.xlsx', suggested_sheet:'原始工资表', recommendation_source:'ai'}],
         file_mapping:{'source.xlsx':{expected_file:'训练名称.xlsx', sheet_mapping:{'原始工资表':'训练Sheet'}, header_mapping:{'工号':'工号'}}}
     });
     const originalHtml = doc.getElementById('_compute_precheck_overlay').html;
-    assert.ok(originalHtml.includes('原始上传.xls &gt; 原始工资表'), '选择标签必须展示原始文件和真实 Sheet');
-    assert.ok(originalHtml.includes('value="source.xlsx &gt; 原始工资表 &gt; 工号"'), '提交值保留稳定身份，不受显示标签影响');
-    assert.ok(originalHtml.includes('data-source-sheet-detail'), '长文件名提供完整来源信息');
+    assert.ok(originalHtml.includes('原始上传.xls') && originalHtml.includes('原始工资表'), '匹配项必须展示原始文件和真实 Sheet');
+    assert.ok(originalHtml.includes('data-upload-source-key="[&quot;source.xlsx&quot;,&quot;原始工资表&quot;]"'), '提交值保留稳定身份，不受显示标签影响');
     console.log('PASS: original upload labels and full source details preserve stable mapping identities');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 
@@ -189,7 +191,7 @@ console.log('PASS: multi-round selections, sheet-scoped columns, remap replaceme
     assert.equal(restored.confirmed_mapping.unmatched_columns.length,0);
     const summary = ctx._precheckSummary({missing_columns:[{error:'缺少列'.repeat(2000), expected_columns:['A','B']}]});
     assert.ok(summary.length < 180);
-    assert.match(summary,/无匹配/);
+    assert.doesNotMatch(summary,/待确认.*列|无匹配/);
     console.log('PASS: empty selection continues, old mapping removed, skip persists and can be undone, missing summary bounded');
 }
 

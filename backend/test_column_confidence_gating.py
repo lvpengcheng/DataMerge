@@ -42,22 +42,25 @@ def _ai_mapping(pay_confidence):
              'suggested_path': 'upload.xlsx > Payroll > ID',
              'confidence': 0.99, 'reason': '测试建议'},
         ],
+        'source_sheet_reviews': [{
+            'expected_file': 'train.xlsx', 'expected_sheet': '工资',
+            'suggested_file': 'upload.xlsx', 'suggested_sheet': 'Payroll',
+            'confidence': 0.95, 'reason': '测试 Sheet 建议',
+            'recommendation_source': 'ai',
+        }],
     }
 
 
-def test_low_confidence_column_only_is_confirmed(monkeypatch):
+def test_low_confidence_columns_do_not_enter_confirmation(monkeypatch):
     monkeypatch.setattr(pre, '_check_target_sheets', lambda *args: None)
     monkeypatch.setattr(FastHeaderMatcher, 'match_headers_only',
                         lambda self, *args, **kwargs: _ai_mapping(0.70))
     result = resolve_with_confirmations(_meta(), skip_history_check=True)
     assert not result.ok
     assert result.mapping_requires_confirmation
-    assert result.missing_columns == [
-        {'file': 'train.xlsx', 'sheet': '工资', 'expected_columns': ['金额']}]
-    assert {item['expected_path'] for item in result.ai_suggestions} == {
-        'train.xlsx > 工资 > 金额', 'train.xlsx > 工资 > 工号'}
-    assert next(item for item in result.ai_suggestions
-                if item['expected_path'].endswith('金额'))['confidence'] == 0.70
+    assert result.missing_columns == []
+    assert result.ai_suggestions == []
+    assert result.source_sheet_reviews[0]['suggested_sheet'] == 'Payroll'
 
 
 def test_high_confidence_columns_do_not_require_column_confirmation(monkeypatch):
@@ -69,10 +72,10 @@ def test_high_confidence_columns_do_not_require_column_confirmation(monkeypatch)
     assert not result.ok
     assert result.mapping_requires_confirmation
     assert result.missing_columns == []
-    assert {item['expected_path'] for item in result.ai_suggestions} == {
-        'train.xlsx > 工资 > 金额', 'train.xlsx > 工资 > 工号'}
+    assert result.ai_suggestions == []
+    assert result.source_sheet_reviews[0]['suggested_sheet'] == 'Payroll'
 
-def test_invalid_ai_entry_does_not_discard_valid_entries(monkeypatch):
+def test_ai_column_payload_shape_does_not_affect_file_sheet_entries(monkeypatch):
     import json
     from backend.ai_engine import ai_provider
     from backend.utils.ai_source_mapping import match_sources_with_ai
@@ -102,7 +105,9 @@ def test_invalid_ai_entry_does_not_discard_valid_entries(monkeypatch):
     result = match_sources_with_ai(FastHeaderMatcher(), training, actual, 'claude')
     mapping = result['mapping']['file_mapping']
     assert mapping['up_a.xlsx']['sheet_mapping'] == {'Pay': '工资'}
-    assert 'up_b.xlsx' not in mapping
+    assert mapping['up_b.xlsx']['sheet_mapping'] == {'SI': '社保'}
+    assert mapping['up_a.xlsx']['header_mapping'] == {'ID': 'ID'}
+    assert mapping['up_b.xlsx']['header_mapping'] == {'ID': 'ID'}
 
 
 def test_multiple_uploaded_files_cannot_map_to_same_training_file(monkeypatch):
