@@ -538,6 +538,99 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
             </div>`;
         if (!overlay.parentNode) document.body.appendChild(overlay);
 
+        // 单个可输入下拉控件：原 select 保留为匹配数据源，输入时在同一下拉列表中过滤候选。
+        overlay.querySelectorAll('select[data-upload-source-key],select[data-rename-uploaded],select[data-target-key]').forEach(sel => {
+            const field = document.createElement('div');
+            field.className = 'precheck-combobox';
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.className = 'precheck-combobox-input';
+            input.setAttribute('role', 'combobox');
+            input.setAttribute('aria-label', '选择或输入关键词筛选匹配候选');
+            input.setAttribute('aria-autocomplete', 'list');
+            input.setAttribute('aria-expanded', 'false');
+            input.autocomplete = 'off';
+            const list = document.createElement('div');
+            list.className = 'precheck-combobox-list';
+            list.setAttribute('role', 'listbox');
+            list.hidden = true;
+            let query = '';
+            field.appendChild(input);
+            sel.before(field);
+            overlay.appendChild(list);
+            sel.style.display = 'none';
+            const selectedText = () => sel.selectedOptions[0]?.textContent || '';
+            const close = () => {
+                list.hidden = true;
+                input.setAttribute('aria-expanded', 'false');
+                input.value = selectedText();
+            };
+            const choose = option => {
+                if (option.disabled) return;
+                sel.value = option.value;
+                close();
+                sel.dispatchEvent(new Event('change', {bubbles: true}));
+            };
+            const render = keyword => {
+                query = keyword;
+                const term = keyword.trim().toLocaleLowerCase();
+                list.replaceChildren();
+                const matches = [...sel.options].filter(option =>
+                    !term || option.textContent.toLocaleLowerCase().includes(term));
+                if (!matches.length) {
+                    const empty = document.createElement('div');
+                    empty.className = 'precheck-combobox-empty';
+                    empty.textContent = '无匹配候选';
+                    list.appendChild(empty);
+                }
+                matches.forEach(option => {
+                    const item = document.createElement('button');
+                    item.type = 'button';
+                    item.className = 'precheck-combobox-option';
+                    item.setAttribute('role', 'option');
+                    item.textContent = option.textContent;
+                    item.disabled = option.disabled;
+                    item.setAttribute('aria-selected', String(option.value === sel.value));
+                    item.addEventListener('mousedown', event => event.preventDefault());
+                    item.addEventListener('click', () => choose(option));
+                    list.appendChild(item);
+                });
+                const rect = input.getBoundingClientRect();
+                list.style.left = `${rect.left}px`;
+                list.style.width = `${rect.width}px`;
+                const below = window.innerHeight - rect.bottom;
+                const height = Math.min(240, Math.max(100, Math.max(below, rect.top) - 12));
+                list.style.maxHeight = `${height}px`;
+                if (below >= Math.min(240, rect.top)) {
+                    list.style.top = `${rect.bottom + 2}px`;
+                    list.style.bottom = 'auto';
+                } else {
+                    list.style.top = 'auto';
+                    list.style.bottom = `${window.innerHeight - rect.top + 2}px`;
+                }
+                list.hidden = false;
+                input.setAttribute('aria-expanded', 'true');
+            };
+            input.value = selectedText();
+            input.addEventListener('focus', () => { input.select(); render(''); });
+            input.addEventListener('click', () => { if (list.hidden) render(''); });
+            input.addEventListener('input', () => render(input.value));
+            input.addEventListener('blur', close);
+            input.addEventListener('keydown', event => {
+                if (event.key === 'Escape') { close(); input.blur(); }
+                if (event.key === 'Enter' && !list.hidden && query.trim()) {
+                    const first = list.querySelector('.precheck-combobox-option:not(:disabled)');
+                    if (first) { event.preventDefault(); first.click(); }
+                }
+            });
+            overlay.addEventListener('mousedown', event => {
+                if (!field.contains(event.target) && !list.contains(event.target)) close();
+            });
+            overlay.addEventListener('scroll', event => {
+                if (!list.contains(event.target) && !list.hidden) close();
+            }, true);
+        });
+
         // ===== 重复匹配检测：一个上传列被多个训练期望列选中 → 红色框实时标记 =====
         const aiSelects = () => overlay.querySelectorAll('select[data-ai-idx]');
         function _syncSourceSheetOptions() {
@@ -577,6 +670,8 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
             renameSelects().forEach(sel => {
                 sel.style.border = '';
                 sel.style.background = '';
+                const input = sel.previousElementSibling?.querySelector('.precheck-combobox-input');
+                if (input) { input.style.border = ''; input.style.background = ''; }
                 const v = sel.value;
                 if (v) cnt.set(v, (cnt.get(v) || 0) + 1);
             });
@@ -585,6 +680,8 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
                 if (sel.value && cnt.get(sel.value) > 1) {
                     sel.style.border = '2px solid #f44336';
                     sel.style.background = '#fff5f5';
+                    const input = sel.previousElementSibling?.querySelector('.precheck-combobox-input');
+                    if (input) { input.style.border = '2px solid #f44336'; input.style.background = '#fff5f5'; }
                     hasDup = true;
                 }
             });
