@@ -3960,7 +3960,8 @@ def _load_script_info_for_precheck(tenant_id: str, script_id: str) -> dict:
 
 
 def _persist_compute_start(tenant_id: str, script_id_str: str,
-                           salary_year: int = None, salary_month: int = None):
+                           salary_year: int = None, salary_month: int = None,
+                           client_submission_id: str = None):
     """创建计算任务记录，返回 (db_session, task_id) 或 (None, None)"""
     try:
         db = SessionLocal()
@@ -3980,7 +3981,8 @@ def _persist_compute_start(tenant_id: str, script_id_str: str,
             status="computing",
             salary_year=salary_year,
             salary_month=salary_month,
-            analysis_report={"original_script_id": script_id_str},
+            analysis_report={"original_script_id": script_id_str,
+                             "client_submission_id": client_submission_id},
         )
         db.add(task)
         db.commit()
@@ -5712,6 +5714,7 @@ async def run_compute_task(
 # 智算会话：一次上传的文件与解析产物在会话目录里存活，人工确认轮只发 JSON、不重传文件。
 # 进程内 dict 为权威（重启即失效 → 前端收到 session_expired 自动退回带文件重传）。
 _COMPUTE_SESSIONS: Dict[str, dict] = {}
+_COMPUTE_SUBMISSION_TASKS: set = set()  # 响应连接断开后仍持有预检任务，直到它自行结束
 
 
 def _compute_session_ttl() -> int:
@@ -6030,10 +6033,11 @@ async def compute_submit(
     skipped_missing_files: Optional[str] = Form(None),
     skip_history_check: Optional[bool] = Form(False),
     mapping_finalized: Optional[bool] = Form(False),
+    client_submission_id: Optional[str] = Form(None),
     current_user=Depends(get_current_user),
     accessible_tenants: list = Depends(get_operable_tenants),
 ):
-    """提交计算任务，立即返回 task_id，计算在后台运行。
+    """上传并预检源文件，完成后返回 task_id，计算在后台运行。
 
     template_file: 模板模式可选上传新模板覆盖训练时模板；不传则用训练时模板。
     """
@@ -6063,7 +6067,8 @@ async def compute_submit(
 
         # 2. 上传落盘前先创建任务 ID；全过程直接写入最终 task 目录，不再复制归档。
         _task_db, compute_task_id = _persist_compute_start(
-            tenant_id, script_id, salary_year=salary_year, salary_month=salary_month)
+            tenant_id, script_id, salary_year=salary_year, salary_month=salary_month,
+            client_submission_id=client_submission_id)
         try:
             _task_db.close()
         except Exception:
@@ -6233,6 +6238,7 @@ async def compute_submit(
                     logger.info(f"[compute/submit] 预检待确认，会话保留: {_session['session_id']}")
                     pending = _compute_pending_payload(pc_result, _session["session_id"])
                     pending["task_id"] = str(compute_task_id)
+                    _session["pending_payload"] = pending
                     return pending
                 if (not mapping_finalized) and not pc_result.ok:
                     logger.info('[compute/submit] 预检无人工可操作项，不弹窗，直接进入计算')
@@ -6246,9 +6252,24 @@ async def compute_submit(
                 if slot_held:
                     semaphore.release()
 
+        async def _finish_compute_submission_safe():
+            try:
+                return await _finish_compute_submission()
+            except Exception as exc:
+                logger.error(f"[compute/submit] 后台预检失败: {exc}", exc_info=True)
+                kept = await asyncio.to_thread(
+                    _finalize_pre_dispatch_compute_failure,
+                    compute_task_id, tenant_id, script_id, temp_dir, str(exc),
+                )
+                return {"error_type": "submit_failed", "detail": str(exc),
+                        "task_id": str(compute_task_id),
+                        "run_dir": str(kept) if kept else None}
+
         async def _stream_submit_result():
             """流式 JSON：先发空白保活，最后发一个完整 JSON；JSON 解析允许前导空白。"""
-            task = asyncio.create_task(_finish_compute_submission())
+            task = asyncio.create_task(_finish_compute_submission_safe())
+            _COMPUTE_SUBMISSION_TASKS.add(task)
+            task.add_done_callback(_COMPUTE_SUBMISSION_TASKS.discard)
             yield " \n"
             try:
                 while not task.done():
@@ -6256,15 +6277,8 @@ async def compute_submit(
                     if not done:
                         yield " \n"
                 result = await task
-            except Exception as exc:
-                logger.error(f"[compute/submit] 后台预检失败: {exc}", exc_info=True)
-                kept = await asyncio.to_thread(
-                    _finalize_pre_dispatch_compute_failure,
-                    compute_task_id, tenant_id, script_id, temp_dir, str(exc),
-                )
-                result = {"error_type": "submit_failed", "detail": str(exc),
-                          "task_id": str(compute_task_id),
-                          "run_dir": str(kept) if kept else None}
+            except asyncio.CancelledError:
+                raise  # 客户端断开只取消响应流，不取消后台预检
             yield json.dumps(result, ensure_ascii=False, default=str)
 
         return StreamingResponse(
@@ -6311,6 +6325,7 @@ async def compute_session_confirm(
     from backend.utils.compute_ingest import ingest_ready, read_meta, resolve_with_confirmations
     if not sess or not ingest_ready(sess["temp_dir"]):
         return {"error_type": "session_expired", "message": "计算会话已过期，请重新提交文件"}
+    sess.pop("pending_payload", None)
 
     meta = await asyncio.to_thread(read_meta, sess["temp_dir"])
     if meta is None:
@@ -6404,6 +6419,7 @@ async def compute_session_confirm(
         if p.get("task_id"):
             pending["task_id"] = str(p["task_id"])
         pending['post_match_completion'] = True
+        sess["pending_payload"] = pending
         return pending
 
     if mapping_finalized and ((not pc_result.ok) or (pc_result.history_warnings and not _skip_history)):
@@ -6421,6 +6437,7 @@ async def compute_session_confirm(
             pending["task_id"] = str(p["task_id"])
         pending['mapping_refreshed'] = refresh_only
         pending['has_review_items'] = _needs_user_action
+        sess["pending_payload"] = pending
         return pending
 
     if (not mapping_finalized) and not pc_result.ok:
@@ -6428,6 +6445,43 @@ async def compute_session_confirm(
 
     return await _dispatch_compute_task(
         sess, pc_result, confirmed_target_map=_confirmed_target_map)
+
+
+@app.get("/api/compute/submission/{client_submission_id}")
+async def recover_compute_submission(
+    client_submission_id: str,
+    current_user=Depends(get_current_user),
+    accessible_tenants: list = Depends(get_operable_tenants),
+):
+    """提交连接被网关截断后，按客户端标识找回原任务或待确认内容。"""
+    if not client_submission_id or len(client_submission_id) > 80:
+        raise HTTPException(status_code=400, detail="无效的计算提交标识")
+    db = SessionLocal()
+    try:
+        recent = (db.query(db_models.ComputeTask)
+                  .filter(db_models.ComputeTask.tenant_id.in_(accessible_tenants))
+                  .order_by(db_models.ComputeTask.id.desc()).limit(1000).all())
+        task = next((item for item in recent if isinstance(item.analysis_report, dict) and
+                     item.analysis_report.get("client_submission_id") == client_submission_id), None)
+        if task is None:
+            raise HTTPException(status_code=404, detail="计算提交尚未建立任务")
+        task_id = str(task.id)
+        if task.status == "failed":
+            return {"error_type": "submit_failed", "task_id": task_id,
+                    "detail": task.error_message or "计算任务失败"}
+        _sweep_compute_sessions()
+        for sess in _COMPUTE_SESSIONS.values():
+            if str(sess.get("params", {}).get("task_id")) == task_id:
+                if sess.get("pending_payload"):
+                    return sess["pending_payload"]
+                return {"state": "waiting", "task_id": task_id}
+        from backend.compute.task_log_buffer import TaskLogBuffer
+        if (TaskLogBuffer.get_instance().get_status(task_id) is not None or
+                task.status == "completed"):
+            return {"task_id": task_id}
+        return {"state": "waiting", "task_id": task_id}
+    finally:
+        db.close()
 
 
 @app.get("/api/compute/{task_id}/stream")

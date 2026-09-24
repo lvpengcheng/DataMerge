@@ -1601,6 +1601,54 @@ async function _readComputeSubmitJson(resp) {
     return body.trim() ? JSON.parse(body.trim()) : null;
 }
 
+async function _recoverComputeSubmission(submissionId) {
+    let missingCount = 0;
+    let lookupFailures = 0;
+    let lastNotice = 0;
+    const started = Date.now();
+    while (true) {
+        try {
+            const response = await AUTH.authFetch(`/api/compute/submission/${encodeURIComponent(submissionId)}`);
+            if (response.status === 404) {
+                if (++missingCount >= 5) {
+                    const error = new Error('连接超时，无法确认任务是否已建立；请先核对后台计算结果，避免重复提交');
+                    error.computeStatusUnknown = true;
+                    throw error;
+                }
+            } else if (response.ok) {
+                const result = await response.json();
+                if (result.state !== 'waiting') return result;
+                missingCount = 0;
+                lookupFailures = 0;
+            } else if ([502, 503, 504].includes(response.status)) {
+                if (++lookupFailures >= 10) {
+                    const error = new Error('无法查询后台任务状态；请先核对后台计算结果，避免重复提交');
+                    error.computeStatusUnknown = true;
+                    throw error;
+                }
+            } else {
+                const error = new Error(`找回计算任务失败: HTTP ${response.status}`);
+                error.computeStatusUnknown = true;
+                throw error;
+            }
+        } catch (error) {
+            if (error.computeStatusUnknown) throw error;
+            console.warn('查询计算提交状态失败，稍后重试:', error);
+            if (++lookupFailures >= 10) {
+                const unknown = new Error('无法查询后台任务状态；请先核对后台计算结果，避免重复提交');
+                unknown.computeStatusUnknown = true;
+                throw unknown;
+            }
+        }
+        const waited = Math.floor((Date.now() - started) / 1000);
+        if (waited - lastNotice >= 30) {
+            lastNotice = waited;
+            addLog('info', `连接已超时，后台任务仍在处理；正在找回任务，已等待 ${waited} 秒...`);
+        }
+        await new Promise(resolve => setTimeout(resolve, 3000));
+    }
+}
+
 // 累积多轮确认项：改名/列名/目标表可能分几轮确认，后一轮不能把前一轮的选择清掉
 function _mergeConfirmations(prev, dialogResult) {
     const merged = Object.assign({}, prev || {});
@@ -1683,6 +1731,9 @@ async function startCompute() {
     updateProgress(10);
 
     const formData = new FormData();
+    const submissionId = globalThis.crypto?.randomUUID?.() ||
+        `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+    formData.append('client_submission_id', submissionId);
     formData.append('tenant_id', currentTenantId);
     formData.append('script_id', currentScriptId);
 
@@ -1735,20 +1786,32 @@ async function startCompute() {
         const dialogChoices = {};
         while (attempt < MAX_RETRY) {
             attempt += 1;
-            if (sessionId && confirmations) {
-                resp = await AUTH.authFetch(`/api/compute/session/${sessionId}/confirm`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(confirmations),
-                });
-            } else {
-                resp = await AUTH.authFetch('/api/compute/submit', {
-                    method: 'POST',
-                    body: formData,
-                });
-            }
+            resp = null;
             responseData = null;
-            try { responseData = await _readComputeSubmitJson(resp); } catch (e) {}
+            let connectionError = null;
+            try {
+                if (sessionId && confirmations) {
+                    resp = await AUTH.authFetch(`/api/compute/session/${sessionId}/confirm`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(confirmations),
+                    });
+                } else {
+                    resp = await AUTH.authFetch('/api/compute/submit', {
+                        method: 'POST',
+                        body: formData,
+                    });
+                }
+                responseData = await _readComputeSubmitJson(resp);
+            } catch (error) {
+                connectionError = error;
+            }
+            if (connectionError || !resp || [502, 503, 504].includes(resp.status) ||
+                    (resp.ok && !responseData)) {
+                addLog('warning', '提交连接中断，正在查询原计算任务状态...');
+                responseData = await _recoverComputeSubmission(submissionId);
+                resp = {ok: true, status: 200};
+            }
             // 提交端使用流式 JSON 保活：预检业务错误也以 JSON error_type 返回，
             // 不能再只依赖 HTTP 422 判断。
             if (resp.ok && responseData && !responseData.error_type) { _closePrecheckDialog(); break; }
@@ -1830,6 +1893,14 @@ async function startCompute() {
     } catch (e) {
         _closePrecheckDialog();
         console.error('计算提交失败:', e);
+        if (e.computeStatusUnknown) {
+            addLog('warning', e.message);
+            updateStatus('计算状态待确认');
+            document.getElementById('result-card').innerHTML = `<p style="color:#b45309;padding:20px;">${_escapeHtml(e.message)}</p>`;
+            btn.disabled = false;
+            btn.textContent = '开始计算';
+            return;
+        }
         addLog('error', `计算失败: ${e.message}`);
         updateStatus('计算失败');
         showError(e.message);
