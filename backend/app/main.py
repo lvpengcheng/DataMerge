@@ -5101,7 +5101,7 @@ async def run_compute_task(
                                     }
                                     buffer.push(task_id, json.dumps(log_msg, ensure_ascii=False))
 
-                            # 验证预加载数据是否包含训练时的所有 sheet
+                            # 本次允许比训练少 Sheet；仅提示缺口，保留已匹配的数据继续计算。
                             expected_keys = set()
                             _ek_pairs = []
                             for train_file, file_data in source_structure.get("files", {}).items():
@@ -5119,17 +5119,15 @@ async def run_compute_task(
 
                             missing_keys = expected_keys - set(pre_loaded_source_data.keys())
                             if missing_keys:
-                                if mapping_finalized:
-                                    logger.info("[compute/task] 预加载未覆盖全部训练表，转用人工映射执行副本: %s",
-                                                sorted(missing_keys))
-                                    buffer.push(task_id, json.dumps({
-                                        "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
-                                        "level": "info",
-                                        "message": "预加载未覆盖全部来源，正在按人工最终关系生成完整执行副本",
-                                    }, ensure_ascii=False))
-                                    pre_loaded_source_data = None
-                                else:
-                                    raise ValueError(f"预加载数据缺少训练所需表: {sorted(missing_keys)}")
+                                warning = (
+                                    f"本次源数据比智训少 {len(missing_keys)} 个 Sheet："
+                                    f"{sorted(missing_keys)}；将使用已有匹配数据继续计算。"
+                                )
+                                logger.warning("[compute/task] %s", warning)
+                                buffer.push(task_id, json.dumps({
+                                    "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                    "level": "warning", "message": warning,
+                                }, ensure_ascii=False))
 
                         log_msg = {
                             "type": "log",
@@ -5773,6 +5771,40 @@ def _get_compute_session(session_id: str, accessible_tenants: list) -> Optional[
     return sess
 
 
+def _precheck_requires_user_action(pc_result, skip_history_check: bool = False) -> bool:
+    """只有弹窗中确实存在可供用户选择/确认的项目时才阻断计算。
+
+    ``ok=False``、``mapping_requires_confirmation`` 或一段提示文字都不能单独
+    触发空审核框。智算已取消列级人工匹配，因此列诊断也不是可操作项。
+    """
+    reviews = [item for item in (pc_result.source_sheet_reviews or [])
+               if item.get('expected_file') and item.get('expected_sheet')]
+    targets = {(str(item['expected_file']), str(item['expected_sheet'])) for item in reviews}
+    locked_sources = {
+        (str(file), str(sheet))
+        for file, info in (pc_result.file_mapping or {}).items()
+        for sheet, target in (info.get('sheet_mapping') or {}).items()
+        if (str(info.get('expected_file') or file), str(target)) not in targets
+    }
+    # 审核按上传 Sheet 渲染；只有训练侧缺口、却没有可选上传来源时，
+    # source_sheet_reviews 非空也不会产生任何下拉框。
+    available_sources = {
+        (str(item['file']), str(item['sheet']))
+        for item in (pc_result.actual_sources or []) if item.get('file') and item.get('sheet')
+    }
+    for path in pc_result.actual_paths or []:
+        parts = str(path).split(' > ', 2)
+        if len(parts) == 3:
+            available_sources.add((parts[0], parts[1]))
+    return bool(
+        (reviews and (available_sources - locked_sources))
+        or (pc_result.rename_candidates or [])
+        or (pc_result.missing_files or [])
+        or (pc_result.target_candidates or [])
+        or ((pc_result.history_warnings or []) and not skip_history_check)
+    )
+
+
 def _compute_pending_payload(pc_result, session_id: Optional[str] = None) -> dict:
     """预检未通过时返回给前端的全部待确认项（改名 / 列名 / 目标表 / 历史一次性给全）。"""
     from copy import deepcopy
@@ -5870,6 +5902,7 @@ def _compute_pending_payload(pc_result, session_id: Optional[str] = None) -> dic
         "unmatched_columns": pc_result.unmatched_columns,
         "target_map": pc_result.target_map,
         "column_auto_accept_threshold": float(os.getenv("COLUMN_AUTO_ACCEPT_THRESHOLD", "0.90")),
+        "has_review_items": _precheck_requires_user_action(pc_result),
     }
     if session_id:
         payload["session_id"] = session_id
@@ -6193,13 +6226,16 @@ async def compute_submit(
                     logger.warning('[compute/submit] 最终映射仍有预检提示，按人工确认结果放行计算')
                     pc_result._source_mapping_warning = None
 
-                if (not mapping_finalized) and (
-                        (not pc_result.ok) or (pc_result.history_warnings and not skip_history_check)):
+                _needs_user_action = _precheck_requires_user_action(
+                    pc_result, bool(skip_history_check))
+                if (not mapping_finalized) and _needs_user_action:
                     # 不再删临时目录：上传文件与解析产物留在会话里，确认轮只发 JSON
                     logger.info(f"[compute/submit] 预检待确认，会话保留: {_session['session_id']}")
                     pending = _compute_pending_payload(pc_result, _session["session_id"])
                     pending["task_id"] = str(compute_task_id)
                     return pending
+                if (not mapping_finalized) and not pc_result.ok:
+                    logger.info('[compute/submit] 预检无人工可操作项，不弹窗，直接进入计算')
 
                 result = await _dispatch_compute_task(
                     _session, pc_result, confirmed_target_map=_confirmed_target_map,
@@ -6377,14 +6413,18 @@ async def compute_session_confirm(
     if mapping_finalized:
         sess['params']['mapping_finalized'] = True
 
-    if refresh_only or ((not mapping_finalized) and (
-            (not pc_result.ok) or (pc_result.history_warnings and not _skip_history))):
+    _needs_user_action = _precheck_requires_user_action(pc_result, _skip_history)
+    if refresh_only or ((not mapping_finalized) and _needs_user_action):
         logger.info(f"[compute/confirm] 仍有待确认项，会话保留: {session_id}")
         pending = _compute_pending_payload(pc_result, session_id)
         if p.get("task_id"):
             pending["task_id"] = str(p["task_id"])
         pending['mapping_refreshed'] = refresh_only
+        pending['has_review_items'] = _needs_user_action
         return pending
+
+    if (not mapping_finalized) and not pc_result.ok:
+        logger.info('[compute/confirm] 预检无人工可操作项，不弹窗，直接进入计算')
 
     return await _dispatch_compute_task(
         sess, pc_result, confirmed_target_map=_confirmed_target_map)
@@ -6813,8 +6853,15 @@ async def compute_with_script_stream(
 
                                         missing_keys = expected_keys - set(pre_loaded_source_data.keys())
                                         if missing_keys:
-                                            logger.warning(f"[compute/stream] 预加载数据缺少: {missing_keys}，将由脚本自行解析")
-                                            pre_loaded_source_data = None
+                                            warning = (
+                                                f"本次源数据比智训少 {len(missing_keys)} 个 Sheet："
+                                                f"{sorted(missing_keys)}；将使用已有匹配数据继续计算。"
+                                            )
+                                            logger.warning("[compute/stream] %s", warning)
+                                            await logs_queue.put(json.dumps({
+                                                "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                                "level": "warning", "message": warning,
+                                            }, ensure_ascii=False))
 
                                     log_msg = {
                                         "type": "log",

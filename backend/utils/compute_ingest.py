@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 # 解析逻辑或产物结构变化时 +1，旧会话产物自动失效
-INGEST_VERSION = 9
+INGEST_VERSION = 10
 
 _META_NAME = "_ingest_meta.pkl"
 _SOURCES_NAME = "_ingest_sources.pkl"

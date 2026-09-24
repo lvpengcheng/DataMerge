@@ -43,6 +43,9 @@ def test_refresh_confirmation_never_dispatches_calculation(tmp_path, monkeypatch
     namespace = {'asyncio': asyncio,
                  '_resolve_compute_ai_provider': lambda: 'deepseek',
                  '_get_compute_session': lambda *args: {'temp_dir': str(tmp_path), 'params': {}},
+                 '_precheck_requires_user_action': lambda pc, skip=False: bool(
+                     pc.source_sheet_reviews or pc.rename_candidates or pc.missing_files
+                     or pc.target_candidates or (pc.history_warnings and not skip)),
                  '_compute_pending_payload': lambda pc, session: {'session_id': session},
                  '_dispatch_compute_task': dispatch,
                  'logger': __import__('logging').getLogger(__name__)}
@@ -93,6 +96,9 @@ def test_final_confirmation_bypasses_precheck_and_dispatches(tmp_path, monkeypat
         '_resolve_compute_ai_provider': lambda: 'deepseek',
         '_get_compute_session': lambda *args: {'temp_dir': str(tmp_path), 'params': {
             'post_match_base_fill_completed': True}},
+        '_precheck_requires_user_action': lambda pc, skip=False: bool(
+            pc.source_sheet_reviews or pc.rename_candidates or pc.missing_files
+            or pc.target_candidates or (pc.history_warnings and not skip)),
         '_compute_pending_payload': lambda *args: pending_calls.append(True) or {'error_type': 'precheck_failed'},
         '_dispatch_compute_task': dispatch,
         'logger': __import__('logging').getLogger(__name__),
@@ -113,6 +119,38 @@ def test_final_confirmation_bypasses_precheck_and_dispatches(tmp_path, monkeypat
     assert result == {'task_id': 'started'}
     assert pending_calls == []
     assert dispatch_calls == [True]
+
+
+def test_empty_mapping_review_state_is_not_actionable():
+    """只有提示标志、没有任何可选项时不得弹审核框。"""
+    import ast
+    from pathlib import Path
+    from backend.utils.compute_precheck import PrecheckResult
+
+    source = Path(__file__).parent / 'app' / 'main.py'
+    tree = ast.parse(source.read_text(encoding='utf-8'))
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                and n.name == '_precheck_requires_user_action')
+    namespace = {}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), 'exec'), namespace)
+    requires_action = namespace['_precheck_requires_user_action']
+
+    empty_review = PrecheckResult(
+        ok=False, mapping_requires_confirmation=True,
+        mapping_notice='AI 已保留能够确定的匹配',
+    )
+    assert requires_action(empty_review) is False
+    unresolved = PrecheckResult(
+        ok=False, source_sheet_reviews=[{'expected_file': 'a.xlsx', 'expected_sheet': 'S'}])
+    assert requires_action(unresolved) is False
+    unresolved.actual_sources = [{'file': 'upload.xlsx', 'sheet': 'Data'}]
+    assert requires_action(unresolved) is True
+    unresolved.file_mapping = {'upload.xlsx': {
+        'expected_file': 'other.xlsx', 'sheet_mapping': {'Data': 'Already matched'}}}
+    assert requires_action(unresolved) is False
+    assert requires_action(PrecheckResult(ok=False, history_warnings=['历史数据待确认'])) is True
+    assert requires_action(
+        PrecheckResult(ok=False, history_warnings=['历史数据待确认']), True) is False
 
 
 def test_runtime_template_remap_honors_final_manual_target_mapping():
@@ -268,3 +306,32 @@ def test_final_manual_source_mapping_never_falls_back_to_raw_uploads():
     assert '最终人工映射未能完整构建预加载数据，已放行并使用原始源文件继续' not in source
     assert '已按人工最终匹配关系生成执行副本，文件名和 Sheet 名已对齐智训结构' in source
     assert 'None if (bool(p.get("mapping_finalized")) and pc_result.file_mapping)' in source
+
+
+@pytest.mark.parametrize('finalized', [False, True])
+def test_missing_training_sheets_warn_and_preserve_existing_preload(finalized):
+    import ast
+    import json
+    import logging
+    from datetime import datetime
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    tree = ast.parse((Path(__file__).parent / 'app/main.py').read_text(encoding='utf-8'))
+    block = next(node for node in ast.walk(tree)
+                 if isinstance(node, ast.If) and isinstance(node.test, ast.Name)
+                 and node.test.id == 'missing_keys'
+                 and not any(isinstance(child, ast.Await) for child in ast.walk(node)))
+    preload = {'四川导出当月_第一批': {'df': object()}}
+    missing = {f'四川导出{month}_{batch}' for month in ['上月', '当月']
+               for batch in ['第四批', '第五批']}
+    logs = []
+    namespace = dict(missing_keys=missing, mapping_finalized=finalized,
+                     pre_loaded_source_data=preload, task_id='test',
+                     logger=logging.getLogger(__name__), json=json, datetime=datetime,
+                     buffer=SimpleNamespace(push=lambda task, message: logs.append(json.loads(message))))
+    exec(compile(ast.Module(body=[block], type_ignores=[]), '<missing-sheets>', 'exec'), namespace)
+    assert namespace['pre_loaded_source_data'] is preload
+    assert len(logs) == 1 and logs[0]['level'] == 'warning'
+    assert all(name in logs[0]['message'] for name in missing)
+    assert '继续计算' in logs[0]['message']

@@ -110,13 +110,14 @@ class FastHeaderMatcher:
         优先读 source_structure["multi_sheet_source"]（新训练记录直接带标记）；
         旧记录无标记时，从结构反推：任一文件含 >=2 个 sheet 即视为 multi_sheet。
         """
-        if "multi_sheet_source" in source_structure:
-            return bool(source_structure["multi_sheet_source"])
         files = source_structure.get("files") or {}
+        # 结构本身已经记录了多个 Sheet 时，它比历史开关更可信。旧训练数据可能
+        # 遗留 multi_sheet_source=false，但 files/sheets 已包含多个 Sheet；若仍
+        # 按 false 只读活动 Sheet，会把其余同名同结构 Sheet 全部误送人工审核。
         for fdata in files.values():
             if isinstance(fdata, dict) and len(fdata.get("sheets") or {}) >= 2:
                 return True
-        return False
+        return bool(source_structure.get("multi_sheet_source", False))
 
     # ==================== 主入口 ====================
 

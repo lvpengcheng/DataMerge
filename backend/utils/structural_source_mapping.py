@@ -21,7 +21,22 @@ def normalized_source_identity(value, *, filename=False):
     return _IDENTITY_NOISE.sub('', text)
 
 
+def raw_source_identity(value, *, filename=False):
+    """只做 Unicode/大小写/扩展名规范化；用于识别真正的完全同名。"""
+    text = unicodedata.normalize('NFKC', str(value or '')).casefold().strip()
+    if filename:
+        text = _EXCEL_SUFFIX.sub('', text).strip()
+    return text
+
+
 def source_identity_similarity(left, right, *, filename=False):
+    # 完全同名必须具有最高优先级。不能先删除月份再比较：纯月份文件名
+    # （202607.xlsx / 202608.xlsx）删除月份后都会变成空串，导致本来完全
+    # 相同的智训/智算文件被误判为“同结构歧义”。
+    raw_left = raw_source_identity(left, filename=filename)
+    raw_right = raw_source_identity(right, filename=filename)
+    if raw_left and raw_left == raw_right:
+        return 1.0
     left = normalized_source_identity(left, filename=filename)
     right = normalized_source_identity(right, filename=filename)
     if not left or not right:
@@ -135,6 +150,53 @@ def match_structural_sources(matcher, training, actual, matching_context=None):
     pending = set(range(len(training)))
     used = set()
     file_targets, target_files, matches = {}, {}, []
+
+    # 文件名 + Sheet 名完全相同是用户定义的硬关系。即使本次表头被解析到
+    # 不同区域或列有增减，也不应再进入 AI/人工“来源”审核；列差异由训练脚本
+    # 在确定的来源内处理。这里只锁唯一的完全同名项，绝不靠列表顺序配对。
+    exact_actual = {}
+    for ai, item in enumerate(actual):
+        key = (raw_source_identity(item.get('file_name'), filename=True),
+               raw_source_identity(item.get('sheet_name')))
+        exact_actual.setdefault(key, []).append(ai)
+    for ti in sorted(tuple(pending)):
+        item = training[ti]
+        key = (raw_source_identity(item.get('file_name'), filename=True),
+               raw_source_identity(item.get('sheet_name')))
+        candidates = [ai for ai in exact_actual.get(key, []) if ai not in used]
+        if not all(key) or len(candidates) != 1:
+            continue
+        ai = candidates[0]
+        source = actual[ai]
+        if file_targets.get(source['file_name'], item['file_name']) != item['file_name']:
+            continue
+        if target_files.get(item['file_name'], source['file_name']) != source['file_name']:
+            continue
+        columns = structural_columns(matcher, item.get('headers') or {}, source.get('headers') or {})
+        if columns is None:
+            # 来源身份已经确定时只保留同名列，不做语义列匹配。
+            source_by_normalized = {}
+            for name in (source.get('headers') or {}):
+                source_by_normalized.setdefault(normalized_header(name), []).append(name)
+            columns = {}
+            for target_name in (item.get('headers') or {}):
+                options = source_by_normalized.get(normalized_header(target_name), [])
+                if len(options) == 1:
+                    columns[options[0]] = target_name
+        file_targets[source['file_name']] = item['file_name']
+        target_files[item['file_name']] = source['file_name']
+        used.add(ai)
+        pending.remove(ti)
+        matches.append({
+            'train_file': item['file_name'], 'train_sheet': item['sheet_name'],
+            'input_file': source['file_name'], 'input_file_path': source['file_path'],
+            'input_sheet': source['sheet_name'], 'col_mapping': columns,
+            'column_confidence': {name: 1.0 for name in columns},
+            'sheet_confidence': 1.0, 'file_confidence': 1.0,
+            'needs_rewrite': not matcher._is_fully_identical(item, source, columns),
+            'identity_exact': True,
+        })
+
     while pending:
         proposals = {}
         for ti in sorted(pending):

@@ -9,6 +9,7 @@ const plain = x => JSON.parse(JSON.stringify(x));
 function mapping(file, sheet, target, columns) {
     return {[file]: {expected_file: 'trained.xlsx', sheet_mapping: {[sheet]: target}, header_mapping_by_sheet: {[sheet]: columns}}};
 }
+
 const first = mapping('a.xlsx', '工资', '工资表', {'编号': '工号', '金额': '工资'});
 {
     const rows = [
@@ -101,6 +102,19 @@ console.log('PASS: multi-round selections, sheet-scoped columns, remap replaceme
         }
     };
     ctx.document = doc;
+    const emptyDecision = await ctx._showPrecheckDialog({has_review_items:false});
+    assert.equal(emptyDecision.mapping_finalized, true);
+    assert.equal(appends, 0, '后端明确无审核项时不得创建空弹窗');
+    for (const has_review_items of [undefined, true]) {
+        const decision = await ctx._showPrecheckDialog({
+            has_review_items, mapping_requires_confirmation:true,
+            source_sheet_reviews:[{expected_file:'missing.xlsx', expected_sheet:'S'}],
+            actual_sources:[], actual_paths:[], review_file_mapping:{},
+        });
+        assert.equal(decision.mapping_finalized, true);
+        assert.equal(appends, 0, '训练侧缺口非空但没有可选上传来源时，不创建弹窗');
+    }
+    console.log('PASS: backend no-review decision advances without rendering an empty dialog');
     const pending = {target_candidates: [], history_warnings:['请确认历史数据缺失']};
     const firstDialog = ctx._showPrecheckDialog(pending);
     const overlay = doc.getElementById('_compute_precheck_overlay');
@@ -120,7 +134,8 @@ console.log('PASS: multi-round selections, sheet-scoped columns, remap replaceme
     ctx._closePrecheckDialog();
     assert.equal(doc.getElementById('_compute_precheck_overlay'), null);
     console.log('PASS: one persistent confirmation window, unchanged selection blocked locally, corrected selection submitted');
-    const refreshDialog = ctx._showPrecheckDialog({session_id:'session-1'});
+    const refreshDialog = ctx._showPrecheckDialog({session_id:'session-1',
+        target_candidates:[{key:'当月2', all_sheets:['202608(1)','202608(2)'], candidates:[]}]});
     const refreshOverlay = doc.getElementById('_compute_precheck_overlay');
     const target = {value:'202608(2)', dataset:{targetKey:'当月2'},
                     matches: selector => selector.includes('data-target-key')};
@@ -135,7 +150,8 @@ console.log('PASS: multi-round selections, sheet-scoped columns, remap replaceme
         sent = JSON.parse(options.body);
         return {ok:true};
     }};
-    ctx._readComputeSubmitJson = async () => ({session_id:'session-1', mapping_refreshed:true});
+    ctx._readComputeSubmitJson = async () => ({session_id:'session-1', mapping_refreshed:true,
+        target_candidates:[{key:'当月2', all_sheets:['202608(1)','202608(2)'], candidates:[]}]});
     refreshOverlay.onchange({target});
     assert.equal(doc.getElementById('_pre_confirm').textContent, '确认匹配并开始计算', '只改目标不重新推断源字段');
     assert.equal(sent, undefined);
@@ -170,6 +186,41 @@ console.log('PASS: multi-round selections, sheet-scoped columns, remap replaceme
     assert.ok(originalHtml.includes('原始上传.xls') && originalHtml.includes('原始工资表'), '匹配项必须展示原始文件和真实 Sheet');
     assert.ok(originalHtml.includes('data-upload-source-key="[&quot;source.xlsx&quot;,&quot;原始工资表&quot;]"'), '提交值保留稳定身份，不受显示标签影响');
     console.log('PASS: original upload labels and full source details preserve stable mapping identities');
+    // 实际提交循环：旧服务返回空审核（仍带 true 标志），无需任何点击即继续到任务流。
+    ctx._closePrecheckDialog();
+    const appendCount = appends;
+    nodes.set('compute-btn', {disabled:false, textContent:''});
+    nodes.set('source-files', {files:['upload.xlsx']});
+    nodes.set('salary-month', {value:''});
+    nodes.set('standard-hours', {value:''});
+    ctx.FormData = class { append() {} set() {} };
+    ctx.console = console;
+    ctx._autoCheckEncryption = async () => true;
+    for (const name of ['clearResult','addLog','updateStatus','updateProgress','_saveActiveTask']) {
+        ctx[name] = () => {};
+    }
+    ctx.showError = error => { throw new Error(error); };
+    let streamedTask;
+    ctx._connectComputeStream = id => { streamedTask = id; };
+    const requests = [];
+    ctx.AUTH = {authFetch: async (url, options) => {
+        requests.push({url, options});
+        return {ok:true, data:requests.length === 1 ? {
+            error_type:'precheck_failed', session_id:'empty-review',
+            has_review_items:true, mapping_requires_confirmation:true,
+            source_sheet_reviews:[{expected_file:'base.xlsx', expected_sheet:'S'}],
+            actual_sources:[], actual_paths:[], review_file_mapping:{},
+        } : {task_id:'computed-without-click'}};
+    }};
+    ctx._readComputeSubmitJson = async response => response.data;
+    vm.runInContext("currentTenantId = 'test'; currentScriptId = 'test-script';", ctx);
+    await ctx.startCompute();
+    assert.equal(appends, appendCount, '整个提交循环不能生成空审核框');
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1].url, '/api/compute/session/empty-review/confirm');
+    assert.equal(JSON.parse(requests[1].options.body).mapping_finalized, true);
+    assert.equal(streamedTask, 'computed-without-click');
+    console.log('PASS: empty review proceeds through submit, session confirmation and task stream without a click');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 
 

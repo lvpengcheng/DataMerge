@@ -100,6 +100,11 @@ function _closePrecheckDialog() {
 }
 
 function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
+    // 前端不重新判断匹配，只执行后端的权威结论。后端明确表示
+    // 没有任何可审核项时，禁止创建空弹窗，直接固化当前结果。
+    if (data?.has_review_items === false) {
+        return Promise.resolve({mapping_finalized: true});
+    }
     // Keep selectors available after the server considers an ambiguity resolved.
     for (const [field, key] of [['target_candidates', 'key'], ['rename_candidates', 'uploaded']]) {
         const merged = new Map((choices[field] || []).map(item => [item[key], item]));
@@ -107,7 +112,7 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
         choices[field] = [...merged.values()];
     }
     data = {...data, target_candidates: choices.target_candidates, rename_candidates: choices.rename_candidates};
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
         // Labels describe upload/base provenance; option values retain stable server identities.
         const sourceIdentities = new Map((data.actual_sources || []).map(source =>
             [JSON.stringify([source.file, source.sheet]), source]));
@@ -493,6 +498,19 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
             ? '系统仅对无法由程序确定的文件和 Sheet 给出 AI 建议。确认后将按智训名称生成执行源文件并直接计算，不再进行列匹配。'
             : '系统检测到计算前仍有事项需要确认，请核对后继续。';
         // 改名候选场景下，要求至少为一个上传文件选了目标，才允许重试
+        // 以实际能显示的控件为准。旧响应可能只有训练侧缺口，上传候选已经
+        // 全部被过滤，仍带着 needs_confirmation；这不构成可人工指定的内容。
+        const hasVisibleActions = sourceSheets.length > 0 || hasRenameCandidates ||
+            hasTargetCandidates || missingFiles.length > 0 || historyWarnings.length > 0;
+        if (!hasVisibleActions) {
+            _closePrecheckDialog();
+            if (missingColumns.length) {
+                reject(new Error(missingColumns.map(item => item.error).join('\n')));
+                return;
+            }
+            resolve({mapping_finalized: true});
+            return;
+        }
         const overlay = document.getElementById('_compute_precheck_overlay') || document.createElement('div');
         overlay.id = '_compute_precheck_overlay';
         overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:9999;display:flex;align-items:center;justify-content:center;';
@@ -697,6 +715,12 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
                         const refreshed = await _readComputeSubmitJson(response);
                         if (!response.ok || !refreshed?.mapping_refreshed) {
                             throw new Error(refreshed?.detail || refreshed?.message || '刷新失败，请重试；计算尚未开始。');
+                        }
+                        if (refreshed.has_review_items === false) {
+                            // 后端是待审核项的唯一权威：关系刷新后已无任何
+                            // 可人工选择的内容，直接固化本次关系并进入计算。
+                            resolve({...updated, mapping_finalized: true});
+                            return;
                         }
                         _showPrecheckDialog(refreshed, updated, choices).then(resolve);
                     } catch (error) {

@@ -19,6 +19,7 @@
 /.pytest_cache
 /.codex-pptx-work
 /.codex-build
+/.codex_tmp_patent
 /.kilo
 *.docx
 *.xlsx

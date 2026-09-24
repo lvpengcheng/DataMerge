@@ -190,7 +190,9 @@ def test_pending_response_includes_final_mapping():
     from backend.utils.compute_precheck import PrecheckResult
     tree = ast.parse((Path(__file__).parent / 'app/main.py').read_text(encoding='utf-8'))
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_compute_pending_payload')
-    ns = {'Optional': Optional}
+    ns = {'Optional': Optional, '_precheck_requires_user_action': lambda pc, skip=False: bool(
+        pc.source_sheet_reviews or pc.rename_candidates or pc.missing_files
+        or pc.target_candidates or (pc.history_warnings and not skip))}
     exec(compile(ast.Module(body=[node], type_ignores=[]), '<pending>', 'exec'), ns)
     result = PrecheckResult(ok=False, file_mapping={'upload.xlsx': {'expected_file': 'training.xlsx'}})
     payload = ns['_compute_pending_payload'](result, 'session')
@@ -204,7 +206,9 @@ def test_pending_response_separates_final_mapping_from_review_subset():
     from backend.utils.compute_precheck import PrecheckResult
     tree = ast.parse((Path(__file__).parent / 'app/main.py').read_text(encoding='utf-8'))
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_compute_pending_payload')
-    ns = {'Optional': Optional}
+    ns = {'Optional': Optional, '_precheck_requires_user_action': lambda pc, skip=False: bool(
+        pc.source_sheet_reviews or pc.rename_candidates or pc.missing_files
+        or pc.target_candidates or (pc.history_warnings and not skip))}
     exec(compile(ast.Module(body=[node], type_ignores=[]), '<pending>', 'exec'), ns)
     result = PrecheckResult(
         ok=False,
@@ -240,7 +244,9 @@ def test_sheet_review_payload_never_carries_column_mapping():
     from backend.utils.compute_precheck import PrecheckResult
     tree = ast.parse((Path(__file__).parent / 'app/main.py').read_text(encoding='utf-8'))
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_compute_pending_payload')
-    ns = {'Optional': Optional}
+    ns = {'Optional': Optional, '_precheck_requires_user_action': lambda pc, skip=False: bool(
+        pc.source_sheet_reviews or pc.rename_candidates or pc.missing_files
+        or pc.target_candidates or (pc.history_warnings and not skip))}
     exec(compile(ast.Module(body=[node], type_ignores=[]), '<pending>', 'exec'), ns)
     result = PrecheckResult(
         ok=False,

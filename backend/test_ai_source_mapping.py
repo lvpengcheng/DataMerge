@@ -160,6 +160,41 @@ def test_exact_training_structure_skips_ai(monkeypatch):
     assert result['structure_identical'] and not result.get('needs_confirmation')
 
 
+def test_exact_period_only_filenames_with_same_schema_skip_ai(monkeypatch):
+    """纯月份文件名不能在去月份后变成空串并被误判成同结构歧义。"""
+    from backend.ai_engine import ai_provider
+    headers = {'工号': 'A', '姓名': 'B', '金额': 'C'}
+    training = [
+        {'file_name': '202607.xlsx', 'sheet_name': 'Sheet1', 'headers': headers},
+        {'file_name': '202608.xlsx', 'sheet_name': 'Sheet1', 'headers': headers},
+    ]
+    actual = [
+        dict(training[1], file_path='/input/202608.xlsx'),
+        dict(training[0], file_path='/input/202607.xlsx'),
+    ]
+    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider',
+                        lambda *_: pytest.fail('文件名、Sheet 名和结构完全相同，不应调用 AI'))
+
+    result = FastHeaderMatcher().match_headers_only(training, actual, 'claude')
+
+    assert result['success'] and result['match_method'] == 'structure'
+    assert result['structure_identical'] and not result.get('needs_confirmation')
+    mapping = result['mapping']['file_mapping']
+    assert mapping['202607.xlsx']['expected_file'] == '202607.xlsx'
+    assert mapping['202608.xlsx']['expected_file'] == '202608.xlsx'
+
+
+def test_recorded_multi_sheet_structure_overrides_stale_false_flag():
+    structure = {
+        'multi_sheet_source': False,
+        'files': {'工资.xlsx': {'sheets': {
+            '一部': {'headers': {'工号': 'A'}},
+            '二部': {'headers': {'工号': 'A'}},
+        }}},
+    }
+    assert FastHeaderMatcher._infer_multi_sheet_source(structure) is True
+
+
 def test_complete_program_structure_with_extra_columns_skips_ai(monkeypatch):
     from backend.ai_engine import ai_provider
     training, _ = schemas()
@@ -224,25 +259,22 @@ def test_high_overall_structure_score_uses_program_not_ai(monkeypatch):
     assert not result.get('needs_confirmation')
 
 
-def test_low_overall_structure_score_calls_ai_even_when_names_match(monkeypatch):
+def test_exact_file_and_sheet_names_skip_ai_even_when_columns_changed(monkeypatch):
     from backend.ai_engine import ai_provider
     monkeypatch.setenv('SOURCE_STRUCTURE_AI_THRESHOLD', '0.85')
     training, actual = schemas()
     actual[0]['file_name'] = training[0]['file_name']
     actual[0]['sheet_name'] = training[0]['sheet_name']
     calls = []
-    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider', lambda _: object())
-    monkeypatch.setattr(ai_provider, 'chat_with_timeout', lambda *a, **k: calls.append(1) or json.dumps({
-        'mappings': [{'training_id': 0, 'actual_id': 0,
-                      'columns': {'Employee ID': '工号', 'Pay': '金额'}}],
-    }))
+    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider',
+                        lambda _: pytest.fail('文件名和 Sheet 名完全相同，不应调用 AI'))
 
     result = FastHeaderMatcher().match_headers_only(training, actual, 'claude')
 
-    assert calls == [1]
-    assert result['success'] and result['match_method'] == 'ai'
+    assert calls == []
+    assert result['success'] and result['match_method'] == 'structure'
     assert result['structure_score'] < result['structure_threshold']
-    assert result['needs_confirmation']
+    assert not result.get('needs_confirmation')
 
 
 def test_ai_popup_requires_structure_file_and_sheet_names_all_changed(monkeypatch):
@@ -309,16 +341,71 @@ def test_identical_structure_ambiguity_sends_only_ambiguous_candidates_to_ai(mon
     assert set(result['mapping']['file_mapping']) == {'another.xlsx'}
 
 
-def test_low_structure_score_with_same_file_and_sheet_opens_ai_review(monkeypatch):
+def test_low_structure_score_with_same_file_and_sheet_still_skips_ai_review(monkeypatch):
     from backend.ai_engine import ai_provider
     training = [{'file_name': '工资.xlsx', 'sheet_name': 'S', 'headers': {'本月个人缴费金额': 'A'}}]
     actual = [dict(training[0], file_path='/input/工资.xlsx', headers={'本月单位缴费金额': 'A'})]
     calls = []
-    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider', lambda _: object())
-    monkeypatch.setattr(ai_provider, 'chat_with_timeout', lambda *a, **k: calls.append(1) or '{"mappings":[]}')
+    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider',
+                        lambda _: pytest.fail('文件名和 Sheet 名完全相同，不应调用 AI'))
     result = FastHeaderMatcher().match_headers_only(training, actual, 'claude')
-    assert not result['success'] and calls == [1]
+    assert result['success'] and result['match_method'] == 'structure' and calls == []
     assert result['structure_score'] < result['structure_threshold']
+
+
+def test_four_exact_source_sheets_go_directly_to_compute(monkeypatch):
+    """四个同名来源 Sheet 全部硬锁定，不产生 4 项 Sheet 审核。"""
+    from backend.ai_engine import ai_provider
+    training = [
+        {'file_name': '工资.xlsx', 'sheet_name': f'第{i}批',
+         'headers': {'工号': 'A', '金额': 'B'}}
+        for i in range(1, 5)
+    ]
+    actual = [
+        {'file_name': '工资.xlsx', 'file_path': '/input/工资.xlsx',
+         'sheet_name': f'第{i}批', 'headers': {'员工编号': 'A', '实发': 'B'}}
+        for i in range(1, 5)
+    ]
+    monkeypatch.setattr(ai_provider.AIProviderFactory, 'create_provider',
+                        lambda _: pytest.fail('四个文件/Sheet 同名项不应进入 AI'))
+
+    result = FastHeaderMatcher().match_headers_only(training, actual, 'claude')
+
+    assert result['success'] and result['match_method'] == 'structure'
+    assert not result.get('needs_confirmation')
+    assert result['mapping']['file_mapping']['工资.xlsx']['sheet_mapping'] == {
+        f'第{i}批': f'第{i}批' for i in range(1, 5)
+    }
+
+
+def test_four_exact_source_sheets_pass_complete_precheck_without_dialog(monkeypatch):
+    """权威流程只看后端匹配结果：程序完整匹配后预检必须直接放行。"""
+    from backend.utils import compute_precheck as pre
+    from backend.utils.compute_ingest import IngestMeta, resolve_with_confirmations
+
+    training = [
+        {'file_name': '工资.xlsx', 'sheet_name': f'第{i}批',
+         'headers': {'工号': 'A', '金额': 'B'}}
+        for i in range(1, 5)
+    ]
+    actual = [dict(row, file_path='/input/工资.xlsx', source_origin='upload')
+              for row in training]
+    meta = IngestMeta(
+        train_sheets=training, input_sheets=actual, ai_provider_name='claude',
+        source_structure={'files': {'工资.xlsx': {'sheets': {
+            row['sheet_name']: {'headers': row['headers']} for row in training
+        }}}},
+    )
+    monkeypatch.setattr(pre, '_check_target_sheets', lambda *a: None)
+
+    result = resolve_with_confirmations(meta, skip_history_check=True)
+
+    assert result.ok
+    assert not result.mapping_requires_confirmation
+    assert result.source_sheet_reviews == []
+    assert result.file_mapping['工资.xlsx']['sheet_mapping'] == {
+        f'第{i}批': f'第{i}批' for i in range(1, 5)
+    }
 
 
 def test_ai_receives_hierarchical_script_context_without_sample_literals(monkeypatch):
