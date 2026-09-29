@@ -388,11 +388,74 @@ def dual_output_enabled() -> bool:
     return val not in ("false", "0", "no", "off", "")
 
 
+def _shifted_summary_tail(output_cells, template_cells):
+    """Find a moved footer from unique summary labels in both sheets.
+
+    Return zero-based (output_start, template_start), or None if ambiguous.
+    Include a matching summary row immediately before the unique label.
+    """
+    markers = ("合计", "总计", "小计", "汇总", "共计", "total", "subtotal")
+
+    def label(value):
+        if not isinstance(value, str):
+            return ""
+        result = "".join(value.split()).lower()
+        return result if any(marker in result for marker in markers) else ""
+
+    def unique_labels(cells):
+        found = {}
+        max_row = cells.MaxDataRow
+        max_col = cells.MaxDataColumn
+        if max_row is None or max_col is None or max_row < 0 or max_col < 0:
+            return found
+        max_col = min(max_col, 8)
+        for row in range(max_row + 1):
+            for col in range(max_col + 1):
+                key = label(cells[row, col].Value)
+                if key:
+                    found[key] = row if key not in found else None
+        return found
+
+    output_labels = unique_labels(output_cells)
+    template_labels = unique_labels(template_cells)
+    pairs = [(out_row, template_labels[key])
+             for key, out_row in output_labels.items()
+             if out_row is not None and template_labels.get(key) is not None
+             and out_row != template_labels[key]]
+    if not pairs or len({template_row - output_row for output_row, template_row in pairs}) != 1:
+        return None
+    output_start, template_start = min(pairs)
+    while output_start > 0 and template_start > 0:
+        previous_output = {label(output_cells[output_start - 1, col].Value)
+                           for col in range(min(output_cells.MaxDataColumn, 8) + 1)}
+        previous_template = {label(template_cells[template_start - 1, col].Value)
+                             for col in range(min(template_cells.MaxDataColumn, 8) + 1)}
+        if not ((previous_output & previous_template) - {""}):
+            break
+        output_start -= 1
+        template_start -= 1
+    return output_start, template_start
+
+
+def _template_format_row(output_row, shifted_tail, template_max_row):
+    """Map an output row to its template row; None preserves inserted row formats."""
+    if not shifted_tail:
+        return output_row
+    output_start, template_start = shifted_tail
+    if output_row >= output_start:
+        template_row = output_row + template_start - output_start
+        return template_row if template_row <= template_max_row else None
+    if template_start < output_start and output_row >= template_start:
+        return None
+    return output_row
+
+
 def restore_formats_from_template(output_path, template_path) -> int:
     """把输出文件的单元格 number_format 刷回模板原格式。
 
     解决 openpyxl 写入 datetime 值时自动把 General 改成日期格式、导致模板常规列
-    在输出里变日期的问题。仅按"同名 sheet + 同坐标"恢复格式，不改值、不重算，幂等。
+    在输出里变日期的问题。汇总区发生行位移时按移动后的行号找模板格式，
+    其余单元格按同坐标恢复；不改值、不重算，幂等。
     返回恢复的单元格数。
 
     **必须用 Aspose，不能用 openpyxl**：openpyxl `load→save` 会把整个文件重写，
@@ -432,6 +495,7 @@ def restore_formats_from_template(output_path, template_path) -> int:
                 continue   # 源_ 等模板没有的 sheet 不动（也不会被 save 毁值，Aspose 保底层数值）
             ocells = ows.Cells
             tcells = tws.Cells
+            shifted_tail = _shifted_summary_tail(ocells, tcells)
             # 只遍历输出中"实际存在"的单元格（GetEnumerator 不含空格 → 不会给输出灌空单元格）
             # 同列唯一且公式相同的单元格可作为移动锚点（如汇总行 TODAY）。
             # 重复公式不猜位置，继续使用原坐标规则。
@@ -446,8 +510,11 @@ def restore_formats_from_template(output_path, template_path) -> int:
             while it.MoveNext():
                 ocell = it.Current
                 try:
-                    tcell = tcells[ocell.Row, ocell.Column]   # 访问模板空格仅在模板侧实例化，不落盘
-                    if ocell.IsFormula:
+                    template_row = _template_format_row(ocell.Row, shifted_tail, tcells.MaxDataRow)
+                    if template_row is None:
+                        continue  # 新增数据行或超出模板的行，保留脚本已写好的格式。
+                    tcell = tcells[template_row, ocell.Column]  # 仅在模板侧实例化，不落盘
+                    if ocell.IsFormula and (not shifted_tail or ocell.Row < shifted_tail[0]):
                         candidates = formula_cells.get((ocell.Column, str(ocell.Formula).strip()), [])
                         if len(candidates) == 1:
                             tcell = candidates[0]
