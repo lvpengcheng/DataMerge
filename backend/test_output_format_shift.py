@@ -124,6 +124,116 @@ class ShiftedSummaryTailTests(unittest.TestCase):
         self.assertEqual(output_amount.style.Custom, template_amount.style.Custom)
         self.assertEqual(output_amount.Value, 35664.75)
 
+    def test_format_restoration_keeps_new_bn_column(self):
+        self.template.MaxDataColumn = 64
+        output = _Cells({15: "合计"})
+        output.MaxDataColumn = 65
+        bn = _Cell(123.45, 2, 65, r"\¥#,##0.00")
+        output._actual[(2, 65)] = bn
+        template_book, output_book = _Book(self.template), _Book(output)
+        fake_aspose = types.ModuleType("Aspose")
+        fake_cells = types.ModuleType("Aspose.Cells")
+        fake_cells.Workbook = _Book
+        fake_aspose.Cells = fake_cells
+        fake_init = types.ModuleType("aspose_init")
+        fake_init.ensure_license = lambda: None
+        with tempfile.TemporaryDirectory() as directory:
+            template_path = Path(directory) / "template.xlsx"
+            output_path = Path(directory) / "output.xlsx"
+            template_path.touch()
+            output_path.touch()
+
+            def open_book(path):
+                return template_book if str(path) == str(template_path) else output_book
+
+            with patch.dict(sys.modules, {"Aspose": fake_aspose,
+                                          "Aspose.Cells": fake_cells,
+                                          "aspose_init": fake_init}), \
+                 patch.object(_module, "_open_workbook", side_effect=open_book):
+                _module.restore_formats_from_template(output_path, template_path)
+
+        self.assertEqual(bn.style.Custom, r"\¥#,##0.00")
+
+
+class NewColumnStyleTests(unittest.TestCase):
+    def test_moved_summary_keeps_new_bn_column_style(self):
+        class Style:
+            def __init__(self, border=False, number_format="General"):
+                self.border = border
+                self.number_format = number_format
+
+            def Copy(self, other):
+                self.border = other.border
+                self.number_format = other.number_format
+
+        class Cell:
+            def __init__(self, value=None, style=None):
+                self.Value = value
+                self.style = style or Style()
+
+            def GetStyle(self):
+                return Style(self.style.border, self.style.number_format)
+
+            def SetStyle(self, style):
+                self.style = style
+
+        class Cells:
+            def __init__(self, max_row, max_col):
+                self.MaxDataRow = max_row
+                self.MaxDataColumn = max_col
+                self.items = {}
+                self.row_heights = {}
+
+            def __getitem__(self, address):
+                return self.items.setdefault(address, Cell())
+
+            def GetRowHeight(self, row):
+                return self.row_heights.get(row, 18)
+
+            def SetRowHeight(self, row, height):
+                self.row_heights[row] = height
+
+        class Book(_Book):
+            def CreateStyle(self):
+                return Style()
+
+        template = Cells(3, 64)  # 模板最后一列 BM；BN 是输出新增列。
+        output = Cells(5, 65)
+        template[2, 64].style = Style(border=True)
+        for row in (1, 2, 4, 5):
+            output[row, 65].style = Style(border=True, number_format='¥#,##0.00')
+        output[2, 65].Value = 123.45
+        output[4, 0].Value = "合计"
+        template[3, 0].Value = "合计"
+        template_book, output_book = Book(template), Book(output)
+        fake_aspose = types.ModuleType("Aspose")
+        fake_cells = types.ModuleType("Aspose.Cells")
+        fake_cells.Workbook = Book
+        fake_aspose.Cells = fake_cells
+        fake_init = types.ModuleType("aspose_init")
+        fake_init.ensure_license = lambda: None
+        with tempfile.TemporaryDirectory() as directory:
+            template_path = Path(directory) / "template.xlsx"
+            output_path = Path(directory) / "output.xlsx"
+            template_path.touch()
+            output_path.touch()
+
+            def open_book(path):
+                return template_book if str(path) == str(template_path) else output_book
+
+            with patch.dict(sys.modules, {"Aspose": fake_aspose,
+                                          "Aspose.Cells": fake_cells,
+                                          "aspose_init": fake_init}), \
+                 patch.object(_module, "_open_workbook", side_effect=open_book), \
+                 patch.object(_module, "_scan_summary_rows", side_effect=[[4], [3]]), \
+                 patch.object(_module, "_fallback_data_start", return_value=1):
+                _module.restore_template_region_format(output_path, template_path)
+
+        for row in (1, 2, 4, 5):
+            self.assertTrue(output[row, 65].style.border, f"BN{row + 1} border lost")
+            self.assertEqual(output[row, 65].style.number_format, '¥#,##0.00')
+        self.assertTrue(output[2, 64].style.border)  # 模板原有列仍正常重刷。
+
 
 if __name__ == "__main__":
     unittest.main()

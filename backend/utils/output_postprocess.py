@@ -496,6 +496,7 @@ def restore_formats_from_template(output_path, template_path) -> int:
             ocells = ows.Cells
             tcells = tws.Cells
             shifted_tail = _shifted_summary_tail(ocells, tcells)
+            template_last_col = tcells.MaxDataColumn
             # 只遍历输出中"实际存在"的单元格（GetEnumerator 不含空格 → 不会给输出灌空单元格）
             # 同列唯一且公式相同的单元格可作为移动锚点（如汇总行 TODAY）。
             # 重复公式不猜位置，继续使用原坐标规则。
@@ -510,6 +511,8 @@ def restore_formats_from_template(output_path, template_path) -> int:
             while it.MoveNext():
                 ocell = it.Current
                 try:
+                    if template_last_col is None or ocell.Column > template_last_col:
+                        continue  # 模板没有的新列保留脚本写入的数字格式。
                     template_row = _template_format_row(ocell.Row, shifted_tail, tcells.MaxDataRow)
                     if template_row is None:
                         continue  # 新增数据行或超出模板的行，保留脚本已写好的格式。
@@ -790,15 +793,16 @@ def restore_template_region_format(output_path, template_path, script_code=None)
             if ds is None or ds < 0 or ds >= o_sr:
                 continue
 
-            ncols = max(o_maxc, t_maxc)
-            if ncols is None or ncols < 0:
+            # 新增月份列可能超出模板数据范围；模板该列的空白默认样式会覆盖脚本写好的边框。
+            style_last_col = min(o_maxc, t_maxc) if o_maxc is not None and t_maxc is not None else -1
+            if style_last_col < 0:
                 continue
 
             # 模板样板样式：数据样板取模板数据区中段一行（避开首/尾行的特殊边框）
             t_de = t_sr - 1
             t_sample = ds + (t_de - ds) // 2 if t_de > ds else ds
-            data_styles = [tcells[t_sample, c].GetStyle() for c in range(ncols + 1)]
-            sum_styles = [tcells[t_sr, c].GetStyle() for c in range(ncols + 1)]
+            data_styles = [tcells[t_sample, c].GetStyle() for c in range(style_last_col + 1)]
+            sum_styles = [tcells[t_sr, c].GetStyle() for c in range(style_last_col + 1)]
             try:
                 sum_h = tcells.GetRowHeight(t_sr)
             except Exception:
@@ -807,12 +811,12 @@ def restore_template_region_format(output_path, template_path, script_code=None)
             # 重刷数据行 [ds, o_sr-1]
             for r in range(ds, o_sr):
                 ocells.SetRowHeight(r, tcells.GetRowHeight(t_sample))
-                for c in range(ncols + 1):
+                for c in range(style_last_col + 1):
                     if _apply_style(ocells[r, c], data_styles[c]):
                         restored += 1
                         touched = True
             # 重刷汇总行 + 行高
-            for c in range(ncols + 1):
+            for c in range(style_last_col + 1):
                 if _apply_style(ocells[o_sr, c], sum_styles[c]):
                     restored += 1
                     touched = True
@@ -826,14 +830,14 @@ def restore_template_region_format(output_path, template_path, script_code=None)
             def_style = out.CreateStyle()
             for r in range(o_sr + 1, (o_maxr or 0) + 1):
                 has_val = False
-                for c in range(ncols + 1):
+                for c in range(o_maxc + 1):
                     v = ocells[r, c].Value
                     if v is not None and str(v).strip() != "":
                         has_val = True
                         break
                 if has_val:
                     break
-                for c in range(ncols + 1):
+                for c in range(style_last_col + 1):
                     if _apply_style(ocells[r, c], def_style):
                         restored += 1
                         touched = True
