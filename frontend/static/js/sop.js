@@ -61,13 +61,11 @@ const SOP = {
         document.getElementById('sop-page-info').textContent = `共 ${total} 条，每页 10 条，第 ${this.page} / ${pages} 页`;
         document.getElementById('sop-page-prev').disabled = this.page <= 1;
         document.getElementById('sop-page-next').disabled = this.page >= pages;
-        if (!this.entries.length) { body.innerHTML = '<tr><td colspan="9">暂无记录</td></tr>'; return; }
+        if (!this.entries.length) { body.innerHTML = '<tr><td colspan="8">暂无记录</td></tr>'; return; }
         body.innerHTML = this.entries.slice(start, start + this.pageSize).map(e => {
             const actions = [`<button class="btn" data-action="detail" data-id="${e.id}">详情</button>`];
             if (AUTH.hasPerm('sop.upload') && ['draft','awaiting_files','rejected','ai_failed','failed'].includes(e.status))
                 actions.push(`<button class="btn" data-action="upload" data-id="${e.id}">上传</button>`);
-            if (AUTH.hasPerm('sop.upload'))
-                actions.push(`<button class="btn" data-action="supplementary" data-id="${e.id}">补充上传</button>`);
             if (AUTH.hasPerm('sop.review') && e.status === 'ai_passed')
                 actions.push(`<button class="btn" data-action="detail" data-id="${e.id}">审核</button>`);
             if (AUTH.isAdmin()) {
@@ -75,7 +73,9 @@ const SOP = {
                     actions.push(`<button class="btn" data-action="resend" data-id="${e.id}">补发通知</button>`);
                 actions.push(`<button class="btn" data-action="delete" data-id="${e.id}">删除</button>`);
             }
-            return `<tr><td>${this.escape(e.batch_month || '-')}</td><td>${this.escape(e.customer_name)}</td><td>${this.escape(e.project_number || '-')}</td>
+            if (AUTH.hasPerm('sop.upload'))
+                actions.push(`<button class="btn sop-supplementary-action" data-action="supplementary" data-id="${e.id}">补充上传</button>`);
+            return `<tr><td>${this.escape(e.batch_month || '-')}</td><td>${this.escape(e.customer_name)}</td>
                 <td>${this.escape(e.salesperson_name || '-')}</td><td>${this.escape(this.status(e.business_status || e.status))}</td>
                 <td>${e.round_no ? 'v' + e.round_no : '-'}</td><td><span class="sop-ai-summary" title="${this.escape(e.ai_comment || '-')}">${this.escape(e.ai_comment || '-')}</span></td>
                 <td>${e.updated_at ? this.escape(new Date(e.updated_at).toLocaleString()) : '-'}</td>
@@ -96,7 +96,6 @@ const SOP = {
         catch (e) { this.error(e.message); return; }
         this.dialog(`<h2>新建 SOP</h2><form id="sop-create-form" class="sop-form">
             <label class="sop-full">客户（租户）<select id="sop-create-customer" required><option value="">请选择客户</option>${choices.customers.map(name => `<option value="${this.escape(name)}">${this.escape(name)}</option>`).join('')}</select></label>
-            <label class="sop-full">项目编号 <span class="sop-required">*</span><input id="sop-create-project-number" maxlength="100" required placeholder="请输入该租户内唯一的项目编号"></label>
             <label>业务员<select id="sop-create-assignee" required><option value="">请选择业务员</option>${choices.users.map(user => `<option value="${user.id}">${this.escape(user.display_name || user.username)}（${this.escape(user.username)}）</option>`).join('')}</select></label>
             <label>业务员邮箱<input id="sop-create-email" type="email" readonly placeholder="选择业务员后自动带出"></label>
             <label class="sop-full">集约月份批次<input id="sop-create-month" type="month" required></label>
@@ -125,7 +124,6 @@ const SOP = {
                 await this.request('/api/tools/sop/entries', {method:'POST',
                     headers:{'Content-Type':'application/json'},
                     body:JSON.stringify({customer_name:name,
-                        project_number:document.getElementById('sop-create-project-number').value.trim(),
                         assignee_user_id:Number(document.getElementById('sop-create-assignee').value),
                         batch_month:document.getElementById('sop-create-month').value.replace('-', ''),
                         description:document.getElementById('sop-create-description').value.trim()})});
@@ -251,7 +249,8 @@ const SOP = {
     },
     async supplementary(id) {
         const entry = this.entries.find(entry => entry.id === Number(id));
-        this.dialog(`<h2>补充上传：${this.escape(entry?.customer_name || '')}</h2>
+        this.dialog(`<p class="sop-supplementary-notice" role="note">不参与审核，请上传流程文件、历史文件等。</p>
+            <h2>补充上传：${this.escape(entry?.customer_name || '')}</h2>
             <p class="sop-muted">可多次上传，同名文件替换，不同名文件追加。</p>
             <form id="sop-supplementary-form" class="sop-form">
                 <label class="sop-full">补充资料（可多选）<input type="file" name="files" multiple required accept=".xlsx,.xls,.txt,.docx,.doc,.zip,.rar,.7z"></label>
@@ -297,7 +296,7 @@ const SOP = {
                 `<button class="btn" data-supplementary="${e.id}" data-index="${index}" data-name="${this.escape(file.name)}">${this.escape(file.name)}</button>`).join('');
             this.dialog(`<div class="sop-detail-heading"><h2>${this.escape(e.customer_name)}</h2>
                 <p>业务员：${this.escape(e.salesperson_name || '-')}　集约月份批次：${this.escape(e.batch_month || '-')}</p>
-                <p>项目编号：${this.escape(e.project_number || '-')}　状态：${this.escape(this.status(e.status))}</p></div>
+                <p>状态：${this.escape(this.status(e.status))}</p></div>
                 <div class="sop-detail-content">${supplementary ? `<section class="sop-file-group"><h3>补充资料</h3><div class="sop-actions">${supplementary}</div></section>` : ''}
                 ${rounds || '<p>尚未上传</p>'}</div>`, 'detail');
         } catch (e) { this.error(e.message); }

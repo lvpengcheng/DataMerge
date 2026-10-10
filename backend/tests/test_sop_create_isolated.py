@@ -27,8 +27,7 @@ class Entry(Base):
     __tablename__ = "entries"
     id = Column(Integer, primary_key=True)
     customer_name = Column(String)
-    project_number = Column(String(100))
-    __table_args__ = (Index("uq_test_project_customer", "project_number", "customer_name", unique=True),)
+    __table_args__ = (Index("uq_test_customer", "customer_name", unique=True),)
     batch_month = Column(String)
     description = Column(String)
     status = Column(String)
@@ -86,7 +85,7 @@ class SopCreateTests(unittest.TestCase):
         nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                  and node.name in {"sop_entries_create", "_sop_customer_choices", "sop_entries_list",
                                    "_sop_status_groups", "_sop_business_status", "_sop_filter_status", "_sop_status_label",
-                                   "_sop_validate_project_number", "_sop_check_project_number", "sop_import_assignments",
+                                   "_sop_check_customer_name", "sop_import_assignments",
                                    "sop_report", "sop_supplementary_upload", "sop_supplementary_download",
                                    "_sop_check_upload", "_sop_check_read", "_sop_is_owner", "_sop_can_read"}]
         for node in nodes:
@@ -105,14 +104,14 @@ class SopCreateTests(unittest.TestCase):
         exec(compile(ast.Module(body=nodes, type_ignores=[]), "sop_create", "exec"), self.ns)
 
     def create(self, **overrides):
-        values = dict(customer_name="客户甲", project_number=" proj-001 ", batch_month="202610", assignee_user_id=7, description="说明")
+        values = dict(customer_name="客户甲", batch_month="202610", assignee_user_id=7, description="说明")
         values.update(overrides)
         return asyncio.run(self.ns["sop_entries_create"](SimpleNamespace(**values), SimpleNamespace(id=1)))
 
     def test_four_status_filters_counts_and_reviewer_scope(self):
         states = ["draft", "awaiting_files", "ai_queued", "ai_analyzing", "ai_passed", "ai_failed", "rejected", "failed", "completed"]
         with self.session() as db:
-            db.add_all(Entry(customer_name="客户甲", batch_month="202610", status=state, assignee_user_id=7) for state in states)
+            db.add_all(Entry(customer_name=f"客户甲{i}", batch_month="202610", status=state, assignee_user_id=7) for i, state in enumerate(states))
             db.add(Entry(customer_name="其他客户", batch_month="202611", status="draft", assignee_user_id=8))
             db.commit()
         self.ns["has_permission"] = lambda user, key: key in user.permissions
@@ -140,7 +139,6 @@ class SopCreateTests(unittest.TestCase):
             entry = db.query(Entry).one()
             self.assertEqual((entry.assignee_user_id, entry.batch_month, entry.status), (7, "202610", "draft"))
             self.assertEqual((entry.salesperson_name, entry.salesperson_email), ("业务员", "seller@example.com"))
-            self.assertEqual(entry.project_number, "PROJ-001")
         with self.assertRaises(HTTPException) as duplicate:
             self.create()
         self.assertEqual(duplicate.exception.status_code, 409)
@@ -173,15 +171,16 @@ class SopCreateTests(unittest.TestCase):
                 path = Path(self.temp.name) / "参考" / "图片和附件" / "合杰开户流程SOP_v3.xlsx"
                 path.parent.mkdir(parents=True)
                 template = Workbook()
-                template.active.append(["旧标题"] * 12)
-                template.active.append(["旧数据"] * 12)
+                template.active.append(["旧标题"] * 12 + ["项目编号"])
+                template.active.append(["旧数据"] * 13)
                 template.save(path)
                 template.close()
             book = load_workbook(asyncio.run(self.ns["sop_report"]()))
             rows = list(book.active.values)
             data = dict(zip(rows[0], rows[1]))
             self.assertEqual(len(rows), 2)
-            self.assertEqual(data["项目编号"], "PROJ-001")
+            self.assertNotIn("项目编号", data)
+            self.assertEqual(len(rows[0]), 12)
             self.assertEqual(data["集约月份批次"], "202610")
             self.assertEqual(data["最近驳回原因"], "最近原因")
             self.assertEqual(data["当前状态"], "通过")
@@ -232,7 +231,7 @@ class SopCreateTests(unittest.TestCase):
         self.assertEqual(private.exception.status_code, 404)
 
     def test_invalid_choices_and_month_are_rejected(self):
-        for change in [dict(project_number=""), dict(project_number="x" * 101), dict(customer_name="手填未知客户"), dict(batch_month="202613"),
+        for change in [dict(customer_name=""), dict(customer_name="手填未知客户"), dict(batch_month="202613"),
                        dict(batch_month="2026-10"), dict(assignee_user_id=999)]:
             with self.subTest(change=change), self.assertRaises(HTTPException):
                 self.create(**change)
@@ -244,29 +243,29 @@ class SopCreateTests(unittest.TestCase):
         with self.session() as db:
             self.assertEqual(db.query(Entry).count(), 0)
 
-    def test_project_number_is_unique_within_customer(self):
+    def test_customer_name_alone_is_unique_across_months(self):
         self.create()
         (Path(self.temp.name) / "客户乙").mkdir()
-        self.create(customer_name="客户乙", batch_month="202611", project_number="proj-001")
+        self.create(customer_name="客户乙", batch_month="202611")
         with self.assertRaises(HTTPException):
             self.create(batch_month="202611")
-        self.create(project_number="proj-002")
         from sqlalchemy.exc import IntegrityError
         with self.session() as db:
-            db.add(Entry(customer_name="客户甲", project_number="PROJ-001"))
+            db.add(Entry(customer_name="客户甲"))
             with self.assertRaises(IntegrityError):
                 db.commit()
 
-    def import_rows(self, rows, include_number=True):
-        frame = pd.DataFrame(rows, columns=["业务员", "邮箱", "租户", "所属月份批次", "项目编号"])
-        if not include_number:
-            frame = frame.drop(columns="项目编号")
+    def import_rows(self, rows, legacy=False):
+        columns = ["业务员", "邮箱", "租户", "所属月份批次"]
+        if legacy:
+            columns.append("项目编号")
+        frame = pd.DataFrame(rows, columns=columns)
         async def read():
             return frame.to_csv(index=False).encode("utf-8-sig")
         return asyncio.run(self.ns["sop_import_assignments"](
             SimpleNamespace(filename="list.csv", read=read), "draft", SimpleNamespace(id=1)))
 
-    def test_import_upserts_by_number_and_customer_and_preserves_progress(self):
+    def test_import_upserts_by_customer_without_number_and_preserves_progress(self):
         self.create()
         with self.session() as db:
             entry = db.query(Entry).one()
@@ -276,23 +275,20 @@ class SopCreateTests(unittest.TestCase):
             db.add(Entry(customer_name="旧客户", status="draft"))
             db.commit()
         result = self.import_rows([
-            ["新业务员", "seller@example.com", "客户甲", "202611", " proj-001 "],
-            ["业务员", "seller@example.com", "客户乙", "202611", "proj-001"],
-            ["业务员", "seller@example.com", "客户甲", "202611", "proj-002"],
-            ["业务员", "seller@example.com", "客户甲", "202612", "PROJ-002"],
-            ["业务员", "seller@example.com", "客户戊", "202611", ""],
-            ["业务员", "seller@example.com", "旧客户", "202610", "000123"],
+            ["新业务员", "seller@example.com", "客户甲", "202611"],
+            ["业务员", "seller@example.com", "客户乙", "202611"],
+            ["业务员", "seller@example.com", " 客户甲 ", "202612"],
+            ["业务员", "seller@example.com", "客户戊", "202611"],
+            ["业务员", "seller@example.com", "旧客户", "202610"],
         ])
-        self.assertEqual((result["created"], result["updated"], len(result["errors"])), (3, 1, 2))
+        self.assertEqual((result["created"], result["updated"], len(result["errors"])), (2, 2, 1))
         with self.session() as db:
             entry = db.get(Entry, original_id)
             self.assertEqual((entry.batch_month, entry.salesperson_name, entry.status), ("202611", "新业务员", "completed"))
             self.assertEqual(entry.description, "已有审核及文件记录")
-            self.assertEqual(db.query(Entry).filter_by(customer_name="旧客户").count(), 2)
-        repeat = self.import_rows([["业务员", "seller@example.com", "客户乙", "202612", "proj-001"]])
+            self.assertEqual(db.query(Entry).filter_by(customer_name="旧客户").count(), 1)
+        repeat = self.import_rows([["业务员", "seller@example.com", "客户乙", "202612", "任意旧编号"]], legacy=True)
         self.assertEqual((repeat["created"], repeat["updated"], repeat["errors"]), (0, 1, []))
-        with self.assertRaises(HTTPException):
-            self.import_rows([], include_number=False)
 
 
 if __name__ == "__main__":

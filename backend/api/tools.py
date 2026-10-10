@@ -2235,7 +2235,6 @@ class SopAiVerdict(BaseModel):
 
 class SopCreateRequest(BaseModel):
     customer_name: str
-    project_number: str
     assignee_user_id: int
     batch_month: str
     description: str = ""
@@ -2477,7 +2476,6 @@ def _sop_entry_to_out(entry: SopEntry, db) -> dict:
     return {
         "id": entry.id,
         "customer_name": entry.customer_name,
-        "project_number": entry.project_number,
         "batch_month": entry.batch_month,
         "salesperson_name": entry.salesperson_name or (entry.assignee.display_name if entry.assignee else ""),
         "salesperson_email": entry.salesperson_email or (entry.assignee.email if entry.assignee else ""),
@@ -2496,20 +2494,12 @@ def _sop_entry_to_out(entry: SopEntry, db) -> dict:
 
 # ---------- SOP 条目 ----------
 
-def _sop_validate_project_number(value):
-    number = str(value or "").strip().upper()
-    if not number or len(number) > 100:
-        raise HTTPException(status_code=400, detail="项目编号必填，且不能超过 100 个字符")
-    return number
-
-
-def _sop_check_project_number(db, number, customer, entry_id=None):
-    from sqlalchemy import func
-    query = db.query(SopEntry).filter(func.upper(SopEntry.project_number) == number, SopEntry.customer_name == customer)
+def _sop_check_customer_name(db, customer, entry_id=None):
+    query = db.query(SopEntry).filter(SopEntry.customer_name == customer)
     if entry_id is not None:
         query = query.filter(SopEntry.id != entry_id)
     if query.first():
-        raise HTTPException(status_code=409, detail=f"项目编号 {number} 在该租户下已存在")
+        raise HTTPException(status_code=409, detail=f"租户 {customer} 已存在")
 
 @router.get("/sop/entries")
 async def sop_entries_list(
@@ -2580,23 +2570,21 @@ async def sop_import_assignments(
     frame = frame.fillna("")
     if "集约月份批次" in frame.columns:
         frame = frame.drop(columns=["所属月份批次"], errors="ignore").rename(columns={"集约月份批次": "所属月份批次"})
-    required = {"业务员", "邮箱", "租户", "所属月份批次", "项目编号"}
+    required = {"业务员", "邮箱", "租户", "所属月份批次"}
     if not required.issubset(set(frame.columns)):
-        raise HTTPException(status_code=400, detail="清单需要业务员、邮箱、租户、集约月份批次、项目编号五列")
+        raise HTTPException(status_code=400, detail="清单需要业务员、邮箱、租户、集约月份批次四列")
     db = SessionLocal()
     created = 0
     updated = 0
     errors = []
-    seen_project_keys = set()
+    seen_customers = set()
     try:
         for index, row in frame.iterrows():
             try:
-                number = _sop_validate_project_number(row["项目编号"])
                 customer = str(row["租户"]).strip()
-                project_key = (number, customer)
-                if project_key in seen_project_keys:
-                    raise HTTPException(status_code=409, detail=f"项目编号 {number} 与租户 {customer} 在导入文件中重复")
-                seen_project_keys.add(project_key)
+                if customer in seen_customers:
+                    raise HTTPException(status_code=409, detail=f"租户 {customer} 在导入文件中重复")
+                seen_customers.add(customer)
             except HTTPException as exc:
                 errors.append(f"第 {index + 2} 行：{exc.detail}")
                 continue
@@ -2617,10 +2605,7 @@ async def sop_import_assignments(
             if not user:
                 errors.append(f"第 {index + 2} 行：邮箱 {email} 尚未关联有效用户")
                 continue
-            entry = db.query(SopEntry).filter(
-                func.upper(SopEntry.project_number) == number,
-                SopEntry.customer_name == customer,
-            ).first()
+            entry = db.query(SopEntry).filter(SopEntry.customer_name == customer).first()
             from sqlalchemy.exc import IntegrityError
             is_new = entry is None
             try:
@@ -2629,7 +2614,6 @@ async def sop_import_assignments(
                         entry = SopEntry(customer_name=customer, status=initial_status, created_by=current_user.id)
                         db.add(entry)
                     entry.batch_month = month
-                    entry.project_number = number
                     entry.assignee_user_id = user.id
                     entry.salesperson_name = person
                     entry.salesperson_email = email
@@ -2639,7 +2623,7 @@ async def sop_import_assignments(
                 else:
                     updated += 1
             except IntegrityError:
-                errors.append(f"第 {index + 2} 行：项目编号 {number} 已存在，未导入该行")
+                errors.append(f"第 {index + 2} 行：租户 {customer} 已存在，未导入该行")
         db.commit()
         return {"created": created, "updated": updated, "errors": errors}
     except Exception:
@@ -2806,9 +2790,11 @@ async def sop_report(
         sheet.title = "全量"
         if sheet.max_row > 1:
             sheet.delete_rows(2, sheet.max_row - 1)
-        # 模板存在时也覆盖表头，避免继续输出旧名称及遗漏项目编号。
-        headers = ["集约月份批次", "SOP名称", "项目编号", "业务员", "业务员邮箱", "当前版本", "当前状态",
+        # 模板存在时也重置列数及表头，移除旧模板中的项目编号列。
+        headers = ["集约月份批次", "SOP名称", "业务员", "业务员邮箱", "当前版本", "当前状态",
                    "首次提交时间", "最近提交时间", "最近驳回原因", "审核完成时间", "驳回次数", "上传次数"]
+        if sheet.max_column > len(headers):
+            sheet.delete_cols(len(headers) + 1, sheet.max_column - len(headers))
         for col, title in enumerate(headers, 1):
             cell = sheet.cell(1, col, title)
             cell.font = Font(bold=True, color="FFFFFF")
@@ -2820,17 +2806,17 @@ async def sop_report(
             last_rejected = rejected[-1] if rejected else None
             reason = (last_rejected.review_comment or last_rejected.ai_comment or "") if last_rejected else ""
             submitted = [r.created_at for r in rounds if r.created_at]
-            sheet.append([entry.batch_month or "", entry.customer_name, entry.project_number or "",
+            sheet.append([entry.batch_month or "", entry.customer_name,
                           entry.salesperson_name or (entry.assignee.display_name if entry.assignee else ""),
                           entry.salesperson_email or (entry.assignee.email if entry.assignee else ""),
                           f"v{latest.round_no}" if latest else "", _sop_status_label(entry.status),
                           min(submitted) if submitted else None, max(submitted) if submitted else None,
                           reason, latest.reviewed_at if latest and entry.status == "completed" else None,
                           len(rejected), len(rounds)])
-        for col, width in enumerate((19, 29, 22, 16, 26, 13, 15, 22, 22, 38, 22, 13, 13), 1):
+        for col, width in enumerate((19, 29, 16, 26, 13, 15, 22, 22, 38, 22, 13, 13), 1):
             sheet.column_dimensions[get_column_letter(col)].width = width
         for row in sheet.iter_rows(min_row=2):
-            for index in (7, 8, 10):
+            for index in (6, 7, 9):
                 row[index].number_format = "yyyy-mm-dd hh:mm:ss"
         sheet.freeze_panes = "A2"
         sheet.auto_filter.ref = sheet.dimensions
@@ -2871,12 +2857,11 @@ async def sop_create_options(current_user=Depends(require_permission("admin"))):
 async def sop_entries_create(req: SopCreateRequest, current_user=Depends(require_permission("admin"))):
     """选择客户、业务员和月份建档，状态 draft。"""
     name = (req.customer_name or "").strip()
-    number = _sop_validate_project_number(req.project_number)
     if not name:
         raise HTTPException(status_code=400, detail="客户名称不能为空")
     db = SessionLocal()
     try:
-        _sop_check_project_number(db, number, name)
+        _sop_check_customer_name(db, name)
         if name not in _sop_customer_choices(db):
             raise HTTPException(status_code=400, detail="请从现有租户或已导入客户清单中选择客户")
         month = req.batch_month.strip()
@@ -2891,7 +2876,7 @@ async def sop_entries_create(req: SopCreateRequest, current_user=Depends(require
                 and has_permission(user, "menu.sop") and has_permission(user, "sop.upload")):
             raise HTTPException(status_code=400, detail="业务员须为已启用、填写邮箱且具有 SOP 上传权限的用户")
         entry = SopEntry(
-            customer_name=name, project_number=number, description=req.description or "",
+            customer_name=name, description=req.description or "",
             batch_month=month, assignee_user_id=user.id,
             salesperson_name=user.display_name or user.username, salesperson_email=user.email.strip(),
             status="draft", created_by=current_user.id,
@@ -2902,7 +2887,7 @@ async def sop_entries_create(req: SopCreateRequest, current_user=Depends(require
             db.commit()
         except IntegrityError:
             db.rollback()
-            raise HTTPException(status_code=409, detail=f"项目编号 {number} 在该租户下已存在")
+            raise HTTPException(status_code=409, detail=f"租户 {name} 已存在")
         db.refresh(entry)
         return _sop_entry_to_out(entry, db)
     finally:

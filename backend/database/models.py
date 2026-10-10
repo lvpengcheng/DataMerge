@@ -546,13 +546,12 @@ class SopEntry(Base):
     """SOP 维护：一条 SOP 条目（客户 + 描述），状态随最新一轮流转。"""
     __tablename__ = "sop_entries"
     __table_args__ = (
-        Index("uq_sop_project_customer", "project_number", "customer_name", unique=True),
+        Index("uq_sop_customer_name", "customer_name", unique=True),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     tenant_id = Column(String(100), nullable=False, index=True, default="__tools_sop__")
     customer_name = Column(String(200), nullable=False, index=True)   # 客户名称
-    project_number = Column(String(100), nullable=True)  # 同一租户内唯一；旧记录可暂为空
     batch_month = Column(String(6), nullable=True, index=True)       # 所属月份批次 YYYYMM
     assignee_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     salesperson_name = Column(String(100), default="")

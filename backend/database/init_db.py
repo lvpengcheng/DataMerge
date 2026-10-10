@@ -197,7 +197,6 @@ def _migrate_add_columns():
         ("sop_rounds", "source_file_names", "JSON"),
         # ---------- sop_entries（负责人和月份批次）----------
         ("sop_entries", "batch_month", "VARCHAR(6)"),
-        ("sop_entries", "project_number", "VARCHAR(100)"),
         ("sop_entries", "assignee_user_id", "INTEGER"),
         ("sop_entries", "salesperson_name", "VARCHAR(100) DEFAULT ''"),
         ("sop_entries", "salesperson_email", "VARCHAR(200) DEFAULT ''"),
@@ -232,15 +231,26 @@ def _migrate_add_columns():
         conn.commit()
 
     if "sop_entries" in insp.get_table_names():
-        # 先建立复合唯一索引，再移除旧的项目编号全局唯一索引。
-        for index in SopEntry.__table__.indexes:
-            if index.name == "uq_sop_project_customer":
-                index.create(bind=engine, checkfirst=True)
-        from sqlalchemy import MetaData, Table
-        legacy_table = Table("sop_entries", MetaData(), autoload_with=engine)
-        for index in legacy_table.indexes:
-            if index.name == "ix_sop_entries_project_number":
-                index.drop(bind=engine, checkfirst=True)
+        # 先建立租户名称唯一约束，历史重复条目保留并明确报告，避免丢失审核和附件。
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            duplicates = conn.execute(text(
+                "SELECT customer_name FROM sop_entries GROUP BY customer_name HAVING COUNT(*) > 1"
+            )).scalars().all()
+        if duplicates:
+            print("      警告：SOP 存在同名历史租户，保留原记录并暂缓唯一约束升级，不影响服务启动：" + "、".join(duplicates))
+        else:
+            for index in SopEntry.__table__.indexes:
+                if index.name == "uq_sop_customer_name":
+                    index.create(bind=engine, checkfirst=True)
+            from sqlalchemy import MetaData, Table
+            legacy_table = Table("sop_entries", MetaData(), autoload_with=engine)
+            for index in legacy_table.indexes:
+                if index.name in ("ix_sop_entries_project_number", "uq_sop_project_customer"):
+                    index.drop(bind=engine, checkfirst=True)
+            if "project_number" in legacy_table.c:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE sop_entries DROP COLUMN project_number"))
 
     # 旧 SOP 权限从智能小工具分组迁到一级模块；其余权限保持原样。
     from sqlalchemy.orm.attributes import flag_modified
