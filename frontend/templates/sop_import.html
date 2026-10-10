@@ -6,7 +6,7 @@
     <title>客户清单导入</title>
     <link rel="stylesheet" href="/static/css/admin.css?v=20260807a">
     <link rel="stylesheet" href="/static/css/tools.css?v=20260814a">
-    <link rel="stylesheet" href="/static/css/sop.css?v=20261008f">
+    <link rel="stylesheet" href="/static/css/sop.css?v=20261010a">
 </head>
 <body>
 <div class="container">
@@ -31,9 +31,9 @@
         <div class="sop-head"><h1>客户清单导入</h1></div>
         <div id="sop-error" class="sop-error" role="alert"></div>
         <section id="sop-import-panel" class="sop-panel" style="display:none;">
-            <p class="sop-muted">上传 xlsx 或 csv 文件，表头须包含：业务员、邮箱、租户、所属月份批次、项目编号。邮箱须对应已启用的用户，月份格式为 YYYYMM。项目编号必填，按项目编号＋租户匹配：已有记录更新清单信息，没有记录则新增；已有文件和审核状态保留。同一清单内项目编号＋租户不能重复。</p>
+            <p class="sop-muted">上传 xlsx 或 csv 文件，表头须包含：业务员、邮箱、租户、集约月份批次、项目编号。邮箱须对应已启用的用户，月份格式为 YYYYMM（兼容旧表头“所属月份批次”）。项目编号必填，按项目编号＋租户匹配：已有记录更新清单信息，没有记录则新增；已有文件和审核状态保留。同一清单内项目编号＋租户不能重复。</p>
             <form id="sop-import-form" class="sop-form">
-                <label>导入客户清单（xlsx/csv，含业务员、邮箱、租户、所属月份批次、项目编号）<input type="file" name="file" accept=".xlsx,.csv" required></label>
+                <label>导入客户清单（xlsx/csv，含业务员、邮箱、租户、集约月份批次、项目编号）<input type="file" name="file" accept=".xlsx,.csv" required></label>
                 <label>清单类型<select name="initial_status"><option value="draft">待上传</option><option value="awaiting_files">历史待审（待补文件）</option></select></label>
                 <button class="btn" type="submit">导入清单</button>
             </form>
@@ -42,7 +42,7 @@
     </main>
 </div>
 <script src="/static/js/auth.js?v=20260722a"></script>
-<script src="/static/js/sop.js?v=20261008k"></script>
+<script src="/static/js/sop.js?v=20261010b"></script>
 <script src="/static/js/sop_import.js?v=20261008a"></script>
 </body>
 </html>

@@ -2303,22 +2303,33 @@ def _sop_reviewer_eligible(user):
     return not _sop_reviewer_issue(user)
 
 
-def _sop_get_reviewer(db):
+def _sop_get_reviewers(db):
     config = db.query(SystemConfig).filter_by(key="sop_final_reviewer").first()
-    user_id = (config.value or {}).get("user_id") if config and isinstance(config.value, dict) else None
-    return db.query(User).filter_by(id=user_id).first() if user_id else None
+    value = config.value if config and isinstance(config.value, dict) else {}
+    ids = value.get("user_ids") if "user_ids" in value else [value.get("user_id")]
+    return [db.query(User).filter_by(id=user_id).first() for user_id in dict.fromkeys(ids or []) if user_id]
+
+
+def _sop_get_reviewer(db):
+    """兼容旧的单复审人调用方。"""
+    return next(iter(_sop_get_reviewers(db)), None)
 
 
 def _sop_notify_ai_pass(db, entry: SopEntry):
-    reviewer = _sop_get_reviewer(db)
-    if not _sop_reviewer_eligible(reviewer):
+    reviewers = [user for user in _sop_get_reviewers(db) if _sop_reviewer_eligible(user)]
+    if not reviewers:
         raise HTTPException(status_code=400, detail="请配置有效复审人，用户须启用、填写邮箱并具有 SOP 审核权限")
-    recipient = reviewer.email.strip()
     link = _sop_public_url("/sop")
-    body = (f"您好 {reviewer.display_name or reviewer.username}，\n\n以下 SOP 已通过 AI 审核，请您进行复审。\n\n"
-            f"业务员：{entry.salesperson_name or '-'}\nSOP 名称：{entry.customer_name}\n\n"
-            f"请点击以下链接审核：\n{link or '请登录 SOP 审核平台'}\n")
-    _sop_executor.submit(send_sop_mail, recipient, f"SOP 待复审：{entry.customer_name}", body)
+    recipients = set()
+    for reviewer in reviewers:
+        recipient = reviewer.email.strip()
+        if recipient.casefold() in recipients:
+            continue
+        recipients.add(recipient.casefold())
+        body = (f"您好 {reviewer.display_name or reviewer.username}，\n\n以下 SOP 已通过 AI 审核，请您进行复审。\n\n"
+                f"业务员：{entry.salesperson_name or '-'}\nSOP 名称：{entry.customer_name}\n\n"
+                f"请点击以下链接审核：\n{link or '请登录 SOP 审核平台'}\n")
+        _sop_executor.submit(send_sop_mail, recipient, f"SOP 待复审：{entry.customer_name}", body)
 
 
 def _sop_round_dir(entry_id: int, round_no: int) -> Path:
@@ -2332,6 +2343,9 @@ def _sop_create_round(db, entry: SopEntry, source_files, result_file, rule_file)
         raise HTTPException(status_code=400, detail="请至少上传一个源文件")
     if not result_file or not result_file.filename or not rule_file or not rule_file.filename:
         raise HTTPException(status_code=400, detail="结果表和规则文件必传")
+    for upload in [*source_files, result_file, rule_file]:
+        if Path(upload.filename).suffix.lower() not in {".xlsx", ".xls"}:
+            raise HTTPException(status_code=400, detail="源文件、目标文件和规则文件仅支持 xlsx、xls 格式")
     entry_id = entry.id
     round_no = db.query(SopRound).filter(SopRound.sop_id == entry_id).count() + 1
     rdir = _sop_round_dir(entry_id, round_no)
@@ -2476,6 +2490,7 @@ def _sop_entry_to_out(entry: SopEntry, db) -> dict:
         "round_no": latest.round_no if latest else 0,
         "ai_comment": (latest.ai_comment or "") if latest else "",
         "latest_round_id": entry.latest_round_id,
+        "supplementary_files": [{"name": f["name"]} for f in (entry.supplementary_files or [])],
     }
 
 
@@ -2501,6 +2516,7 @@ async def sop_entries_list(
     keyword: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     batch_month: Optional[str] = Query(None),
+    salesperson: Optional[str] = Query(None),
     current_user=Depends(require_permission("menu.sop")),
 ):
     """SOP 条目列表：客户名称模糊搜索 + 状态过滤。"""
@@ -2521,6 +2537,12 @@ async def sop_entries_list(
             q = q.filter(SopEntry.customer_name.like(f"%{keyword}%"))
         if batch_month:
             q = q.filter(SopEntry.batch_month == batch_month)
+        if salesperson and (_sop_is_superadmin(current_user) or has_permission(current_user, "sop.review")
+                            or has_permission(current_user, "sop.report")):
+            from sqlalchemy import or_
+            q = q.filter(or_(SopEntry.salesperson_name.contains(salesperson, autoescape=True),
+                             SopEntry.assignee.has(User.display_name.contains(salesperson, autoescape=True)),
+                             SopEntry.assignee.has(User.username.contains(salesperson, autoescape=True))))
         counts = {"total": q.count()}
         for key, values in _sop_status_groups().items():
             counts[key] = q.filter(SopEntry.status.in_(values)).count()
@@ -2556,9 +2578,11 @@ async def sop_import_assignments(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"无法读取清单: {exc}")
     frame = frame.fillna("")
+    if "集约月份批次" in frame.columns:
+        frame = frame.drop(columns=["所属月份批次"], errors="ignore").rename(columns={"集约月份批次": "所属月份批次"})
     required = {"业务员", "邮箱", "租户", "所属月份批次", "项目编号"}
     if not required.issubset(set(frame.columns)):
-        raise HTTPException(status_code=400, detail="清单需要业务员、邮箱、租户、所属月份批次、项目编号五列")
+        raise HTTPException(status_code=400, detail="清单需要业务员、邮箱、租户、集约月份批次、项目编号五列")
     db = SessionLocal()
     created = 0
     updated = 0
@@ -2669,19 +2693,22 @@ async def sop_ai_schedule_save(payload: SopAiScheduleRequest, current_user=Depen
 
 
 class SopReviewerConfigRequest(BaseModel):
-    user_id: int
+    user_ids: Optional[List[int]] = None
+    user_id: Optional[int] = None  # 兼容旧页面
 
 
 @router.get("/sop/reviewer-config")
 async def sop_reviewer_config(current_user=Depends(require_permission("admin"))):
     db = SessionLocal()
     try:
-        reviewer = _sop_get_reviewer(db)
+        reviewers = _sop_get_reviewers(db)
+        reviewer = next((user for user in reviewers if user), None)
         users = db.query(User).order_by(User.username).all()
         return {
             "user_id": reviewer.id if reviewer else None,
-            "reviewer_name": (reviewer.display_name or reviewer.username) if reviewer else None,
-            "reviewer_valid": _sop_reviewer_eligible(reviewer),
+            "user_ids": [user.id for user in reviewers if user],
+            "reviewer_name": "、".join(user.display_name or user.username for user in reviewers if user),
+            "reviewer_valid": bool(reviewers) and all(_sop_reviewer_eligible(user) for user in reviewers),
             "users": [{"id": user.id, "username": user.username,
                        "display_name": user.display_name, "email": user.email,
                        "selectable": _sop_reviewer_eligible(user),
@@ -2697,17 +2724,20 @@ async def sop_save_reviewer_config(payload: SopReviewerConfigRequest,
                                    current_user=Depends(require_permission("admin"))):
     db = SessionLocal()
     try:
-        reviewer = db.query(User).filter_by(id=payload.user_id).first()
-        if not _sop_reviewer_eligible(reviewer):
-            raise HTTPException(status_code=400, detail="所选用户须启用、填写邮箱并具有 SOP 审核权限")
+        ids = list(dict.fromkeys(payload.user_ids if payload.user_ids is not None else ([payload.user_id] if payload.user_id else [])))
+        if not ids:
+            raise HTTPException(status_code=400, detail="请至少选择一位复审人")
+        for user_id in ids:
+            if not _sop_reviewer_eligible(db.query(User).filter_by(id=user_id).first()):
+                raise HTTPException(status_code=400, detail="所有所选用户须启用、填写邮箱并具有 SOP 审核权限")
         config = db.query(SystemConfig).filter_by(key="sop_final_reviewer").first()
         if config is None:
-            config = SystemConfig(key="sop_final_reviewer", value={"user_id": reviewer.id})
+            config = SystemConfig(key="sop_final_reviewer", value={"user_ids": ids})
             db.add(config)
         else:
-            config.value = {"user_id": reviewer.id}
+            config.value = {"user_ids": ids}
         db.commit()
-        return {"ok": True, "user_id": reviewer.id}
+        return {"ok": True, "user_ids": ids}
     finally:
         db.close()
 
@@ -2719,13 +2749,13 @@ async def sop_setup_status(current_user=Depends(require_permission("admin"))):
     accounts = EmailHandler().config.get("email_accounts") or []
     db = SessionLocal()
     try:
-        reviewer = _sop_get_reviewer(db)
+        reviewers = _sop_get_reviewers(db)
         return {
             "public_url_configured": bool(_sop_public_url("/sop")),
             "smtp_configured": any(a.get("smtp_server") and a.get("email_address") for a in accounts),
-            "reviewer_configured": bool(reviewer),
-            "reviewer_email_configured": bool(reviewer and (reviewer.email or "").strip()),
-            "reviewer_can_review": bool(reviewer and reviewer.is_active and has_permission(reviewer, "menu.sop") and has_permission(reviewer, "sop.review")),
+            "reviewer_configured": bool(reviewers),
+            "reviewer_email_configured": bool(reviewers) and all(user and (user.email or "").strip() for user in reviewers),
+            "reviewer_can_review": bool(reviewers) and all(_sop_reviewer_eligible(user) for user in reviewers),
         }
     finally:
         db.close()
@@ -2734,11 +2764,12 @@ async def sop_setup_status(current_user=Depends(require_permission("admin"))):
 @router.get("/sop/report")
 async def sop_report(
     batch_month: Optional[str] = Query(None), status: Optional[str] = Query(None),
+    keyword: Optional[str] = Query(None), salesperson: Optional[str] = Query(None),
     date_from: Optional[str] = Query(None), date_to: Optional[str] = Query(None),
     incomplete_only: bool = Query(False),
     current_user=Depends(_require_sop_action("sop.report")),
 ):
-    """按样例的 12 列导出进度报表，筛选条件缺省时导出全量。"""
+    """导出进度报表，筛选条件缺省时导出全量。"""
     from openpyxl import Workbook, load_workbook
     from openpyxl.styles import Font, PatternFill
     from openpyxl.utils import get_column_letter
@@ -2754,6 +2785,13 @@ async def sop_report(
         q = db.query(SopEntry)
         if batch_month:
             q = q.filter(SopEntry.batch_month == batch_month)
+        if keyword:
+            q = q.filter(SopEntry.customer_name.like(f"%{keyword}%"))
+        if salesperson:
+            from sqlalchemy import or_
+            q = q.filter(or_(SopEntry.salesperson_name.contains(salesperson, autoescape=True),
+                             SopEntry.assignee.has(User.display_name.contains(salesperson, autoescape=True)),
+                             SopEntry.assignee.has(User.username.contains(salesperson, autoescape=True))))
         q = _sop_filter_status(q, status)
         if incomplete_only:
             q = q.filter(SopEntry.status != "completed")
@@ -2768,27 +2806,32 @@ async def sop_report(
         sheet.title = "全量"
         if sheet.max_row > 1:
             sheet.delete_rows(2, sheet.max_row - 1)
-        if not report_template.is_file():
-            sheet.append(["所属月份批次", "SOP名称", "业务员", "业务员邮箱", "当前版本", "当前状态",
-                          "首次提交时间", "最近提交时间", "驳回原因", "审核完成时间", "驳回次数", "上传次数"])
-            for cell in sheet[1]:
-                cell.font = Font(bold=True, color="FFFFFF")
-                cell.fill = PatternFill("solid", fgColor="285890")
+        # 模板存在时也覆盖表头，避免继续输出旧名称及遗漏项目编号。
+        headers = ["集约月份批次", "SOP名称", "项目编号", "业务员", "业务员邮箱", "当前版本", "当前状态",
+                   "首次提交时间", "最近提交时间", "最近驳回原因", "审核完成时间", "驳回次数", "上传次数"]
+        for col, title in enumerate(headers, 1):
+            cell = sheet.cell(1, col, title)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="285890")
         for entry in q.order_by(SopEntry.batch_month, SopEntry.customer_name).all():
             rounds = sorted(entry.rounds, key=lambda r: r.round_no)
             latest = rounds[-1] if rounds else None
             rejected = [r for r in rounds if r.status in ("ai_failed", "rejected")]
-            reason = (latest.review_comment or latest.ai_comment or "") if latest and entry.status in ("rejected", "ai_failed") else ""
+            last_rejected = rejected[-1] if rejected else None
+            reason = (last_rejected.review_comment or last_rejected.ai_comment or "") if last_rejected else ""
             submitted = [r.created_at for r in rounds if r.created_at]
-            sheet.append([entry.batch_month or "", entry.customer_name,
+            sheet.append([entry.batch_month or "", entry.customer_name, entry.project_number or "",
                           entry.salesperson_name or (entry.assignee.display_name if entry.assignee else ""),
                           entry.salesperson_email or (entry.assignee.email if entry.assignee else ""),
                           f"v{latest.round_no}" if latest else "", _sop_status_label(entry.status),
                           min(submitted) if submitted else None, max(submitted) if submitted else None,
                           reason, latest.reviewed_at if latest and entry.status == "completed" else None,
                           len(rejected), len(rounds)])
-        for col, width in enumerate((17, 29, 16, 26, 13, 15, 22, 22, 38, 22, 13, 13), 1):
+        for col, width in enumerate((19, 29, 22, 16, 26, 13, 15, 22, 22, 38, 22, 13, 13), 1):
             sheet.column_dimensions[get_column_letter(col)].width = width
+        for row in sheet.iter_rows(min_row=2):
+            for index in (7, 8, 10):
+                row[index].number_format = "yyyy-mm-dd hh:mm:ss"
         sheet.freeze_panes = "A2"
         sheet.auto_filter.ref = sheet.dimensions
         stream = io.BytesIO()
@@ -2838,11 +2881,11 @@ async def sop_entries_create(req: SopCreateRequest, current_user=Depends(require
             raise HTTPException(status_code=400, detail="请从现有租户或已导入客户清单中选择客户")
         month = req.batch_month.strip()
         if not re.fullmatch(r"\d{6}", month):
-            raise HTTPException(status_code=400, detail="所属月份批次须为 YYYYMM")
+            raise HTTPException(status_code=400, detail="集约月份批次须为 YYYYMM")
         try:
             datetime.strptime(month, "%Y%m")
         except ValueError:
-            raise HTTPException(status_code=400, detail="所属月份批次无效")
+            raise HTTPException(status_code=400, detail="集约月份批次无效")
         user = db.query(User).filter_by(id=req.assignee_user_id).first()
         if not (user and user.is_active and (user.email or "").strip()
                 and has_permission(user, "menu.sop") and has_permission(user, "sop.upload")):
@@ -2878,6 +2921,88 @@ async def sop_entries_detail(entry_id: int, current_user=Depends(require_permiss
         out = _sop_entry_to_out(entry, db)
         out["rounds"] = [_sop_round_to_out(r) for r in sorted(entry.rounds, key=lambda x: x.round_no)]
         return out
+    finally:
+        db.close()
+
+
+@router.post("/sop/entries/{entry_id}/supplementary")
+async def sop_supplementary_upload(
+    entry_id: int, files: List[UploadFile] = File(...),
+    current_user=Depends(_require_sop_action("sop.upload")),
+):
+    """补充资料按文件名替换或追加，不创建审核轮次或 AI 任务。"""
+    from sqlalchemy import update
+    db = SessionLocal()
+    folder = None
+    committed = False
+    try:
+        entry = db.query(SopEntry).filter_by(id=entry_id).first()
+        if not entry:
+            raise HTTPException(status_code=404, detail="SOP条目不存在")
+        _sop_check_upload(entry, current_user)
+        if not files or any(not file.filename for file in files):
+            raise HTTPException(status_code=400, detail="请选择补充资料")
+        allowed = {".xlsx", ".xls", ".txt", ".docx", ".doc", ".zip", ".rar", ".7z"}
+        names = [file.filename.replace("\\", "/").rsplit("/", 1)[-1] for file in files]
+        if any(Path(name).suffix.lower() not in allowed for name in names):
+            raise HTTPException(status_code=400, detail="补充资料仅支持 xlsx、xls、txt、docx、doc、zip、rar、7z 格式")
+        folder = SOP_ROOT / "entries" / str(entry_id) / "supplementary" / uuid.uuid4().hex
+        records = []
+        for index, (upload, name) in enumerate(zip(files, names)):
+            path = folder / f"{index}{Path(name).suffix.lower()}"
+            if not await save_upload_file(upload, path):
+                raise HTTPException(status_code=400, detail=f"补充资料不能为空：{name}")
+            records.append({"name": name, "path": str(path)})
+        # 文件落盘后开启短写事务，锁定条目再读取最新清单，避免并发追加互相覆盖。
+        db.rollback()
+        claimed = db.execute(update(SopEntry).where(
+            SopEntry.id == entry_id,
+        ).values(updated_at=datetime.utcnow()).execution_options(synchronize_session=False))
+        if claimed.rowcount != 1:
+            raise HTTPException(status_code=404, detail="SOP条目不存在")
+        db.refresh(entry)
+        _sop_check_upload(entry, current_user)
+        previous = entry.supplementary_files or []
+        merged = {record["name"]: record for record in previous}
+        merged.update({record["name"]: record for record in records})
+        entry.supplementary_files = list(merged.values())
+        db.commit()
+        committed = True
+        retained = {record["path"] for record in merged.values()}
+        supplementary_root = (SOP_ROOT / "entries" / str(entry_id) / "supplementary").resolve()
+        for record in [*previous, *records]:
+            obsolete = Path(record["path"])
+            if record["path"] not in retained and obsolete.resolve().is_relative_to(supplementary_root):
+                try:
+                    obsolete.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("[sop] 无法清理被替换的补充资料：%s", obsolete)
+        return {"ok": True, "files": [{"name": record["name"]} for record in merged.values()]}
+    finally:
+        if not committed:
+            db.rollback()
+            if folder and folder.resolve().is_relative_to(SOP_ROOT.resolve()) and folder.exists():
+                shutil.rmtree(folder)
+        db.close()
+
+
+@router.get("/sop/entries/{entry_id}/supplementary/{index}")
+async def sop_supplementary_download(
+    entry_id: int, index: int, current_user=Depends(require_permission("menu.sop")),
+):
+    db = SessionLocal()
+    try:
+        entry = db.query(SopEntry).filter_by(id=entry_id).first()
+        if not entry:
+            raise HTTPException(status_code=404, detail="SOP条目不存在")
+        _sop_check_read(entry, current_user)
+        files = entry.supplementary_files or []
+        if index < 0 or index >= len(files):
+            raise HTTPException(status_code=404, detail="补充资料不存在")
+        record = files[index]
+        if not Path(record["path"]).is_file():
+            raise HTTPException(status_code=404, detail="补充资料文件不存在")
+        return FileResponse(record["path"], filename=record["name"])
     finally:
         db.close()
 
@@ -3072,6 +3197,7 @@ def _sop_package_files(round):
     if round.rule_file_path or round.rule_file_name:
         records.append(("规则", round.rule_file_path, round.rule_file_name, None))
     files, missing, seen = [], [], set()
+    archive_names = set()
     rdir = _sop_round_dir(round.sop_id, round.round_no)
     for folder, stored_path, original_name, index in records:
         stored_name = str(stored_path or "").replace("\\", "/").rsplit("/", 1)[-1]
@@ -3090,7 +3216,12 @@ def _sop_package_files(round):
         if key in seen:
             continue
         seen.add(key)
-        archive_name = f"{folder}/{str(index) + '_' if index is not None else ''}{name}"
+        archive_name = f"{folder}/{name}"
+        duplicate = 2
+        while archive_name.casefold() in archive_names:
+            archive_name = f"{folder}/{Path(name).stem} ({duplicate}){Path(name).suffix}"
+            duplicate += 1
+        archive_names.add(archive_name.casefold())
         files.append((path, archive_name))
     if missing:
         raise HTTPException(status_code=409, detail="无法生成完整压缩包，以下文件缺失："
@@ -3146,6 +3277,13 @@ async def sop_entries_review(entry_id: int, req: SopReviewRequest, current_user=
             raise HTTPException(status_code=404, detail="轮次不存在")
         if entry.latest_round_id != r.id:
             raise HTTPException(status_code=400, detail="只能审核最新一轮")
+        from sqlalchemy import update
+        claimed = db.execute(update(SopEntry).where(
+            SopEntry.id == entry_id, SopEntry.status == "ai_passed", SopEntry.latest_round_id == r.id,
+        ).values(status=req.verdict).execution_options(synchronize_session=False))
+        if claimed.rowcount != 1:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="该版本已由其他审核员处理，请刷新页面")
         r.review_status = req.verdict
         r.review_comment = req.comment or ""
         r.reviewed_by = current_user.id

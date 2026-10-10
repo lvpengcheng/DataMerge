@@ -6,7 +6,7 @@
     <title>SOP审核平台</title>
     <link rel="stylesheet" href="/static/css/admin.css?v=20260807a">
     <link rel="stylesheet" href="/static/css/tools.css?v=20260814a">
-    <link rel="stylesheet" href="/static/css/sop.css?v=20261009a">
+    <link rel="stylesheet" href="/static/css/sop.css?v=20261010a">
 </head>
 <body>
 <div class="container">
@@ -44,16 +44,16 @@
         </div>
         <div class="sop-toolbar">
             <input id="sop-keyword" type="search" placeholder="搜索客户名称">
-            <input id="sop-month" type="text" maxlength="6" inputmode="numeric" placeholder="月份批次 YYYYMM">
+            <input id="sop-salesperson" type="search" placeholder="搜索业务员" aria-label="搜索业务员" hidden>
+            <input id="sop-month" type="text" maxlength="6" inputmode="numeric" placeholder="集约月份批次 YYYYMM">
             <select id="sop-status"><option value="">全部状态</option><option value="pending_upload">待上传</option><option value="pending_review">待审核</option><option value="rejected">驳回</option><option value="completed">通过</option></select>
             <button class="btn" id="sop-search">查询</button>
-            <label data-perm="sop.report"><input id="sop-incomplete" type="checkbox"> 仅未完成</label>
         </div>
         <div class="sop-table-wrap"><table class="data-table" id="sop-table"><colgroup>
             <col style="width:100px"><col style="width:130px"><col style="width:130px"><col style="width:95px"><col style="width:95px">
             <col style="width:60px"><col style="width:220px"><col style="width:165px"><col style="width:290px">
         </colgroup><thead><tr>
-            <th>月份批次</th><th>客户名称</th><th>项目编号</th><th>业务员</th><th>当前状态</th><th>版本</th><th>AI评价</th><th>更新时间</th><th>操作</th>
+            <th>集约月份批次</th><th>客户名称</th><th>项目编号</th><th>业务员</th><th>当前状态</th><th>版本</th><th>AI评价</th><th>更新时间</th><th>操作</th>
         </tr></thead><tbody><tr><td colspan="9">加载中...</td></tr></tbody></table></div>
         <nav class="sop-pagination" aria-label="SOP 列表分页">
             <span id="sop-page-info" role="status" aria-live="polite">每页 10 条</span>
@@ -65,7 +65,7 @@
 
     </main>
 </div>
-<dialog id="sop-dialog" class="sop-dialog"><button class="btn" id="sop-close" style="float:right">关闭</button><div id="sop-dialog-body"></div></dialog>
+<dialog id="sop-dialog" class="sop-dialog"><div class="sop-dialog-bar"><button class="btn" id="sop-close">关闭</button></div><div id="sop-dialog-body"></div></dialog>
 <dialog id="sop-review-dialog" class="sop-dialog sop-reject-dialog">
     <h2>驳回 SOP</h2>
     <form id="sop-review-form" class="sop-form">
@@ -74,6 +74,6 @@
     </form>
 </dialog>
 <script src="/static/js/auth.js?v=20260722a"></script>
-<script src="/static/js/sop.js?v=20261009a"></script>
+<script src="/static/js/sop.js?v=20261010b"></script>
 </body>
 </html>

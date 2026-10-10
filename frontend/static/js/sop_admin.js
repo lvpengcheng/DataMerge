@@ -41,14 +41,14 @@ const SOP_ADMIN = {
             const data = await (await this.request('/api/tools/sop/reviewer-config')).json();
             const select = document.getElementById('sop-reviewer-user');
             const available = data.users.filter(user => user.selectable);
-            select.innerHTML = '<option value="">请选择复审人</option>' + data.users.map(user =>
-                `<option value="${user.id}"${user.selectable ? '' : ' disabled'}>${this.escape(user.display_name || user.username)}（${this.escape(user.username)} · ${this.escape(user.email || '无邮箱')}）${user.selectable ? '' : ' — ' + this.escape(user.disabled_reason)}</option>`).join('');
-            select.value = data.reviewer_valid ? String(data.user_id) : '';
+            const selected = new Set((data.user_ids || (data.user_id ? [data.user_id] : [])).map(Number));
+            select.innerHTML = data.users.map(user =>
+                `<option value="${user.id}"${user.selectable ? '' : ' disabled'}${selected.has(user.id) && user.selectable ? ' selected' : ''}>${this.escape(user.display_name || user.username)}（${this.escape(user.username)} · ${this.escape(user.email || '无邮箱')}）${user.selectable ? '' : ' — ' + this.escape(user.disabled_reason)}</option>`).join('');
             document.getElementById('sop-reviewer-save').disabled = !available.length;
             document.getElementById('sop-reviewer-status').textContent = data.reviewer_valid
                 ? `当前复审通知接收人：${data.reviewer_name}`
-                : data.reviewer_name ? `原复审人 ${data.reviewer_name} 已不符合条件，请重新选择。`
-                : available.length ? '用户列表来自用户管理。请选择并保存复审人，AI 通过后的通知将发送到该用户邮箱。'
+                : data.reviewer_name ? `已配置的复审人中存在失效账号，请检查并重新保存：${data.reviewer_name}`
+                : available.length ? '用户列表来自用户管理。可选择多位复审人，AI 通过后的通知将发送到所有有效复审人的邮箱。'
                 : data.users.length ? '用户表中暂无符合条件的复审人。请根据下拉框提示，在用户管理中完善邮箱、启用状态和 SOP 权限。'
                 : '用户表中暂无用户，请先在用户管理中创建用户。';
         } catch (e) { this.error(e.message); }
@@ -94,7 +94,7 @@ const SOP_ADMIN = {
             try {
                 await this.request('/api/tools/sop/reviewer-config', {method:'PUT',
                     headers:{'Content-Type':'application/json'},
-                    body:JSON.stringify({user_id:Number(document.getElementById('sop-reviewer-user').value)})});
+                    body:JSON.stringify({user_ids:Array.from(document.getElementById('sop-reviewer-user').selectedOptions, option => Number(option.value))})});
                 await this.reviewerConfig();
                 await this.setup();
             } catch (e) { this.error(e.message); }

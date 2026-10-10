@@ -42,9 +42,9 @@ class SopPackageTests(unittest.TestCase):
 
     def test_all_files_and_duplicate_original_names_are_preserved(self):
         with zipfile.ZipFile(namespace["_sop_build_package"](self.round)) as archive:
-            self.assertEqual(archive.namelist(), ["源文件/1_工资.xlsx", "源文件/2_工资.xlsx", "结果表/结果.xlsx", "规则/规则.docx"])
-            self.assertEqual(archive.read("源文件/1_工资.xlsx"), b"source one\x00\xff")
-            self.assertEqual(archive.read("源文件/2_工资.xlsx"), b"source two")
+            self.assertEqual(archive.namelist(), ["源文件/工资.xlsx", "源文件/工资 (2).xlsx", "结果表/结果.xlsx", "规则/规则.docx"])
+            self.assertEqual(archive.read("源文件/工资.xlsx"), b"source one\x00\xff")
+            self.assertEqual(archive.read("源文件/工资 (2).xlsx"), b"source two")
             self.assertIsNone(archive.testzip())
 
     def test_migrated_linux_and_windows_paths_resolve_in_same_round(self):

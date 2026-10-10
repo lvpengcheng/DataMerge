@@ -14,7 +14,7 @@ button.sop-card:focus-visible { outline:2px solid #1976d2; outline-offset:2px; }
 #sop-table { table-layout:fixed; min-width:1290px; }
 #sop-table td { vertical-align:middle; }
 #sop-table .sop-ai-summary { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:3; overflow:hidden; overflow-wrap:anywhere; line-height:1.6; }
-#sop-table .sop-row-actions { display:flex; align-items:center; gap:6px; flex-wrap:nowrap; }
+#sop-table .sop-row-actions { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
 #sop-table .sop-row-actions .btn { flex-shrink:0; white-space:nowrap; padding:8px 10px; }
 .sop-form { display:grid; gap:12px; }
 .sop-form label { display:grid; gap:5px; }
@@ -22,6 +22,12 @@ button.sop-card:focus-visible { outline:2px solid #1976d2; outline-offset:2px; }
 .sop-dialog { position:fixed; inset:0; margin:auto; width:min(800px,94vw); max-height:90vh; border:0; border-radius:10px; box-shadow:0 15px 60px #0004; padding:22px; overflow:auto; }
 .sop-dialog::backdrop { background:#0007; }
 .sop-dialog h2 { margin-top:0; }
+.sop-dialog-bar { display:flex; justify-content:flex-end; background:white; }
+.sop-detail-dialog[open] { display:flex; flex-direction:column; overflow:hidden; }
+.sop-detail-dialog .sop-dialog-bar { flex-shrink:0; }
+.sop-detail-dialog #sop-dialog-body { display:flex; flex-direction:column; min-height:0; }
+.sop-detail-heading { flex-shrink:0; }
+.sop-detail-content { min-height:0; overflow:auto; overscroll-behavior:contain; }
 .sop-round { border:1px solid #dde5ed; padding:12px; border-radius:7px; margin:10px 0; }
 .sop-muted { color:#667; font-size:13px; }
 .sop-required { color:#d32f2f; font-weight:700; }

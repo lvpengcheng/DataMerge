@@ -201,6 +201,7 @@ def _migrate_add_columns():
         ("sop_entries", "assignee_user_id", "INTEGER"),
         ("sop_entries", "salesperson_name", "VARCHAR(100) DEFAULT ''"),
         ("sop_entries", "salesperson_email", "VARCHAR(200) DEFAULT ''"),
+        ("sop_entries", "supplementary_files", "JSON"),
         # ---------- assemble_field_mappings（智能组表置信度闭环）----------
         ("assemble_field_mappings", "match_type", "VARCHAR(20) DEFAULT 'semantic'"),
         ("assemble_field_mappings", "confirm_count", "INTEGER DEFAULT 0"),

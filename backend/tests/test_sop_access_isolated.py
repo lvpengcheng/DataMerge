@@ -17,12 +17,14 @@ class HTTPException(Exception):
 source = (Path(__file__).parent.parent / "api").joinpath("tools.py").read_text(encoding="utf-8")
 tree = ast.parse(source)
 names = {"_sop_is_superadmin", "_sop_is_owner", "_sop_can_read", "_sop_check_read", "_sop_check_upload", "_require_sop_action", "_sop_create_round", "_sop_reviewer_issue", "_sop_reviewer_eligible", "_sop_get_reviewer", "_sop_notify_ai_pass", "sop_reviewer_config"}
+names.add("_sop_get_reviewers")
 names.update({"_sop_current_rules", "_sop_effective_rule"})
 functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
 for function in functions:
     function.decorator_list = []
 namespace = {
     "HTTPException": HTTPException,
+    "Path": Path,
     "SopEntry": object,
     "SopRound": object,
     "Depends": lambda dependency: None,
@@ -140,6 +142,25 @@ class SopAccessTests(unittest.TestCase):
         self.assertIsNone(namespace["_sop_get_reviewer"](db))
         db.query.assert_called_once_with(config_model)
 
+    def test_multiple_reviewers_receive_notices_with_duplicate_emails_deduplicated(self):
+        people = []
+        for identifier, email, active in [(1, "one@example.com", True), (2, "two@example.com", True),
+                                           (3, "ONE@example.com", True), (4, "inactive@example.com", False)]:
+            person = user(identifier, "menu.sop", "sop.review")
+            person.email, person.is_active = email, active
+            person.display_name = person.username = str(identifier)
+            people.append(person)
+        config_model, user_model = object(), object()
+        db, config_query, user_query = Mock(), Mock(), Mock()
+        config_query.filter_by.return_value.first.return_value = types.SimpleNamespace(value={"user_ids": [1, 2, 3, 4]})
+        user_query.filter_by.side_effect = lambda id: types.SimpleNamespace(first=lambda: people[id - 1])
+        db.query.side_effect = lambda model: config_query if model is config_model else user_query
+        namespace.update(SystemConfig=config_model, User=user_model, _sop_executor=Mock(),
+                         send_sop_mail=Mock(), _sop_public_url=lambda path: None)
+        namespace["_sop_notify_ai_pass"](db, types.SimpleNamespace(salesperson_name="业务员", customer_name="客户"))
+        recipients = [call.args[1] for call in namespace["_sop_executor"].submit.call_args_list]
+        self.assertEqual(recipients, ["one@example.com", "two@example.com"])
+
     def test_business_user_sees_only_assigned_entries(self):
         seller = user(1, "menu.sop", "sop.upload")
         self.assertTrue(namespace["_sop_can_read"](entry(1), seller))
@@ -188,6 +209,15 @@ class SopAccessTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as missing_rule:
             upload(None, entry(1, "draft"), [source], result, None)
         self.assertIn("规则文件", missing_rule.exception.detail)
+
+    def test_upload_rejects_disallowed_formats_before_creating_files_or_rounds(self):
+        for slot in range(3):
+            for extension in ("xlsm", "pdf", "docx", "txt", "zip"):
+                files = [types.SimpleNamespace(filename="file.xlsx") for _ in range(3)]
+                files[slot].filename = "file." + extension
+                with self.subTest(slot=slot, extension=extension), self.assertRaises(HTTPException) as rejected:
+                    namespace["_sop_create_round"](None, entry(1), [files[0]], files[1], files[2])
+                self.assertEqual(rejected.exception.status_code, 400)
 
 
 if __name__ == "__main__":

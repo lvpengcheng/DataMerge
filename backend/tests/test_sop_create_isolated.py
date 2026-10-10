@@ -7,12 +7,17 @@ from datetime import datetime
 from pathlib import Path
 import re
 import tempfile
+import shutil
+import uuid
 from types import SimpleNamespace
 from typing import Optional
 import unittest
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, Index, create_engine
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Index, JSON, ForeignKey, create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from starlette.datastructures import UploadFile
+from fastapi.responses import FileResponse
+from backend.utils.upload_stream import save_upload_file
 
 
 Base = declarative_base()
@@ -28,7 +33,11 @@ class Entry(Base):
     description = Column(String)
     status = Column(String)
     created_by = Column(Integer)
-    assignee_user_id = Column(Integer)
+    assignee_user_id = Column(Integer, ForeignKey("users.id"))
+    assignee = relationship("User")
+    supplementary_files = Column(JSON(none_as_null=True))
+    rounds = relationship("Round")
+    created_at = Column(DateTime, default=datetime.now)
     salesperson_name = Column(String)
     salesperson_email = Column(String)
     updated_at = Column(DateTime, default=datetime.now)
@@ -42,6 +51,18 @@ class User(Base):
     email = Column(String)
     is_active = Column(Boolean)
     can_upload = Column(Boolean)
+
+
+class Round(Base):
+    __tablename__ = "rounds"
+    id = Column(Integer, primary_key=True)
+    sop_id = Column(Integer, ForeignKey("entries.id"))
+    round_no = Column(Integer)
+    status = Column(String)
+    review_comment = Column(String)
+    ai_comment = Column(String)
+    reviewed_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.now)
 
 
 class HTTPException(Exception):
@@ -65,7 +86,9 @@ class SopCreateTests(unittest.TestCase):
         nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                  and node.name in {"sop_entries_create", "_sop_customer_choices", "sop_entries_list",
                                    "_sop_status_groups", "_sop_business_status", "_sop_filter_status", "_sop_status_label",
-                                   "_sop_validate_project_number", "_sop_check_project_number", "sop_import_assignments"}]
+                                   "_sop_validate_project_number", "_sop_check_project_number", "sop_import_assignments",
+                                   "sop_report", "sop_supplementary_upload", "sop_supplementary_download",
+                                   "_sop_check_upload", "_sop_check_read", "_sop_is_owner", "_sop_can_read"}]
         for node in nodes:
             node.decorator_list = []
         self.ns = dict(SopCreateRequest=object, Depends=lambda value: None, require_permission=lambda key: None,
@@ -75,7 +98,10 @@ class SopCreateTests(unittest.TestCase):
                        _sop_entry_to_out=lambda entry, db: {"id":entry.id},
                        Optional=Optional, Query=lambda value: value,
                        UploadFile=object, File=lambda value: value, Form=lambda value: value, pd=pd, io=io,
-                       _sop_is_superadmin=lambda user: user.role == "admin")
+                       _sop_is_superadmin=lambda user: user.role == "admin",
+                       List=list, Path=Path, _require_sop_action=lambda key: None,
+                       uuid=uuid, shutil=shutil, save_upload_file=save_upload_file, FileResponse=FileResponse,
+                       PROJECT_ROOT=Path(self.temp.name), StreamingResponse=lambda stream, **kwargs: stream)
         exec(compile(ast.Module(body=nodes, type_ignores=[]), "sop_create", "exec"), self.ns)
 
     def create(self, **overrides):
@@ -118,6 +144,92 @@ class SopCreateTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as duplicate:
             self.create()
         self.assertEqual(duplicate.exception.status_code, 409)
+
+    def test_salesperson_filter_applies_to_list_and_report(self):
+        self.create()
+        self.ns["has_permission"] = lambda user, key: key in user.permissions
+        reviewer = SimpleNamespace(id=3, role="reviewer", permissions={"sop.review"})
+        for word, expected in [("业务", 1), ("seller", 1), ("不存在", 0), ("%", 0)]:
+            data = asyncio.run(self.ns["sop_entries_list"](salesperson=word, current_user=reviewer))
+            self.assertEqual(len(data["items"]), expected)
+            self.assertEqual(data["counts"]["total"], expected)
+            from openpyxl import load_workbook
+            book = load_workbook(asyncio.run(self.ns["sop_report"](salesperson=word)))
+            self.assertEqual(book.active.max_row, expected + 1)
+            book.close()
+
+    def test_report_headers_and_last_rejection_survive_later_approval_and_template(self):
+        self.create()
+        with self.session() as db:
+            entry = db.query(Entry).one()
+            entry.status = "completed"
+            db.add_all([Round(sop_id=entry.id, round_no=1, status="ai_failed", ai_comment="旧原因"),
+                        Round(sop_id=entry.id, round_no=2, status="rejected", review_comment="最近原因"),
+                        Round(sop_id=entry.id, round_no=3, status="completed")])
+            db.commit()
+        from openpyxl import Workbook, load_workbook
+        for with_template in (False, True):
+            if with_template:
+                path = Path(self.temp.name) / "参考" / "图片和附件" / "合杰开户流程SOP_v3.xlsx"
+                path.parent.mkdir(parents=True)
+                template = Workbook()
+                template.active.append(["旧标题"] * 12)
+                template.active.append(["旧数据"] * 12)
+                template.save(path)
+                template.close()
+            book = load_workbook(asyncio.run(self.ns["sop_report"]()))
+            rows = list(book.active.values)
+            data = dict(zip(rows[0], rows[1]))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(data["项目编号"], "PROJ-001")
+            self.assertEqual(data["集约月份批次"], "202610")
+            self.assertEqual(data["最近驳回原因"], "最近原因")
+            self.assertEqual(data["当前状态"], "通过")
+            self.assertEqual(data["驳回次数"], 2)
+            book.close()
+
+    def test_supplementary_upload_replaces_appends_and_remains_authorized_and_independent(self):
+        self.create()
+        self.ns["has_permission"] = lambda user, key: key in user.permissions
+        seller = SimpleNamespace(id=7, role="seller", permissions={"sop.upload"})
+        stranger = SimpleNamespace(id=8, role="seller", permissions={"sop.upload"})
+        reviewer = SimpleNamespace(id=3, role="reviewer", permissions={"sop.review"})
+        with self.session() as db:
+            entry = db.query(Entry).one()
+            entry.status = "completed"
+            identifier = entry.id
+            db.commit()
+        def upload(who, name="注意事项.txt", content=b"supplement"):
+            file = UploadFile(io.BytesIO(content), filename=name)
+            try:
+                return asyncio.run(self.ns["sop_supplementary_upload"](identifier, [file], who))
+            finally:
+                file.file.close()
+        with self.assertRaises(HTTPException) as denied:
+            upload(stranger)
+        self.assertEqual(denied.exception.status_code, 403)
+        with self.assertRaises(HTTPException):
+            upload(seller, "bad.exe")
+        self.assertTrue(upload(seller)["ok"])
+        original = asyncio.run(self.ns["sop_supplementary_download"](identifier, 0, reviewer)).path
+        self.assertTrue(upload(seller, content=b"replacement")["ok"])
+        self.assertFalse(Path(original).exists())
+        result = upload(seller, "历史数据.xlsx", b"history")
+        self.assertEqual([file["name"] for file in result["files"]], ["注意事项.txt", "历史数据.xlsx"])
+        with self.assertRaises(HTTPException):
+            upload(seller, content=b"")
+        with self.session() as db:
+            entry = db.get(Entry, identifier)
+            self.assertEqual(entry.status, "completed")
+            self.assertEqual(entry.rounds, [])
+            self.assertEqual(len(entry.supplementary_files), 2)
+        response = asyncio.run(self.ns["sop_supplementary_download"](identifier, 0, reviewer))
+        self.assertEqual(Path(response.path).read_bytes(), b"replacement")
+        response = asyncio.run(self.ns["sop_supplementary_download"](identifier, 1, reviewer))
+        self.assertEqual(Path(response.path).read_bytes(), b"history")
+        with self.assertRaises(HTTPException) as private:
+            asyncio.run(self.ns["sop_supplementary_download"](identifier, 0, stranger))
+        self.assertEqual(private.exception.status_code, 404)
 
     def test_invalid_choices_and_month_are_rejected(self):
         for change in [dict(project_number=""), dict(project_number="x" * 101), dict(customer_name="手填未知客户"), dict(batch_month="202613"),

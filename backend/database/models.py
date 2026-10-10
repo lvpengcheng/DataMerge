@@ -557,6 +557,7 @@ class SopEntry(Base):
     assignee_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     salesperson_name = Column(String(100), default="")
     salesperson_email = Column(String(200), default="")
+    supplementary_files = Column(JSON(none_as_null=True), nullable=True)  # 补充资料，独立于审核版本，按文件名替换或追加
     description = Column(Text, default="")                            # SOP 大体描述
     # 状态机: draft / ai_analyzing / ai_failed / ai_passed / completed / rejected
     status = Column(String(20), default="draft")

@@ -19,9 +19,10 @@
     <p id="summary">正在验证链接...</p>
     <p id="message" role="alert"></p>
     <form id="resubmit-form" style="display:none;">
-        <label><span>源文件（可多选） <span style="color:#d32f2f;font-weight:700" aria-hidden="true">*</span></span><input type="file" name="source_files" multiple required accept=".xlsx,.xls,.xlsm"></label>
-        <label><span>目标文件（结果表） <span style="color:#d32f2f;font-weight:700" aria-hidden="true">*</span></span><input type="file" name="result_file" required accept=".xlsx,.xls,.xlsm"></label>
-        <label><span>规则文件 <span style="color:#d32f2f;font-weight:700" aria-hidden="true">*</span></span><input type="file" name="rule_file" required accept=".xlsx,.xls,.xlsm,.doc,.docx,.pdf,.txt,.md"></label>
+        <label><span>源文件（可多选） <span style="color:#d32f2f;font-weight:700" aria-hidden="true">*</span></span><input type="file" name="source_files" multiple required accept=".xlsx,.xls"></label>
+        <label><span>目标文件（结果表） <span style="color:#d32f2f;font-weight:700" aria-hidden="true">*</span></span><input type="file" name="result_file" required accept=".xlsx,.xls"></label>
+        <label><span>规则文件 <span style="color:#d32f2f;font-weight:700" aria-hidden="true">*</span></span><input type="file" name="rule_file" required accept=".xlsx,.xls"></label>
+        <p>源文件和目标文件仅支持 xlsx、xls 格式；规则文件仅支持 xlsx、xls 格式。</p>
         <button class="btn btn-primary" type="submit">提交新版本</button>
     </form>
 </main>
@@ -38,7 +39,7 @@
             const resp = await fetch('/api/tools/sop/resubmit/info', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({token})});
             if (!resp.ok) throw new Error('链接无效或已过期。');
             const data = await resp.json();
-            summary.textContent = `客户：${data.customer_name}　月份：${data.batch_month || '-'}　新版本：v${data.next_version}`;
+            summary.textContent = `客户：${data.customer_name}　集约月份批次：${data.batch_month || '-'}　新版本：v${data.next_version}`;
             form.style.display = 'grid';
         } catch (e) { summary.textContent = e.message; token = ''; }
     };
@@ -48,6 +49,11 @@
         const button = form.querySelector('button');
         button.disabled = true; message.textContent = '正在提交并处理初审，请稍候…';
         try {
+            for (const input of form.querySelectorAll('input[type=file]')) {
+                for (const file of input.files) {
+                    if (!/\.(xlsx|xls)$/i.test(file.name)) throw new Error('源文件、目标文件和规则文件仅支持 xlsx、xls 格式');
+                }
+            }
             const data = new FormData(form); data.append('token', token);
             const resp = await fetch('/api/tools/sop/resubmit/upload', {method:'POST', body:data});
             if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(err.detail || '提交失败'); }

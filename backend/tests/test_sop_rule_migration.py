@@ -5,7 +5,7 @@ from pathlib import Path
 import unittest
 
 from sqlalchemy import (Boolean, Column, DateTime, ForeignKey, Integer, MetaData,
-                        String, Table, Text, create_engine, inspect)
+                        String, Table, Text, Index, JSON, create_engine, inspect)
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.schema import CreateTable
 
@@ -32,13 +32,16 @@ class SopRuleMigrationTests(unittest.TestCase):
         namespace["_migrate_add_columns"]()
         namespace["_migrate_add_columns"]()
         indexes = inspect(engine).get_indexes("sop_entries")
-        self.assertTrue(any(index["name"] == "ix_sop_entries_project_number" and index["unique"] for index in indexes))
+        self.assertTrue(any(index["name"] == "uq_sop_project_customer" and index["unique"] for index in indexes))
+        self.assertIn("supplementary_files", {col["name"] for col in inspect(engine).get_columns("sop_entries")})
         from sqlalchemy.exc import IntegrityError
         with engine.begin() as conn:
             self.assertEqual(conn.exec_driver_sql("SELECT count(*) FROM sop_entries WHERE project_number IS NULL").scalar(), 2)
             conn.exec_driver_sql("UPDATE sop_entries SET project_number='001' WHERE id=1")
-        with self.assertRaises(IntegrityError), engine.begin() as conn:
             conn.exec_driver_sql("UPDATE sop_entries SET project_number='001' WHERE id=2")
+            self.assertEqual(conn.exec_driver_sql("SELECT count(*) FROM sop_entries WHERE supplementary_files IS NULL").scalar(), 2)
+        with self.assertRaises(IntegrityError), engine.begin() as conn:
+            conn.exec_driver_sql("UPDATE sop_entries SET customer_name='旧客户甲' WHERE id=2")
 
     def test_preserves_rule_ids_and_review_references_and_allows_new_versions(self):
         root = Path(__file__).parent.parent / "database"

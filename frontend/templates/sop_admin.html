@@ -6,7 +6,7 @@
     <title>SOP系统管理</title>
     <link rel="stylesheet" href="/static/css/admin.css?v=20260807a">
     <link rel="stylesheet" href="/static/css/tools.css?v=20260814a">
-    <link rel="stylesheet" href="/static/css/sop.css?v=20261008f">
+    <link rel="stylesheet" href="/static/css/sop.css?v=20261010a">
 </head>
 <body>
 <div class="container">
@@ -47,7 +47,7 @@
             <h2>复审通知配置</h2>
             <p id="sop-setup" class="sop-muted"></p>
             <form id="sop-reviewer-form" class="sop-form sop-reviewer-form">
-                <label>复审通知接收人<select id="sop-reviewer-user" required><option value="">加载用户中...</option></select></label>
+                <label>复审通知接收人（可多选）<select id="sop-reviewer-user" multiple size="6" required><option value="" disabled>加载用户中...</option></select><span class="sop-muted">按住 Ctrl（Mac 为 Command）点击可选择多位复审人。</span></label>
                 <button class="btn" type="submit" id="sop-reviewer-save">保存复审人</button>
             </form>
             <p id="sop-reviewer-status" class="sop-muted" role="status">从用户表选择。未启用、未填写邮箱或缺少 SOP 审核权限的用户会显示原因，且不可选。</p>
@@ -72,7 +72,7 @@
     </main>
 </div>
 <script src="/static/js/auth.js?v=20260722a"></script>
-<script src="/static/js/sop.js?v=20261008k"></script>
-<script src="/static/js/sop_admin.js?v=20261008e"></script>
+<script src="/static/js/sop.js?v=20261010b"></script>
+<script src="/static/js/sop_admin.js?v=20261010a"></script>
 </body>
 </html>

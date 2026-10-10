@@ -65,15 +65,15 @@ function environment(html, admin) {
     ])`, managed.context);
     assert.deepEqual(Array.from(rules, rule => rule.id), [2,4]);
     const select = managed.elements.get('sop-reviewer-user');
-    assert.equal(select.value, '42');
+    assert.match(select.innerHTML, /value="42" selected/);
     assert.match(select.innerHTML, /value="43" disabled/);
     assert.ok(select.innerHTML.includes('&lt;inactive&gt;'));
     assert.ok(select.innerHTML.includes('账号已停用、未填写邮箱'));
     assert.equal(managed.elements.get('sop-reviewer-save').disabled, false);
-    select.value = '42';
+    select.selectedOptions = [{value: '42'}, {value: '44'}];
     await managed.elements.get('sop-reviewer-form').onsubmit({preventDefault() {}});
     const saved = managed.requests.find(request => request.options?.method === 'PUT');
-    assert.equal(JSON.parse(saved.options.body).user_id, 42);
+    assert.deepEqual(JSON.parse(saved.options.body).user_ids, [42,44]);
     const importing = environment(importHtml, true);
     await vm.runInContext('SOP_IMPORT.init()', importing.context);
     await importing.elements.get('sop-import-form').onsubmit({preventDefault() {}, currentTarget: {}});

@@ -17,11 +17,20 @@ const SOP = {
     },
     filters() {
         const p = new URLSearchParams();
-        for (const [id, key] of [['sop-keyword','keyword'],['sop-status','status'],['sop-month','batch_month']]) {
+        for (const [id, key] of [['sop-keyword','keyword'],['sop-status','status'],['sop-month','batch_month'],['sop-salesperson','salesperson']]) {
+            if (key === 'salesperson' && !this.canSearchSalesperson()) continue;
             const value = document.getElementById(id).value.trim();
             if (value) p.set(key, value);
         }
         return p;
+    },
+    canSearchSalesperson() { return AUTH.isAdmin() || AUTH.hasPerm('sop.review') || AUTH.hasPerm('sop.report'); },
+    validateExcelFiles(form) {
+        for (const input of form.querySelectorAll('input[type=file]')) {
+            for (const file of input.files) {
+                if (!/\.(xlsx|xls)$/i.test(file.name)) throw new Error('源文件、目标文件和规则文件仅支持 xlsx、xls 格式');
+            }
+        }
     },
     async load() {
         this.error('');
@@ -57,6 +66,8 @@ const SOP = {
             const actions = [`<button class="btn" data-action="detail" data-id="${e.id}">详情</button>`];
             if (AUTH.hasPerm('sop.upload') && ['draft','awaiting_files','rejected','ai_failed','failed'].includes(e.status))
                 actions.push(`<button class="btn" data-action="upload" data-id="${e.id}">上传</button>`);
+            if (AUTH.hasPerm('sop.upload'))
+                actions.push(`<button class="btn" data-action="supplementary" data-id="${e.id}">补充上传</button>`);
             if (AUTH.hasPerm('sop.review') && e.status === 'ai_passed')
                 actions.push(`<button class="btn" data-action="detail" data-id="${e.id}">审核</button>`);
             if (AUTH.isAdmin()) {
@@ -88,7 +99,7 @@ const SOP = {
             <label class="sop-full">项目编号 <span class="sop-required">*</span><input id="sop-create-project-number" maxlength="100" required placeholder="请输入该租户内唯一的项目编号"></label>
             <label>业务员<select id="sop-create-assignee" required><option value="">请选择业务员</option>${choices.users.map(user => `<option value="${user.id}">${this.escape(user.display_name || user.username)}（${this.escape(user.username)}）</option>`).join('')}</select></label>
             <label>业务员邮箱<input id="sop-create-email" type="email" readonly placeholder="选择业务员后自动带出"></label>
-            <label class="sop-full">所属月份批次<input id="sop-create-month" type="month" required></label>
+            <label class="sop-full">集约月份批次<input id="sop-create-month" type="month" required></label>
             <label class="sop-full">SOP 描述<textarea id="sop-create-description" rows="5" placeholder="请输入 SOP 描述（选填）"></textarea></label>
             ${!choices.customers.length ? '<p class="sop-muted sop-full">暂无可选客户，请先导入客户清单。</p>' : ''}
             ${!choices.users.length ? '<p class="sop-muted sop-full">暂无可选业务员，请在用户管理中启用用户、填写邮箱并授予 SOP 上传权限。</p>' : ''}
@@ -120,7 +131,7 @@ const SOP = {
                         description:document.getElementById('sop-create-description').value.trim()})});
                 this.close();
                 // 清除筛选，避免新建的待上传记录被之前的状态或月份筛选隐藏。
-                for (const id of ['sop-keyword', 'sop-month', 'sop-status']) document.getElementById(id).value = '';
+                for (const id of ['sop-keyword', 'sop-month', 'sop-status', 'sop-salesperson']) document.getElementById(id).value = '';
                 await this.load();
             } catch (e) { error.textContent = e.message; }
             finally { button.disabled = false; button.textContent = '确认新建'; }
@@ -141,9 +152,10 @@ const SOP = {
                     </div>
                     <input id="sop-customer-select" type="hidden">
                 </div>
-                <label><span>源文件（可多选） <span class="sop-required" aria-hidden="true">*</span></span><input type="file" name="source_files" multiple accept=".xlsx,.xls,.xlsm" required></label>
-                <label><span>目标文件（结果表） <span class="sop-required" aria-hidden="true">*</span></span><input type="file" name="result_file" accept=".xlsx,.xls,.xlsm" required></label>
-                <label><span>规则文件 <span class="sop-required" aria-hidden="true">*</span></span><input type="file" name="rule_file" accept=".xlsx,.xls,.xlsm,.doc,.docx,.pdf,.txt,.md" required></label>
+                <label><span>源文件（可多选） <span class="sop-required" aria-hidden="true">*</span></span><input type="file" name="source_files" multiple accept=".xlsx,.xls" required></label>
+                <label><span>目标文件（结果表） <span class="sop-required" aria-hidden="true">*</span></span><input type="file" name="result_file" accept=".xlsx,.xls" required></label>
+                <label><span>规则文件 <span class="sop-required" aria-hidden="true">*</span></span><input type="file" name="rule_file" accept=".xlsx,.xls" required></label>
+                <p class="sop-muted sop-full">源文件和目标文件仅支持 xlsx、xls 格式；规则文件仅支持 xlsx、xls 格式。</p>
                 <button class="btn btn-primary" type="submit">提交审核</button><p class="sop-error" id="sop-upload-error"></p>
             </form>`);
             const select = document.getElementById('sop-customer-select');
@@ -222,6 +234,7 @@ const SOP = {
                 const originalText = button.textContent;
                 button.textContent = '正在提交并处理初审，请稍候…';
                 try {
+                    this.validateExcelFiles(form);
                     const data = await (await this.request(`/api/tools/sop/entries/${id}/upload`,
                         {method:'POST', body:new FormData(form)})).json();
                     this.close();
@@ -235,6 +248,33 @@ const SOP = {
                 finally { button.disabled = false; button.textContent = originalText; }
             };
         } catch (e) { this.error(e.message); }
+    },
+    async supplementary(id) {
+        const entry = this.entries.find(entry => entry.id === Number(id));
+        this.dialog(`<h2>补充上传：${this.escape(entry?.customer_name || '')}</h2>
+            <p class="sop-muted">可多次上传，同名文件替换，不同名文件追加。</p>
+            <form id="sop-supplementary-form" class="sop-form">
+                <label class="sop-full">补充资料（可多选）<input type="file" name="files" multiple required accept=".xlsx,.xls,.txt,.docx,.doc,.zip,.rar,.7z"></label>
+                <p class="sop-muted sop-full">支持格式：xlsx、xls、txt、docx、doc，以及 zip、rar、7z 压缩包。</p>
+                <p class="sop-error sop-full" id="sop-supplementary-error" role="alert"></p>
+                <button class="btn btn-primary" type="submit">提交补充资料</button>
+            </form>`);
+        document.getElementById('sop-supplementary-form').onsubmit = async event => {
+            event.preventDefault();
+            const form = event.currentTarget;
+            const button = form.querySelector('button[type=submit]');
+            button.disabled = true;
+            try {
+                for (const file of form.querySelector('input[type=file]').files) {
+                    if (!/\.(xlsx|xls|txt|docx|doc|zip|rar|7z)$/i.test(file.name)) throw new Error('请选择支持的补充资料格式');
+                }
+                await this.request(`/api/tools/sop/entries/${id}/supplementary`, {method:'POST', body:new FormData(form)});
+                this.close();
+                await this.load();
+                await this.detail(id);
+            } catch (e) { document.getElementById('sop-supplementary-error').textContent = e.message; }
+            finally { button.disabled = false; }
+        };
     },
     async detail(id) {
         try {
@@ -253,8 +293,13 @@ const SOP = {
                     <p class="sop-comment">${this.escape(r.ai_comment || r.error_message || '')}</p><div class="sop-actions sop-file-actions">${packageButton}</div><div class="sop-file-groups">${files}</div>
                     ${r.review_comment ? `<p class="sop-comment">审核意见：${this.escape(r.review_comment)}</p>` : ''}${review}</div>`;
             }).join('');
-            this.dialog(`<h2>${this.escape(e.customer_name)}</h2><p>业务员：${this.escape(e.salesperson_name || '-')}　月份：${this.escape(e.batch_month || '-')}</p>
-                <p>项目编号：${this.escape(e.project_number || '-')}　状态：${this.escape(this.status(e.status))}</p>${rounds || '<p>尚未上传</p>'}`, 'detail');
+            const supplementary = (e.supplementary_files || []).map((file, index) =>
+                `<button class="btn" data-supplementary="${e.id}" data-index="${index}" data-name="${this.escape(file.name)}">${this.escape(file.name)}</button>`).join('');
+            this.dialog(`<div class="sop-detail-heading"><h2>${this.escape(e.customer_name)}</h2>
+                <p>业务员：${this.escape(e.salesperson_name || '-')}　集约月份批次：${this.escape(e.batch_month || '-')}</p>
+                <p>项目编号：${this.escape(e.project_number || '-')}　状态：${this.escape(this.status(e.status))}</p></div>
+                <div class="sop-detail-content">${supplementary ? `<section class="sop-file-group"><h3>补充资料</h3><div class="sop-actions">${supplementary}</div></section>` : ''}
+                ${rounds || '<p>尚未上传</p>'}</div>`, 'detail');
         } catch (e) { this.error(e.message); }
     },
     async review(entryId, roundId, verdict) {
@@ -304,6 +349,8 @@ const SOP = {
         if (!AUTH.requireAuth()) return;
         if (!AUTH.hasPerm('menu.sop')) { this.error('账号未开通 SOP 入口权限，请联系管理员。'); return; }
         AUTH.renderUserInfo(document.querySelector('header'));
+        document.getElementById('sop-salesperson').hidden = !this.canSearchSalesperson();
+        document.getElementById('sop-salesperson').onkeydown = event => { if (event.key === 'Enter') this.load(); };
         document.getElementById('sop-search').onclick = () => this.load();
         document.getElementById('sop-status').onchange = () => this.load();
         document.querySelectorAll('[data-sop-status]').forEach(card => {
@@ -321,13 +368,13 @@ const SOP = {
         document.getElementById('sop-review-cancel').onclick = () => document.getElementById('sop-review-dialog').close();
         document.getElementById('sop-export').onclick = () => {
             const params = this.filters();
-            if (document.getElementById('sop-incomplete').checked) params.set('incomplete_only', 'true');
             this.download('/api/tools/sop/report?' + params, 'sop_report.xlsx');
         };
         document.getElementById('sop-table').onclick = event => {
             const button = event.target.closest('button[data-action]');
             if (!button) return;
             if (button.dataset.action === 'upload') this.upload(button.dataset.id);
+            else if (button.dataset.action === 'supplementary') this.supplementary(button.dataset.id);
             else if (button.dataset.action === 'resend') {
                 this.request(`/api/tools/sop/entries/${button.dataset.id}/resend-notice`, {method:'POST'})
                     .then(() => alert('通知已加入发送队列')).catch(e => this.error(e.message));
@@ -338,6 +385,11 @@ const SOP = {
             } else this.detail(button.dataset.id);
         };
         document.getElementById('sop-dialog').onclick = event => {
+            const supplementary = event.target.closest('button[data-supplementary]');
+            if (supplementary) {
+                this.download(`/api/tools/sop/entries/${supplementary.dataset.supplementary}/supplementary/${supplementary.dataset.index}`, supplementary.dataset.name);
+                return;
+            }
             const file = event.target.closest('button[data-file]');
             if (file) {
                 const url = `/api/tools/sop/rounds/${file.dataset.file}/${file.dataset.kind === 'package' ? 'package' : 'download?kind=' + file.dataset.kind + '&idx=' + (file.dataset.index || 0)}`;
