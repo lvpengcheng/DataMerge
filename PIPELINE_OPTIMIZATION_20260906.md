@@ -89,7 +89,7 @@ Docker 内存限制现在可通过 `APP_MEM_LIMIT` 配置，默认仍为 8g，�
 离线回归命令：
 
 ```powershell
-python -m pytest backend/test_pipeline_accuracy.py backend/test_resource_and_output.py backend/test_training_compute_chain.py backend/test_code_generation_stream_fallback.py backend/test_template_migration_paths.py backend/test_compute_smart_rename.py backend/test_report_formula_recalculation.py backend/test_formula_recalculation.py -q
+python -m pytest backend/tests/test_pipeline_accuracy.py backend/tests/test_resource_and_output.py backend/tests/test_training_compute_chain.py backend/tests/test_code_generation_stream_fallback.py backend/tests/test_template_migration_paths.py backend/tests/test_compute_smart_rename.py backend/tests/test_report_formula_recalculation.py backend/tests/test_formula_recalculation.py -q
 ```
 
 结果：98 项通过（2026-09-07，7.16 秒）。包括真实子进程成功/错误/超时/取消、模拟不可杀进程的停止派发、队列公平性与等待上限、源解析单次打开及源文件不变、1904 日期、模板格式恢复、跨 Sheet 改名后的公式缓存、XLS 公式保留、合表与生成脚本执行，以及聊天智训实际执行与对比、样例隔离、历史高分回退、多输出歧义、人工选定保持实测评分等链路回归。Python 编译检查、前端 JavaScript 语法检查及 Git diff 空白检查通过。未调用真实 AI 服务，未做生产服务器压测或故障注入。

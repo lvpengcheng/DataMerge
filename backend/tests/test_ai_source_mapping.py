@@ -844,7 +844,7 @@ def test_compute_provider_reads_current_config_over_stale_environment(tmp_path, 
     import ast
     import os
     from pathlib import Path
-    source = Path(__file__).parent / 'app' / 'main.py'
+    source = Path(__file__).parent.parent / 'app' / 'main.py'
     node = next(n for n in ast.parse(source.read_text(encoding='utf-8')).body
                 if isinstance(n, ast.FunctionDef) and n.name == '_resolve_compute_ai_provider')
     node.returns = None

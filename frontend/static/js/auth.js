@@ -104,6 +104,14 @@ const AUTH = {
             window.location.href = '/login';
             return false;
         }
+        const p = this.getPermissions();
+        const sopKeys = new Set(['menu.sop', 'sop.upload', 'sop.review', 'sop.report']);
+        const granted = Object.keys(p).filter(key => p[key] === true);
+        const sopOnly = granted.some(key => sopKeys.has(key)) && granted.every(key => sopKeys.has(key));
+        if (sopOnly && !window.location.pathname.startsWith('/sop')) {
+            window.location.href = '/sop';
+            return false;
+        }
         return true;
     },
 

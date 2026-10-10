@@ -16,6 +16,7 @@
                     <a href="/training" data-perm="can_train">智训</a>
                     <a href="/compute" data-perm="can_compute">智算</a>
                     <a href="/tools" data-perm="menu.tools">智能小工具</a>
+                    <a href="/sop" data-perm="menu.sop">SOP审核平台</a>
                     <a href="/admin" class="active" data-perm="can_manage_users">管理</a>
                 </nav>
             </div>
@@ -31,7 +32,6 @@
             <button class="tab-btn" data-tab="ref-data" data-perm="admin.ref_data">基础数据</button>
             <button class="tab-btn" data-tab="scripts" data-perm="admin.scripts">脚本管理</button>
             <button class="tab-btn" data-tab="test-migration" data-perm="admin.test_migration">测试迁移</button>
-            <button class="tab-btn" data-tab="sop-rules" data-perm="tools.sop.manage">SOP规则</button>
             <button class="tab-btn" data-tab="assemble-rules" data-perm="tools.assemble.manage">智能组表规则</button>
             <button class="tab-btn" data-tab="system-config" data-perm="admin.config">系统配置</button>
         </div>
@@ -40,6 +40,8 @@
         <div class="tab-content active" id="tab-users">
             <div class="toolbar">
                 <button class="btn btn-primary" onclick="Admin.showCreateUser()">新建用户</button>
+                <button class="btn" id="user-import-template" hidden onclick="Admin.downloadUserTemplate()">下载模板</button>
+                <button class="btn" id="user-import-open" hidden onclick="Admin.showImportUsers()">批量导入</button>
             </div>
             <table class="data-table" id="users-table">
                 <thead>
@@ -216,29 +218,6 @@
             </table>
         </div>
 
-        <!-- SOP规则 Tab -->
-        <div class="tab-content" id="tab-sop-rules">
-            <div class="toolbar" style="flex-wrap:wrap;gap:12px;align-items:center;">
-                <button class="btn btn-primary" onclick="Admin.showCreateSopRule()">+ 上传规则文件</button>
-                <span style="font-size:12px;color:#888;">全局大规则：AI 分析所有 SOP 的兜底依据；按客户规则：仅该客户优先使用。</span>
-            </div>
-            <table class="data-table" id="sop-rules-table">
-                <thead>
-                    <tr>
-                        <th>ID</th>
-                        <th>作用域</th>
-                        <th>客户名称</th>
-                        <th>规则名称</th>
-                        <th>文件名</th>
-                        <th>状态</th>
-                        <th>更新时间</th>
-                        <th>操作</th>
-                    </tr>
-                </thead>
-                <tbody></tbody>
-            </table>
-        </div>
-
         <!-- 智能组表规则 Tab -->
         <div class="tab-content" id="tab-assemble-rules">
             <div class="toolbar" style="flex-wrap:wrap;gap:12px;align-items:center;">
@@ -331,6 +310,6 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260722a"></script>
-    <script src="/static/js/admin.js?v=20260828a"></script>
+    <script src="/static/js/admin.js?v=20261009a"></script>
 </body>
 </html>

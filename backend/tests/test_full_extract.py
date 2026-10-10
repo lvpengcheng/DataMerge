@@ -1,11 +1,12 @@
 """测试完整的代码提取流程"""
 import sys
-sys.path.insert(0, '.')
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ai_engine.formula_code_generator import FormulaCodeGenerator
 
 # 读取AI响应
-with open('../tenants/rex104/training_logs/rex104_薪资计算规则_response_20260309_123811_01_generate.txt', 'r', encoding='utf-8') as f:
+with open(Path(__file__).resolve().parents[2] / 'tenants/rex104/training_logs/rex104_薪资计算规则_response_20260309_123811_01_generate.txt', 'r', encoding='utf-8') as f:
     ai_response = f.read()
 
 # 创建代码生成器实例

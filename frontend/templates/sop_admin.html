@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SOP系统管理</title>
+    <link rel="stylesheet" href="/static/css/admin.css?v=20260807a">
+    <link rel="stylesheet" href="/static/css/tools.css?v=20260814a">
+    <link rel="stylesheet" href="/static/css/sop.css?v=20261008f">
+</head>
+<body>
+<div class="container">
+    <header>
+        <div class="header-left"><nav class="nav-links">
+            <a href="/dashboard" data-perm="can_view">首页</a>
+            <a href="/rules" data-perm="menu.rules">规则</a>
+            <a href="/training" data-perm="can_train">智训</a>
+            <a href="/compute" data-perm="can_compute">智算</a>
+            <a href="/tools" data-perm="menu.tools">智能小工具</a>
+            <a href="/sop" class="active" data-perm="menu.sop">SOP审核平台</a>
+            <a href="/admin" data-perm="can_manage_users">管理</a>
+        </nav></div>
+        <div class="user-info" id="user-info"></div>
+    </header>
+    <nav class="tab-nav sop-tabs" aria-label="SOP 二级菜单">
+        <a href="/sop" class="tab-btn">SOP业务操作</a>
+        <a href="/sop/import" class="tab-btn" data-perm="admin">客户清单导入</a>
+        <a href="/sop/admin" class="tab-btn active" aria-current="page" data-perm="admin">系统管理</a>
+    </nav>
+    <main class="tab-content active sop-wrap">
+        <div class="sop-head"><h1>SOP系统管理</h1></div>
+        <div id="sop-error" class="sop-error" role="alert"></div>
+        <div class="sop-settings" id="sop-admin" style="display:none;">
+            <section class="sop-panel">
+                <h2>AI 初审设置</h2>
+                <p class="sop-muted">立即审核：提交后尽快开始初审。定时审核：每隔指定小时数扫描待初审记录。保存定时设置后，从保存时间开始计算下一次扫描；已开始的审核继续执行。</p>
+                <form id="sop-ai-schedule-form" class="sop-form">
+                    <label>初审类型<select id="sop-ai-mode"><option value="immediate">立即审核</option><option value="scheduled">定时审核</option></select></label>
+                    <label>扫描间隔（小时）<input id="sop-ai-hours" type="number" min="1" max="168" step="1" value="6" required disabled></label>
+                    <button class="btn btn-primary" id="sop-ai-save" type="submit">保存初审设置</button>
+                    <button class="btn" id="sop-ai-refresh" type="button">刷新任务状态</button>
+                </form>
+                <p id="sop-ai-schedule-status" class="sop-muted" role="status"></p>
+                <p id="sop-ai-schedule-error" class="sop-error" role="alert"></p>
+            </section>
+            <section class="sop-panel">
+            <h2>复审通知配置</h2>
+            <p id="sop-setup" class="sop-muted"></p>
+            <form id="sop-reviewer-form" class="sop-form sop-reviewer-form">
+                <label>复审通知接收人<select id="sop-reviewer-user" required><option value="">加载用户中...</option></select></label>
+                <button class="btn" type="submit" id="sop-reviewer-save">保存复审人</button>
+            </form>
+            <p id="sop-reviewer-status" class="sop-muted" role="status">从用户表选择。未启用、未填写邮箱或缺少 SOP 审核权限的用户会显示原因，且不可选。</p>
+            </section>
+            <section class="sop-panel">
+            <h2>上传审核规则</h2>
+            <p class="sop-muted">上传后替换同一适用范围的当前规则，历史版本不再生效。</p>
+            <form id="sop-rule-form" class="sop-form">
+                <label>规则文件<input type="file" name="file" required></label>
+                <label>适用范围<select name="scope"><option value="global">全局</option><option value="customer">指定客户</option></select></label>
+                <label>客户名称<input name="customer_name" placeholder="指定客户时填写"></label>
+                <label>规则名称<input name="name"></label>
+                <button class="btn" type="submit">上传规则</button>
+            </form>
+            </section>
+            <section class="sop-panel">
+            <h2>当前规则</h2>
+            <p class="sop-muted">全局及每个客户分别显示最新规则；客户专属规则优先。</p>
+            <div id="sop-rules-list"></div>
+            </section>
+        </div>
+    </main>
+</div>
+<script src="/static/js/auth.js?v=20260722a"></script>
+<script src="/static/js/sop.js?v=20261008k"></script>
+<script src="/static/js/sop_admin.js?v=20261008e"></script>
+</body>
+</html>

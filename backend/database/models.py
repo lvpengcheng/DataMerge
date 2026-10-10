@@ -545,10 +545,18 @@ class ScriptMigration(Base):
 class SopEntry(Base):
     """SOP 维护：一条 SOP 条目（客户 + 描述），状态随最新一轮流转。"""
     __tablename__ = "sop_entries"
+    __table_args__ = (
+        Index("uq_sop_project_customer", "project_number", "customer_name", unique=True),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     tenant_id = Column(String(100), nullable=False, index=True, default="__tools_sop__")
     customer_name = Column(String(200), nullable=False, index=True)   # 客户名称
+    project_number = Column(String(100), nullable=True)  # 同一租户内唯一；旧记录可暂为空
+    batch_month = Column(String(6), nullable=True, index=True)       # 所属月份批次 YYYYMM
+    assignee_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    salesperson_name = Column(String(100), default="")
+    salesperson_email = Column(String(200), default="")
     description = Column(Text, default="")                            # SOP 大体描述
     # 状态机: draft / ai_analyzing / ai_failed / ai_passed / completed / rejected
     status = Column(String(20), default="draft")
@@ -558,10 +566,12 @@ class SopEntry(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     creator = relationship("User", foreign_keys=[created_by])
+    assignee = relationship("User", foreign_keys=[assignee_user_id])
     rounds = relationship(
         "SopRound", back_populates="sop", order_by="SopRound.round_no",
         cascade="all, delete-orphan",
     )
+    resubmit_tokens = relationship("SopResubmitToken", cascade="all, delete-orphan")
 
 
 class SopRound(Base):
@@ -635,8 +645,40 @@ class SopRuleFile(Base):
 
     creator = relationship("User", foreign_keys=[created_by])
 
-    __table_args__ = (
-        UniqueConstraint("scope", "customer_name", name="uq_sop_rule_scope_customer"),
-    )
+    # 同一范围保留历史版本；由 SOP 规则选择逻辑只使用最新版本。
 
 
+class SopAiSchedule(Base):
+    """SOP 初审调度配置及跨进程共享扫描时间。"""
+    __tablename__ = "sop_ai_schedule"
+    id = Column(Integer, primary_key=True)
+    mode = Column(String(20), nullable=False, default="immediate")
+    interval_hours = Column(Integer, nullable=False, default=6)
+    next_run_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    last_run_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class SopAiJob(Base):
+    """持久化初审队列；租约和认领标识防止重复提交审核结果。"""
+    __tablename__ = "sop_ai_jobs"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    round_id = Column(Integer, nullable=False, unique=True, index=True)
+    entry_id = Column(Integer, nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="pending", index=True)
+    claim_token = Column(String(64), nullable=True)
+    lease_until = Column(DateTime, nullable=True, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    finished_at = Column(DateTime, nullable=True)
+
+
+class SopResubmitToken(Base):
+    """SOP 驳回后的一次性、限时免登录重传凭据；数据库只保存哈希。"""
+    __tablename__ = "sop_resubmit_tokens"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    entry_id = Column(Integer, ForeignKey("sop_entries.id"), nullable=False, index=True)
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    expires_at = Column(DateTime, nullable=False)
+    used_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)

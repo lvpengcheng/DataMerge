@@ -36,6 +36,20 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 
 # ========================= 用户管理 =========================
 
+@router.get("/users/import-template")
+def user_import_template(db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    from fastapi.responses import StreamingResponse
+    from .user_import import build_user_import_template
+    return StreamingResponse(build_user_import_template(db),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=user_import_template.xlsx"})
+
+
+@router.post("/users/import")
+def users_import(file: UploadFile = File(...), db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
+    from .user_import import import_users
+    return import_users(file.file.read(5 * 1024 * 1024 + 1), file.filename or "", db)
+
 @router.get("/users", response_model=List[UserResponse])
 async def list_users(
     org_id: Optional[int] = Query(None),

@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SOP 文件重新上传</title>
+    <link rel="stylesheet" href="/static/css/admin.css?v=20260807a">
+    <style>
+        body { background:#f4f7fb; }
+        main { max-width:620px; margin:55px auto; background:white; padding:28px; border-radius:12px; box-shadow:0 8px 30px #1b33441a; }
+        form, label { display:grid; gap:10px; }
+        form { margin-top:20px; }
+        label { font-weight:500; }
+        input[type=file] { border:1px solid #ccd5df; border-radius:6px; padding:10px; }
+        #message { white-space:pre-wrap; color:#b3261e; }
+    </style>
+</head>
+<body><main>
+    <h1>重新上传 SOP</h1>
+    <p id="summary">正在验证链接...</p>
+    <p id="message" role="alert"></p>
+    <form id="resubmit-form" style="display:none;">
+        <label><span>源文件（可多选） <span style="color:#d32f2f;font-weight:700" aria-hidden="true">*</span></span><input type="file" name="source_files" multiple required accept=".xlsx,.xls,.xlsm"></label>
+        <label><span>目标文件（结果表） <span style="color:#d32f2f;font-weight:700" aria-hidden="true">*</span></span><input type="file" name="result_file" required accept=".xlsx,.xls,.xlsm"></label>
+        <label><span>规则文件 <span style="color:#d32f2f;font-weight:700" aria-hidden="true">*</span></span><input type="file" name="rule_file" required accept=".xlsx,.xls,.xlsm,.doc,.docx,.pdf,.txt,.md"></label>
+        <button class="btn btn-primary" type="submit">提交新版本</button>
+    </form>
+</main>
+<script>
+(() => {
+    let token = new URLSearchParams(location.hash.slice(1)).get('token') || '';
+    history.replaceState(null, '', location.pathname);
+    const summary = document.getElementById('summary');
+    const message = document.getElementById('message');
+    const form = document.getElementById('resubmit-form');
+    const load = async () => {
+        if (!token) { summary.textContent = '链接无效或已过期。'; return; }
+        try {
+            const resp = await fetch('/api/tools/sop/resubmit/info', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({token})});
+            if (!resp.ok) throw new Error('链接无效或已过期。');
+            const data = await resp.json();
+            summary.textContent = `客户：${data.customer_name}　月份：${data.batch_month || '-'}　新版本：v${data.next_version}`;
+            form.style.display = 'grid';
+        } catch (e) { summary.textContent = e.message; token = ''; }
+    };
+    form.addEventListener('submit', async event => {
+        event.preventDefault();
+        if (!token) return;
+        const button = form.querySelector('button');
+        button.disabled = true; message.textContent = '正在提交并处理初审，请稍候…';
+        try {
+            const data = new FormData(form); data.append('token', token);
+            const resp = await fetch('/api/tools/sop/resubmit/upload', {method:'POST', body:data});
+            if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(err.detail || '提交失败'); }
+            const result = await resp.json();
+            const feedback = result.status === 'ai_passed' ? '初审通过，等待复审。'
+                : result.status === 'ai_failed' ? '初审未通过。'
+                : result.status === 'failed' ? '初审执行失败。'
+                : result.status === 'ai_queued' ? '已进入定时初审队列。' : '初审处理中。';
+            summary.textContent = `版本 v${result.round_no}：${feedback}`;
+            message.textContent = result.error_message || result.ai_comment || '';
+            form.style.display = 'none'; token = '';
+        } catch (e) { message.textContent = e.message; button.disabled = false; }
+    });
+    load();
+})();
+</script></body></html>

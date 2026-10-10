@@ -22,8 +22,8 @@ python run.py
 python -m backend.database.init_db
 
 # Run tests
-pytest backend/ -v
-pytest backend/test_rule_extractor.py -v   # single test file
+python -m pytest backend/tests/ -v
+pytest backend/tests/test_rule_extractor.py -v   # single test file
 
 # Docker
 docker-compose up -d

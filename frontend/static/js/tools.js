@@ -89,7 +89,6 @@ const Tools = {
         else if (tab === 'compute-history') this.loadComputeHistory();
         else if (tab === 'data-compare') this.loadCompareHistory();
         else if (tab === 'data-integrate') this.loadIntegrateSchemes();
-        else if (tab === 'sop') this.loadSops();
         else if (tab === 'smart-assemble') this.initSmartAssemble();
     },
 

@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>客户清单导入</title>
+    <link rel="stylesheet" href="/static/css/admin.css?v=20260807a">
+    <link rel="stylesheet" href="/static/css/tools.css?v=20260814a">
+    <link rel="stylesheet" href="/static/css/sop.css?v=20261008f">
+</head>
+<body>
+<div class="container">
+    <header>
+        <div class="header-left"><nav class="nav-links">
+            <a href="/dashboard" data-perm="can_view">首页</a>
+            <a href="/rules" data-perm="menu.rules">规则</a>
+            <a href="/training" data-perm="can_train">智训</a>
+            <a href="/compute" data-perm="can_compute">智算</a>
+            <a href="/tools" data-perm="menu.tools">智能小工具</a>
+            <a href="/sop" class="active" data-perm="menu.sop">SOP审核平台</a>
+            <a href="/admin" data-perm="can_manage_users">管理</a>
+        </nav></div>
+        <div class="user-info" id="user-info"></div>
+    </header>
+    <nav class="tab-nav sop-tabs" aria-label="SOP 二级菜单">
+        <a href="/sop" class="tab-btn">SOP业务操作</a>
+        <a href="/sop/import" class="tab-btn active" aria-current="page" data-perm="admin">客户清单导入</a>
+        <a href="/sop/admin" class="tab-btn" data-perm="admin">系统管理</a>
+    </nav>
+    <main class="tab-content active sop-wrap">
+        <div class="sop-head"><h1>客户清单导入</h1></div>
+        <div id="sop-error" class="sop-error" role="alert"></div>
+        <section id="sop-import-panel" class="sop-panel" style="display:none;">
+            <p class="sop-muted">上传 xlsx 或 csv 文件，表头须包含：业务员、邮箱、租户、所属月份批次、项目编号。邮箱须对应已启用的用户，月份格式为 YYYYMM。项目编号必填，按项目编号＋租户匹配：已有记录更新清单信息，没有记录则新增；已有文件和审核状态保留。同一清单内项目编号＋租户不能重复。</p>
+            <form id="sop-import-form" class="sop-form">
+                <label>导入客户清单（xlsx/csv，含业务员、邮箱、租户、所属月份批次、项目编号）<input type="file" name="file" accept=".xlsx,.csv" required></label>
+                <label>清单类型<select name="initial_status"><option value="draft">待上传</option><option value="awaiting_files">历史待审（待补文件）</option></select></label>
+                <button class="btn" type="submit">导入清单</button>
+            </form>
+            <p id="sop-import-result" class="sop-muted" role="status"></p>
+        </section>
+    </main>
+</div>
+<script src="/static/js/auth.js?v=20260722a"></script>
+<script src="/static/js/sop.js?v=20261008k"></script>
+<script src="/static/js/sop_import.js?v=20261008a"></script>
+</body>
+</html>

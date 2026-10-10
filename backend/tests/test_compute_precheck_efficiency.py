@@ -27,7 +27,7 @@ def test_refresh_confirmation_never_dispatches_calculation(tmp_path, monkeypatch
     from pathlib import Path
     from backend.utils import compute_ingest
     from backend.utils.compute_precheck import PrecheckResult
-    source = Path(__file__).parent / 'app' / 'main.py'
+    source = Path(__file__).parent.parent / 'app' / 'main.py'
     tree = ast.parse(source.read_text(encoding='utf-8'))
     endpoint = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef)
                     and n.name == 'compute_session_confirm')
@@ -77,7 +77,7 @@ def test_final_confirmation_bypasses_precheck_and_dispatches(tmp_path, monkeypat
     from backend.utils import compute_ingest
     from backend.utils.compute_precheck import PrecheckResult
 
-    source = Path(__file__).parent / 'app' / 'main.py'
+    source = Path(__file__).parent.parent / 'app' / 'main.py'
     tree = ast.parse(source.read_text(encoding='utf-8'))
     endpoint = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef)
                     and n.name == 'compute_session_confirm')
@@ -127,7 +127,7 @@ def test_empty_mapping_review_state_is_not_actionable():
     from pathlib import Path
     from backend.utils.compute_precheck import PrecheckResult
 
-    source = Path(__file__).parent / 'app' / 'main.py'
+    source = Path(__file__).parent.parent / 'app' / 'main.py'
     tree = ast.parse(source.read_text(encoding='utf-8'))
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
                 and n.name == '_precheck_requires_user_action')
@@ -159,7 +159,7 @@ def test_runtime_template_remap_honors_final_manual_target_mapping():
     import logging
     from pathlib import Path
 
-    source = Path(__file__).parent / 'app' / 'main.py'
+    source = Path(__file__).parent.parent / 'app' / 'main.py'
     tree = ast.parse(source.read_text(encoding='utf-8'))
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
                 and n.name == '_build_sheet_remap')
@@ -186,7 +186,7 @@ def test_runtime_template_remap_does_not_autofill_manually_skipped_target():
     import logging
     from pathlib import Path
 
-    source = Path(__file__).parent / 'app' / 'main.py'
+    source = Path(__file__).parent.parent / 'app' / 'main.py'
     tree = ast.parse(source.read_text(encoding='utf-8'))
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
                 and n.name == '_build_sheet_remap')
@@ -301,7 +301,7 @@ def test_confirmed_mapping_is_composed_in_memory_without_rewriting_files(tmp_pat
 
 def test_final_manual_source_mapping_never_falls_back_to_raw_uploads():
     from pathlib import Path
-    source = (Path(__file__).parent / 'app' / 'main.py').read_text(encoding='utf-8')
+    source = (Path(__file__).parent.parent / 'app' / 'main.py').read_text(encoding='utf-8')
     assert '源数据自动映射未通过，使用原文件继续计算' not in source
     assert '最终人工映射未能完整构建预加载数据，已放行并使用原始源文件继续' not in source
     assert '已按人工最终匹配关系生成执行副本，文件名和 Sheet 名已对齐智训结构' in source
@@ -317,7 +317,7 @@ def test_missing_training_sheets_warn_and_preserve_existing_preload(finalized):
     from pathlib import Path
     from types import SimpleNamespace
 
-    tree = ast.parse((Path(__file__).parent / 'app/main.py').read_text(encoding='utf-8'))
+    tree = ast.parse((Path(__file__).parent.parent / 'app/main.py').read_text(encoding='utf-8'))
     block = next(node for node in ast.walk(tree)
                  if isinstance(node, ast.If) and isinstance(node.test, ast.Name)
                  and node.test.id == 'missing_keys'

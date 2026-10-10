@@ -62,7 +62,7 @@ def test_settings_validation_rejects_invalid_or_private_fields(settings):
 
 
 def api_function(name, namespace):
-    path = Path(__file__).parent / 'api' / 'training_chat.py'
+    path = Path(__file__).parent.parent / 'api' / 'training_chat.py'
     node = next(n for n in ast.parse(path.read_text(encoding='utf-8')).body
                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name)
     node.decorator_list = []

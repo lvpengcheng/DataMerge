@@ -1,0 +1,75 @@
+.sop-head, .sop-toolbar, .sop-actions { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+.sop-head { justify-content:space-between; margin-bottom:18px; }
+.sop-head h1 { margin:0; font-size:24px; }
+.sop-cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:18px; }
+.sop-card { background:#fff; border:1px solid #e3e8ef; border-radius:9px; padding:15px; }
+.sop-card strong { display:block; font-size:24px; color:#23548d; margin-top:5px; }
+button.sop-card { text-align:left; font:inherit; color:inherit; cursor:pointer; }
+button.sop-card:hover, button.sop-card[aria-pressed=true] { border-color:#1976d2; background:#f5f9ff; }
+button.sop-card:focus-visible { outline:2px solid #1976d2; outline-offset:2px; }
+.sop-toolbar { margin-bottom:13px; }
+.sop-toolbar input, .sop-toolbar select, .sop-form input, .sop-form select, .sop-form textarea { padding:8px; border:1px solid #ccd5df; border-radius:5px; }
+.sop-table-wrap { overflow:auto; background:#fff; }
+.sop-table-wrap .data-table { min-width:1050px; }
+#sop-table { table-layout:fixed; min-width:1290px; }
+#sop-table td { vertical-align:middle; }
+#sop-table .sop-ai-summary { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:3; overflow:hidden; overflow-wrap:anywhere; line-height:1.6; }
+#sop-table .sop-row-actions { display:flex; align-items:center; gap:6px; flex-wrap:nowrap; }
+#sop-table .sop-row-actions .btn { flex-shrink:0; white-space:nowrap; padding:8px 10px; }
+.sop-form { display:grid; gap:12px; }
+.sop-form label { display:grid; gap:5px; }
+.sop-form input[type=file] { width:100%; box-sizing:border-box; }
+.sop-dialog { position:fixed; inset:0; margin:auto; width:min(800px,94vw); max-height:90vh; border:0; border-radius:10px; box-shadow:0 15px 60px #0004; padding:22px; overflow:auto; }
+.sop-dialog::backdrop { background:#0007; }
+.sop-dialog h2 { margin-top:0; }
+.sop-round { border:1px solid #dde5ed; padding:12px; border-radius:7px; margin:10px 0; }
+.sop-muted { color:#667; font-size:13px; }
+.sop-required { color:#d32f2f; font-weight:700; }
+.sop-error { color:#b3261e; margin:8px 0; white-space:pre-wrap; }
+.sop-wrap { width:100%; }
+.sop-pagination { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px; padding:18px 0 4px; color:#667; font-size:14px; }
+.sop-pagination button:disabled { opacity:0.45; cursor:not-allowed; }
+.sop-tabs { flex-shrink:0; flex-wrap:wrap; }
+.sop-tabs a { text-decoration:none; }
+.sop-settings { display:grid; gap:24px; }
+.sop-panel { border:1px solid #e2e8f0; border-radius:8px; padding:22px; background:#fff; }
+.sop-panel h2 { font-size:18px; margin-bottom:10px; }
+.sop-panel .sop-muted { line-height:1.7; margin-bottom:16px; }
+.sop-form { max-width:880px; grid-template-columns:repeat(2,minmax(0,1fr)); align-items:end; }
+.sop-form label { min-width:0; font-size:14px; color:#444; }
+.sop-form input, .sop-form select { width:100%; min-width:0; }
+.sop-form button { justify-self:start; }
+.sop-form .sop-full { grid-column:1 / -1; }
+.sop-reviewer-form { grid-template-columns:minmax(0,1fr) auto; }
+.sop-rule-row { display:flex; gap:16px; align-items:center; justify-content:space-between; padding:14px 0; border-bottom:1px solid #eee; }
+.sop-rule-row p { margin:5px 0; overflow-wrap:anywhere; }
+.sop-rule-row .sop-actions { flex-shrink:0; }
+#sop-import-result { white-space:pre-wrap; margin-top:18px; }
+.sop-detail-dialog { width:min(1120px,94vw); padding:32px; }
+.sop-detail-dialog h2 { padding-right:80px; margin-bottom:18px; overflow-wrap:anywhere; }
+.sop-detail-dialog p { line-height:1.8; margin:10px 0; }
+.sop-detail-dialog .sop-round { padding:22px; margin:22px 0 0; }
+.sop-comment { white-space:pre-wrap; overflow-wrap:anywhere; }
+.sop-file-actions { margin-top:18px; gap:12px; }
+.sop-file-groups { display:grid; gap:16px; margin-top:20px; }
+.sop-file-group { border-top:1px solid #e3e8ef; padding-top:16px; min-width:0; }
+.sop-file-group h3 { font-size:14px; color:#444; }
+.sop-file-group .sop-file-actions { margin-top:10px; }
+.sop-file-group .btn { max-width:100%; overflow-wrap:anywhere; text-align:left; }
+.sop-review-actions { border-top:1px solid #e3e8ef; padding-top:18px; margin-top:20px; justify-content:flex-end; }
+.sop-reject-dialog { width:min(720px,94vw); padding:28px; }
+.sop-reject-dialog h2 { margin-bottom:22px; }
+#sop-review-form { grid-template-columns:minmax(0,1fr); max-width:none; gap:16px; }
+#sop-review-form label { gap:10px; }
+#sop-review-comment { width:100%; min-height:180px; resize:vertical; line-height:1.7; }
+#sop-review-form .sop-review-actions { margin-top:0; }
+.sop-customer-field { display:grid; gap:5px; }
+.sop-customer-combobox { position:relative; }
+.sop-customer-combobox input { padding-right:42px; }
+#sop-customer-toggle { position:absolute; right:1px; top:1px; bottom:1px; width:36px; border:0; border-radius:0 5px 5px 0; background:#f4f7fb; cursor:pointer; }
+.sop-customer-options { position:absolute; top:calc(100% + 4px); left:0; right:0; max-height:220px; overflow:auto; background:white; border:1px solid #ccd5df; border-radius:6px; box-shadow:0 5px 16px #0002; z-index:2; padding:4px; }
+.sop-customer-options button { display:block; width:100%; text-align:left; padding:10px; border:0; border-radius:4px; background:white; cursor:pointer; overflow-wrap:anywhere; }
+.sop-customer-options button:hover, .sop-customer-options button.active, .sop-customer-options button[aria-selected="true"] { background:#e3f2fd; color:#1976d2; }
+.sop-customer-options p { padding:10px; }
+@media(max-width:700px) { .sop-detail-dialog, .sop-reject-dialog { padding:20px; } .sop-detail-dialog .sop-round { padding:16px; } }
+@media(max-width:700px) { .sop-form, .sop-reviewer-form { grid-template-columns:1fr; } .sop-rule-row { align-items:flex-start; flex-direction:column; } .sop-panel { padding:16px; } }

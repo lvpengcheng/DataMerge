@@ -29,6 +29,8 @@ const Admin = {
             return;
         }
         AUTH.renderUserInfo(document.querySelector('header'));
+        const systemAdmin = (AUTH.getUser() || {}).role_name === 'admin';
+        for (const id of ['user-import-template', 'user-import-open']) document.getElementById(id).hidden = !systemAdmin;
         this.initTabs();
         await this.loadRoles();
         await this.loadOrgs();
@@ -53,7 +55,6 @@ const Admin = {
                 else if (tab === 'ref-data') this.loadRefCategories().then(() => this.loadRefData());
                 else if (tab === 'scripts') this.loadScripts();
                 else if (tab === 'test-migration') this.initMigration();
-                else if (tab === 'sop-rules') this.loadSopRules();
                 else if (tab === 'assemble-rules') this.loadAssembleRules();
                 else if (tab === 'system-config') this.loadAiProviders();
             });
@@ -77,19 +78,70 @@ const Admin = {
         tbody.innerHTML = users.map(u => `
             <tr>
                 <td>${u.id}</td>
-                <td>${u.username}</td>
-                <td>${u.display_name || '-'}</td>
-                <td>${u.org_name || '-'}</td>
-                <td><span class="tag">${u.role_name || '-'}</span></td>
+                <td>${this._escapeHtml(u.username)}</td>
+                <td>${this._escapeHtml(u.display_name || '-')}</td>
+                <td>${this._escapeHtml(u.org_name || '-')}</td>
+                <td><span class="tag">${this._escapeHtml(u.role_name || '-')}</span></td>
                 <td><span class="${u.is_active ? 'status-active' : 'status-inactive'}">${u.is_active ? '启用' : '禁用'}</span></td>
                 <td class="actions">
                     <button class="btn btn-sm" onclick="Admin.showEditUser(${u.id})">编辑</button>
-                    <button class="btn btn-sm" onclick="Admin.setPassword(${u.id}, '${u.username}')">修改密码</button>
-                    <button class="btn btn-sm" onclick="Admin.resetPassword(${u.id}, '${u.username}')">重置密码</button>
-                    ${u.is_active ? `<button class="btn btn-sm btn-danger" onclick="Admin.disableUser(${u.id}, '${u.username}')">禁用</button>` : ''}
+                    <button class="btn btn-sm" onclick="Admin.setPassword(${u.id}, ${this._escapeHtml(JSON.stringify(u.username))})">修改密码</button>
+                    <button class="btn btn-sm" onclick="Admin.resetPassword(${u.id}, ${this._escapeHtml(JSON.stringify(u.username))})">重置密码</button>
+                    ${u.is_active ? `<button class="btn btn-sm btn-danger" onclick="Admin.disableUser(${u.id}, ${this._escapeHtml(JSON.stringify(u.username))})">禁用</button>` : ''}
                 </td>
             </tr>
         `).join('');
+    },
+
+    async downloadUserTemplate() {
+        if ((AUTH.getUser() || {}).role_name !== 'admin') return;
+        const button = document.getElementById('user-import-template');
+        button.disabled = true;
+        try {
+            const response = await AUTH.authFetch('/api/admin/users/import-template');
+            if (!response.ok) { await _alertErr(response, '模板下载失败'); return; }
+            const url = URL.createObjectURL(await response.blob());
+            const link = document.createElement('a');
+            link.href = url; link.download = '用户批量导入模板.xlsx';
+            document.body.appendChild(link); link.click(); link.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 60000);
+        } catch (_) { alert('模板下载失败，请稍后重试'); }
+        finally { button.disabled = false; }
+    },
+
+    showImportUsers() {
+        if ((AUTH.getUser() || {}).role_name !== 'admin') return;
+        this.openModal('批量导入用户', `
+            <p style="line-height:1.8;margin-bottom:16px">请先下载模板，从第 2 行开始填写。用户名、初始密码、角色必填；角色及组织请参考模板中的填写选项。最多 500 人，不能导入系统管理员。已有用户名不会被覆盖。</p>
+            <form id="user-import-form">
+                <div class="form-group"><label>选择已填写的模板（.xlsx，最大 5MB）</label><input id="user-import-file" type="file" accept=".xlsx" required></div>
+                <button type="submit" class="btn btn-primary" id="user-import-submit">开始导入</button>
+            </form>
+            <pre id="user-import-result" role="status" style="white-space:pre-wrap;overflow-wrap:anywhere;margin-top:16px;line-height:1.8"></pre>
+        `, null, {wide:true});
+        document.getElementById('modal-confirm').hidden = true;
+        document.getElementById('user-import-form').onsubmit = async event => {
+            event.preventDefault();
+            const button = document.getElementById('user-import-submit');
+            const result = document.getElementById('user-import-result');
+            const file = document.getElementById('user-import-file').files[0];
+            if (!file) return;
+            const form = new FormData(); form.append('file', file);
+            button.disabled = true; result.textContent = '正在校验并导入，请稍候…';
+            try {
+                const response = await AUTH.authFetch('/api/admin/users/import', {method:'POST', body:form});
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.detail || '导入失败');
+                if (data.errors.length) {
+                    result.textContent = '校验未通过，本次未导入任何用户。请修改后重新导入。\n' + data.errors.map(error => `第 ${error.row} 行${error.username ? '（' + error.username + '）' : ''}：${error.message}`).join('\n');
+                } else {
+                    result.textContent = `导入成功，共创建 ${data.created} 个用户。`;
+                    document.getElementById('user-import-file').value = '';
+                    await this.loadUsers();
+                }
+            } catch (error) { result.textContent = error.message || '导入失败，请稍后重试'; }
+            finally { button.disabled = false; }
+        };
     },
 
     showCreateUser() {
@@ -126,10 +178,10 @@ const Admin = {
         const u = await resp.json();
 
         this.openModal('编辑用户', `
-            <div class="form-group"><label>用户名</label><input value="${u.username}" disabled></div>
-            <div class="form-group"><label>显示名</label><input id="m-display-name" value="${u.display_name || ''}"></div>
-            <div class="form-group"><label>邮箱</label><input id="m-email" value="${u.email || ''}"></div>
-            <div class="form-group"><label>电话</label><input id="m-phone" value="${u.phone || ''}"></div>
+            <div class="form-group"><label>用户名</label><input value="${this._escapeHtml(u.username)}" disabled></div>
+            <div class="form-group"><label>显示名</label><input id="m-display-name" value="${this._escapeHtml(u.display_name || '')}"></div>
+            <div class="form-group"><label>邮箱</label><input id="m-email" value="${this._escapeHtml(u.email || '')}"></div>
+            <div class="form-group"><label>电话</label><input id="m-phone" value="${this._escapeHtml(u.phone || '')}"></div>
             <div class="form-group"><label>组织</label><select id="m-org">${this.orgOptions(u.org_id)}</select></div>
             <div class="form-group"><label>角色</label><select id="m-role">${this.roleOptions(u.role_id)}</select></div>
             <div class="form-group"><label>状态</label><select id="m-active">
@@ -301,12 +353,16 @@ const Admin = {
                 { key: 'tools.training_history', label: '└ 训练历史' },
                 { key: 'tools.compute_history', label: '└ 计算历史' },
                 { key: 'tools.data_compare', label: '└ 数据对比（管理员）' },
-                { key: 'tools.sop', label: '└ SOP维护' },
-                { key: 'tools.sop.create', label: '　　└ 新建SOP / 上传文件' },
-                { key: 'tools.sop.review', label: '　　└ 人工审核' },
-                { key: 'tools.sop.manage', label: '　　└ 规则文件管理 / 删除SOP' },
                 { key: 'tools.assemble', label: '└ 智能组表（应用 / 执行）' },
                 { key: 'tools.assemble.manage', label: '　　└ 规则文件 / 匹配知识库管理' },
+            ]
+        },
+        {
+            label: 'SOP审核平台', children: [
+                { key: 'menu.sop', label: '进入 SOP 审核平台' },
+                { key: 'sop.upload', label: '查看本人任务 / 上传与重传' },
+                { key: 'sop.review', label: '审核已提交 SOP' },
+                { key: 'sop.report', label: '查看全量进度 / 下载报表' },
             ]
         },
         {
@@ -635,6 +691,7 @@ const Admin = {
 
     // ==================== 弹窗工具 ====================
     openModal(title, bodyHtml, onConfirm, opts) {
+        document.getElementById('modal-confirm').hidden = false;
         document.getElementById('modal-title').textContent = title;
         document.getElementById('modal-body').innerHTML = bodyHtml;
         document.getElementById('modal-overlay').style.display = 'flex';
@@ -645,6 +702,7 @@ const Admin = {
     },
 
     closeModal() {
+        document.getElementById('modal-confirm').hidden = false;
         document.getElementById('modal-overlay').style.display = 'none';
         _modalCallback = null;
     },

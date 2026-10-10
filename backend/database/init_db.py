@@ -113,9 +113,51 @@ def init_database():
     _migrate_add_columns()
 
 
+def _migrate_sop_rule_versions():
+    """解除旧版按客户唯一约束，以保留规则版本及审核引用。"""
+    from sqlalchemy import inspect
+    from sqlalchemy.schema import CreateTable, CreateIndex
+    inspector = inspect(engine)
+    if "sop_rule_files" not in inspector.get_table_names():
+        return
+    constraints = inspector.get_unique_constraints("sop_rule_files")
+    if not any(item.get("name") == "uq_sop_rule_scope_customer" for item in constraints):
+        return
+    if engine.dialect.name == "sqlite":
+        # SQLite 不能直接删除表级唯一约束；保留主键和所有数据重建本表。
+        table = SopRuleFile.__table__
+        ddl = str(CreateTable(table).compile(engine)).replace(
+            "CREATE TABLE sop_rule_files", "CREATE TABLE sop_rule_files_version_migration", 1)
+        columns = ", ".join('"' + col.name + '"' for col in table.columns)
+        with engine.connect() as conn:
+            foreign_keys = conn.exec_driver_sql("PRAGMA foreign_keys").scalar()
+            conn.commit()
+            conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            conn.commit()
+            try:
+                with conn.begin():
+                    conn.exec_driver_sql("BEGIN")
+                    conn.exec_driver_sql(ddl)
+                    conn.exec_driver_sql(f"INSERT INTO sop_rule_files_version_migration ({columns}) SELECT {columns} FROM sop_rule_files")
+                    conn.exec_driver_sql("DROP TABLE sop_rule_files")
+                    conn.exec_driver_sql("ALTER TABLE sop_rule_files_version_migration RENAME TO sop_rule_files")
+                    for index in table.indexes:
+                        conn.execute(CreateIndex(index))
+            finally:
+                conn.exec_driver_sql(f"PRAGMA foreign_keys={int(bool(foreign_keys))}")
+                conn.commit()
+    elif engine.dialect.name in ("postgresql", "mysql", "mariadb"):
+        command = ("ALTER TABLE sop_rule_files DROP CONSTRAINT uq_sop_rule_scope_customer"
+                   if engine.dialect.name == "postgresql" else
+                   "ALTER TABLE sop_rule_files DROP INDEX uq_sop_rule_scope_customer")
+        with engine.begin() as conn:
+            conn.exec_driver_sql(command)
+
+
 def _migrate_add_columns():
     """安全地为已有表添加新列（列已存在时跳过）"""
     from sqlalchemy import text, inspect
+    _migrate_sop_rule_versions()
     insp = inspect(engine)
 
     migrations = [
@@ -153,6 +195,12 @@ def _migrate_add_columns():
         # ---------- sop_rounds（SOP 多源文件）----------
         ("sop_rounds", "source_file_paths", "JSON"),
         ("sop_rounds", "source_file_names", "JSON"),
+        # ---------- sop_entries（负责人和月份批次）----------
+        ("sop_entries", "batch_month", "VARCHAR(6)"),
+        ("sop_entries", "project_number", "VARCHAR(100)"),
+        ("sop_entries", "assignee_user_id", "INTEGER"),
+        ("sop_entries", "salesperson_name", "VARCHAR(100) DEFAULT ''"),
+        ("sop_entries", "salesperson_email", "VARCHAR(200) DEFAULT ''"),
         # ---------- assemble_field_mappings（智能组表置信度闭环）----------
         ("assemble_field_mappings", "match_type", "VARCHAR(20) DEFAULT 'semantic'"),
         ("assemble_field_mappings", "confirm_count", "INTEGER DEFAULT 0"),
@@ -181,6 +229,49 @@ def _migrate_add_columns():
             except Exception as e:
                 print(f"      回填 assemble_field_mappings.confirm_count 跳过: {e}")
         conn.commit()
+
+    if "sop_entries" in insp.get_table_names():
+        # 先建立复合唯一索引，再移除旧的项目编号全局唯一索引。
+        for index in SopEntry.__table__.indexes:
+            if index.name == "uq_sop_project_customer":
+                index.create(bind=engine, checkfirst=True)
+        from sqlalchemy import MetaData, Table
+        legacy_table = Table("sop_entries", MetaData(), autoload_with=engine)
+        for index in legacy_table.indexes:
+            if index.name == "ix_sop_entries_project_number":
+                index.drop(bind=engine, checkfirst=True)
+
+    # 旧 SOP 权限从智能小工具分组迁到一级模块；其余权限保持原样。
+    from sqlalchemy.orm.attributes import flag_modified
+    db = SessionLocal()
+    try:
+        for role in db.query(Role).all():
+            perms = dict(role.permissions or {})
+            old = dict(perms)
+            if perms.pop("tools.sop", False):
+                perms["menu.sop"] = True
+            if perms.pop("tools.sop.create", False):
+                perms["menu.sop"] = True
+                perms["sop.upload"] = True
+            if perms.pop("tools.sop.review", False):
+                perms["menu.sop"] = True
+                perms["sop.review"] = True
+            if perms.pop("tools.sop.manage", False):
+                perms["menu.sop"] = True
+                perms["sop.report"] = True
+            if perms != old:
+                role.permissions = perms
+                flag_modified(role, "permissions")
+        for name, description, permissions in (
+            ("sop_user", "SOP业务员", {"menu.sop": True, "sop.upload": True}),
+            ("sop_reviewer", "SOP审核员", {"menu.sop": True, "sop.review": True}),
+            ("sop_manager", "SOP只读管理员", {"menu.sop": True, "sop.report": True}),
+        ):
+            if not db.query(Role).filter_by(name=name).first():
+                db.add(Role(name=name, description=description, permissions=permissions, is_system=False))
+        db.commit()
+    finally:
+        db.close()
 
 
 def seed_roles(db):

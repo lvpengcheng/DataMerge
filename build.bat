@@ -52,7 +52,7 @@ mkdir "%DOCKER_DIR%"
 echo [1/6] 复制后端代码...
 xcopy /E /I /Q /Y backend "%DOCKER_DIR%\backend" >nul
 for /d /r "%DOCKER_DIR%\backend" %%d in (__pycache__) do @if exist "%%d" rd /s /q "%%d"
-del /q "%DOCKER_DIR%\backend\test_*.py" 2>nul
+if exist "%DOCKER_DIR%\backend\tests" rd /s /q "%DOCKER_DIR%\backend\tests"
 
 echo [2/6] 复制前端和静态资源...
 xcopy /E /I /Q /Y frontend "%DOCKER_DIR%\frontend" >nul
@@ -121,7 +121,7 @@ mkdir "%IIS_DIR%\temp"
 echo [1/6] 复制后端代码...
 xcopy /E /I /Q /Y backend "%IIS_DIR%\backend" >nul
 for /d /r "%IIS_DIR%\backend" %%d in (__pycache__) do @if exist "%%d" rd /s /q "%%d"
-del /q "%IIS_DIR%\backend\test_*.py" 2>nul
+if exist "%IIS_DIR%\backend\tests" rd /s /q "%IIS_DIR%\backend\tests"
 
 echo [2/6] 复制前端和静态资源...
 xcopy /E /I /Q /Y frontend "%IIS_DIR%\frontend" >nul

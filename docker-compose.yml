@@ -17,6 +17,7 @@ services:
       - DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
       - DOTNET_ROLL_FORWARD=LatestMajor
     volumes:
+      - ./email_config.json:/app/email_config.json
       - ./tenants:/app/tenants
       - ./global_assets:/app/global_assets
       - ./data:/app/data

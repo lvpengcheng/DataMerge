@@ -90,7 +90,7 @@ def test_training_structure_entry_points_mask_each_region(tmp_path, monkeypatch,
     monkeypatch.setattr(evidence, "collect_formula_evidence", lambda *a: {})
     path = tmp_path / "source.xlsx"
     path.touch()
-    tree = ast.parse((Path(__file__).parent / filename).read_text(encoding="utf-8"))
+    tree = ast.parse((Path(__file__).parent.parent / filename).read_text(encoding="utf-8"))
     nodes = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == owner).body if owner else tree.body
     node = next(n for n in nodes if isinstance(n, ast.FunctionDef) and n.name == function)
     ns = dict(Dict=Dict, Any=Any, List=List, Optional=Optional, Path=Path, os=os,

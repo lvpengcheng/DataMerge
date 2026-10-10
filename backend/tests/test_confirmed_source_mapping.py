@@ -188,7 +188,7 @@ def test_pending_response_includes_final_mapping():
     import ast
     from typing import Optional
     from backend.utils.compute_precheck import PrecheckResult
-    tree = ast.parse((Path(__file__).parent / 'app/main.py').read_text(encoding='utf-8'))
+    tree = ast.parse((Path(__file__).parent.parent / 'app/main.py').read_text(encoding='utf-8'))
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_compute_pending_payload')
     ns = {'Optional': Optional, '_precheck_requires_user_action': lambda pc, skip=False: bool(
         pc.source_sheet_reviews or pc.rename_candidates or pc.missing_files
@@ -204,7 +204,7 @@ def test_pending_response_separates_final_mapping_from_review_subset():
     import ast
     from typing import Optional
     from backend.utils.compute_precheck import PrecheckResult
-    tree = ast.parse((Path(__file__).parent / 'app/main.py').read_text(encoding='utf-8'))
+    tree = ast.parse((Path(__file__).parent.parent / 'app/main.py').read_text(encoding='utf-8'))
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_compute_pending_payload')
     ns = {'Optional': Optional, '_precheck_requires_user_action': lambda pc, skip=False: bool(
         pc.source_sheet_reviews or pc.rename_candidates or pc.missing_files
@@ -242,7 +242,7 @@ def test_sheet_review_payload_never_carries_column_mapping():
     import ast
     from typing import Optional
     from backend.utils.compute_precheck import PrecheckResult
-    tree = ast.parse((Path(__file__).parent / 'app/main.py').read_text(encoding='utf-8'))
+    tree = ast.parse((Path(__file__).parent.parent / 'app/main.py').read_text(encoding='utf-8'))
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_compute_pending_payload')
     ns = {'Optional': Optional, '_precheck_requires_user_action': lambda pc, skip=False: bool(
         pc.source_sheet_reviews or pc.rename_candidates or pc.missing_files

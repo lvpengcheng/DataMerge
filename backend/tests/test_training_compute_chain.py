@@ -23,7 +23,7 @@ def test_precheck_combines_db_headers_with_local_training_structure(tmp_path):
     """DB 字段不齐时按字段读取本地智训结构，不能因已有表头配置而停止回退。"""
     import json
 
-    source = Path(__file__).parent / 'app' / 'main.py'
+    source = Path(__file__).parent.parent / 'app' / 'main.py'
     node = next(n for n in ast.parse(source.read_text(encoding='utf-8')).body
                 if isinstance(n, ast.FunctionDef)
                 and n.name == '_load_script_info_for_precheck')
@@ -99,7 +99,7 @@ def test_composite_primary_key_declaration_preserves_all_columns(declaration):
 
 def test_manual_selection_preserves_measured_accuracy(tmp_path, monkeypatch):
     import sys
-    path = Path(__file__).parent / 'api' / 'training_chat.py'
+    path = Path(__file__).parent.parent / 'api' / 'training_chat.py'
     node = next(n for n in ast.parse(path.read_text(encoding='utf-8')).body
                 if isinstance(n, ast.FunctionDef) and n.name == 'set_as_best')
     node.decorator_list = []
@@ -137,7 +137,7 @@ def test_manual_selection_preserves_measured_accuracy(tmp_path, monkeypatch):
 def test_generated_fallback_loads_formula_values_and_rejects_partial_input(tmp_path, kind):
     from backend.ai_engine.formula_code_generator import FormulaCodeGenerator
     from backend.ai_engine.template_code_generator import TemplateCodeGenerator
-    from backend.test_pipeline_accuracy import function_namespace
+    from backend.tests.test_pipeline_accuracy import function_namespace
     from backend.utils.data_helpers import assign_sheet_keys, apply_dataframe_column_schemas, region_schemas_by_name
     from excel_parser import IntelligentExcelParser
     source = tmp_path / 'source'
@@ -206,7 +206,7 @@ def test_failed_full_source_loading_never_falls_back_to_another_parse(monkeypatc
     monkeypatch.setattr(runner, 'run_in_subprocess', lambda *a, **kw: SimpleNamespace(
         success=False, result=None, timed_out=killed, killed_by_memory=False,
         killed=killed, termination_failed=False, error='parse failed'))
-    path = Path(__file__).parent / 'api' / 'training_chat.py'
+    path = Path(__file__).parent.parent / 'api' / 'training_chat.py'
     node = next(n for n in ast.parse(path.read_text(encoding='utf-8')).body
                 if isinstance(n, ast.FunctionDef) and n.name == '_load_full_source_data_subproc')
     namespace = {'logger': logging.getLogger('chain-test')}
@@ -407,7 +407,7 @@ def test_shared_entry_passes_selected_period_and_keyword_only_parameters():
 
 
 def load_chat_iteration():
-    path = Path(__file__).parent / 'api' / 'training_chat.py'
+    path = Path(__file__).parent.parent / 'api' / 'training_chat.py'
     node = next(n for n in ast.parse(path.read_text(encoding='utf-8')).body
                 if isinstance(n, ast.FunctionDef) and n.name == '_run_single_iteration')
     namespace = {'__package__': 'backend.api', '__file__': str(path), 'Path': Path,
@@ -459,7 +459,7 @@ def main(input_folder, output_folder, salary_month=1):
 ])
 def test_all_training_comparisons_calculate_expected_formulas(relative_path, expected_calls):
     """智训的所有新旧入口都必须按两侧公式的计算结果进行比较。"""
-    path = Path(__file__).parent / relative_path
+    path = Path(__file__).parent.parent / relative_path
     tree = ast.parse(path.read_text(encoding='utf-8'))
     calls = [node for node in ast.walk(tree)
              if isinstance(node, ast.Call)

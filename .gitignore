@@ -23,6 +23,7 @@
 /.kilo
 *.docx
 *.xlsx
+!backend/admin/templates/user_import_template.xlsx
 nul
 # 部署配置（含服务器密码，勿提交）
 deploy.config.json

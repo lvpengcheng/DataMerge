@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SOP审核平台</title>
+    <link rel="stylesheet" href="/static/css/admin.css?v=20260807a">
+    <link rel="stylesheet" href="/static/css/tools.css?v=20260814a">
+    <link rel="stylesheet" href="/static/css/sop.css?v=20261009a">
+</head>
+<body>
+<div class="container">
+    <header>
+        <div class="header-left"><nav class="nav-links">
+            <a href="/dashboard" data-perm="can_view">首页</a>
+            <a href="/rules" data-perm="menu.rules">规则</a>
+            <a href="/training" data-perm="can_train">智训</a>
+            <a href="/compute" data-perm="can_compute">智算</a>
+            <a href="/tools" data-perm="menu.tools">智能小工具</a>
+            <a href="/sop" class="active" data-perm="menu.sop">SOP审核平台</a>
+            <a href="/admin" data-perm="can_manage_users">管理</a>
+        </nav></div>
+        <div class="user-info" id="user-info"></div>
+    </header>
+    <nav class="tab-nav sop-tabs" aria-label="SOP 二级菜单">
+        <a href="/sop" class="tab-btn active" aria-current="page">SOP业务操作</a>
+        <a href="/sop/import" class="tab-btn" data-perm="admin">客户清单导入</a>
+        <a href="/sop/admin" class="tab-btn" data-perm="admin">系统管理</a>
+    </nav>
+    <main class="tab-content active sop-wrap">
+
+        <div class="sop-head"><h1>SOP业务操作</h1><div class="sop-actions">
+            <button class="btn" id="sop-create-open" data-perm="admin">新建 SOP</button>
+            <button class="btn btn-primary" id="sop-upload-open" data-perm="sop.upload">上传文件</button>
+            <button class="btn" id="sop-export" data-perm="sop.report">下载报表</button>
+        </div></div>
+        <div id="sop-error" class="sop-error" role="alert"></div>
+        <div class="sop-cards">
+            <button type="button" class="sop-card" data-sop-status="" aria-pressed="true"><span>全量数量</span><strong id="sop-total">0</strong></button>
+            <button type="button" class="sop-card" data-sop-status="pending_upload" aria-pressed="false"><span>待上传</span><strong id="sop-pending-upload">0</strong></button>
+            <button type="button" class="sop-card" data-sop-status="pending_review" aria-pressed="false"><span>待审核</span><strong id="sop-pending-review">0</strong></button>
+            <button type="button" class="sop-card" data-sop-status="rejected" aria-pressed="false"><span>驳回</span><strong id="sop-rejected">0</strong></button>
+            <button type="button" class="sop-card" data-sop-status="completed" aria-pressed="false"><span>通过</span><strong id="sop-completed">0</strong></button>
+        </div>
+        <div class="sop-toolbar">
+            <input id="sop-keyword" type="search" placeholder="搜索客户名称">
+            <input id="sop-month" type="text" maxlength="6" inputmode="numeric" placeholder="月份批次 YYYYMM">
+            <select id="sop-status"><option value="">全部状态</option><option value="pending_upload">待上传</option><option value="pending_review">待审核</option><option value="rejected">驳回</option><option value="completed">通过</option></select>
+            <button class="btn" id="sop-search">查询</button>
+            <label data-perm="sop.report"><input id="sop-incomplete" type="checkbox"> 仅未完成</label>
+        </div>
+        <div class="sop-table-wrap"><table class="data-table" id="sop-table"><colgroup>
+            <col style="width:100px"><col style="width:130px"><col style="width:130px"><col style="width:95px"><col style="width:95px">
+            <col style="width:60px"><col style="width:220px"><col style="width:165px"><col style="width:290px">
+        </colgroup><thead><tr>
+            <th>月份批次</th><th>客户名称</th><th>项目编号</th><th>业务员</th><th>当前状态</th><th>版本</th><th>AI评价</th><th>更新时间</th><th>操作</th>
+        </tr></thead><tbody><tr><td colspan="9">加载中...</td></tr></tbody></table></div>
+        <nav class="sop-pagination" aria-label="SOP 列表分页">
+            <span id="sop-page-info" role="status" aria-live="polite">每页 10 条</span>
+            <div class="sop-actions">
+                <button class="btn" type="button" id="sop-page-prev" disabled>上一页</button>
+                <button class="btn" type="button" id="sop-page-next" disabled>下一页</button>
+            </div>
+        </nav>
+
+    </main>
+</div>
+<dialog id="sop-dialog" class="sop-dialog"><button class="btn" id="sop-close" style="float:right">关闭</button><div id="sop-dialog-body"></div></dialog>
+<dialog id="sop-review-dialog" class="sop-dialog sop-reject-dialog">
+    <h2>驳回 SOP</h2>
+    <form id="sop-review-form" class="sop-form">
+        <label>驳回原因<textarea id="sop-review-comment" rows="7" required placeholder="请说明需要修改的内容"></textarea></label>
+        <div class="sop-actions sop-review-actions"><button type="button" class="btn" id="sop-review-cancel">取消</button><button type="submit" class="btn btn-primary">确认驳回</button></div>
+    </form>
+</dialog>
+<script src="/static/js/auth.js?v=20260722a"></script>
+<script src="/static/js/sop.js?v=20261009a"></script>
+</body>
+</html>

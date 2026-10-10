@@ -3,7 +3,7 @@ FastAPI 认证依赖
 """
 
 from typing import Optional, List
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 
@@ -15,6 +15,7 @@ security = HTTPBearer(auto_error=False)
 
 
 async def get_current_user(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     db: Session = Depends(get_db),
 ) -> User:
@@ -33,6 +34,16 @@ async def get_current_user(
     user = db.query(User).filter(User.id == user_id, User.is_active == True).first()
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户不存在或已禁用")
+
+    # 纯 SOP 角色只能调用 SOP 与自身账户接口；阻止直接访问其它仅要求登录的 API。
+    perms = user.role.permissions if user.role and isinstance(user.role.permissions, dict) else {}
+    sop_keys = {"menu.sop", "sop.upload", "sop.review", "sop.report"}
+    granted = {key for key, enabled in perms.items() if enabled is True}
+    sop_only = bool(granted & sop_keys) and granted <= sop_keys
+    path = request.url.path
+    if sop_only and path.startswith("/api/") and not (
+        path.startswith("/api/tools/sop/") or path.startswith("/api/auth/")):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="该账号仅可使用 SOP 审核平台")
 
     return user
 

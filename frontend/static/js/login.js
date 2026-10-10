@@ -4,7 +4,7 @@
 
 // 已登录则跳转
 if (AUTH.isLoggedIn()) {
-    window.location.href = '/dashboard';
+    window.location.href = AUTH.hasPerm('menu.sop') && !AUTH.hasPerm('can_view') ? '/sop' : '/dashboard';
 }
 
 // ============================
@@ -93,7 +93,7 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
             showNotification('登录成功！欢迎回来~');
 
             setTimeout(() => {
-                window.location.href = '/dashboard';
+                window.location.href = AUTH.hasPerm('menu.sop') && !AUTH.hasPerm('can_view') ? '/sop' : '/dashboard';
             }, 1500);
         } else {
             btn.classList.remove('loading');

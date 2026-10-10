@@ -7,7 +7,7 @@ from fastapi import HTTPException
 
 
 def test_compare_history_detail_and_download_are_owner_only():
-    tree = ast.parse((Path(__file__).parent / 'app/main.py').read_text(encoding='utf-8'))
+    tree = ast.parse((Path(__file__).parent.parent / 'app/main.py').read_text(encoding='utf-8'))
     names = {'list_compare_history', 'get_compare_detail', 'download_compare_result'}
     functions = [n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name in names]
     for fn in functions:

@@ -652,6 +652,8 @@ async def startup_event():
     # 增量迁移：为已有表添加新列
     from backend.database.init_db import _migrate_add_columns
     _migrate_add_columns()
+    from backend.utils.sop_scheduler import start_sop_dispatcher
+    await asyncio.to_thread(start_sop_dispatcher)
     # 基础数据上传的单消费者：恢复中断任务，并确保解析并发恒为 1。
     from backend.api.assets import start_asset_upload_dispatcher
     await start_asset_upload_dispatcher()
@@ -675,6 +677,12 @@ async def startup_event():
             except Exception as e:
                 logger.warning(f"清理智算会话异常: {e}")
     asyncio.create_task(_cleanup_compute_sessions())
+
+
+@app.on_event("shutdown")
+async def shutdown_sop_dispatcher():
+    from backend.utils.sop_scheduler import stop_sop_dispatcher
+    await asyncio.to_thread(stop_sop_dispatcher)
 
 
 # 挂载前端静态文件
@@ -7623,6 +7631,42 @@ async def tools_page():
     if template_file.exists():
         return HTMLResponse(content=template_file.read_text(encoding="utf-8"))
     raise HTTPException(status_code=404, detail="智能小工具页面未找到")
+
+
+@app.get("/sop", response_class=HTMLResponse)
+async def sop_page():
+    """独立的 SOP 审核平台页面；数据权限由 /api/tools/sop 接口校验。"""
+    template_file = Path(__file__).resolve().parent.parent.parent / "frontend" / "templates" / "sop.html"
+    if template_file.exists():
+        return HTMLResponse(content=template_file.read_text(encoding="utf-8"))
+    raise HTTPException(status_code=404, detail="SOP 页面未找到")
+
+
+@app.get("/sop/admin", response_class=HTMLResponse)
+async def sop_admin_page():
+    """SOP 系统管理页面框架；业务数据由管理员专用接口保护。"""
+    template_file = Path(__file__).resolve().parent.parent.parent / "frontend" / "templates" / "sop_admin.html"
+    if template_file.exists():
+        return HTMLResponse(content=template_file.read_text(encoding="utf-8"))
+    raise HTTPException(status_code=404, detail="SOP 系统管理页面未找到")
+
+
+@app.get("/sop/import", response_class=HTMLResponse)
+async def sop_import_page():
+    """客户清单导入独立页面；导入接口校验管理员权限。"""
+    template_file = Path(__file__).resolve().parent.parent.parent / "frontend" / "templates" / "sop_import.html"
+    if template_file.exists():
+        return HTMLResponse(content=template_file.read_text(encoding="utf-8"))
+    raise HTTPException(status_code=404, detail="SOP 客户清单导入页面未找到")
+
+
+@app.get("/sop/resubmit", response_class=HTMLResponse)
+async def sop_resubmit_page():
+    """一次性链接的免登录重传页面。"""
+    template_file = Path(__file__).resolve().parent.parent.parent / "frontend" / "templates" / "sop_resubmit.html"
+    if template_file.exists():
+        return HTMLResponse(content=template_file.read_text(encoding="utf-8"))
+    raise HTTPException(status_code=404, detail="SOP 重传页面未找到")
 
 
 @app.get("/tools/split-sheet", response_class=HTMLResponse)

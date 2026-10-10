@@ -24,13 +24,16 @@ logger = logging.getLogger(__name__)
 class EmailHandler:
     """邮件处理器"""
 
-    def __init__(self, config_file: str = "email_config.json"):
+    def __init__(self, config_file: Optional[str] = None):
         """初始化邮件处理器
 
         Args:
-            config_file: 配置文件路径
+            config_file: 配置文件路径；未指定时使用项目根目录下的 email_config.json
         """
-        self.config_file = config_file
+        self.config_file = str(
+            Path(config_file) if config_file is not None
+            else Path(__file__).resolve().parents[2] / "email_config.json"
+        )
         self.config = self._load_config()
 
     def _load_config(self) -> Dict[str, Any]:

@@ -12,7 +12,7 @@ def test_formula_errors_default_to_downloadable_warning(monkeypatch, setting, bl
         monkeypatch.delenv('COMPUTE_STRICT_FORMULA_ERRORS', raising=False)
     else:
         monkeypatch.setenv('COMPUTE_STRICT_FORMULA_ERRORS', setting)
-    tree = ast.parse((Path(__file__).parent / 'app' / 'main.py').read_text(encoding='utf-8'))
+    tree = ast.parse((Path(__file__).parent.parent / 'app' / 'main.py').read_text(encoding='utf-8'))
     gate = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
                 and 'COMPUTE_STRICT_FORMULA_ERRORS' in ast.unparse(node.test))
     program = compile(ast.fix_missing_locations(ast.Module(body=[gate], type_ignores=[])), '<gate>', 'exec')

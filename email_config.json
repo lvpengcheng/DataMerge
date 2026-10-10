@@ -2,15 +2,15 @@
   "last_check_time": "2026-03-03T23:38:18.418549",
   "email_accounts": [
     {
-      "email_address": "lupech@163.com",
+      "email_address": "talefull@fsg.com.cn",
       "pop3_server": "pop.163.com",
       "pop3_port": 995,
       "pop3_ssl": true,
       "pop3_password": "YRbEUpDrNDTpCtHw",
-      "smtp_server": "smtp.163.com",
+      "smtp_server": "smtphz.qiye.163.com",
       "smtp_port": 465,
       "smtp_ssl": true,
-      "smtp_password": "YRbEUpDrNDTpCtHw",
+      "smtp_password": "Efesco20170828",
       "recipients": [
         "lupech@163.com"
       ],

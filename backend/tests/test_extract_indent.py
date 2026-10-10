@@ -2,7 +2,7 @@
 import re
 
 # 读取AI响应
-with open('../tenants/rex104/training_logs/rex104_薪资计算规则_response_20260309_123811_01_generate.txt', 'r', encoding='utf-8') as f:
+with open(Path(__file__).resolve().parents[2] / 'tenants/rex104/training_logs/rex104_薪资计算规则_response_20260309_123811_01_generate.txt', 'r', encoding='utf-8') as f:
     ai_response = f.read()
 
 print("=" * 80)

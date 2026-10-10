@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 
 _spec = importlib.util.spec_from_file_location(
-    "output_postprocess_under_test", Path(__file__).resolve().parent / "utils" / "output_postprocess.py")
+    "output_postprocess_under_test", Path(__file__).resolve().parent.parent / "utils" / "output_postprocess.py")
 _module = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_module)
 _shifted_summary_tail = _module._shifted_summary_tail

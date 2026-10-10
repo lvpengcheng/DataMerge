@@ -1,0 +1,187 @@
+"""SOP 新建字段与数据归属校验，使用独立内存数据库。"""
+import ast
+import asyncio
+import io
+import pandas as pd
+from datetime import datetime
+from pathlib import Path
+import re
+import tempfile
+from types import SimpleNamespace
+from typing import Optional
+import unittest
+
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Index, create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+
+Base = declarative_base()
+
+
+class Entry(Base):
+    __tablename__ = "entries"
+    id = Column(Integer, primary_key=True)
+    customer_name = Column(String)
+    project_number = Column(String(100))
+    __table_args__ = (Index("uq_test_project_customer", "project_number", "customer_name", unique=True),)
+    batch_month = Column(String)
+    description = Column(String)
+    status = Column(String)
+    created_by = Column(Integer)
+    assignee_user_id = Column(Integer)
+    salesperson_name = Column(String)
+    salesperson_email = Column(String)
+    updated_at = Column(DateTime, default=datetime.now)
+
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    username = Column(String)
+    display_name = Column(String)
+    email = Column(String)
+    is_active = Column(Boolean)
+    can_upload = Column(Boolean)
+
+
+class HTTPException(Exception):
+    def __init__(self, status_code, detail):
+        self.status_code, self.detail = status_code, detail
+
+
+class SopCreateTests(unittest.TestCase):
+    def setUp(self):
+        self.engine = create_engine("sqlite://")
+        self.addCleanup(self.engine.dispose)
+        Base.metadata.create_all(self.engine)
+        self.session = sessionmaker(bind=self.engine)
+        with self.session() as db:
+            db.add(User(id=7, username="seller", display_name="业务员", email="seller@example.com", is_active=True, can_upload=True))
+            db.commit()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        (Path(self.temp.name) / "客户甲").mkdir()
+        tree = ast.parse(Path(__file__).parent.parent.joinpath("api/tools.py").read_text(encoding="utf-8"))
+        nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 and node.name in {"sop_entries_create", "_sop_customer_choices", "sop_entries_list",
+                                   "_sop_status_groups", "_sop_business_status", "_sop_filter_status", "_sop_status_label",
+                                   "_sop_validate_project_number", "_sop_check_project_number", "sop_import_assignments"}]
+        for node in nodes:
+            node.decorator_list = []
+        self.ns = dict(SopCreateRequest=object, Depends=lambda value: None, require_permission=lambda key: None,
+                       SessionLocal=self.session, SopEntry=Entry, User=User, HTTPException=HTTPException,
+                       SOP_ROOT=Path(self.temp.name) / "__tools_sop__", re=re, datetime=datetime,
+                       has_permission=lambda user, key: user.can_upload,
+                       _sop_entry_to_out=lambda entry, db: {"id":entry.id},
+                       Optional=Optional, Query=lambda value: value,
+                       UploadFile=object, File=lambda value: value, Form=lambda value: value, pd=pd, io=io,
+                       _sop_is_superadmin=lambda user: user.role == "admin")
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "sop_create", "exec"), self.ns)
+
+    def create(self, **overrides):
+        values = dict(customer_name="客户甲", project_number=" proj-001 ", batch_month="202610", assignee_user_id=7, description="说明")
+        values.update(overrides)
+        return asyncio.run(self.ns["sop_entries_create"](SimpleNamespace(**values), SimpleNamespace(id=1)))
+
+    def test_four_status_filters_counts_and_reviewer_scope(self):
+        states = ["draft", "awaiting_files", "ai_queued", "ai_analyzing", "ai_passed", "ai_failed", "rejected", "failed", "completed"]
+        with self.session() as db:
+            db.add_all(Entry(customer_name="客户甲", batch_month="202610", status=state, assignee_user_id=7) for state in states)
+            db.add(Entry(customer_name="其他客户", batch_month="202611", status="draft", assignee_user_id=8))
+            db.commit()
+        self.ns["has_permission"] = lambda user, key: key in user.permissions
+        reviewer = SimpleNamespace(id=3, role="reviewer", permissions={"sop.review"})
+        admin = SimpleNamespace(id=1, role="admin", permissions=set())
+        seller = SimpleNamespace(id=7, role="seller", permissions={"sop.upload"})
+        def listing(user, status=None, month="202610"):
+            return asyncio.run(self.ns["sop_entries_list"](keyword=None, status=status, batch_month=month, current_user=user))
+        self.assertEqual(listing(reviewer), listing(admin))
+        expected = {"pending_upload":2, "pending_review":3, "rejected":3, "completed":1}
+        for status, count in expected.items():
+            data = listing(reviewer, status)
+            self.assertEqual(len(data["items"]), count)
+            self.assertEqual(data["counts"], {"total":9, **expected})
+        self.assertEqual(len(listing(seller, month=None)["items"]), 9)
+        self.assertEqual(len(listing(reviewer, month=None)["items"]), 10)
+        with self.assertRaises(HTTPException):
+            listing(reviewer, "ai_passed")
+        for status in states:
+            self.assertIn(self.ns["_sop_status_label"](status), {"待上传", "待审核", "驳回", "通过"})
+
+    def test_creation_persists_selected_owner_month_and_email(self):
+        self.create()
+        with self.session() as db:
+            entry = db.query(Entry).one()
+            self.assertEqual((entry.assignee_user_id, entry.batch_month, entry.status), (7, "202610", "draft"))
+            self.assertEqual((entry.salesperson_name, entry.salesperson_email), ("业务员", "seller@example.com"))
+            self.assertEqual(entry.project_number, "PROJ-001")
+        with self.assertRaises(HTTPException) as duplicate:
+            self.create()
+        self.assertEqual(duplicate.exception.status_code, 409)
+
+    def test_invalid_choices_and_month_are_rejected(self):
+        for change in [dict(project_number=""), dict(project_number="x" * 101), dict(customer_name="手填未知客户"), dict(batch_month="202613"),
+                       dict(batch_month="2026-10"), dict(assignee_user_id=999)]:
+            with self.subTest(change=change), self.assertRaises(HTTPException):
+                self.create(**change)
+        with self.session() as db:
+            db.query(User).filter_by(id=7).update({"can_upload":False})
+            db.commit()
+        with self.assertRaises(HTTPException):
+            self.create()
+        with self.session() as db:
+            self.assertEqual(db.query(Entry).count(), 0)
+
+    def test_project_number_is_unique_within_customer(self):
+        self.create()
+        (Path(self.temp.name) / "客户乙").mkdir()
+        self.create(customer_name="客户乙", batch_month="202611", project_number="proj-001")
+        with self.assertRaises(HTTPException):
+            self.create(batch_month="202611")
+        self.create(project_number="proj-002")
+        from sqlalchemy.exc import IntegrityError
+        with self.session() as db:
+            db.add(Entry(customer_name="客户甲", project_number="PROJ-001"))
+            with self.assertRaises(IntegrityError):
+                db.commit()
+
+    def import_rows(self, rows, include_number=True):
+        frame = pd.DataFrame(rows, columns=["业务员", "邮箱", "租户", "所属月份批次", "项目编号"])
+        if not include_number:
+            frame = frame.drop(columns="项目编号")
+        async def read():
+            return frame.to_csv(index=False).encode("utf-8-sig")
+        return asyncio.run(self.ns["sop_import_assignments"](
+            SimpleNamespace(filename="list.csv", read=read), "draft", SimpleNamespace(id=1)))
+
+    def test_import_upserts_by_number_and_customer_and_preserves_progress(self):
+        self.create()
+        with self.session() as db:
+            entry = db.query(Entry).one()
+            entry.status = "completed"
+            entry.description = "已有审核及文件记录"
+            original_id = entry.id
+            db.add(Entry(customer_name="旧客户", status="draft"))
+            db.commit()
+        result = self.import_rows([
+            ["新业务员", "seller@example.com", "客户甲", "202611", " proj-001 "],
+            ["业务员", "seller@example.com", "客户乙", "202611", "proj-001"],
+            ["业务员", "seller@example.com", "客户甲", "202611", "proj-002"],
+            ["业务员", "seller@example.com", "客户甲", "202612", "PROJ-002"],
+            ["业务员", "seller@example.com", "客户戊", "202611", ""],
+            ["业务员", "seller@example.com", "旧客户", "202610", "000123"],
+        ])
+        self.assertEqual((result["created"], result["updated"], len(result["errors"])), (3, 1, 2))
+        with self.session() as db:
+            entry = db.get(Entry, original_id)
+            self.assertEqual((entry.batch_month, entry.salesperson_name, entry.status), ("202611", "新业务员", "completed"))
+            self.assertEqual(entry.description, "已有审核及文件记录")
+            self.assertEqual(db.query(Entry).filter_by(customer_name="旧客户").count(), 2)
+        repeat = self.import_rows([["业务员", "seller@example.com", "客户乙", "202612", "proj-001"]])
+        self.assertEqual((repeat["created"], repeat["updated"], repeat["errors"]), (0, 1, []))
+        with self.assertRaises(HTTPException):
+            self.import_rows([], include_number=False)
+
+
+if __name__ == "__main__":
+    unittest.main()
