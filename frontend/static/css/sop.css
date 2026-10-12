@@ -16,7 +16,6 @@ button.sop-card:focus-visible { outline:2px solid #1976d2; outline-offset:2px; }
 #sop-table .sop-ai-summary { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:3; overflow:hidden; overflow-wrap:anywhere; line-height:1.6; }
 #sop-table .sop-row-actions { display:flex; align-items:center; gap:6px; flex-wrap:nowrap; }
 #sop-table .sop-row-actions .btn { flex-shrink:0; white-space:nowrap; padding:8px 10px; }
-#sop-table .sop-supplementary-action { margin-left:auto; }
 .sop-form { display:grid; gap:12px; }
 .sop-form label { display:grid; gap:5px; }
 .sop-form input[type=file] { width:100%; box-sizing:border-box; }
