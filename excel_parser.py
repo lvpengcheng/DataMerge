@@ -3379,6 +3379,8 @@ class IntelligentExcelParser:
         这里的结论会贯穿 DataFrame、主键匹配和 Excel 写入；优先级是明确列头语义 >
         文本格式(@) > 样例值 > number_format。最多采样 32 个非空格，避免偶发首行污染。
         """
+        from openpyxl.styles.numbers import BUILTIN_FORMATS
+
         type_counts: Dict[str, int] = {}
         formats: Dict[str, tuple] = {}
         limit = min(row_end, row_start + 63)
@@ -3389,8 +3391,17 @@ class IntelligentExcelParser:
                 if cell is None:
                     continue
                 style = cell.GetStyle()
-                code = str(style.Custom or "General").strip() or "General"
-                key = (int(style.Number or 0), code)
+                number_id = int(style.Number or 0)
+                code = str(style.Custom or "").strip()
+                if not code:
+                    # 内置格式的 Custom 为空，必须从编号恢复格式码，不能直接当作 General。
+                    code = BUILTIN_FORMATS.get(number_id)
+                    if code is None:
+                        # 部分地区专用日期/时间编号没有通用格式码，使用稳定的标准格式。
+                        code = ("yyyy-mm-dd" if number_id in self._DATE_BUILTIN_FMT_IDS
+                                else "h:mm:ss" if number_id in self._TIME_BUILTIN_FMT_IDS
+                                else "General")
+                key = (number_id, code)
                 value = cell.Value
                 # 空模板数据格仍可能预设 @/日期/金额格式；非 General 样式必须纳入字段定义。
                 if ((value is not None and str(value).strip() != "")
