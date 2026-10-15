@@ -61,7 +61,7 @@ function _renderSessionAssets(data) {
     edit.onclick = toggleAttachPopover; details.append(edit);
     for (const [label, category, names] of [
         ['源文件', 'source', data.source_file_names || []],
-        ['目标文件', 'expected', data.expected_file_name ? [data.expected_file_name] : []],
+        ['目标文件', 'expected', data.expected_file_names || (data.expected_file_name ? [data.expected_file_name] : [])],
         ['规则附件', 'rule-file', data.rule_file_names || []],
     ]) {
         const row = document.createElement('div'); row.append(document.createTextNode(`${label}：`));
@@ -97,7 +97,7 @@ async function saveSessionAssets() {
         form.append('source_mode', document.getElementById('source-update-mode').value);
         form.append('file_passwords', JSON.stringify(_filePasswordsMap || {}));
         for (const file of inputs[0].files) form.append('source_files', file);
-        if (inputs[1].files[0]) form.append('expected_result', inputs[1].files[0]);
+        for (const file of inputs[1].files) form.append('target_files', file);
         for (const file of inputs[2].files) form.append('rule_files', file);
         _savingAssets = true; button.disabled = true; _setUIStreaming(_isStreaming);
         status.textContent = '正在排队验证并保存，原文件在成功前保持可用…';

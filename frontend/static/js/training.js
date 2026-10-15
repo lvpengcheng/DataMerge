@@ -996,7 +996,8 @@ function sendMessage(action) {
 function _startTraining(userText) {
     if (_isStreaming) return;  // 防止重复触发
     const sourceFiles = document.getElementById('source-files').files;
-    const targetFile = document.getElementById('target-file').files[0];
+    const targetFiles = Array.from(document.getElementById('target-file').files);
+    const targetFile = targetFiles[0];
     const ruleFiles = document.getElementById('rule-files').files;
     const aiProvider = document.getElementById('ai-provider').value;
     const mode = document.getElementById('mode').value;
@@ -1006,11 +1007,25 @@ function _startTraining(userText) {
     // 模板/自动模式：先轻量解析目标文件，弹出 sheet 多选框，让用户勾选目标 sheet
     const _needsPicker = (mode === 'template' || mode === 'auto') && targetFile;
     const _go = (selectedSheets) => {
-        _submitStartTraining(userText, sourceFiles, targetFile, ruleFiles,
+        _submitStartTraining(userText, sourceFiles, targetFiles, ruleFiles,
                              aiProvider, mode, salaryMonth, standardHours,
                              selectedSheets || []);
     };
-    if (_needsPicker) {
+    if (targetFiles.length > 1 && !['formula', 'template'].includes(mode)) {
+        alert('多个目标文件请使用公式模式或模板模式');
+        return;
+    }
+    if (_needsPicker && targetFiles.length > 1) {
+        (async () => {
+            const selection = {};
+            for (const file of targetFiles) {
+                const sheets = await _pickTargetSheets(file);
+                if (sheets === null) return;
+                selection[file.name.replace(/\.(xls|xlsm)$/i, '.xlsx')] = sheets;
+            }
+            _go(selection);
+        })().catch(err => alert('目标文件分析失败：' + err.message));
+    } else if (_needsPicker) {
         console.log('[训练] 模板/自动模式 → 调用 peek-template-sheets');
         _pickTargetSheets(targetFile).then(selectedSheets => {
             if (selectedSheets === null) {
@@ -1028,11 +1043,12 @@ function _startTraining(userText) {
     }
 }
 
-function _submitStartTraining(userText, sourceFiles, targetFile, ruleFiles,
+function _submitStartTraining(userText, sourceFiles, targetFiles, ruleFiles,
                               aiProvider, mode, salaryMonth, standardHours,
                               selectedSheets) {
     const formData = new FormData();
     formData.append('tenant_id', _currentTenantId);
+    formData.append('message', userText);
     if (_pendingScriptName) formData.append('script_name', _pendingScriptName);
     formData.append('ai_provider', aiProvider);
     formData.append('mode', mode);
@@ -1048,13 +1064,13 @@ function _submitStartTraining(userText, sourceFiles, targetFile, ruleFiles,
     if (Object.keys(_filePasswordsMap).length > 0) {
         formData.append('file_passwords', JSON.stringify(_filePasswordsMap));
     }
-    if (selectedSheets && selectedSheets.length > 0) {
+    if (selectedSheets && Object.keys(selectedSheets).length > 0) {
         formData.append('target_sheets', JSON.stringify(selectedSheets));
         console.log('[训练] target_sheets:', selectedSheets);
     }
     // 文件字段放在所有文本字段之后，避免 python-multipart 旧版本解析丢失后续字段
     Array.from(sourceFiles).forEach(f => formData.append('source_files', f));
-    if (targetFile) formData.append('target_file', targetFile);
+    targetFiles.forEach(file => formData.append('target_files', file));
     if (ruleFiles.length > 0) {
         Array.from(ruleFiles).forEach(f => formData.append('rule_files', f));
     }
@@ -1513,8 +1529,8 @@ function _showDownloadBar(sessionId, files) {
     const baseUrl = `/api/training/chat/sessions/${sessionId}/download`;
 
     const items = [
-        { type: 'output', label: '生成结果 (.xlsx)', icon: '📊' },
-        { type: 'diff', label: '差异对比 (.xlsx)', icon: '📋' },
+        { type: 'output', label: '生成结果（多文件为 ZIP）', icon: '📊' },
+        { type: 'diff', label: '差异对比（多文件为 ZIP）', icon: '📋' },
         { type: 'script', label: '脚本 (.py)', icon: '📄' },
     ];
 
@@ -1788,8 +1804,8 @@ function _showHistoryDownloadBar(sessionId, latestFiles, hasRules) {
     contentDiv.className = 'message-content download-buttons';
 
     const items = [
-        { type: 'output', label: '生成结果 (.xlsx)', icon: '\uD83D\uDCCA', has: latestFiles.output_file },
-        { type: 'diff', label: '差异对比 (.xlsx)', icon: '\uD83D\uDCCB', has: latestFiles.diff_file },
+        { type: 'output', label: '生成结果（多文件为 ZIP）', icon: '\uD83D\uDCCA', has: latestFiles.output_file },
+        { type: 'diff', label: '差异对比（多文件为 ZIP）', icon: '\uD83D\uDCCB', has: latestFiles.diff_file },
         { type: 'script', label: '脚本 (.py)', icon: '\uD83D\uDCC4', has: latestFiles.script_file },
     ];
 

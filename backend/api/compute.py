@@ -313,6 +313,28 @@ async def execute_compute(
             # 查找输出文件
             output_files = list(output_dir.glob("*.xlsx")) + list(output_dir.glob("*.xls"))
 
+            from backend.utils.multi_workbook import workbook_definitions, deliver_workbooks
+            if len(workbook_definitions(script.expected_structure)) > 1:
+                tenant_output_dir = PROJECT_ROOT / "tenants" / task.tenant_id / "assets" / "result"
+                delivery = await asyncio.to_thread(
+                    deliver_workbooks, output_dir, tenant_output_dir, script_code,
+                    script.expected_structure, task.tenant_id, script.name,
+                    task.salary_year, task.salary_month)
+                package = tenant_output_dir / delivery["output_file"]
+                db.add(DataAsset(tenant_id=task.tenant_id, asset_type="result",
+                    name=f"计算结果_{package.name}", file_path=str(package), file_name=package.name,
+                    file_size=package.stat().st_size, source_task_id=task.id,
+                    uploaded_by=current_user.id, sheet_summary=[]))
+                delivery["saved_assets"] = [package.name]
+                delivery["execution_time"] = duration
+                task.status = "completed"
+                task.result_summary = delivery
+                task.duration_seconds = duration
+                task.finished_at = datetime.utcnow()
+                db.commit()
+                db.refresh(task)
+                return _task_to_dict(task)
+
             result_summary = {
                 "output_files": [f.name for f in output_files],
                 "execution_time": duration,

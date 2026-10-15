@@ -113,6 +113,15 @@ class FormulaCodeGenerator:
             if stream_callback:
                 stream_callback(msg)
 
+        from backend.utils.multi_workbook import workbook_definitions, generate_workbooks
+        if len(workbook_definitions(expected_structure)) > 1:
+            return generate_workbooks(self, dict(
+                input_folder=input_folder, rules_content=rules_content,
+                expected_structure=expected_structure, manual_headers=manual_headers,
+                stream_callback=stream_callback, thinking_callback=thinking_callback,
+                multi_sheet_source=multi_sheet_source, analysis=analysis,
+                skip_load=skip_load, use_history=use_history))
+
         log("=== 公式模式：开始生成代码 ===")
         self.last_prompt = None  # 记录实际提示词，供调用方获取
         self._multi_sheet_source = multi_sheet_source  # 记录给 _build_complete_code 使用
@@ -123,7 +132,8 @@ class FormulaCodeGenerator:
         # 1. 加载源数据获取结构信息
         if not skip_load:
             log("步骤1: 分析源数据结构...")
-            _reserved_sheets = set((expected_structure or {}).get("sheets", {}).keys())
+            _reserved_sheets = set((expected_structure or {}).get("reserved_source_sheet_names")
+                                   or (expected_structure or {}).get("sheets", {}).keys())
             source_info = self.formula_builder.load_source_data(input_folder, manual_headers,
                                                                  multi_sheet_source=multi_sheet_source,
                                                                  reserved_sheet_names=_reserved_sheets)
@@ -2339,7 +2349,8 @@ def main():
         # 替换 __RESERVED_SHEETS__ 占位符（结果 sheet 名集合，供脚本判定与源 sheet 同名情形）
         # 顺序保留 expected_structure 中 sheets 的插入序，运行时按此顺序重排结果 sheet
         _exp_struct = getattr(self, "_expected_structure", None) or {}
-        _reserved_names = list((_exp_struct.get("sheets", {}) or {}).keys())
+        _reserved_names = list(_exp_struct.get("reserved_source_sheet_names")
+                               or (_exp_struct.get("sheets", {}) or {}).keys())
         import json as _json_rs
         complete_code = complete_code.replace(
             "__RESERVED_SHEETS__", _json_rs.dumps(_reserved_names, ensure_ascii=False)
@@ -2697,6 +2708,14 @@ def main():
             logger.info(msg)
             if stream_callback:
                 stream_callback(msg)
+
+        from backend.utils.multi_workbook import script_targets, correct_workbooks
+        if script_targets(original_code):
+            return correct_workbooks(self, dict(
+                original_code=original_code, comparison_result=comparison_result,
+                rules_content=rules_content, source_structure=source_structure,
+                stream_callback=stream_callback, thinking_callback=thinking_callback,
+                iteration_num=iteration_num))
 
         log("=== 开始修正公式模式代码 ===")
 

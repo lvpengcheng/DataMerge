@@ -2172,7 +2172,8 @@ function showResult(data) {
         ? data.output_files
         : (data.output_file ? [data.output_file] : []);
 
-    const _label = (fn) => fn && fn.includes('_纯值') ? '纯值版' : '原版';
+    const _label = (fn) => fn && fn.toLowerCase().endsWith('.zip') ? 'ZIP交付包'
+        : fn && fn.includes('_纯值') ? '纯值版' : '原版';
 
     resultCard.className = 'result-card result-success';
     const _valWarn = data.values_copy_failed

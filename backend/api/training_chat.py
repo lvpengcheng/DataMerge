@@ -118,6 +118,7 @@ def _prepare_training_uploads_subprocess(payload: dict) -> dict:
     """智训上传预处理子进程：解密、xls 转换和列去虚高，不计算公式。"""
     source_dir = Path(payload["source_dir"])
     expected_file = payload.get("expected_file")
+    expected_files = payload.get("expected_files") or ([expected_file] if expected_file else [])
     passwords = payload.get("passwords") or {}
 
     from backend.utils.aspose_helper import is_encrypted, decrypt_excel
@@ -126,8 +127,7 @@ def _prepare_training_uploads_subprocess(payload: dict) -> dict:
     files = [(str(p), p.name) for p in source_dir.iterdir()
              if p.is_file() and p.suffix.lower() in (".xlsx", ".xls", ".xlsm")
              and not p.name.startswith("~")]
-    if expected_file:
-        files.append((expected_file, Path(expected_file).name))
+    files.extend((path, Path(path).name) for path in expected_files)
 
     decrypt_failures = []
     for file_path, filename in files:
@@ -147,19 +147,19 @@ def _prepare_training_uploads_subprocess(payload: dict) -> dict:
     for p in list(source_dir.iterdir()):
         if p.is_file() and p.suffix.lower() == ".xls":
             convert_xls_to_xlsx(str(p))
-    if expected_file and expected_file.lower().endswith(".xls"):
-        expected_file = convert_xls_to_xlsx(expected_file)
+    expected_files = [convert_xls_to_xlsx(path) if path.lower().endswith(".xls") else path
+                      for path in expected_files]
+    expected_file = expected_files[0] if expected_files else None
 
     normalized_files = [(str(p), p.name) for p in source_dir.iterdir()
                         if p.is_file() and p.suffix.lower() in (".xlsx", ".xlsm")
                         and not p.name.startswith("~")]
-    if expected_file:
-        normalized_files.append((expected_file, Path(expected_file).name))
+    normalized_files.extend((path, Path(path).name) for path in expected_files)
     for file_path, _ in normalized_files:
         shrink_inflated_columns(file_path)
 
     # banner_splitter 会展平公式，上传阶段明确不执行。
-    return {"error_type": None, "expected_file": expected_file,
+    return {"error_type": None, "expected_file": expected_file, "expected_files": expected_files,
             "files": normalized_files}
 
 
@@ -468,6 +468,19 @@ def _analyze_expected_structure_impl(expected_file: str) -> Dict[str, Any]:
 
 def _analyze_expected_structure(expected_file: str) -> Dict[str, Any]:
     """分析预期文件结构（在【独立子进程】执行，防护同 _build_source_structure_from_dir）。"""
+    if isinstance(expected_file, (list, tuple)):
+        from backend.utils.multi_workbook import combine_structures
+        structures = {}
+        for path in expected_file:
+            name = Path(path).with_suffix(".xlsx").name
+            if name.casefold() in {key.casefold() for key in structures}:
+                raise ValueError(f"目标文件重名: {name}")
+            info = _analyze_expected_structure(path)
+            if info.get("error") or not info.get("sheets"):
+                raise ValueError(f"目标文件解析失败: {name}")
+            info["expected_file"] = str(path)
+            structures[name] = info
+        return combine_structures(structures)
     from backend.utils.subprocess_runner import run_in_subprocess, default_max_memory_mb, default_timeout
 
     r = run_in_subprocess(
@@ -809,6 +822,19 @@ def _persist_iteration_files(tenant_id: str, session_id: int, iteration_num: int
         script_path.write_text(code, encoding="utf-8", newline="")
         paths["script_file"] = str(script_path)
 
+        if len(run_result.get("output_files") or []) > 1:
+            from backend.utils.multi_workbook import create_zip
+            copied = []
+            for source in run_result["output_files"]:
+                destination = iter_dir / Path(source).name
+                shutil.copy2(source, destination)
+                copied.append(destination)
+            paths["output_file"] = str(create_zip(iter_dir / "交付结果.zip", copied))
+            diff_files = run_result.get("diff_files") or []
+            if diff_files:
+                paths["diff_file"] = str(create_zip(iter_dir / "差异对比.zip", diff_files))
+            return paths
+
         # 复制生成的 Excel
         output_dir = run_result.get("output_dir", "")
         if output_dir and os.path.isdir(output_dir):
@@ -930,6 +956,12 @@ def _run_single_iteration(
                 "output_dir": str(output_dir),
                 "execution_time": execution_time,
             }
+
+        from backend.utils.multi_workbook import workbook_definitions, validate_workbooks
+        if len(workbook_definitions(expected_structure)) > 1:
+            result = validate_workbooks(output_dir, code, expected_structure, rules_content, tenant_id)
+            result["execution_time"] = execution_time
+            return result
 
         # 查找输出文件（排除临时文件和对比文件）
         output_files = [
@@ -1451,6 +1483,7 @@ def get_session_assets(session_id: int, db: Session = Depends(get_db),
 async def update_session_assets(
     session_id: int, settings: str = Form('{}'), source_mode: str = Form('merge'),
     source_files: List[UploadFile] = File(default=[]), expected_result: UploadFile = File(None),
+    target_files: List[UploadFile] = File(default=[]),
     rule_files: List[UploadFile] = File(default=[]), file_passwords: str = Form('{}'),
     db: Session = Depends(get_db), current_user=Depends(get_current_user),
     accessible_tenants: list = Depends(get_operable_tenants),
@@ -1474,7 +1507,7 @@ async def update_session_assets(
     uploads = {'source': [], 'expected': [], 'rules': []}
     update_task = None
     try:
-        for category, files in [('source', source_files), ('expected', [expected_result] if expected_result else []), ('rules', rule_files)]:
+        for category, files in [('source', source_files), ('expected', target_files or ([expected_result] if expected_result else [])), ('rules', rule_files)]:
             folder = staging / category
             folder.mkdir()
             names = set()
@@ -1554,7 +1587,9 @@ async def start_training(
     source_files: List[UploadFile] = File(...),
     expected_result: UploadFile = File(None),
     target_file: UploadFile = File(None),
+    target_files: List[UploadFile] = File(default=[]),
     rule_files: List[UploadFile] = File(default=[]),
+    message: str = Form(""),
     ai_provider: str = Form("deepseek"),
     mode: str = Form("formula"),
     salary_year_month: Optional[str] = Form(None),
@@ -1597,11 +1632,21 @@ async def start_training(
         filename = safe_upload_name(f.filename, f"source_{index + 1}.xlsx")
         await save_upload_file(f, os.path.join(source_dir, filename))
 
-    expected_file = None
-    ef = expected_result or target_file
-    if ef:
-        expected_file = os.path.join(work_dir, safe_upload_name(ef.filename, "expected.xlsx"))
-        await save_upload_file(ef, expected_file)
+    expected_files = []
+    uploads = target_files or ([expected_result or target_file] if expected_result or target_file else [])
+    seen_names = set()
+    for ef in uploads:
+        name = safe_upload_name(ef.filename, "expected.xlsx")
+        normalized_name = Path(name).with_suffix(".xlsx").name.casefold()
+        if normalized_name in seen_names:
+            raise HTTPException(status_code=400, detail=f"目标文件重名: {name}")
+        seen_names.add(normalized_name)
+        path = os.path.join(work_dir, name)
+        await save_upload_file(ef, path)
+        expected_files.append(path)
+    expected_file = expected_files[0] if expected_files else None
+    if len(expected_files) > 1 and mode not in ("formula", "template"):
+        raise HTTPException(status_code=400, detail="多目标文件目前支持公式模式和模板模式")
 
     # 解析密码并解密加密文件
     passwords = {}
@@ -1632,6 +1677,10 @@ async def start_training(
             if isinstance(_ts, list):
                 _parsed_target_sheets = [str(x).strip() for x in _ts if str(x).strip()]
                 logger.info(f"[chat训练] 用户勾选 target_sheets: {_parsed_target_sheets}")
+            elif isinstance(_ts, dict):
+                _parsed_target_sheets = {
+                    str(name): [str(x) for x in sheets] for name, sheets in _ts.items()
+                    if isinstance(sheets, list)}
         except Exception:
             logger.warning(f"target_sheets JSON 解析失败: {target_sheets}")
 
@@ -1686,6 +1735,12 @@ async def start_training(
                     _emit({"type": "error", "message": "会话不存在"})
                     return
                 ts.status = "running"
+                expected_struct_dict = _analyze_expected_structure(
+                    expected_files if len(expected_files) > 1 else expected_file) if expected_file else {}
+                updated_config = dict(ts.config or {})
+                updated_config.update(expected_file=expected_file, expected_files=expected_files,
+                                      expected_structure=expected_struct_dict)
+                ts.config = updated_config
                 db.commit()
             else:
                 session_key = f"{tenant_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -1703,13 +1758,17 @@ async def start_training(
                 try:
                     if expected_file:
                         _emit({"type": "status", "message": "正在分析文件结构..."})
-                        expected_struct_dict = _analyze_expected_structure(expected_file)
+                        expected_struct_dict = _analyze_expected_structure(
+                            expected_files if len(expected_files) > 1 else expected_file)
                 except Exception as e:
                     logger.warning(f"预期文件结构分析失败: {e}")
+                    if len(expected_files) > 1:
+                        raise
 
                 config = {
                     "source_dir": source_dir,
                     "expected_file": expected_file,
+                    "expected_files": expected_files,
                     "work_dir": work_dir,
                     "rules_content": rules_content[:70000],
                     "expected_structure": expected_struct_dict,
@@ -1827,6 +1886,25 @@ async def start_training(
                 if p_template:
                     _cfg["template_path"] = p_template
                     _cfg["mode"] = "template"
+                if len(expected_files) > 1:
+                    from backend.utils.multi_workbook import combine_structures
+                    definitions = {}
+                    persistent_targets = []
+                    for path in expected_files:
+                        dest = session_persist_dir / Path(path).name
+                        if Path(path).resolve() != dest.resolve():
+                            shutil.copy2(path, dest)
+                        persistent_targets.append(str(dest))
+                        name = dest.with_suffix(".xlsx").name
+                        info = dict(expected_struct_dict["workbooks"][name])
+                        info["expected_file"] = str(dest)
+                        if mode == "template":
+                            tpl = templates_dir / f"{sid}_{dest.name}"
+                            shutil.copy2(dest, tpl)
+                            info["template_path"] = str(tpl)
+                        definitions[name] = info
+                    _cfg["expected_files"] = persistent_targets
+                    _cfg["expected_structure"] = combine_structures(definitions)
                 ts.config = _cfg
                 from sqlalchemy.orm.attributes import flag_modified
                 flag_modified(ts, "config")
@@ -1835,6 +1913,8 @@ async def start_training(
                 config = dict(_cfg)  # 后续迭代提交不能把持久化路径覆盖回即将清理的临时目录。
             except Exception as e:
                 logger.warning(f"持久化训练文件失败: {e}")
+                if len(expected_files) > 1:
+                    raise RuntimeError("多目标文件持久化失败，已停止训练，避免保存失效模板路径") from e
 
             # 添加系统消息
             _add_message(db, sid, "system", "训练开始，正在生成代码...", "status",
@@ -2268,7 +2348,7 @@ def main(source_dir, output_dir, **kwargs):
 
     async def _prepare_then_train():
         """SSE 已建立后再排队预处理；等待期间客户端持续收到状态/心跳，不再被代理判 504。"""
-        nonlocal expected_file, all_excel_files, rules_content
+        nonlocal expected_file, expected_files, all_excel_files, rules_content
         from ..utils.subprocess_runner import run_in_fresh_subprocess_async
         try:
             _emit({"type": "status", "message": "文件已接收，正在等待 Excel 预处理队列..."})
@@ -2278,6 +2358,7 @@ def main(source_dir, output_dir, **kwargs):
                 prepared = await run_in_fresh_subprocess_async(
                     "backend.api.training_chat:_prepare_training_uploads_subprocess",
                     args=({"source_dir": source_dir, "expected_file": expected_file,
+                           "expected_files": expected_files,
                            "passwords": passwords, "mode": mode},),
                     timeout=int(os.getenv("TRAINING_UPLOAD_TIMEOUT", "600")),
                     max_memory_mb=int(os.getenv("TRAINING_UPLOAD_MAX_MEMORY_MB", "1536")),
@@ -2291,6 +2372,7 @@ def main(source_dir, output_dir, **kwargs):
                 names = ", ".join(prepared_data.get("files") or [])
                 raise RuntimeError(f"以下文件未正确解密: {names}")
             expected_file = prepared_data.get("expected_file") or expected_file
+            expected_files = prepared_data.get("expected_files") or expected_files
             all_excel_files = prepared_data.get("files") or []
 
             if saved_rule_paths:
@@ -2308,6 +2390,9 @@ def main(source_dir, output_dir, **kwargs):
                 if not parsed_rules.success:
                     raise RuntimeError(f"智训规则附件解析失败: {parsed_rules.error}")
                 rules_content = parsed_rules.result or ""
+
+            if message.strip():
+                rules_content = (rules_content + "\n\n" + message.strip()).strip()
 
             _emit({"type": "status", "message": "预处理完成，智训已进入并发执行队列..."})
             await _run_training_serialized(_run_first_iteration, _emit)
@@ -2604,7 +2689,12 @@ async def send_message(
             _emit({"type": "status", "message": "AI 正在基于最新文件精确修改读取、清洗、组装或公式及必要调用点..."})
             logger.info(f"[chat修正] {_cur_mode} 模式：尝试精确编辑（结构化替换）")
             try:
-                if _cur_mode == "template":
+                from backend.utils.multi_workbook import script_targets, precise_edit_workbooks
+                if script_targets(original_code):
+                    code = precise_edit_workbooks(provider, original_code, message,
+                        extra_context=_history_context + _input_context + "\n" + (rules or ""),
+                        stream_callback=stream_cb, thinking_callback=thinking_cb, reason_sink=_edit_reasons)
+                elif _cur_mode == "template":
                     # 模板模式：对整份脚本精确编辑（可改 fill_template 与 _append_source_sheets 等骨架逻辑）
                     code = generator.generate_precise_edit(
                         original_code=original_code,
@@ -3057,6 +3147,7 @@ async def send_message(
                     multi_sheet_source=config.get("multi_sheet_source", False),
                     use_history=config.get("use_history", False),
                     expected_structure=expected_struct,
+                    target_sheets=config.get("target_sheets"),
                 )
             elif _is_auto_mode:
                 _emit({"type": "status", "message": "AI 正在生成代码（自动模式 — 自由设计）..."})
@@ -3794,10 +3885,18 @@ def download_iteration_file(
                 for f in iter_dir.iterdir():
                     if f.name == "script.py":
                         files["script_file"] = str(f)
+                    elif f.name == "交付结果.zip":
+                        files["output_file"] = str(f)
+                    elif f.name == "差异对比.zip":
+                        files["diff_file"] = str(f)
                     elif ("diff" in f.name.lower() or "差异对比" in f.name) and f.suffix in (".xlsx", ".xls"):
                         files["diff_file"] = str(f)
                     elif f.suffix in (".xlsx", ".xls") and not f.name.startswith("~"):
                         files.setdefault("output_file", str(f))
+                # The package wins regardless of directory iteration order.
+                for key, name in (("output_file", "交付结果.zip"), ("diff_file", "差异对比.zip")):
+                    if (iter_dir / name).is_file():
+                        files[key] = str(iter_dir / name)
         except Exception:
             pass
     if not files:
@@ -3831,6 +3930,10 @@ def download_iteration_file(
 
     if not file_path or not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail=f"文件不存在: {file_type}")
+
+    if Path(file_path).suffix.lower() == ".zip":
+        media_type = "application/zip"
+        filename = str(Path(filename).with_suffix(".zip"))
 
     # no-store: 下载 URL 不带迭代号（同一 URL 每轮指向不同文件），禁缓存防浏览器/代理返回旧结果
     return FileResponse(
@@ -4001,7 +4104,8 @@ def download_original_file(
         return FileResponse(file_path, filename=os.path.basename(file_path), headers=_NO_STORE_HEADERS)
 
     elif file_category == "expected":
-        file_path = config.get("expected_file", "")
+        candidates = config.get("expected_files") or [config.get("expected_file", "")]
+        file_path = next((path for path in candidates if not filename or Path(path).name == filename), "")
         if not file_path or not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail="预期文件不存在")
         return FileResponse(file_path, filename=os.path.basename(file_path), headers=_NO_STORE_HEADERS)

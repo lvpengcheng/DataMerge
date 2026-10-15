@@ -42,6 +42,9 @@ def _md5(path):
 
 def extract_template_ref(script_code):
     """从脚本源码抠出 (TEMPLATE_NAME, TEMPLATE_HASH, TEMPLATE_PATH)；缺名则用路径文件名兜底。"""
+    # Each child of a multi-workbook script resolves its own template.
+    if script_code and "MULTI_WORKBOOK_SCRIPTS = " in script_code:
+        return None, None, None
     name = hsh = baked = None
     if script_code:
         m = _NAME_RE.search(script_code); name = m.group(2) if m else None

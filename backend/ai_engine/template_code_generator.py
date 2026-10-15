@@ -74,6 +74,15 @@ class TemplateCodeGenerator:
             if stream_callback:
                 stream_callback(msg)
 
+        from backend.utils.multi_workbook import workbook_definitions, generate_workbooks
+        if len(workbook_definitions(expected_structure)) > 1:
+            return generate_workbooks(self, dict(
+                input_folder=input_folder, rules_content=rules_content,
+                expected_structure=expected_structure, template_path=template_path,
+                manual_headers=manual_headers, stream_callback=stream_callback,
+                thinking_callback=thinking_callback, multi_sheet_source=multi_sheet_source,
+                use_history=use_history, target_sheets=target_sheets))
+
         log("=== 模板填充模式：开始生成代码 ===")
 
         if not template_path or not os.path.exists(template_path):
@@ -102,7 +111,8 @@ class TemplateCodeGenerator:
         log("步骤3: 构造 AI prompt...")
         # 源 sheet 命名的 reserved 集合：与智算 fast_header_matcher 完全一致地取
         # expected_structure["sheets"]；缺省才退化为模板自身 sheet 名。
-        _reserved_names = set((expected_structure or {}).get("sheets", {}).keys()) or None
+        _reserved_names = set((expected_structure or {}).get("reserved_source_sheet_names")
+                              or (expected_structure or {}).get("sheets", {}).keys()) or None
         prompt = self._build_prompt(rules_content, template_struct, source_struct, use_history,
                                     reserved_names=_reserved_names)
         self.last_prompt = prompt
@@ -1654,6 +1664,14 @@ if __name__ == "__main__":
             logger.info(msg)
             if stream_callback:
                 stream_callback(msg)
+
+        from backend.utils.multi_workbook import script_targets, correct_workbooks
+        if script_targets(original_code):
+            return correct_workbooks(self, dict(
+                original_code=original_code, comparison_result=comparison_result,
+                rules_content=rules_content, source_structure=source_structure,
+                stream_callback=stream_callback, thinking_callback=thinking_callback,
+                iteration_num=iteration_num))
 
         log("=== 模板填充模式：开始差异修正 ===")
 

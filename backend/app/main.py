@@ -4398,6 +4398,8 @@ def _rename_xlsx_sheets(path: str, name_map: dict) -> bool:
 
 def _extract_template_path(script_content: str):
     """从脚本里提取 TEMPLATE_PATH 常量值（训练模板的绝对路径）。"""
+    if "MULTI_WORKBOOK_SCRIPTS = " in (script_content or ""):
+        return None
     import re as _re
     m = _re.search(r"TEMPLATE_PATH\s*=\s*(['\"])(.+?)\1", script_content)
     return m.group(2) if m else None
@@ -4710,6 +4712,10 @@ async def run_compute_task(
         db_session = SessionLocal()
         compute_task_id = int(task_id)
         compute_start_time = datetime.now()
+
+        from backend.utils.multi_workbook import workbook_definitions
+        if len(workbook_definitions(expected_structure)) > 1 and template_override_path:
+            raise ValueError("多目标脚本分别复用智训中保存的模板，不支持用一个新模板覆盖多个文件；请在智训会话更新对应目标后重新生成")
 
         # 旧脚本里 baked 的训练模板可能是 .xls（模板模式骨架用 openpyxl 加载，不支持 .xls）。
         # 若未上传新模板且训练模板是 .xls，则转成 .xlsx 并作为 override 注入，救活旧脚本。
@@ -5428,6 +5434,39 @@ async def run_compute_task(
         output_files = list(output_dir.glob("*.xlsx"))
         if not output_files:
             raise Exception("未生成输出文件")
+
+        from backend.utils.multi_workbook import workbook_definitions, deliver_workbooks
+        if len(workbook_definitions(expected_structure)) > 1:
+            tenant_dir = storage_manager.get_tenant_dir(tenant_id)
+            compute_dir = tenant_dir / "compute_results"
+            buffer.push(task_id, json.dumps({"type": "log", "level": "info",
+                "message": f"正在逐文件处理 {len(workbook_definitions(expected_structure))} 个结果并生成 ZIP 交付包"},
+                ensure_ascii=False))
+            delivery = await asyncio.to_thread(
+                deliver_workbooks, output_dir, compute_dir, script_content, expected_structure,
+                tenant_id, _resolve_script_display_name(tenant_id, script_id, script_content),
+                salary_year, salary_month)
+            package = compute_dir / delivery["output_file"]
+            if db_session:
+                _persist_result_file(db_session, compute_task_id, tenant_id, package, package.name,
+                                     sheet_summary=[])
+            try:
+                from backend.utils.compute_run_archive import finalize_compute_run
+                archived_run_dir = await asyncio.to_thread(
+                    finalize_compute_run, temp_dir, storage_manager, tenant_id, task_id,
+                    status="completed", script_id=script_id, extra={"result_file": package.name,
+                        "output_files": delivery["business_files"], "rows_processed": delivery["rows_processed"]})
+            except Exception as archive_error:
+                logger.warning("多文件计算归档失败（不影响结果）: %s", archive_error)
+            delivery.update(tenant_id=tenant_id, script_id=script_id,
+                            archive_dir=str(archived_run_dir) if archived_run_dir else None)
+            if db_session:
+                duration = (datetime.now() - compute_start_time).total_seconds() if compute_start_time else 0
+                _persist_compute_complete(db_session, compute_task_id, duration, delivery)
+            compute_succeeded = True
+            buffer.push(task_id, json.dumps({"type": "complete", "success": True, "data": delivery},
+                                            ensure_ascii=False))
+            return
 
         # 选出真实结果：有的定制骨架会把模板原样副本也留在输出目录（详见 _pick_result_output），
         # 若误取到那份副本，用户下载到的就是空模板。此处剔除模板副本 + 取最新，收窄到真实结果，
@@ -7538,7 +7577,8 @@ async def download_compute_result(tenant_id: str, filename: str):
         return FileResponse(
             path=str(file_path),
             filename=filename,
-            media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            media_type=('application/zip' if file_path.suffix.lower() == '.zip' else
+                        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
         )
     except Exception as e:
         logger.error(f"下载计算结果失败: {e}")

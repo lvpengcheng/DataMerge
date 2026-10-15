@@ -50,6 +50,26 @@ def resolve_asset_config(config, session_root):
         candidate = root.joinpath(*parts[parts.index('revisions'):]) if 'revisions' in parts else root / 'rule_files'
         if candidate.is_dir():
             cfg['rule_files_dir'] = str(candidate)
+    if cfg.get('expected_files'):
+        import copy
+        definitions = copy.deepcopy((cfg.get('expected_structure') or {}).get('workbooks') or {})
+        paths = []
+        for original in cfg['expected_files']:
+            parts = PureWindowsPath(str(original)).parts
+            candidates = [Path(original), root / basename(original), root / 'expected' / basename(original)]
+            if 'revisions' in parts:
+                candidates.append(root.joinpath(*parts[parts.index('revisions'):]))
+            found = next((str(path) for path in candidates if path.is_file()), original)
+            paths.append(found)
+            name = Path(basename(original)).with_suffix('.xlsx').name
+            if name in definitions:
+                definitions[name]['expected_file'] = found
+                if cfg.get('mode') == 'template':
+                    definitions[name]['template_path'] = found
+        cfg['expected_files'] = paths
+        if definitions:
+            from backend.utils.multi_workbook import combine_structures
+            cfg['expected_structure'] = combine_structures(definitions)
     return cfg
 
 
@@ -61,6 +81,8 @@ def asset_manifest(config, session_root):
     return {
         'source_file_names': [p.name for p in excel_files(cfg.get('source_dir'))],
         'expected_file_name': basename(expected) if expected and Path(expected).is_file() else None,
+        'expected_file_names': [basename(path) for path in (cfg.get('expected_files') or ([expected] if expected else []))
+                                if Path(path).is_file()],
         'rule_file_names': rules,
         'settings': {key: cfg.get(key) for key in PUBLIC_SETTINGS},
         'input_revision': cfg.get('input_revision'),
@@ -127,9 +149,17 @@ def stage_revision(config, session_root, uploads, settings, source_mode='merge')
     if uploads.get('expected'):
         target = revision / 'expected'
         target.mkdir()
-        path = Path(uploads['expected'][0])
-        shutil.copy2(path, target / path.name)
-        cfg['expected_file'] = str(target / path.name)
+        paths = []
+        seen = set()
+        for source in uploads['expected']:
+            path = Path(source)
+            if path.stem.casefold() in seen:
+                raise ValueError(f'目标文件重名: {path.name}')
+            seen.add(path.stem.casefold())
+            shutil.copy2(path, target / path.name)
+            paths.append(str(target / path.name))
+        cfg['expected_files'] = paths
+        cfg['expected_file'] = paths[0]
         cfg.pop('target_sheets', None)  # Sheet selections belonged to the previous workbook.
     if uploads.get('rules'):
         cfg.setdefault('rule_base_content', cfg.get('rules_content', '') if not cfg.get('rule_files_dir') else '')
@@ -162,11 +192,13 @@ def prepare_revision(config, revision_path, changed_categories):
         result = _prepare_training_uploads_subprocess({
             'source_dir': str(source),
             'expected_file': cfg.get('expected_file') if 'expected' in changed_categories else None,
+            'expected_files': cfg.get('expected_files') if 'expected' in changed_categories else None,
             'passwords': cfg.get('file_passwords') or {}, 'mode': cfg.get('mode')})
         if result.get('error_type'):
             raise ValueError(f"文件需要有效密码: {result.get('files')}")
         if 'expected' in changed_categories:
             cfg['expected_file'] = result['expected_file']
+            cfg['expected_files'] = result.get('expected_files') or [result['expected_file']]
     has_sources = bool(excel_files(cfg.get('source_dir')))
     sources = (_build_source_structure_from_dir_impl(cfg.get('source_dir', ''),
         cfg.get('manual_headers'), cfg.get('multi_sheet_source', False)) if has_sources
@@ -175,12 +207,27 @@ def prepare_revision(config, revision_path, changed_categories):
                                              for v in sources.get('files', {}).values())):
         raise ValueError('源文件结构解析失败，请检查文件、密码及手动表头')
     expected = cfg.get('expected_file')
-    if expected and Path(expected).is_file():
+    expected_files = cfg.get('expected_files') or []
+    if expected and Path(expected).is_file() and len(expected_files) <= 1:
         cfg['expected_structure'] = _analyze_expected_structure_impl(expected)
         if not any(sheet.get('headers') for sheet in cfg['expected_structure'].get('sheets', {}).values()):
             raise ValueError('目标文件没有可识别的数据区域')
     if cfg.get('mode') == 'template':
         cfg['template_path'] = expected
+    if len(expected_files) > 1:
+        from backend.utils.multi_workbook import combine_structures
+        if cfg.get('mode') not in ('formula', 'template'):
+            raise ValueError('多目标文件目前支持公式模式和模板模式')
+        definitions = {}
+        for path in expected_files:
+            info = _analyze_expected_structure_impl(path)
+            if not info.get('sheets') or info.get('error'):
+                raise ValueError(f'目标文件解析失败: {basename(path)}')
+            info['expected_file'] = path
+            if cfg.get('mode') == 'template':
+                info['template_path'] = path
+            definitions[Path(path).with_suffix('.xlsx').name] = info
+        cfg['expected_structure'] = combine_structures(definitions)
     if 'rules' in changed_categories:
         from backend.ai_engine.document_parser import get_document_parser
         parts = [cfg.get('rule_base_content', '')]
