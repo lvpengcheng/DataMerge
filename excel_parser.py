@@ -3363,6 +3363,10 @@ class IntelligentExcelParser:
             return "time"
         if IntelligentExcelParser._fmt_is_clear_date(number_id, c):
             return "datetime" if any(x in low for x in ("h", "ss", "am/pm")) else "date"
+        # 格式分类需识别 mm/dd/yy 等短年份格式；是否按日期读取仍由列 schema 决定。
+        from openpyxl.styles.numbers import is_date_format
+        if is_date_format(c):
+            return "date"
         if "%" in c:
             return "percentage"
         no_locale = re.sub(r"\[\$-[^\]]+\]", "", c)
@@ -3393,15 +3397,16 @@ class IntelligentExcelParser:
                 style = cell.GetStyle()
                 number_id = int(style.Number or 0)
                 code = str(style.Custom or "").strip()
+                is_builtin = not code or BUILTIN_FORMATS.get(number_id) == code
                 if not code:
                     # 内置格式的 Custom 为空，必须从编号恢复格式码，不能直接当作 General。
                     code = BUILTIN_FORMATS.get(number_id)
                     if code is None:
                         # 部分地区专用日期/时间编号没有通用格式码，使用稳定的标准格式。
-                        code = ("yyyy-mm-dd" if number_id in self._DATE_BUILTIN_FMT_IDS
+                        code = str(style.CultureCustom or "").strip() or ("yyyy-mm-dd" if number_id in self._DATE_BUILTIN_FMT_IDS
                                 else "h:mm:ss" if number_id in self._TIME_BUILTIN_FMT_IDS
                                 else "General")
-                key = (number_id, code)
+                key = (number_id, code, is_builtin)
                 value = cell.Value
                 # 空模板数据格仍可能预设 @/日期/金额格式；非 General 样式必须纳入字段定义。
                 if ((value is not None and str(value).strip() != "")
@@ -3430,11 +3435,12 @@ class IntelligentExcelParser:
                 continue
 
         if formats:
-            _, (number_id, raw_format) = max(formats.values(), key=lambda item: item[0])
+            _, (number_id, raw_format, is_builtin) = max(formats.values(), key=lambda item: item[0])
         else:
-            number_id, raw_format = 0, "General"
+            number_id, raw_format, is_builtin = 0, "General", True
         format_type = self._format_type(number_id, raw_format)
-        clean_format = self._clean_number_format(raw_format) or "General"
+        clean_format = (raw_format if format_type in ("date", "datetime", "time")
+                        else self._clean_number_format(raw_format)) or "General"
 
         header_name = str(header or "").strip().lower()
         numeric_header = any(k in header_name for k in (
@@ -3489,10 +3495,17 @@ class IntelligentExcelParser:
                 "integer", "decimal", "percentage", "currency", "date", "datetime", "time"):
             format_type, clean_format = "text", "@"
 
+        if clean_format != raw_format:
+            from openpyxl.styles.numbers import BUILTIN_FORMATS_REVERSE
+            number_id = BUILTIN_FORMATS_REVERSE.get(clean_format)
+            is_builtin = number_id is not None
+
         return {
             "field_type": field_type,
             "format_type": format_type,
             "number_format": clean_format,
+            "number_format_id": number_id,
+            "is_builtin_format": is_builtin,
             "sample_count": sampled,
             "inference": reason,
         }

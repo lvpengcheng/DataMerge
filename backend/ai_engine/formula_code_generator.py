@@ -1803,6 +1803,7 @@ def write_cell(ws, row, column, value, number_format=None):
 
 def apply_target_column_schemas(wb):
     """非模板输出：按目标 Excel 的解析定义固定列格式及直接写入值类型。"""
+    from backend.utils.column_formats import apply_openpyxl_column_format
     for sheet_name, schemas in (_TARGET_COLUMN_SCHEMAS or {}).items():
         if sheet_name not in wb.sheetnames or not schemas:
             continue
@@ -1813,14 +1814,13 @@ def apply_target_column_schemas(wb):
             if not ci:
                 continue
             field_type = (schema or {}).get("field_type")
-            number_format = (schema or {}).get("number_format") or "General"
             for ri in range(2, ws.max_row + 1):
                 cell = ws.cell(ri, ci)
                 if field_type == "text" and cell.value is not None and not (
                         isinstance(cell.value, str) and cell.value.startswith("=")):
                     cell.value = str(cell.value)
                     cell.data_type = "s"
-                cell.number_format = number_format
+                apply_openpyxl_column_format(cell, schema, cell.number_format)
 
 
 def convert_region_to_dataframe(region) -> pd.DataFrame:

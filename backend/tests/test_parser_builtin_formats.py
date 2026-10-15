@@ -17,6 +17,9 @@ def test_builtin_and_custom_formats_survive_schema_sampling(tmp_path):
         ("备注", "example", "@", "text", "text"),
         ("金额", 12.5, "General", "decimal", "general"),
         ("日期", datetime(2026, 10, 14), "yyyy/m/d;@", "date", "date"),
+        ("结束", datetime(2026, 10, 14), "mm/dd/yy", "date", "date"),
+        ("开始", datetime(2026, 10, 14), "yyyy-mm-dd", "date", "date"),
+        ("时间戳", datetime(2026, 10, 14, 12, 30), "yyyy-mm-dd hh:mm:ss", "datetime", "datetime"),
     ]
     for column, (header, value, code, _, _) in enumerate(cases, 1):
         sheet.cell(1, column, header)
@@ -37,5 +40,6 @@ def test_builtin_and_custom_formats_survive_schema_sampling(tmp_path):
             assert schema["field_type"] == field_type
             assert schema["format_type"] == format_type
             assert schema["number_format"] == code
+            assert schema["is_builtin_format"] == (code in openpyxl.styles.numbers.BUILTIN_FORMATS_REVERSE)
     finally:
         source.Dispose()

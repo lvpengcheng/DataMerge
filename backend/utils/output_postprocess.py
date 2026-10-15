@@ -11,8 +11,12 @@ import os
 import re
 import time
 import logging
+from copy import copy
 from contextvars import ContextVar
 from datetime import datetime
+from backend.utils.column_formats import (
+    resolve_column_format, apply_aspose_column_format, apply_openpyxl_column_format,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,9 +83,9 @@ def apply_expected_column_schemas(output_path, expected_structure) -> int:
                 if not ci:
                     continue
                 field_type = (schema or {}).get("field_type")
-                number_format = (schema or {}).get("number_format") or "General"
                 for ri in range(header_row + 1, ws.max_row + 1):
                     cell = ws.cell(ri, ci)
+                    number_format = resolve_column_format(schema, cell.number_format)
                     value = cell.value
                     is_formula = isinstance(value, str) and value.startswith("=")
                     if value is not None and not is_formula:
@@ -107,8 +111,9 @@ def apply_expected_column_schemas(output_path, expected_structure) -> int:
                                 changed += 1
                             except Exception:
                                 pass
-                    if cell.number_format != number_format:
-                        cell.number_format = number_format
+                    previous_style = copy(cell._style)
+                    apply_openpyxl_column_format(cell, schema, number_format)
+                    if cell._style != previous_style:
                         changed += 1
         if changed:
             wb.save(str(output_path))
@@ -255,7 +260,12 @@ def _apply_expected_schemas_in_workbook(wb, structure):
                         except ValueError:
                             pass
                 style = cell.GetStyle()
-                style.Custom = schema.get("number_format") or "General"
+                effective_schema = dict(schema)
+                effective_schema["number_format"] = resolve_column_format(
+                    schema, str(style.Custom or style.CultureCustom or "General"))
+                if effective_schema["number_format"] != schema.get("number_format"):
+                    effective_schema["is_builtin_format"] = False
+                apply_aspose_column_format(style, effective_schema)
                 cell.SetStyle(style)
 
 

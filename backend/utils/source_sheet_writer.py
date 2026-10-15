@@ -116,8 +116,8 @@ def write_source_dataframe(ws, df, column_schemas=None, column_formats=None, hea
     """一次遍历写源表；固定列策略，避免反复 ws['A'] 扫描整个工作表计算边界。"""
     import pandas as pd
     from openpyxl.styles import Font
-    from openpyxl.styles.numbers import is_date_format
     from backend.utils.data_helpers import _schema_text_value
+    from backend.utils.column_formats import resolve_column_format, apply_openpyxl_column_format
 
     schemas, formats = column_schemas or {}, column_formats or {}
     policies = []
@@ -125,12 +125,11 @@ def write_source_dataframe(ws, df, column_schemas=None, column_formats=None, hea
         schema = schemas.get(name) or {}
         kind = schema.get('field_type')
         is_date = kind in ('date', 'datetime') or is_date_keyword_column(name)
-        fmt = schema.get('number_format') or formats.get(name) or ('yyyy-mm-dd' if is_date else 'General')
-        if is_date and not is_date_format(fmt):
-            source_fmt = formats.get(name)
-            fmt = source_fmt if source_fmt and is_date_format(source_fmt) else (
-                'yyyy-mm-dd hh:mm:ss' if kind == 'datetime' else 'yyyy-mm-dd')
-        policies.append((kind, is_date, fmt))
+        format_schema = dict(schema)
+        if is_date and kind not in ('date', 'datetime'):
+            format_schema['field_type'] = 'date'
+        fmt = resolve_column_format(format_schema, formats.get(name))
+        policies.append((kind, is_date, fmt, format_schema))
     ws.append(list(df.columns))
     bold = Font(bold=True)
     for cell in ws[1]:
@@ -139,7 +138,7 @@ def write_source_dataframe(ws, df, column_schemas=None, column_formats=None, hea
             cell.fill = header_fill
             cell.font = bold
     for ri, row in enumerate(df.itertuples(index=False, name=None), 2):
-        for ci, (value, (kind, is_date, fmt)) in enumerate(zip(row, policies), 1):
+        for ci, (value, (kind, is_date, fmt, format_schema)) in enumerate(zip(row, policies), 1):
             if value is None or value is pd.NA or pd.isna(value):
                 value = None
             elif is_date:
@@ -149,7 +148,7 @@ def write_source_dataframe(ws, df, column_schemas=None, column_formats=None, hea
             elif isinstance(value, datetime):
                 value = dt_to_excel_serial(value)
             cell = ws.cell(ri, ci, value)
-            cell.number_format = fmt
+            apply_openpyxl_column_format(cell, format_schema, fmt)
             # 源数据的文本（包括 = 开头的说明）不得变成新增的可执行公式。
             if isinstance(value, str):
                 cell.data_type = 's'
