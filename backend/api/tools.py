@@ -2338,13 +2338,15 @@ def _sop_round_dir(entry_id: int, round_no: int) -> Path:
 def _sop_create_round(db, entry: SopEntry, source_files, result_file, rule_file) -> SopRound:
     if entry.status not in ("draft", "awaiting_files", "rejected", "ai_failed", "failed"):
         raise HTTPException(status_code=400, detail="当前状态不允许上传")
-    if not source_files or any(not f.filename for f in source_files):
-        raise HTTPException(status_code=400, detail="请至少上传一个源文件")
-    if not result_file or not result_file.filename or not rule_file or not rule_file.filename:
-        raise HTTPException(status_code=400, detail="结果表和规则文件必传")
-    for upload in [*source_files, result_file, rule_file]:
+    source_files = [f for f in (source_files or []) if f.filename]
+    result_file = result_file if result_file and result_file.filename else None
+    if not rule_file or not rule_file.filename:
+        raise HTTPException(status_code=400, detail="规则文件必传")
+    for upload in [*source_files, *([result_file] if result_file else [])]:
         if Path(upload.filename).suffix.lower() not in {".xlsx", ".xls"}:
-            raise HTTPException(status_code=400, detail="源文件、目标文件和规则文件仅支持 xlsx、xls 格式")
+            raise HTTPException(status_code=400, detail="源文件和目标文件仅支持 xlsx、xls 格式")
+    if Path(rule_file.filename).suffix.lower() not in {".xlsx", ".xls", ".txt", ".md", ".markdown", ".pdf", ".doc", ".docx"}:
+        raise HTTPException(status_code=400, detail="规则文件仅支持 xlsx、xls、txt、md、markdown、pdf、doc、docx 格式")
     entry_id = entry.id
     round_no = db.query(SopRound).filter(SopRound.sop_id == entry_id).count() + 1
     rdir = _sop_round_dir(entry_id, round_no)
@@ -2358,11 +2360,11 @@ def _sop_create_round(db, entry: SopEntry, source_files, result_file, rule_file)
         return str(dest), orig
 
     src_items = [save(f, "source", i) for i, f in enumerate(source_files)]
-    res_path, res_name = save(result_file, "result")
+    res_path, res_name = save(result_file, "result") if result_file else ("", "")
     rule_path, rule_name = save(rule_file, "rule")
     round = SopRound(
         sop_id=entry_id, round_no=round_no, status="ai_queued",
-        source_file_path=src_items[0][0], source_file_name=src_items[0][1],
+        source_file_path=src_items[0][0] if src_items else "", source_file_name=src_items[0][1] if src_items else "",
         source_file_paths=[p for p, _ in src_items], source_file_names=[n for _, n in src_items],
         result_file_path=res_path, result_file_name=res_name,
         rule_file_path=rule_path, rule_file_name=rule_name,
@@ -3013,8 +3015,8 @@ async def sop_entries_delete(entry_id: int, current_user=Depends(require_permiss
 @router.post("/sop/entries/{entry_id}/upload")
 async def sop_entries_upload(
     entry_id: int,
-    source_files: List[UploadFile] = File(...),
-    result_file: UploadFile = File(...),
+    source_files: List[UploadFile] = File(default=[]),
+    result_file: Optional[UploadFile] = File(default=None),
     rule_file: UploadFile = File(...),
     current_user=Depends(_require_sop_action("sop.upload")),
 ):
@@ -3076,8 +3078,8 @@ async def sop_resubmit_info(req: SopTokenRequest):
 
 @router.post("/sop/resubmit/upload")
 async def sop_resubmit_upload(
-    token: str = Form(...), source_files: List[UploadFile] = File(...),
-    result_file: UploadFile = File(...), rule_file: UploadFile = File(...),
+    token: str = Form(...), source_files: List[UploadFile] = File(default=[]),
+    result_file: Optional[UploadFile] = File(default=None), rule_file: UploadFile = File(...),
 ):
     """一次性免登录重传；不提供列表、详情或已有文件的访问能力。"""
     from sqlalchemy import update
@@ -3174,10 +3176,11 @@ def _sop_package_files(round):
     if legacy and not any(str(path or "").replace("\\", "/") == str(legacy).replace("\\", "/")
                           for path, _ in sources):
         sources.insert(0, (legacy, round.source_file_name))
-    if not sources:
-        sources = [(None, round.source_file_name or "未记录源文件")]
+    if not sources and round.source_file_name:
+        sources = [(None, round.source_file_name)]
     records = [("源文件", path, name, i + 1) for i, (path, name) in enumerate(sources)]
-    records.append(("结果表", round.result_file_path, round.result_file_name, None))
+    if round.result_file_path or round.result_file_name:
+        records.append(("结果表", round.result_file_path, round.result_file_name, None))
     # 旧版允许未提交规则文件；已记录的规则文件则必须完整打包。
     if round.rule_file_path or round.rule_file_name:
         records.append(("规则", round.rule_file_path, round.rule_file_name, None))
@@ -3497,7 +3500,7 @@ async def sop_rules_download(rule_id: int, current_user=Depends(require_permissi
 
 SOP_SYSTEM_PROMPT = """你是企业 SOP 合规审核专家。请严格依据给定的【大规则】，逐项核对用户提交的【源文件】、【结果文件】与【本轮规则文件】是否满足规则要求。
 要求：
-0. 逐列检查结果表：每一列都必须在规则文件中有明确规则及详细来源；缺失任一列的规则或来源即判定不通过，并在 issues 中列出列名。
+0. 源文件和结果文件允许不上传；未提交时只审核已提供的材料，不得推断未提供文件中的列或数据。若大规则明确要求提交某类材料，仍按大规则审核。提交了结果表时逐列检查：每一列都必须在规则文件中有明确规则及详细来源；缺失任一列的规则或来源即判定不通过，并在 issues 中列出列名。
 1. 只输出一个 JSON 对象，不要任何解释或 Markdown 代码块标记。
 2. JSON 结构：
 {
@@ -3591,7 +3594,7 @@ def _run_sop_ai_analysis(round_id: int, entry_id: int, job_id: int, claim_token:
         for i, p in enumerate(src_paths):
             src_parts.append(f"--- 源文件 {i + 1}: {os.path.basename(p)} ---\n{_sop_read_file(p)}")
         source_text = "\n\n".join(src_parts) if src_parts else "（无源文件）"
-        result_text = _sop_read_file(r.result_file_path)
+        result_text = _sop_read_file(r.result_file_path) if r.result_file_path else "（未上传目标文件）"
         rule_text = _sop_read_file(r.rule_file_path, max_chars=30000) if r.rule_file_path else None
         admin_rule_text = _sop_read_file(rule.file_path, max_chars=30000) if rule else "（无后台规则）"
 

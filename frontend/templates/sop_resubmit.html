@@ -19,10 +19,10 @@
     <p id="summary">正在验证链接...</p>
     <p id="message" role="alert"></p>
     <form id="resubmit-form" style="display:none;">
-        <label><span>源文件（可多选） <span style="color:#d32f2f;font-weight:700" aria-hidden="true">*</span></span><input type="file" name="source_files" multiple required accept=".xlsx,.xls"></label>
-        <label><span>目标文件（结果表） <span style="color:#d32f2f;font-weight:700" aria-hidden="true">*</span></span><input type="file" name="result_file" required accept=".xlsx,.xls"></label>
-        <label><span>规则文件 <span style="color:#d32f2f;font-weight:700" aria-hidden="true">*</span></span><input type="file" name="rule_file" required accept=".xlsx,.xls"></label>
-        <p>源文件和目标文件仅支持 xlsx、xls 格式；规则文件仅支持 xlsx、xls 格式。</p>
+        <label><span>源文件（可选，可多选）</span><input type="file" name="source_files" multiple accept=".xlsx,.xls"></label>
+        <label><span>目标文件（结果表，可选）</span><input type="file" name="result_file" accept=".xlsx,.xls"></label>
+        <label><span>规则文件 <span style="color:#d32f2f;font-weight:700" aria-hidden="true">*</span></span><input type="file" name="rule_file" required accept=".xlsx,.xls,.txt,.md,.markdown,.pdf,.doc,.docx"></label>
+        <p>源文件和目标文件仅支持 xlsx、xls 格式；规则文件支持 Excel、TXT、Markdown、PDF 和 Word。</p>
         <button class="btn btn-primary" type="submit">提交新版本</button>
     </form>
 </main>
@@ -51,10 +51,15 @@
         try {
             for (const input of form.querySelectorAll('input[type=file]')) {
                 for (const file of input.files) {
-                    if (!/\.(xlsx|xls)$/i.test(file.name)) throw new Error('源文件、目标文件和规则文件仅支持 xlsx、xls 格式');
+                    if (input.name === 'rule_file') {
+                        if (!/\.(xlsx|xls|txt|md|markdown|pdf|doc|docx)$/i.test(file.name)) throw new Error('规则文件仅支持 xlsx、xls、txt、md、markdown、pdf、doc、docx 格式');
+                    } else if (!/\.(xlsx|xls)$/i.test(file.name)) throw new Error('源文件和目标文件仅支持 xlsx、xls 格式');
                 }
             }
             const data = new FormData(form); data.append('token', token);
+            for (const name of ['source_files', 'result_file']) {
+                if (!form.querySelector(`input[name="${name}"]`).files.length) data.delete(name);
+            }
             const resp = await fetch('/api/tools/sop/resubmit/upload', {method:'POST', body:data});
             if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(err.detail || '提交失败'); }
             const result = await resp.json();

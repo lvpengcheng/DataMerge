@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fontconfig \
     libfreetype6 \
     libgdiplus \
+    antiword \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

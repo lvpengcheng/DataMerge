@@ -25,10 +25,12 @@ const SOP = {
         return p;
     },
     canSearchSalesperson() { return AUTH.isAdmin() || AUTH.hasPerm('sop.review') || AUTH.hasPerm('sop.report'); },
-    validateExcelFiles(form) {
+    validateUploadFiles(form) {
         for (const input of form.querySelectorAll('input[type=file]')) {
             for (const file of input.files) {
-                if (!/\.(xlsx|xls)$/i.test(file.name)) throw new Error('源文件、目标文件和规则文件仅支持 xlsx、xls 格式');
+                if (input.name === 'rule_file') {
+                    if (!/\.(xlsx|xls|txt|md|markdown|pdf|doc|docx)$/i.test(file.name)) throw new Error('规则文件仅支持 xlsx、xls、txt、md、markdown、pdf、doc、docx 格式');
+                } else if (!/\.(xlsx|xls)$/i.test(file.name)) throw new Error('源文件和目标文件仅支持 xlsx、xls 格式');
             }
         }
     },
@@ -150,10 +152,10 @@ const SOP = {
                     </div>
                     <input id="sop-customer-select" type="hidden">
                 </div>
-                <label><span>源文件（可多选） <span class="sop-required" aria-hidden="true">*</span></span><input type="file" name="source_files" multiple accept=".xlsx,.xls" required></label>
-                <label><span>目标文件（结果表） <span class="sop-required" aria-hidden="true">*</span></span><input type="file" name="result_file" accept=".xlsx,.xls" required></label>
-                <label><span>规则文件 <span class="sop-required" aria-hidden="true">*</span></span><input type="file" name="rule_file" accept=".xlsx,.xls" required></label>
-                <p class="sop-muted sop-full">源文件和目标文件仅支持 xlsx、xls 格式；规则文件仅支持 xlsx、xls 格式。</p>
+                <label><span>源文件（可选，可多选）</span><input type="file" name="source_files" multiple accept=".xlsx,.xls"></label>
+                <label><span>目标文件（结果表，可选）</span><input type="file" name="result_file" accept=".xlsx,.xls"></label>
+                <label><span>规则文件 <span class="sop-required" aria-hidden="true">*</span></span><input type="file" name="rule_file" accept=".xlsx,.xls,.txt,.md,.markdown,.pdf,.doc,.docx" required></label>
+                <p class="sop-muted sop-full">源文件和目标文件仅支持 xlsx、xls 格式；规则文件支持 Excel、TXT、Markdown、PDF 和 Word。</p>
                 <button class="btn btn-primary" type="submit">提交审核</button><p class="sop-error" id="sop-upload-error"></p>
             </form>`);
             const select = document.getElementById('sop-customer-select');
@@ -232,9 +234,13 @@ const SOP = {
                 const originalText = button.textContent;
                 button.textContent = '正在提交并处理初审，请稍候…';
                 try {
-                    this.validateExcelFiles(form);
+                    this.validateUploadFiles(form);
+                    const files = new FormData(form);
+                    for (const name of ['source_files', 'result_file']) {
+                        if (!form.querySelector(`input[name="${name}"]`).files.length) files.delete(name);
+                    }
                     const data = await (await this.request(`/api/tools/sop/entries/${id}/upload`,
-                        {method:'POST', body:new FormData(form)})).json();
+                        {method:'POST', body:files})).json();
                     this.close();
                     await this.load();
                     const feedback = data.status === 'ai_passed' ? '初审通过，等待复审。'

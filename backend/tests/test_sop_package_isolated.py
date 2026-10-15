@@ -80,6 +80,14 @@ class SopPackageTests(unittest.TestCase):
             namespace["_sop_build_package"](self.round)
         self.assertIn("遗漏.xlsx", raised.exception.detail)
 
+    def test_rule_only_round_can_be_downloaded(self):
+        self.round.source_file_paths = self.round.source_file_names = []
+        self.round.source_file_path = self.round.source_file_name = ""
+        self.round.result_file_path = self.round.result_file_name = ""
+        with zipfile.ZipFile(namespace["_sop_build_package"](self.round)) as archive:
+            self.assertEqual(archive.namelist(), ["规则/规则.docx"])
+            self.assertEqual(archive.read("规则/规则.docx"), b"rule")
+
 
 if __name__ == "__main__":
     unittest.main()

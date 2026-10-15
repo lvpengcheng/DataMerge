@@ -36,7 +36,7 @@ class DocumentParser:
                 return self._parse_word(file_path)
             elif file_ext in ['.xls', '.xlsx', '.xlsm']:
                 return self._parse_excel(file_path)
-            elif file_ext in ['.txt', '.md', '.json', '.yaml', '.yml']:
+            elif file_ext in ['.txt', '.md', '.markdown', '.json', '.yaml', '.yml']:
                 return self._parse_text_file(file_path)
             elif file_ext in ['.png', '.jpg', '.jpeg', '.bmp', '.tiff']:
                 return self._parse_image(file_path)
@@ -375,7 +375,7 @@ class DocumentParser:
         return [
             '.pdf', '.doc', '.docx',  # 文档
             '.xls', '.xlsx', '.csv',  # 表格
-            '.txt', '.md', '.json', '.yaml', '.yml',  # 文本
+            '.txt', '.md', '.markdown', '.json', '.yaml', '.yml',  # 文本
             '.html', '.htm',  # 网页
             '.png', '.jpg', '.jpeg', '.bmp', '.tiff',  # 图像（需要OCR）
         ]

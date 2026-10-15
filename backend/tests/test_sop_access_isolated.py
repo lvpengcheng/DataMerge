@@ -2,9 +2,12 @@
 
 import ast
 import asyncio
+import io
+import tempfile
+from datetime import datetime
 import types
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 
@@ -212,12 +215,36 @@ class SopAccessTests(unittest.TestCase):
 
     def test_upload_rejects_disallowed_formats_before_creating_files_or_rounds(self):
         for slot in range(3):
-            for extension in ("xlsm", "pdf", "docx", "txt", "zip"):
+            extensions = ("xlsm", "zip", "exe") if slot == 2 else ("xlsm", "pdf", "docx", "txt", "zip")
+            for extension in extensions:
                 files = [types.SimpleNamespace(filename="file.xlsx") for _ in range(3)]
                 files[slot].filename = "file." + extension
                 with self.subTest(slot=slot, extension=extension), self.assertRaises(HTTPException) as rejected:
                     namespace["_sop_create_round"](None, entry(1), [files[0]], files[1], files[2])
                 self.assertEqual(rejected.exception.status_code, 400)
+
+    def test_rule_formats_and_optional_source_and_result(self):
+        for extension in ("xlsx", "xls", "txt", "md", "markdown", "pdf", "doc", "docx"):
+            for has_source, has_result in ((False, False), (True, False), (False, True), (True, True)):
+                with self.subTest(extension=extension, source=has_source, result=has_result), tempfile.TemporaryDirectory() as folder:
+                    def file(name):
+                        return types.SimpleNamespace(filename=name, file=io.BytesIO(b"uploaded content"))
+                    db = Mock()
+                    db.query.return_value.filter.return_value.count.return_value = 0
+                    model = Mock(side_effect=lambda **fields: types.SimpleNamespace(id=7, **fields))
+                    current = entry(1)
+                    current.id = 1
+                    with patch.dict(namespace, SopRound=model, SopAiJob=lambda **fields: fields,
+                                    UploadFile=object, datetime=datetime, _sop_round_dir=lambda *args: Path(folder)):
+                        result = namespace["_sop_create_round"](
+                            db, current, [file("source.xlsx")] if has_source else [],
+                            file("result.xls") if has_result else None, file("rules." + extension))
+                    self.assertEqual(current.status, "ai_queued")
+                    self.assertEqual(len(result.source_file_paths), int(has_source))
+                    self.assertEqual(bool(result.source_file_path), has_source)
+                    self.assertEqual(bool(result.result_file_path), has_result)
+                    self.assertEqual(Path(result.rule_file_path).read_bytes(), b"uploaded content")
+                    self.assertEqual(db.add.call_count, 2)
 
 
 if __name__ == "__main__":

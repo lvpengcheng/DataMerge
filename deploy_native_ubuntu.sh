@@ -44,7 +44,7 @@ install_system_packages() {
         "${PYTHON_BIN}" "${PYTHON_BIN}-venv" "${PYTHON_BIN}-dev" \
         build-essential gcc g++ pkg-config default-libmysqlclient-dev \
         libicu-dev libssl-dev libfontconfig1 fontconfig libfreetype6 libgdiplus \
-        redis-server
+        redis-server antiword
 }
 
 install_dotnet_runtime() {

@@ -53,6 +53,13 @@ function environment(html, admin) {
 
 (async () => {
     const managed = environment(adminHtml, true);
+    const validate = inputs => vm.runInContext('SOP.validateUploadFiles', managed.context)({querySelectorAll: () => inputs});
+    for (const extension of ['xlsx', 'xls', 'txt', 'md', 'markdown', 'pdf', 'doc', 'docx']) {
+        validate([{name: 'source_files', files: []}, {name: 'result_file', files: []},
+            {name: 'rule_file', files: [{name: 'rules.' + extension}]}]);
+    }
+    assert.throws(() => validate([{name: 'source_files', files: [{name: 'source.pdf'}]}]), /xlsx/);
+    assert.throws(() => validate([{name: 'rule_file', files: [{name: 'rules.zip'}]}]), /规则文件/);
     // Loading the shared business script on the admin page must make no business requests.
     managed.callbacks[0]();
     assert.equal(managed.requests.length, 0);
