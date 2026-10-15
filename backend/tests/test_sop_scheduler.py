@@ -215,6 +215,8 @@ class SopSchedulerTests(unittest.TestCase):
                        _sop_read_file=lambda *args, **kwargs: "测试文件", _build_sop_prompt=lambda *args: "测试提示",
                        SOP_SYSTEM_PROMPT="测试", _sop_notify_ai_pass=Mock(), _sop_notify_rejection=Mock(),
                        re=re, json=json)
+        from backend.utils.sop_privacy import SopPrivacy
+        context["SopPrivacy"] = SopPrivacy
         exec(compile(ast.Module(body=[node], type_ignores=[]), "sop_analyzer", "exec"), context)
         return context["_run_sop_ai_analysis"]
 

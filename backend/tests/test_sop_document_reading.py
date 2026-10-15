@@ -1,6 +1,7 @@
 """Exercise SOP rule reading through the shared document parser."""
 import ast
 import os
+import re
 from pathlib import Path
 import tempfile
 import types
@@ -13,7 +14,7 @@ from backend.ai_engine.document_parser import DocumentParser
 source = Path(__file__).parent.parent.joinpath("api/tools.py").read_text(encoding="utf-8")
 nodes = [node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef)
          and node.name == "_sop_read_file"]
-namespace = dict(Path=Path, os=os, DocumentParser=DocumentParser)
+namespace = dict(Path=Path, os=os, re=re, DocumentParser=DocumentParser)
 exec(compile(ast.Module(body=nodes, type_ignores=[]), "sop_reading", "exec"), namespace)
 
 

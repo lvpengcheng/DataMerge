@@ -3501,6 +3501,7 @@ async def sop_rules_download(rule_id: int, current_user=Depends(require_permissi
 SOP_SYSTEM_PROMPT = """你是企业 SOP 合规审核专家。请严格依据给定的【大规则】，逐项核对用户提交的【源文件】、【结果文件】与【本轮规则文件】是否满足规则要求。
 要求：
 0. 源文件和结果文件允许不上传；未提交时只审核已提供的材料，不得推断未提供文件中的列或数据。若大规则明确要求提交某类材料，仍按大规则审核。提交了结果表时逐列检查：每一列都必须在规则文件中有明确规则及详细来源；缺失任一列的规则或来源即判定不通过，并在 issues 中列出列名。
+审核前提：检查全部已提供文件的非隐藏 Sheet 清单，区分结果表、内部源数据表和参考表。每个 Sheet 提供的是表头和少量样本，不是全部数据；不得把未抽取的行或样本中没有出现的字段认定为文件不存在，也不能把抽查表述为全量核对。目标文件内的源数据同样有效，不因未单独上传源文件而驳回。引用隐藏 Sheet 或未提供的外部文件而无法核对时，说明需要补充的材料。姓名、证件、地址等已使用同次审核内一致的代号脱敏；代号不是数据缺失，不得因脱敏而驳回或尝试还原个人信息。金额、公式和人员对应关系用于核对；必须区分已有计算值与独立核算结果。问题用业务人员能看懂的语言说明文件、Sheet、列名及工号或行号，并给出修改建议；样本不足以判断时明确说明“暂时无法核对”。
 1. 只输出一个 JSON 对象，不要任何解释或 Markdown 代码块标记。
 2. JSON 结构：
 {
@@ -3513,42 +3514,26 @@ SOP_SYSTEM_PROMPT = """你是企业 SOP 合规审核专家。请严格依据给�
 }"""
 
 
-def _sop_read_file(path: str, max_chars: int = 6000) -> str:
-    """读取文件内容供 AI 分析：Excel → 表头(含列字母映射) + 前 10 行数据；其它格式 → 文档解析。失败返回错误片段，不中断。"""
+def _sop_read_file(path: str, max_chars: int = 180000, privacy=None) -> str:
+    """Read samples from every visible sheet, or text from a rule document."""
     if not path or not os.path.exists(path):
-        return "（文件缺失）"
+        raise ValueError(f"审核材料缺失：{Path(path).name if path else '未记录文件'}，请恢复或重新上传后审核")
     ext = Path(path).suffix.lower()
     try:
         if ext in (".xlsx", ".xls", ".xlsm"):
-            # 延迟导入，避免模块顶层加载 Aspose/.NET 产生副作用
-            if str(PROJECT_ROOT) not in sys.path:
-                sys.path.insert(0, str(PROJECT_ROOT))
-            from excel_parser import IntelligentExcelParser
-            sheets = IntelligentExcelParser().parse_excel_file(
-                path, read_formulas=False, calculate_formulas=True,
-                active_sheet_only=False, best_region_only=False,
-            )
-            parts = []
-            for sd in sheets:
-                parts.append(f"== Sheet {sd.sheet_name} ==")
-                for region in (sd.regions or []):
-                    # head_data 结构为 {表头名: 列字母}，反转为 {列字母: 表头名} 用于数据行渲染
-                    letter_to_name = {str(v).upper(): k for k, v in (region.head_data or {}).items()}
-                    if region.head_data:
-                        parts.append("表头: " + " | ".join(f"{name}({col})" for name, col in region.head_data.items()))
-                    for i, row in enumerate((region.data or [])[:10]):
-                        cells = " | ".join(f"{letter_to_name.get(str(k).upper(), k)}: {v}" for k, v in row.items())
-                        parts.append(f"第{i + 1}行: {cells}")
-            text = "\n".join(parts)
+            from backend.utils.sop_reader import read_sop_excel
+            text = read_sop_excel(path, max_chars, privacy=privacy)
         else:
             text = DocumentParser().parse_document(path)
-        if not text:
-            return "（空内容）"
+        if not text or not text.strip():
+            raise ValueError("文件没有可读取的内容")
+        if re.match(r'^\[.*(?:失败|未提取到文本)', text):
+            raise ValueError("文件内容未能完整读取，请检查文件格式或转换为可读取的文件")
         if len(text) > max_chars:
-            text = text[:max_chars] + "\n...[内容过长已截断]"
-        return text
+            raise ValueError("文件内容超过单次审核容量，请按业务拆分材料后重新审核；本次未截断内容继续审核")
+        return privacy.redact(text) if privacy else text
     except Exception as e:
-        return f"[文件解析失败: {e}]"
+        raise ValueError(f"无法完成审核，文件“{Path(path).name}”读取失败：{e}") from e
 
 
 def _build_sop_prompt(entry: SopEntry, admin_rule_text: str, source_text: str, result_text: str, rule_text: Optional[str]) -> str:
@@ -3567,13 +3552,17 @@ def _build_sop_prompt(entry: SopEntry, admin_rule_text: str, source_text: str, r
     ]
     if rule_text:
         lines += ["", "========== 本轮规则文件 ==========", rule_text]
-    return "\n".join(lines)
+    prompt = "\n".join(lines)
+    if len(prompt) + len(SOP_SYSTEM_PROMPT) > 180000:
+        raise ValueError("全部 Sheet 样本和规则合计超过单次审核容量，请拆分材料后重新审核；本次没有截掉后续 Sheet 继续审核")
+    return prompt
 
 
 def _run_sop_ai_analysis(round_id: int, entry_id: int, job_id: int, claim_token: str):
     """后台 AI 分析：选规则 → 读文件 → 构建 prompt → 调 AI → 解析判定 → 更新状态。"""
     from ..ai_engine.ai_provider import AIProviderFactory
     from ..utils.sop_scheduler import lock_job
+    from ..utils.sop_privacy import SopPrivacy
     db = SessionLocal()
     try:
         r = db.query(SopRound).filter_by(id=round_id).first()
@@ -3588,18 +3577,20 @@ def _run_sop_ai_analysis(round_id: int, entry_id: int, job_id: int, claim_token:
         rule = _sop_effective_rule(db.query(SopRuleFile).all(), entry.customer_name)
         r.rule_used_id = rule.id if rule else None
 
-        # 2) 读文件
+        # 2) 同一次审核共享脱敏映射，保留跨文件、跨 Sheet 的匹配关系。
+        privacy = SopPrivacy()
+        privacy.alias(entry.customer_name, "单位")
         src_paths = r.source_file_paths or ([r.source_file_path] if r.source_file_path else [])
         src_parts = []
         for i, p in enumerate(src_paths):
-            src_parts.append(f"--- 源文件 {i + 1}: {os.path.basename(p)} ---\n{_sop_read_file(p)}")
+            src_parts.append(f"--- 源文件 {i + 1}: {os.path.basename(p)} ---\n{_sop_read_file(p, privacy=privacy)}")
         source_text = "\n\n".join(src_parts) if src_parts else "（无源文件）"
-        result_text = _sop_read_file(r.result_file_path) if r.result_file_path else "（未上传目标文件）"
-        rule_text = _sop_read_file(r.rule_file_path, max_chars=30000) if r.rule_file_path else None
-        admin_rule_text = _sop_read_file(rule.file_path, max_chars=30000) if rule else "（无后台规则）"
+        result_text = _sop_read_file(r.result_file_path, privacy=privacy) if r.result_file_path else "（未上传目标文件）"
+        rule_text = _sop_read_file(r.rule_file_path, privacy=privacy) if r.rule_file_path else None
+        admin_rule_text = _sop_read_file(rule.file_path, privacy=privacy) if rule else "（无后台规则）"
 
         # 3) 构建 prompt 并落库（排查用）
-        r.prompt_text = _build_sop_prompt(entry, admin_rule_text, source_text, result_text, rule_text)
+        r.prompt_text = privacy.redact(_build_sop_prompt(entry, admin_rule_text, source_text, result_text, rule_text))
         if not lock_job(db, job_id, claim_token):
             return
         db.commit()
