@@ -1707,18 +1707,14 @@ def _match_scheme_config(cfg: dict, files_meta: List[dict]) -> Optional[dict]:
 
 
 def _replace_expr_tokens(expr: str, replacements: dict) -> str:
-    """用占位符一次性替换公式 token，避免新列名再次被后续规则误替换。"""
+    """最长引用优先、单次替换；原名不变的引用和字符串常量也须保护。"""
     text = str(expr or "")
-    placeholders = {}
-    for i, (old, new) in enumerate(sorted(replacements.items(), key=lambda kv: len(str(kv[0])), reverse=True)):
-        if not old or old == new or str(old) not in text:
-            continue
-        key = f"\u0002INTMAP{i}\u0003"
-        text = text.replace(str(old), key)
-        placeholders[key] = str(new)
-    for key, val in placeholders.items():
-        text = text.replace(key, val)
-    return text
+    refs = {str(old): str(new) for old, new in replacements.items() if old}
+    if not refs:
+        return text
+    names = sorted(refs, key=len, reverse=True)
+    pattern = re.compile(r'"(?:[^"]|"")*"|' + "|".join(re.escape(name) for name in names))
+    return pattern.sub(lambda m: refs.get(m.group(0), m.group(0)), text)
 
 
 def _resolved_scheme_config(cfg: dict, match: dict) -> dict:

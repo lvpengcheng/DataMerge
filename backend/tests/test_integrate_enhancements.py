@@ -11,6 +11,7 @@ from backend.api.tools import (
     _parse_file_all_sheets_impl,
     _parse_file_full_impl,
     _required_cols_by_role,
+    _replace_expr_tokens,
     _resolved_scheme_config,
     _suggest_column_map,
 )
@@ -324,6 +325,41 @@ def test_month_header_change_produces_confirmable_mapping_and_resolved_formula()
     match = _match_scheme_config(cfg, files)
     resolved = _resolved_scheme_config(cfg, match)
     assert resolved["overwrite_pairs"][0]["source_expr"] == "ROUND(2026年6月社保个人养老,2)"
+
+
+def test_source_column_rename_preserves_other_tables_unchanged_column_references():
+    salary = "Normally Basic Salary 2026"
+    cfg = {
+        "roles": [{"fp": "main", "file": "主表.xlsx"},
+                  {"fp": "source", "file": "来源.xlsx"},
+                  {"fp": "other", "file": "其他.xlsx"}],
+        "overwrite_pairs": [{
+            "a_col": salary, "source_role": 1,
+            "source_expr": f"主表.xlsx.{salary}+{salary}+其他.xlsx.{salary}",
+        }],
+    }
+    match = {
+        "roles": cfg["roles"],
+        "role_files": ["主表.xlsx", "实际计算-来源.xlsx", "实际计算-其他.xlsx"],
+        "column_maps_by_role": {0: {salary: salary},
+                                1: {salary: "Normally Basic Salary"},
+                                2: {salary: salary}},
+    }
+    pair = _resolved_scheme_config(cfg, match)["overwrite_pairs"][0]
+    assert pair["a_col"] == salary
+    assert pair["source_expr"] == (
+        f"主表.xlsx.{salary}+Normally Basic Salary+实际计算-其他.xlsx.{salary}")
+    indexes = {
+        "主表.xlsx": {"cols": [salary], "rows": {"001": [{salary: 10}]}},
+        "实际计算-来源.xlsx": {"cols": ["Normally Basic Salary"],
+                              "rows": {"001": [{"Normally Basic Salary": 20}]}},
+        "实际计算-其他.xlsx": {"cols": [salary], "rows": {"001": [{salary: 30}]}},
+    }
+    assert eval_source_expr_cross(pair["source_expr"], match["role_files"][1], indexes, "001") == 60
+
+
+def test_expression_mapping_is_simultaneous_and_preserves_string_literals():
+    assert _replace_expr_tokens('IF(A=1,"A ""B""",B)', {"A": "B", "B": "C"}) == 'IF(B=1,"A ""B""",C)'
 
 
 def test_excel_round_and_if_formula_subset():

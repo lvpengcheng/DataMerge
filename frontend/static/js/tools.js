@@ -18,6 +18,7 @@ let _integrateSchemeList = [];   // 方案列表页数据（GET /schemes）
 let _intMode = 'create';         // create | apply | edit
 let _intEditingSchemeId = null;  // edit 模式：正在修改的方案 id
 let _intApplyTarget = null;      // apply 模式：目标方案 {id,name}
+let _intApplyReady = false;     // 当前解析结果已校验并回填，可检查后生成
 let _intSchemePage = 1;          // 方案列表分页：当前页
 let _intSchemeFilterKw = '';     // 方案列表筛选：关键词
 const _ALLOWED_EXT = new Set(['xlsx', 'xls', 'xlsm']);
@@ -362,6 +363,7 @@ const Tools = {
     },
 
     _intResetWork() {
+        _intApplyReady = false;
         _integrateFiles = [];
         _integrateAnalysis = null;
         _integrateSchemes = [];
@@ -523,8 +525,11 @@ const Tools = {
             }
             _integrateAnalysis = await resp.json();
             this._renderIntegrateConfig(_integrateAnalysis);
+            if (_intMode === 'apply' || _intMode === 'edit') {
+                await this._intRestoreSchemeHeaders();
+            }
             if (_intMode === 'apply') {
-                this._setIntegrateStatus('解析完成，请检查列头范围后点击「应用方案」', 'ok');
+                await this._intPrefillForApply();
             } else {
                 const tableCount = (_integrateAnalysis.files || []).length;
                 this._setIntegrateStatus(`解析完成，共识别 ${tableCount} 张表，可按需要重新定义列头范围`, 'ok');
@@ -539,6 +544,51 @@ const Tools = {
 
     _intFindMatched(id) {
         return (_integrateAnalysis.matched_schemes || []).find(s => s.id === id) || null;
+    },
+
+    // 首次上传沿用方案保存的列头范围；之后人工重新解析时保留用户指定范围。
+    async _intRestoreSchemeHeaders() {
+        const id = _intMode === 'apply' ? _intApplyTarget?.id : _intEditingSchemeId;
+        const saved = _integrateSchemeList.find(s => s.id === id);
+        const cfg = saved?.config || {};
+        const matched = this._intFindMatched(id);
+        const files = this._intFiles();
+        const ranges = Object.fromEntries(files.map(f => [f.name, {
+            start_row: Number(f.header_start) || 1,
+            end_row: Number(f.header_end) || Number(f.header_start) || 1,
+        }]));
+        let changed = false;
+        const used = new Set();
+        (cfg.roles || []).forEach((role, i) => {
+            const range = (cfg.header_ranges_by_role || {})[String(i)];
+            if (!Array.isArray(range) || range.length !== 2) return;
+            const name = matched?.role_files?.[i] || role.file;
+            let file = files.find(f => f.name === name);
+            if (!file) {
+                const candidates = files.filter(f => f.fingerprint === role.fp);
+                if (candidates.length === 1) file = candidates[0];
+            }
+            if (!file || used.has(file.name)) return;
+            used.add(file.name);
+            const [start, end] = range.map(Number);
+            if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end - start > 20) return;
+            if (ranges[file.name].start_row !== start || ranges[file.name].end_row !== end) {
+                ranges[file.name] = { start_row: start, end_row: end };
+                changed = true;
+            }
+        });
+        if (!changed) return;
+        this._setIntegrateStatus('正在按方案保存的列头范围解析...');
+        const resp = await AUTH.authFetch('/api/tools/integrate/reparse-headers', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: _integrateAnalysis.session_id, header_ranges: ranges }),
+        });
+        if (!resp.ok) {
+            const msg = await _alertErr(resp, '恢复方案列头范围失败');
+            throw new Error(msg || '恢复方案列头范围失败');
+        }
+        _integrateAnalysis = await resp.json();
+        this._renderIntegrateConfig(_integrateAnalysis);
     },
 
     // 同结构表歧义：上传文件里存在表头结构相同的表（一个角色可对应多个文件），
@@ -631,10 +681,16 @@ const Tools = {
         });
     },
 
-    // apply 模式：analyze 后调 apply-validate；不一致硬阻断并列出理由；一致则回填 + 直接生成下载。
-    // 存在同结构表歧义时，先弹匹配框让操作人员手动确认对应关系，再回填执行。
-    async _intRunApply() {
+    // apply 模式：解析后校验并回填，供用户检查；生成由独立按钮触发。
+    // 存在同结构表歧义时，先确认角色对应关系，再回填供检查。
+    async _intPrefillForApply() {
         if (!_intApplyTarget) return;
+        _intApplyReady = false;
+        const btn = document.getElementById('int-apply-confirm');
+        const execBtn = document.getElementById('int-execute');
+        if (btn) btn.disabled = true;
+        if (execBtn) execBtn.disabled = true;
+        this._setIntegrateStatus('正在校验并加载方案配置...');
         const rz = document.getElementById('int-apply-reasons');
         try {
             const resp = await AUTH.authFetch('/api/tools/integrate/scheme/apply-validate', {
@@ -667,10 +723,13 @@ const Tools = {
                 if (!ok) { this._setIntegrateStatus('已取消应用', ''); return; }
             }
             this._intFillFromScheme(scheme);
-            this._setIntegrateStatus('校验通过，正在生成结果...', 'ok');
-            await this._doIntegrateExecute();
+            _intApplyReady = true;
+            this._setIntegrateStatus('已回填方案的主表、关联键、覆盖与对比映射，请检查后点击「生成并下载」', 'ok');
         } catch (e) {
             this._setIntegrateStatus('应用失败: ' + e.message, 'error');
+        } finally {
+            if (btn) btn.disabled = false;
+            if (execBtn) execBtn.disabled = !_intApplyReady;
         }
     },
 
@@ -731,7 +790,8 @@ const Tools = {
             _integrateAnalysis = await resp.json();
             this._renderIntegrateConfig(_integrateAnalysis);
             this._setIntegrateStatus('已按人工范围重新解析列头', 'ok');
-            if (_intMode === 'edit') await this._intPrefillForEdit();
+            if (_intMode === 'apply') await this._intPrefillForApply();
+            else if (_intMode === 'edit') await this._intPrefillForEdit();
         } catch (e) {
             this._setIntegrateStatus('重新解析失败: ' + e.message, 'error');
         } finally {
@@ -740,6 +800,7 @@ const Tools = {
     },
 
     _renderIntegrateConfig(data) {
+        _intApplyReady = false;
         const files = data.files || [];
         const box = document.getElementById('integrate-config');
         box.style.display = 'block';
@@ -756,7 +817,7 @@ const Tools = {
                 </div>`).join('')}
                 <div style="margin-top:8px;display:flex;align-items:center;gap:8px;">
                     <button type="button" class="btn btn-sm" id="int-reparse-headers">按指定范围重新解析</button>
-                    ${_intMode === 'apply' ? '<button type="button" class="btn btn-sm btn-primary" id="int-apply-confirm">应用方案</button>' : ''}
+                    ${_intMode === 'apply' ? '<button type="button" class="btn btn-sm" id="int-apply-confirm">重新加载方案配置</button>' : ''}
                 </div>
             </div>
 
@@ -838,7 +899,7 @@ const Tools = {
         this._intRenderPicker('ow');
         this._intRenderPicker('cmp');
         document.getElementById('int-reparse-headers')?.addEventListener('click', () => this._intReparseHeaders());
-        document.getElementById('int-apply-confirm')?.addEventListener('click', () => this._intRunApply());
+        document.getElementById('int-apply-confirm')?.addEventListener('click', () => this._intPrefillForApply());
         document.getElementById('int-main-file').addEventListener('change', () => {
             this._intRenderKeyMap();
             this._intRenderDiffCols();
@@ -870,7 +931,7 @@ const Tools = {
         if (_intMode === 'apply') {
             if (saveRow) saveRow.style.display = 'none';
             const execBtn = document.getElementById('int-execute');
-            if (execBtn && execBtn.parentElement) execBtn.parentElement.style.display = 'none';
+            if (execBtn) execBtn.disabled = true;
         } else if (_intMode === 'edit') {
             const cur = _integrateSchemeList.find(s => s.id === _intEditingSchemeId);
             if (nameInp && cur) nameInp.value = cur.name;
@@ -1352,6 +1413,10 @@ const Tools = {
     },
 
     async _doIntegrateExecute() {
+        if (_intMode === 'apply' && !_intApplyReady) {
+            this._setIntegrateStatus('请先成功加载方案配置，再生成结果', 'error');
+            return;
+        }
         const main = this._intMainFile();
         const key_map = {};
         document.querySelectorAll('.int-key').forEach(s => { key_map[s.dataset.file] = s.value; });
