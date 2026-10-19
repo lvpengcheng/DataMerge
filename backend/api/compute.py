@@ -241,6 +241,10 @@ async def execute_compute(
     if task.status not in ("analyzed", "failed"):
         raise HTTPException(status_code=400, detail=f"任务状态不允许执行: {task.status}")
 
+    from backend.solutions.execution import binding
+    if binding(task.tenant_id, str(task.script_id), db):
+        raise HTTPException(status_code=409, detail="此脚本已转为方案，请通过智算页面新版上传入口计算")
+
     # 更新用户修正的表头映射
     if req and req.header_mapping:
         task.header_mapping = req.header_mapping

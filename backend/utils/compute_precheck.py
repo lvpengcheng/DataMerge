@@ -47,8 +47,9 @@ class PrecheckResult:
     actual_paths: List[str] = field(default_factory=list)
     actual_sources: List[Dict[str, str]] = field(default_factory=list)
     history_warnings: List[str] = field(default_factory=list)
-    # 目标模板表（②模板目标侧）：歧义时的候选，交前端人工选择；确认后的映射透传给计算
+    # 全部关键目标表及其匹配状态；确认后的完整关系透传给计算。
     target_candidates: List[Dict[str, Any]] = field(default_factory=list)
+    target_confirmation_required: bool = False
     target_map: Optional[Dict[str, str]] = None
     file_mapping: Optional[Dict[str, Any]] = None
     unmatched_columns: List[list] = field(default_factory=list)
@@ -77,6 +78,7 @@ def precheck_compute(
     session_dir: Optional[str] = None,
     skipped_missing_files: Optional[List[str]] = None,
     defer_base_fill: bool = False,
+    mapping_finalized: bool = False,
 ) -> PrecheckResult:
     """智算事前校验主入口（compute_ingest 的薄封装）
 
@@ -95,8 +97,10 @@ def precheck_compute(
         confirmed_mapping = confirmed_mapping.get('file_mapping') or None
 
     if not source_structure:
-        # 老脚本可能没存 source_structure，无法校验，直接放行
-        logger.info("[Precheck] 缺少 source_structure，跳过校验")
+        # 老脚本没有源结构时仍须确认模板目标表。
+        logger.info("[Precheck] 缺少 source_structure，仅校验目标表")
+        _check_target_sheets(script_content, tenant_id, template_override_path,
+                             confirmed_target_map, result, ai_provider_name)
         return result
 
     payload = {
@@ -117,6 +121,7 @@ def precheck_compute(
         "session_dir": session_dir,
         "skipped_missing_files": skipped_missing_files,
         "defer_base_fill": defer_base_fill,
+        "mapping_finalized": mapping_finalized,
     }
     if in_worker:
         # 外层已有总超时/内存护栏，直接解析避免嵌套进程和大表 pickle 往返。
@@ -168,6 +173,8 @@ def _ingest_and_resolve_inner(payload: dict, keep_preload: bool, db_session) -> 
         ingest_source_dir, resolve_with_confirmations, build_preload, write_ingest,
     )
 
+    reuse_args = ({'reuse_session_dir': payload.get('session_dir')}
+                  if payload.get('mapping_finalized') and payload.get('session_dir') else {})
     meta, parsed_sheets_map = ingest_source_dir(
         source_dir=payload["source_dir"],
         source_structure=payload["source_structure"],
@@ -181,6 +188,7 @@ def _ingest_and_resolve_inner(payload: dict, keep_preload: bool, db_session) -> 
         confirmed_renames=payload.get("confirmed_renames"),
         confirmed_mapping=payload.get("confirmed_mapping"),
         defer_base_fill=bool(payload.get("defer_base_fill")),
+        **reuse_args,
     )
     result = resolve_with_confirmations(
         meta,
@@ -197,6 +205,7 @@ def _ingest_and_resolve_inner(payload: dict, keep_preload: bool, db_session) -> 
         allow_ai_matching=not bool(payload.get("mapping_finalized")),
     )
     session_dir = payload.get("session_dir")
+    result._reused_source_parse = bool(getattr(meta, '_reused_source_parse', False))
     wrote_session = False
     if session_dir and parsed_sheets_map:
         try:
@@ -273,20 +282,37 @@ def _check_target_sheets(
     result: PrecheckResult,
     ai_provider_name: Optional[str] = None,
 ) -> None:
-    """校验模板里的目标表能否唯一对到训练固化的 _COL_MAP 键。
-
-    歧义（多候选并列）→ result.ok=False + target_candidates（交前端人工选择）；
-    唯一解析 → 把非同名映射记入 result.target_map（计算时注入 _target_sheet_manual_map）；
-    无候选的键（本月缺该表）仅记日志、不阻断。仅对模板模式脚本生效。
-    """
-    if not script_content or "_COL_MAP" not in script_content or "def fill_template" not in script_content:
+    """展示全部关键目标表；匹配成功、缺失和跳过都必须由用户确认。"""
+    from .multi_workbook import script_targets
+    from .compute_templates import target_key, workbook_target_map
+    children = script_targets(script_content) if script_content else {}
+    if len(children) > 1:
+        overrides = template_override_path if isinstance(template_override_path, dict) else {}
+        result.target_map = {}
+        result.target_candidates = []
+        result.target_confirmation_required = False
+        for name, child in children.items():
+            review = PrecheckResult()
+            _check_target_sheets(child['code'], tenant_id, overrides.get(name),
+                                 workbook_target_map(confirmed_target_map, name), review, ai_provider_name)
+            result.ok = result.ok and review.ok
+            result.target_confirmation_required |= review.target_confirmation_required
+            result.missing_columns.extend({**item, 'file': name} for item in review.missing_columns)
+            result.target_map.update({target_key(name, key): value for key, value in (review.target_map or {}).items()})
+            result.target_candidates.extend({**row, 'key': target_key(name, row['key']),
+                                             'workbook': name, 'sheet_key': row['key']}
+                                            for row in review.target_candidates)
+        return
+    if not script_content or "_COL_MAP" not in script_content:
         return
     col_map = _extract_colmap(script_content)
     if not col_map:
         return
     tpl = _locate_template(tenant_id, script_content, template_override_path)
     if not tpl:
-        logger.info("[Precheck/Target] 未定位到模板，跳过目标表校验（运行时兜底/报错）")
+        result.ok = False
+        result.target_confirmation_required = True
+        result.missing_columns.append({'error': '未找到计算模板，请上传模板后重新匹配。'})
         return
     ambiguous_key_sigs = {}
     ambiguous_sheet_vocab = {}
@@ -295,7 +321,7 @@ def _check_target_sheets(
         from .target_sheet_resolver import (
             resolve_target_sheets, _key_signature, _sheet_header_vocab,
         )
-        wb = openpyxl.load_workbook(tpl, read_only=False, data_only=True)
+        wb = openpyxl.load_workbook(tpl, read_only=True, data_only=True)
         try:
             resolved, ambiguous, unresolved = resolve_target_sheets(
                 wb, col_map, manual_map=(confirmed_target_map or {})
@@ -313,15 +339,34 @@ def _check_target_sheets(
         finally:
             wb.close()
     except Exception as e:
-        logger.warning(f"[Precheck/Target] 目标表校验异常（不阻断）: {e}", exc_info=True)
+        result.ok = False
+        result.target_confirmation_required = True
+        result.missing_columns.append({'error': f'无法读取模板工作表，请检查模板后重试：{e}'})
+        logger.warning(f"[Precheck/Target] 目标表校验失败: {e}", exc_info=True)
         return
 
-    if ambiguous:
+    manual = confirmed_target_map or {}
+    result.target_map = dict(resolved)
+    result.target_candidates = []
+    for key in col_map:
+        selected = str(manual.get(key) or '').strip()
+        confirmed = key in manual and (not selected or resolved.get(key) == selected)
+        status = ('skipped' if not selected else 'confirmed') if confirmed else (
+            'invalid' if key in manual else 'matched' if key in resolved else
+            'ambiguous' if key in ambiguous else 'missing')
+        result.target_candidates.append({
+            'key': key, 'candidates': ambiguous.get(key, []), 'all_sheets': all_sheets,
+            'selected_sheet': (selected if confirmed else resolved.get(key)) if status != 'invalid' else None,
+            'status': status, 'requires_confirmation': not confirmed,
+        })
+        if confirmed and not selected:
+            result.target_map[key] = ''
+    result.target_confirmation_required = any(
+        row['requires_confirmation'] for row in result.target_candidates)
+    if result.target_confirmation_required:
         result.ok = False
-        result.target_candidates = [
-            {"key": k, "candidates": v, "all_sheets": all_sheets}
-            for k, v in ambiguous.items()
-        ]
+
+    if ambiguous:
         if ai_provider_name:
             try:
                 from .ai_target_sheet_mapping import suggest_target_sheet_mapping
@@ -334,11 +379,6 @@ def _check_target_sheets(
             except Exception as ai_exc:
                 logger.warning(f"[Precheck/Target] AI 目标表推荐失败（不阻断）: {ai_exc}")
         logger.warning(f"[Precheck/Target] 目标表歧义需人工确认: {list(ambiguous.keys())}")
-    else:
-        # 只记非同名映射（同名的运行时精确匹配即可），供计算注入 _target_sheet_manual_map
-        result.target_map = {k: v for k, v in resolved.items() if v != k}
-        if unresolved:
-            logger.info(f"[Precheck/Target] 目标表本月无对应（运行时落空跳过）: {unresolved}")
 
 # ==================== 内部工具 ====================
 

@@ -678,12 +678,8 @@ def _get_session_context(db: Session, session_id: int) -> Dict[str, Any]:
     )
 
     # 获取最近的迭代（最新执行结果）
-    latest_iteration = (
-        db.query(TrainingIteration)
-        .filter_by(session_id=session_id)
-        .order_by(TrainingIteration.iteration_num.desc())
-        .first()
-    )
+    from ..utils.training_code import latest_code_revision
+    latest_iteration = latest_code_revision(db, session)
 
     # 获取最近 20 轮对话消息（user+assistant 合计 40 条）
     recent_messages = (
@@ -699,7 +695,7 @@ def _get_session_context(db: Session, session_id: int) -> Dict[str, Any]:
     context = {
         "tenant_id": session.tenant_id,
         "mode": session.mode,
-        "config": session.config or {},
+        "config": dict(session.config or {}),
         "source_structure": session.source_structure or {},
         "best_code": best_iteration.generated_code if best_iteration else None,
         "best_accuracy": best_iteration.accuracy if best_iteration else None,
@@ -714,7 +710,9 @@ def _get_session_context(db: Session, session_id: int) -> Dict[str, Any]:
             {"role": m.role, "content": m.content} for m in recent_messages
         ],
     }
-    if (session.config or {}).get('validation_stale'):
+    if (session.config or {}).get('validation_stale') or (latest_iteration and
+            (latest_iteration.execution_result or {}).get('validation_pending')):
+        context['config']['validation_stale'] = True
         for key in ('latest_diff', 'latest_accuracy', 'best_accuracy', 'latest_execution_result'):
             context[key] = None
     return context
@@ -756,6 +754,8 @@ def _build_chat_system_prompt(context: Dict, config: Dict, rules: str) -> str:
         _uploaded_note = ""
         if context.get("latest_source") == "manual_upload":
             _uploaded_note = "（用户刚手动上传/替换了这份代码，是全新的最新版本）"
+        elif context.get("latest_source") in ("solution_import", "saved_script"):
+            _uploaded_note = "（导入或已保存的脚本，可直接修正；尚未在本环境验证）"
         parts.append(
             f"\n## 当前代码{_uploaded_note}（共 {len(code_lines)} 行）\n"
             "这是本会话**唯一有效、最新**的代码，请严格以它为准进行分析。\n"
@@ -1154,6 +1154,10 @@ def list_chat_sessions(
         pass
 
     def _session_hidden(s):
+        # An imported script is inactive until publication; that must not hide
+        # its editable training workspace as if it had been explicitly disabled.
+        if (s.config or {}).get('solution_import') or str(s.session_key or '').startswith('solution_'):
+            return False
         has_any = s.id in _src_any
         has_active = s.id in _src_active
         if s.final_script_id is not None and s.final_script_id in _id_active:
@@ -1338,12 +1342,8 @@ def get_session_messages(
         return result
 
     # ===== 首屏：附加会话级大字段 =====
-    latest_iteration = (
-        db.query(TrainingIteration)
-        .filter_by(session_id=session_id)
-        .order_by(TrainingIteration.iteration_num.desc())
-        .first()
-    )
+    from ..utils.training_code import latest_code_revision
+    latest_iteration = latest_code_revision(db, session)
 
     cfg = session.config or {}
     latest_files = cfg.get("latest_files", {})
@@ -2499,7 +2499,7 @@ async def send_message(
 
             # 构建上下文
             context = _get_session_context(db, session_id)
-            config = dict(session.config) if session.config else {}
+            config = dict(context.get('config') or {})
 
             # 合并规则
             rules = config.get("rules_content", "")
@@ -2572,7 +2572,7 @@ async def send_message(
 
             # 构建上下文
             context = _get_session_context(db, session_id)
-            config = dict(session.config) if session.config else {}
+            config = dict(context.get('config') or {})
             # 合并规则
             rules = config.get("rules_content", "")
             if new_rules:
@@ -2813,6 +2813,7 @@ async def send_message(
                 pre_loaded_source_data=_full_source_data,
                 rules_content=config.get("rules_content", ""),
                 expected_structure=config.get("expected_structure"),
+                template_override_path=config.get("template_path"),
             )
 
             # 保存详细差异文本到 config
@@ -3386,13 +3387,8 @@ def set_as_best(
         # 未显式指定：取「最新一轮有代码」的迭代，即用户当前看到/刚上传的这版。
         # （按钮语义是"将当前代码设为最佳"；手动上传的代码永远是最新一轮，
         #   过去按 accuracy DESC 选会挑到之前分更高的旧代码，导致智算跑的不是刚上传的脚本。）
-        iteration = (
-            db.query(TrainingIteration)
-            .filter_by(session_id=session_id)
-            .filter(TrainingIteration.generated_code.isnot(None))
-            .order_by(TrainingIteration.iteration_num.desc())
-            .first()
-        )
+        from ..utils.training_code import latest_code_revision
+        iteration = latest_code_revision(db, session)
 
     if not iteration or not iteration.generated_code:
         raise HTTPException(status_code=400, detail="没有可用的代码")
@@ -3832,13 +3828,11 @@ def get_current_code(
     current_user=Depends(get_current_user),
 ):
     """获取会话最新代码（最近一次迭代/上传的代码，而非历史最高分）"""
-    best = (
-        db.query(TrainingIteration)
-        .filter_by(session_id=session_id)
-        .filter(TrainingIteration.generated_code.isnot(None))
-        .order_by(TrainingIteration.iteration_num.desc())
-        .first()
-    )
+    session = db.query(TrainingSession).filter_by(id=session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    from ..utils.training_code import latest_code_revision
+    best = latest_code_revision(db, session)
     if not best:
         raise HTTPException(status_code=404, detail="暂无代码")
 
@@ -4225,14 +4219,8 @@ async def generate_final_rules(
 
     # 2) 当前代码（最新一轮有代码的那一轮，与 current_code / 智算 / 设为最佳 口径一致）：
     #    逆向分析的是"当前生效的这份代码"，而非历史最高分那一轮——用户在哪个状态点击就逆向哪份代码。
-    cur_iteration = (
-        db.query(TrainingIteration)
-        .filter_by(session_id=session_id)
-        .filter(TrainingIteration.generated_code.isnot(None))
-        .filter(TrainingIteration.generated_code != "")
-        .order_by(TrainingIteration.iteration_num.desc())
-        .first()
-    )
+    from ..utils.training_code import latest_code_revision
+    cur_iteration = latest_code_revision(db, session)
     best_code = cur_iteration.generated_code if cur_iteration else ""
     best_accuracy = cur_iteration.accuracy if cur_iteration else None
 

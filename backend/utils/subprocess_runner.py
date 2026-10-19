@@ -192,8 +192,11 @@ def _run_single(entry, args, kwargs, timeout, max_memory_mb, progress_cb,
             pickle.dump({"entry": entry, "args": args, "kwargs": kwargs}, f, protocol=pickle.HIGHEST_PROTOCOL)
         env = os.environ.copy()
         env.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+        from backend.solutions.execution import launch
+        solution = args[0].get("_solution") if args and isinstance(args[0], dict) else None
+        command = launch(params_file, solution, "rpc") or [sys.executable, "-u", "-m", "backend.utils.subprocess_worker", params_file]
         proc = subprocess.Popen(
-            [sys.executable, "-u", "-m", "backend.utils.subprocess_worker", params_file],
+            command,
             cwd=_PROJ_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             env=env, **process_group_options())
 

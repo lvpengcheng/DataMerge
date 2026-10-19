@@ -3,6 +3,7 @@ let tenantListData = [];
 let currentTenantId = '';
 let currentScriptId = '';
 let scriptsCache = [];          // 当前租户脚本列表（含 mode，供模板入口判断）
+let _tenantScriptsLoadId = 0;
 let _filePasswordsMap = null;  // 文件名→密码映射
 let _encryptionCheckInProgress = false;  // 加密检测进行中
 let _encryptionCheckQueue = Promise.resolve();
@@ -78,7 +79,8 @@ function _precheckSummary(data) {
     if (!(data.source_sheet_reviews || []).length && (data.rename_candidates || []).length) {
         reasons.push(`文件来源 ${data.rename_candidates.length} 项待确认`);
     }
-    if ((data.target_candidates || []).length) reasons.push(`目标 Sheet ${data.target_candidates.length} 项待确认`);
+    const targetPending = (data.target_candidates || []).filter(row => row.requires_confirmation !== false).length;
+    if (targetPending) reasons.push(`目标 Sheet ${targetPending} 项待确认`);
     if ((data.history_warnings || []).length) reasons.push(`历史数据提示 ${data.history_warnings.length} 项`);
     const error = (data.missing_columns || []).find(row => row.error)?.error;
     if (error) reasons.push(String(error).split('\n')[0].slice(0, 100) + (String(error).length > 100 ? '…（展开详情）' : ''));
@@ -405,9 +407,9 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
         const hasTargetCandidates = targetCandidates.length > 0;
         const targetCandidatesHtml = !hasTargetCandidates ? '' : `
             <div style="margin-bottom:14px;padding:10px 12px;border:1px solid #ffe0b2;background:#fff3e0;border-radius:6px;">
-                <div style="font-weight:bold;color:#e65100;margin-bottom:6px;">⚠ 模板目标表无法唯一匹配，请指定对应关系</div>
+                <div style="font-weight:bold;color:#e65100;margin-bottom:6px;">模板关键 Sheet 对应关系（全部 ${targetCandidates.length} 项）</div>
                 <div style="font-size:12px;color:#5d4037;margin-bottom:8px;">
-                    训练时的目标表（左）在当月模板里找到多张结构相近的候选，无法自动判定，请为每个目标表选择对应的模板 sheet（否则该表将不被填充）。
+                    请逐项核对训练目标表与本次模板的对应关系。同名匹配也会列出；未找到的表必须选择对应 Sheet，或明确选择“本次跳过该表”。跳过的表不会填入计算结果。
                 </div>
                 <table style="width:100%;border-collapse:collapse;font-size:12px;">
                     <thead><tr style="background:#fff8e1;">
@@ -420,10 +422,13 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
                         (tc.candidates || []).forEach(c => { scoreMap[c.sheet] = c.score; });
                         const topSheet = (tc.candidates && tc.candidates.length) ? tc.candidates[0].sheet : '';
                         const aiRec = tc.ai_recommended || '';
-                        const selectedSheet = previousConfirmations?.confirmed_target_map?.[tc.key] ??
-                            data.target_map?.[tc.key] ?? (aiRec || topSheet);
+                        const selectedSheet = Object.prototype.hasOwnProperty.call(tc, 'selected_sheet')
+                            ? (tc.selected_sheet ?? '__pending_target__')
+                            : (previousConfirmations?.confirmed_target_map?.[tc.key] ??
+                                data.target_map?.[tc.key] ?? '__pending_target__');
                         const sheetList = (tc.all_sheets && tc.all_sheets.length) ? tc.all_sheets : (tc.candidates || []).map(c => c.sheet);
-                        const opts = [`<option value=""${selectedSheet === '' ? ' selected' : ''}>（不映射，跳过该表）</option>`]
+                        const opts = [`<option value="__pending_target__" disabled${selectedSheet === '__pending_target__' ? ' selected' : ''}>请选择对应 Sheet 或明确跳过</option>`,
+                            `<option value=""${selectedSheet === '' ? ' selected' : ''}>本次跳过该表（不填充结果）</option>`]
                             .concat(sheetList.map(sn => {
                                 const sc = scoreMap[sn];
                                 const isAi = sn === aiRec;
@@ -437,9 +442,9 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
                             ? `<div style="font-size:11px;color:#2e7d32;margin-top:3px;">✨ AI 推荐：${_escapeHtml(aiRec)}${tc.ai_confidence != null ? `（置信度 ${Number(tc.ai_confidence).toFixed(2)}）` : ''}${tc.ai_reason ? ' — ' + _escapeHtml(tc.ai_reason) : ''}</div>`
                             : '';
                         return `<tr>
-                            <td style="padding:6px;border:1px solid #ffe0b2;font-family:monospace;font-size:12px;vertical-align:top;">${_escapeHtml(tc.key)}</td>
+                            <td style="padding:6px;border:1px solid #ffe0b2;font-family:monospace;font-size:12px;vertical-align:top;">${tc.workbook ? _escapeHtml(tc.workbook) + ' / ' : ''}${_escapeHtml(tc.sheet_key || tc.key)}<div style="margin-top:4px;color:#666;">${_escapeHtml(({matched:'已自动匹配，待确认', confirmed:'已确认', skipped:'已明确跳过', missing:'未找到对应 Sheet', ambiguous:'有多个候选，待选择', invalid:'原选择无效或重复，请重新选择'})[tc.status] || '待确认')}</div></td>
                             <td style="padding:4px;border:1px solid #ffe0b2;vertical-align:top;">
-                                <select data-target-key="${_escapeHtml(tc.key)}" style="width:100%;padding:4px;font-size:11px;font-family:monospace;">${opts}</select>
+                                <select data-target-key="${_escapeHtml(tc.key)}" data-target-workbook="${_escapeHtml(tc.workbook || '')}" style="width:100%;padding:4px;font-size:11px;font-family:monospace;">${opts}</select>
                                 ${aiHint}
                             </td>
                         </tr>`;
@@ -525,6 +530,7 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
                     ${autoRenamedHtml}
                     ${renameCandidatesHtml}
                     ${targetCandidatesHtml}
+                    ${(data.source_mapping_overview || []).length ? `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid #c8e6c9;border-radius:6px;"><b>已匹配的源文件 / Sheet 关系</b><ul>${data.source_mapping_overview.map(row => `<li>${_escapeHtml(row.file)} / ${_escapeHtml(row.sheet)} → ${_escapeHtml(row.expected_file)} / ${_escapeHtml(row.expected_sheet)}</li>`).join('')}</ul></div>` : ''}
                     ${missingColsHtml}
                     ${aiSuggestionsHtml}
                     ${historyHtml}
@@ -721,12 +727,14 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
                 }).filter(Boolean));
             const pending = Array.from(skipBoxes()).filter(cb => !cb.checked &&
                 !selectedExpectedFiles.has(cb.dataset.skipMissing)).length;
-            confirmBtn.disabled = pending > 0;
-            confirmBtn.style.background = pending > 0 ? '#bdbdbd' : '#1976d2';
-            confirmBtn.style.cursor = pending > 0 ? 'not-allowed' : 'pointer';
-            confirmBtn.textContent = pending > 0
+            const targetIssue = _targetMappingIssue(overlay);
+            const blocked = pending > 0 || !!targetIssue;
+            confirmBtn.disabled = blocked;
+            confirmBtn.style.background = blocked ? '#bdbdbd' : '#1976d2';
+            confirmBtn.style.cursor = blocked ? 'not-allowed' : 'pointer';
+            confirmBtn.textContent = targetIssue || (pending > 0
                 ? '请先补齐或勾选跳过缺失文件'
-                : (tableMappingDirty ? '应用表关系并刷新字段' : '确认匹配并开始计算');
+                : (tableMappingDirty ? '应用表关系并刷新字段' : '确认匹配并开始计算'));
         }
         overlay.onchange = (e) => {
             if (!e.target?.matches) return;
@@ -918,7 +926,7 @@ function _showPrecheckDialog(data, previousConfirmations = null, choices = {}) {
                 }
                 // 请求期间保留同一个窗口；失败时更新内容，成功后再关闭。
                 document.getElementById('_pre_confirm').disabled = true;
-                document.getElementById('_pre_confirm').textContent = '正在校验…';
+                document.getElementById('_pre_confirm').textContent = '正在提交计算…';
                 document.getElementById('_pre_cancel').disabled = true;
                 overlay.querySelectorAll('input,select').forEach(el => { el.disabled = true; });
                 resolve(out);
@@ -951,12 +959,26 @@ function _collectConfirmedRenames(overlay) {
  * 同上：选"（不映射，跳过该表）"的键值为空串，表示明确跳过该表，一并上报。
  */
 function _collectConfirmedTargetMap(overlay) {
+    const issue = _targetMappingIssue(overlay);
+    if (issue) throw new Error(issue);
     const result = {};
     overlay.querySelectorAll('select[data-target-key]').forEach(sel => {
         const key = sel.dataset.targetKey;
         if (key) result[key] = sel.value || '';
     });
     return result;
+}
+
+function _targetMappingIssue(overlay) {
+    const claimed = new Set();
+    for (const sel of overlay.querySelectorAll('select[data-target-key]')) {
+        if (sel.value === '__pending_target__') return '请完成全部关键 Sheet 的匹配或明确跳过';
+        if (!sel.value) continue;
+        const identity = JSON.stringify([sel.dataset.targetWorkbook || '', sel.value]);
+        if (claimed.has(identity)) return '同一文件中的多个目标表不能选择同一个模板 Sheet';
+        claimed.add(identity);
+    }
+    return '';
 }
 
 /** 收集独立的源 Sheet 人工关系，不能只依赖列下拉框反推。 */
@@ -1340,8 +1362,7 @@ document.addEventListener('DOMContentLoaded', function() {
             _autoCheckEncryption(Array.from(this.files || []), 'template');
             const list = document.getElementById('template-file-list');
             if (!list) return;
-            list.innerHTML = (this.files && this.files.length > 0)
-                ? `<div>${_escapeHtml(this.files[0].name)}</div>` : '';
+            list.innerHTML = Array.from(this.files || []).map(file => `<div>${_escapeHtml(file.name)}</div>`).join('');
         });
     }
 
@@ -1459,20 +1480,48 @@ async function loadTenantScripts(tenantId) {
     const group = document.getElementById('script-selector-group');
     const selector = document.getElementById('script-selector');
     const info = document.getElementById('script-info');
+    const loadId = ++_tenantScriptsLoadId;
+    currentScriptId = '';
+    scriptsCache = [];
+    selector.innerHTML = '';
+    selector.disabled = true;
+    info.textContent = '';
+    group.style.display = 'none';
+    toggleTemplateInput(null);
+    checkCanCompute();
 
     try {
         const resp = await AUTH.authFetch(`/api/tenant-scripts/${encodeURIComponent(tenantId)}`);
+        if (loadId !== _tenantScriptsLoadId) return;
         if (!resp.ok) {
             group.style.display = 'none';
             return;
         }
 
         const data = await resp.json();
+        if (loadId !== _tenantScriptsLoadId) return;
         if (!data.scripts || data.scripts.length === 0) {
-            group.style.display = 'none';
-            addLog('warning', '该租户没有可用的训练脚本');
+            if ((data.pending_solutions || []).length) {
+                group.style.display = 'block';
+                const option = document.createElement('option');
+                option.value = '';
+                option.textContent = '已导入，待验收启用';
+                selector.appendChild(option);
+                const names = data.pending_solutions.map(s => s.name).join('、');
+                info.textContent = `已保存方案：${names}。请到智训页面的「计算方案」完成验收并启用，再返回刷新版本列表。`;
+                const link = document.createElement('a');
+                link.href = '/training';
+                link.target = '_blank';
+                link.rel = 'noopener';
+                link.textContent = ' 前往智训';
+                info.appendChild(link);
+                addLog('warning', '该租户已有导入方案，尚未验收启用，暂不能用于智算');
+            } else {
+                addLog('warning', '该租户没有可用的训练脚本');
+            }
             return;
         }
+        selector.disabled = false;
 
         // 按分数排序，最高分在前
         const scripts = data.scripts.sort((a, b) => (b.score || 0) - (a.score || 0));
@@ -1497,6 +1546,7 @@ async function loadTenantScripts(tenantId) {
         toggleTemplateInput(activeScript || scripts[0]);
 
     } catch (e) {
+        if (loadId !== _tenantScriptsLoadId) return;
         console.error('加载脚本列表失败:', e);
         group.style.display = 'none';
     }
@@ -1666,6 +1716,7 @@ function _mergeConfirmations(prev, dialogResult) {
         merged.confirmed_mapping = {file_mapping: _mergeFileMappings(
             _withoutUnmatchedMappings((merged.confirmed_mapping || {}).file_mapping, skipped), incoming.file_mapping),
             unmatched_columns: skipped};
+
     }
     if (dialogResult.confirmed_renames && Object.keys(dialogResult.confirmed_renames).length > 0) {
         merged.confirmed_renames = Object.assign({}, merged.confirmed_renames || {}, dialogResult.confirmed_renames);
@@ -1736,6 +1787,8 @@ async function startCompute() {
     formData.append('client_submission_id', submissionId);
     formData.append('tenant_id', currentTenantId);
     formData.append('script_id', currentScriptId);
+    const selectedScript = scriptsCache.find(s => s.script_id === currentScriptId);
+    if (selectedScript?.name) formData.append('script_display_name', selectedScript.name);
 
     Array.from(files).forEach(file => {
         formData.append('source_files', file);
@@ -1744,7 +1797,7 @@ async function startCompute() {
     // 模板模式可选新模板：上传则覆盖训练时模板
     const templateInput = document.getElementById('template-file');
     if (templateInput && templateInput.files && templateInput.files.length > 0) {
-        formData.append('template_file', templateInput.files[0]);
+        Array.from(templateInput.files).forEach(file => formData.append('template_files', file));
     }
 
     // 添加可选参数
@@ -2226,7 +2279,7 @@ function showError(message) {
             </div>
             <div class="result-item" style="flex: 3;">
                 <div class="label">错误信息</div>
-                <div class="value" style="font-size: 13px; color: #dc3545;">${message}</div>
+                <div class="value" style="font-size: 13px; color: #dc3545;">${_escapeHtml(message)}</div>
             </div>
         </div>
     `;
@@ -2311,7 +2364,7 @@ function addLog(level, message) {
     const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
     const entry = document.createElement('div');
     entry.className = `log-entry ${level}`;
-    entry.innerHTML = `<span class="log-timestamp">[${time}]</span>${message}`;
+    entry.innerHTML = `<span class="log-timestamp">[${time}]</span>${_escapeHtml(message)}`;
     logContent.appendChild(entry);
     logContent.scrollTop = logContent.scrollHeight;
 }

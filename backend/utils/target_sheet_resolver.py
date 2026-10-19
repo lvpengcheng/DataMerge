@@ -52,8 +52,8 @@ def _sheet_header_vocab(ws, max_rows: int = 6) -> set:
     vocab = set()
     try:
         mr = min(max_rows, ws.max_row or 1)
-        for r in range(1, mr + 1):
-            for cell in ws[r]:
+        for row in ws.iter_rows(min_row=1, max_row=mr):
+            for cell in row:
                 v = cell.value
                 if v is None:
                     continue
@@ -96,6 +96,7 @@ def resolve_target_sheets(
     manual = manual_map or {}
     resolved: Dict[str, str] = {}
     claimed = set()
+    header_vocab = {}
     # 人工已决定的键（含"空值=明确跳过"）：无论如何都不再进 ambiguous，
     # 否则前端会对同一个键反复弹窗，用户永远跳不过去。
     decided = {str(k) for k in manual.keys() if k}
@@ -155,7 +156,9 @@ def resolve_target_sheets(
         for sn in _candidates():
             if sn in claimed:
                 continue
-            vocab = _sheet_header_vocab(wb[sn])
+            if sn not in header_vocab:
+                header_vocab[sn] = _sheet_header_vocab(wb[sn])
+            vocab = header_vocab[sn]
             if not vocab:
                 continue
             hit = sum(1 for vs in variants if vs & vocab)

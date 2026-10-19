@@ -120,9 +120,14 @@ def execute_workbooks(targets, environment):
                               "convert_region_to_dataframe", "normalize_emp_code", "print_available_columns",
                               "load_files_to_dataframes", "EMPTY", "ZERO", "excel_text", "write_cell")}
             env.update(output_folder=str(child_dir), __name__="multi_workbook_child")
-            template = resolve_child_template(target["code"], environment.get("tenant_id"))
+            overrides = environment.get('_template_override_paths') or {}
+            template = overrides.get(name) or resolve_child_template(target["code"], environment.get("tenant_id"))
             if template:
                 env["_template_override_path"] = template
+            from .compute_templates import workbook_target_map
+            manual_map = workbook_target_map(environment.get('_target_sheet_manual_map'), name)
+            if manual_map:
+                env['_target_sheet_manual_map'] = manual_map
             exec(compile(target["code"], name + ".py", "exec"), env)
             for key in ("salary_year", "salary_month", "monthly_standard_hours", "tenant_id"):
                 if environment.get(key) is not None:
@@ -239,7 +244,7 @@ def validate_workbooks(output_dir, code, structure, rules_content=None, tenant_i
 
 
 def deliver_workbooks(output_dir, destination_dir, code, structure, tenant_id, display_name,
-                      salary_year=None, salary_month=None):
+                      salary_year=None, salary_month=None, template_override_paths=None):
     """Finalize every declared workbook before publishing one ZIP."""
     from backend.utils.output_postprocess import (
         finalize_output_workbook, build_result_filename, dual_output_enabled,
@@ -259,7 +264,7 @@ def deliver_workbooks(output_dir, destination_dir, code, structure, tenant_id, d
     with tempfile.TemporaryDirectory(prefix="delivery_", dir=destination_dir) as staged:
         for output in outputs:
             child_code = targets.get(output.name, {}).get("code", code)
-            template = resolve_child_template(child_code, tenant_id)
+            template = (template_override_paths or {}).get(output.name) or resolve_child_template(child_code, tenant_id)
             result = finalize_output_workbook(str(output), template, definitions[output.name], child_code)
             report = inspect_formula_cache(str(output))
             reports[output.name] = report

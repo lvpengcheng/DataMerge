@@ -73,6 +73,12 @@ const Tools = {
         const savedBtn = saved && document.querySelector('.tab-btn[data-tab="' + saved + '"]');
         if (savedBtn && savedBtn.offsetParent !== null) {   // offsetParent==null → 被 display:none 隐藏(无权限)
             this._activateTab(saved);
+        } else {
+            const active = document.querySelector('.tab-btn.active');
+            if (!active || active.offsetParent === null) {
+                const first = Array.from(document.querySelectorAll('.tab-btn')).find(b => b.offsetParent !== null);
+                if (first) this._activateTab(first.dataset.tab);
+            }
         }
     },
 
@@ -241,6 +247,14 @@ const Tools = {
     },
 
     // ==================== 多表数据合并 ====================
+    _intFetch(url, options) {
+        if (this._integrationKind === 'split') url = url.replace('/api/tools/integrate/', '/api/tools/table-split/');
+        return AUTH.authFetch(url, options);
+    },
+    _intPerm(action) {
+        return `tools.${this._integrationKind === 'split' ? 'table_split' : 'data_integrate'}.${action}`;
+    },
+
     // ==================== 多表整合对比 ====================
     initDataIntegrate() {
         const zone = document.getElementById('integrate-upload-zone');
@@ -276,7 +290,7 @@ const Tools = {
         this._intShowList();
         this._intSetListStatus('加载中...');
         try {
-            const resp = await AUTH.authFetch('/api/tools/integrate/schemes');
+            const resp = await this._intFetch('/api/tools/integrate/schemes');
             if (!resp.ok) { await _alertErr(resp, '加载方案失败'); this._intSetListStatus('加载失败', 'error'); return; }
             _integrateSchemeList = await resp.json();
             this._intRenderSchemeList();
@@ -330,9 +344,9 @@ const Tools = {
             this._intRenderPagination(0);
             return;
         }
-        const canApply = AUTH.hasPerm('tools.data_integrate.apply');
-        const canEditPerm = AUTH.hasPerm('tools.data_integrate.edit');
-        const canDelPerm = AUTH.hasPerm('tools.data_integrate.delete');
+        const canApply = AUTH.hasPerm(this._intPerm('apply'));
+        const canEditPerm = AUTH.hasPerm(this._intPerm('edit'));
+        const canDelPerm = AUTH.hasPerm(this._intPerm('delete'));
         tbody.innerHTML = pageItems.map(s => {
             // 最后修改时间：有 updated_at 用之，否则回退创建时间
             const t = ((s.updated_at || s.created_at) || '').replace('T', ' ').slice(0, 19);
@@ -419,7 +433,7 @@ const Tools = {
     async _intDeleteSchemeRow(scheme) {
         if (!scheme || !confirm(`删除方案「${scheme.name}」？`)) return;
         try {
-            const resp = await AUTH.authFetch('/api/tools/integrate/scheme/' + scheme.id, { method: 'DELETE' });
+            const resp = await this._intFetch('/api/tools/integrate/scheme/' + scheme.id, { method: 'DELETE' });
             if (!resp.ok) { await _alertErr(resp, '删除失败'); return; }
             this.loadIntegrateSchemes();
         } catch (e) { alert('删除失败: ' + e.message); }
@@ -428,7 +442,7 @@ const Tools = {
     async _intExportScheme(scheme) {
         if (!scheme) return;
         try {
-            const resp = await AUTH.authFetch(`/api/tools/integrate/scheme/${scheme.id}/export`);
+            const resp = await this._intFetch(`/api/tools/integrate/scheme/${scheme.id}/export`);
             if (!resp.ok) { await _alertErr(resp, '导出失败'); return; }
             const blob = await resp.blob();
             const url = URL.createObjectURL(blob);
@@ -455,7 +469,7 @@ const Tools = {
             fd.append('file', file);
             fd.append('name', name.trim());
             this._intSetListStatus('导入中...');
-            const resp = await AUTH.authFetch('/api/tools/integrate/scheme/import', { method: 'POST', body: fd });
+            const resp = await this._intFetch('/api/tools/integrate/scheme/import', { method: 'POST', body: fd });
             if (!resp.ok) { await _alertErr(resp, '导入失败'); this._intSetListStatus('导入失败', 'error'); return; }
             await this.loadIntegrateSchemes();
             this._intSetListStatus(`方案「${name.trim()}」已导入`, 'ok');
@@ -493,7 +507,7 @@ const Tools = {
             this._renderIntegrateList();
         }));
         const allSheets = !!document.getElementById('int-parse-all-sheets')?.checked;
-        document.getElementById('btn-integrate-analyze').disabled = allSheets
+        document.getElementById('btn-integrate-analyze').disabled = (allSheets || this._integrationKind === 'split')
             ? (_integrateFiles.length < 1) : (_integrateFiles.length < 2);
     },
 
@@ -505,7 +519,7 @@ const Tools = {
 
     async _analyzeIntegrate() {
         const parseAllSheets = !!document.getElementById('int-parse-all-sheets')?.checked;
-        if ((!parseAllSheets && _integrateFiles.length < 2) || _integrateFiles.length < 1) {
+        if ((this._integrationKind !== 'split' && !parseAllSheets && _integrateFiles.length < 2) || _integrateFiles.length < 1) {
             this._setIntegrateStatus(parseAllSheets ? '请至少上传 1 个文件' : '请至少上传 2 个文件', 'error');
             return;
         }
@@ -517,7 +531,9 @@ const Tools = {
             _integrateFiles.forEach(f => fd.append('files', f));
             fd.append('tenant_id', '__tools_integrate__');
             fd.append('parse_all_sheets', parseAllSheets ? 'true' : 'false');
-            const resp = await AUTH.authFetch('/api/tools/integrate/analyze', { method: 'POST', body: fd });
+            const schemeId = this._intTargetSchemeId();
+            if (schemeId != null) fd.append('scheme_id', schemeId);
+            const resp = await this._intFetch('/api/tools/integrate/analyze', { method: 'POST', body: fd });
             if (!resp.ok) {
                 const msg = await _alertErr(resp, '解析失败');
                 this._setIntegrateStatus(msg || '解析失败', 'error');
@@ -544,6 +560,12 @@ const Tools = {
 
     _intFindMatched(id) {
         return (_integrateAnalysis.matched_schemes || []).find(s => s.id === id) || null;
+    },
+
+    _intTargetSchemeId() {
+        if (_intMode === 'apply') return _intApplyTarget?.id ?? null;
+        if (_intMode === 'edit') return _intEditingSchemeId;
+        return null;
     },
 
     // 首次上传沿用方案保存的列头范围；之后人工重新解析时保留用户指定范围。
@@ -579,9 +601,10 @@ const Tools = {
         });
         if (!changed) return;
         this._setIntegrateStatus('正在按方案保存的列头范围解析...');
-        const resp = await AUTH.authFetch('/api/tools/integrate/reparse-headers', {
+        const resp = await this._intFetch('/api/tools/integrate/reparse-headers', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_id: _integrateAnalysis.session_id, header_ranges: ranges }),
+            body: JSON.stringify({ session_id: _integrateAnalysis.session_id, header_ranges: ranges,
+                scheme_id: this._intTargetSchemeId() }),
         });
         if (!resp.ok) {
             const msg = await _alertErr(resp, '恢复方案列头范围失败');
@@ -693,7 +716,7 @@ const Tools = {
         this._setIntegrateStatus('正在校验并加载方案配置...');
         const rz = document.getElementById('int-apply-reasons');
         try {
-            const resp = await AUTH.authFetch('/api/tools/integrate/scheme/apply-validate', {
+            const resp = await this._intFetch('/api/tools/integrate/scheme/apply-validate', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ session_id: _integrateAnalysis.session_id, scheme_id: _intApplyTarget.id }),
             });
@@ -724,7 +747,7 @@ const Tools = {
             }
             this._intFillFromScheme(scheme);
             _intApplyReady = true;
-            this._setIntegrateStatus('已回填方案的主表、关联键、覆盖与对比映射，请检查后点击「生成并下载」', 'ok');
+            this._setIntegrateStatus('已回填方案配置，请检查后点击列头范围下方的「应用方案」生成并下载', 'ok');
         } catch (e) {
             this._setIntegrateStatus('应用失败: ' + e.message, 'error');
         } finally {
@@ -737,7 +760,7 @@ const Tools = {
     async _intPrefillForEdit() {
         if (!_intEditingSchemeId) return;
         try {
-            const resp = await AUTH.authFetch('/api/tools/integrate/scheme/apply-validate', {
+            const resp = await this._intFetch('/api/tools/integrate/scheme/apply-validate', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ session_id: _integrateAnalysis.session_id, scheme_id: _intEditingSchemeId }),
             });
@@ -782,9 +805,10 @@ const Tools = {
         const btn = document.getElementById('int-reparse-headers');
         if (btn) btn.disabled = true;
         try {
-            const resp = await AUTH.authFetch('/api/tools/integrate/reparse-headers', {
+            const resp = await this._intFetch('/api/tools/integrate/reparse-headers', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ session_id: _integrateAnalysis.session_id, header_ranges: ranges }),
+                body: JSON.stringify({ session_id: _integrateAnalysis.session_id, header_ranges: ranges,
+                    scheme_id: this._intTargetSchemeId() }),
             });
             if (!resp.ok) { await _alertErr(resp, '重新解析失败'); this._setIntegrateStatus('重新解析失败', 'error'); return; }
             _integrateAnalysis = await resp.json();
@@ -817,7 +841,7 @@ const Tools = {
                 </div>`).join('')}
                 <div style="margin-top:8px;display:flex;align-items:center;gap:8px;">
                     <button type="button" class="btn btn-sm" id="int-reparse-headers">按指定范围重新解析</button>
-                    ${_intMode === 'apply' ? '<button type="button" class="btn btn-sm" id="int-apply-confirm">重新加载方案配置</button>' : ''}
+                    ${_intMode === 'apply' ? '<button type="button" class="btn btn-sm btn-primary" id="int-execute" disabled>应用方案</button><span class="status" id="int-exec-status"></span>' : ''}
                 </div>
             </div>
 
@@ -882,10 +906,10 @@ const Tools = {
                 顺序 <select id="int-diff-order"><option value="id_name">身份证,姓名</option><option value="name_id">姓名,身份证</option></select>
             </div>
 
-            <div class="actions" style="margin-top:16px;">
+            ${_intMode !== 'apply' ? `<div class="actions" style="margin-top:16px;">
                 <button class="btn btn-primary" id="int-execute">生成并下载</button>
                 <span class="status" id="int-exec-status"></span>
-            </div>
+            </div>` : ''}
             <div class="actions" id="int-save-row" style="margin-top:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
                 <span id="int-save-label">保存为方案：</span>
                 <input type="text" id="int-scheme-name" placeholder="方案名称（如 5月工资整合）" style="min-width:200px;">
@@ -1042,13 +1066,14 @@ const Tools = {
             normalize_keys: true,
             date_key_mode: document.getElementById('int-date-mode')?.value || 'off',
             union_source_keys: !!document.getElementById('int-union-source-keys')?.checked,
+            split_config: this._integrationKind === 'split' ? this._readSplitConfig() : null,
         };
         // 另存为不带 scheme_id（走新建分支）；保存修改才带
         if (!asNew && _intMode === 'edit' && _intEditingSchemeId) payload.scheme_id = _intEditingSchemeId;
         const st = document.getElementById('int-save-status');
         st.textContent = '保存中...'; st.className = 'status';
         try {
-            const resp = await AUTH.authFetch('/api/tools/integrate/scheme/save', {
+            const resp = await this._intFetch('/api/tools/integrate/scheme/save', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
             });
             if (!resp.ok) { await _alertErr(resp, '保存失败'); st.textContent = '保存失败'; st.className = 'status error'; return; }
@@ -1360,7 +1385,7 @@ const Tools = {
         this._intNonMainFiles().forEach(f => (f.columns || []).forEach(c => source_cols.push({ file: f.name, col: c })));
         st.textContent = '匹配中...'; st.className = 'status';
         try {
-            const resp = await AUTH.authFetch('/api/tools/integrate/match', {
+            const resp = await this._intFetch('/api/tools/integrate/match', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ session_id: _integrateAnalysis.session_id, main_file: this._intMainFile(), source_cols, use_ai: !!useAi }),
             });
@@ -1422,7 +1447,7 @@ const Tools = {
         document.querySelectorAll('.int-key').forEach(s => { key_map[s.dataset.file] = s.value; });
         const { overwrite_pairs, compare_pairs } = { overwrite_pairs: this._readSectionPairs('ow'), compare_pairs: this._readSectionPairs('cmp') };
         const mode = parseInt(document.querySelector('input[name="int-output-mode"]:checked').value, 10);
-        if (overwrite_pairs.length === 0) { alert('请至少在「覆盖字段」里选好一列'); return; }
+        if (this._integrationKind !== 'split' && overwrite_pairs.length === 0) { alert('请至少在「覆盖字段」里选好一列'); return; }
         if (mode === 2 && compare_pairs.length === 0) { alert('输出方式2需在「对比字段」里选好一列'); return; }
         const payload = {
             session_id: _integrateAnalysis.session_id, main_file: main, key_map,
@@ -1433,6 +1458,7 @@ const Tools = {
             normalize_keys: true,
             date_key_mode: document.getElementById('int-date-mode')?.value || 'off',
             union_source_keys: !!document.getElementById('int-union-source-keys')?.checked,
+            split_config: this._integrationKind === 'split' ? this._readSplitConfig() : null,
         };
         const st = document.getElementById('int-exec-status');
         const btn = document.getElementById('int-execute');
@@ -1440,7 +1466,7 @@ const Tools = {
         // 与套用方案入口的状态元素统一（#integrate-status），避免"正在生成结果"永不更新
         this._setIntegrateStatus('正在生成结果...', 'ok');
         try {
-            const resp = await AUTH.authFetch('/api/tools/integrate/execute', {
+            const resp = await this._intFetch('/api/tools/integrate/execute', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload),
             });
@@ -1453,10 +1479,10 @@ const Tools = {
             const blob = await resp.blob();
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
-            a.href = url; a.download = '整合结果_' + main;
+            a.href = url; a.download = this._integrationKind === 'split' ? '拆表结果.zip' : '整合结果_' + main;
             document.body.appendChild(a); a.click(); a.remove();
             URL.revokeObjectURL(url);
-            const info = `新增${resp.headers.get('X-Integrate-Added') || 0}行 命中${resp.headers.get('X-Integrate-Matched') || 0}行 覆盖${resp.headers.get('X-Integrate-Cells') || 0}格 差异${resp.headers.get('X-Integrate-Diffs') || 0}行`;
+            const info = (this._integrationKind === 'split' ? `拆成${resp.headers.get('X-Split-Groups') || 0}个Excel，共${resp.headers.get('X-Split-Rows') || 0}行；` : '') + `新增${resp.headers.get('X-Integrate-Added') || 0}行 命中${resp.headers.get('X-Integrate-Matched') || 0}行 覆盖${resp.headers.get('X-Integrate-Cells') || 0}格 差异${resp.headers.get('X-Integrate-Diffs') || 0}行`;
             st.textContent = '已生成下载（' + info + '）'; st.className = 'status ok';
             this._setIntegrateStatus('已生成下载（' + info + '）', 'ok');
         } catch (e) {

@@ -994,7 +994,7 @@ function sendMessage(action) {
 }
 
 function _startTraining(userText) {
-    if (_isStreaming) return;  // 防止重复触发
+    if (_isStreaming || _sheetPickerResolver) return;  // 防止重复触发及覆盖正在选择的文件
     const sourceFiles = document.getElementById('source-files').files;
     const targetFiles = Array.from(document.getElementById('target-file').files);
     const targetFile = targetFiles[0];
@@ -1015,28 +1015,15 @@ function _startTraining(userText) {
         alert('多个目标文件请使用公式模式或模板模式');
         return;
     }
-    if (_needsPicker && targetFiles.length > 1) {
-        (async () => {
-            const selection = {};
-            for (const file of targetFiles) {
-                const sheets = await _pickTargetSheets(file);
-                if (sheets === null) return;
-                selection[file.name.replace(/\.(xls|xlsm)$/i, '.xlsx')] = sheets;
-            }
-            _go(selection);
-        })().catch(err => alert('目标文件分析失败：' + err.message));
-    } else if (_needsPicker) {
-        console.log('[训练] 模板/自动模式 → 调用 peek-template-sheets');
-        _pickTargetSheets(targetFile).then(selectedSheets => {
+    if (_needsPicker) {
+        _pickTargetSheets(targetFiles.length > 1 ? targetFiles : targetFile).then(selectedSheets => {
             if (selectedSheets === null) {
                 console.log('[训练] 用户取消 sheet 选择，跳过本次训练');
                 return;  // 取消才中止
             }
             _go(selectedSheets);
         }).catch(err => {
-            console.warn('[sheet 选择] 解析失败，fallback 走全量 sheet:', err);
-            try { _addMessage('system', '目标文件 sheet 解析失败：' + (err && err.message ? err.message : err) + '；将默认使用全部 sheet 进入训练'); } catch (e) {}
-            _go([]);  // 软失败：仍进入训练，由后端按全量 sheet 处理
+            alert('目标文件分析失败：' + err.message);
         });
     } else {
         _go([]);  // 公式模式/直接导入：不需选择
@@ -1086,9 +1073,13 @@ function _submitStartTraining(userText, sourceFiles, targetFiles, ruleFiles,
 // ==================== 目标 Sheet 选择弹窗 ====================
 
 let _sheetPickerResolver = null;  // Promise resolve 函数
+let _sheetPickerFiles = null;
 
-function _pickTargetSheets(targetFile) {
+function _pickTargetSheets(targetFiles) {
+    const multiple = Array.isArray(targetFiles);
+    const files = multiple ? targetFiles : [targetFiles];
     return new Promise((resolve, reject) => {
+        if (_sheetPickerResolver) return reject(new Error('请先完成当前工作表选择'));
         // 先检查 modal DOM 是否存在（应对浏览器缓存了旧版 training.html 的情况）
         const modal = document.getElementById('sheet-picker-modal');
         const list = document.getElementById('sheet-picker-list');
@@ -1097,10 +1088,14 @@ function _pickTargetSheets(targetFile) {
             return reject(new Error('sheet 选择弹窗 DOM 不存在；请按 Ctrl+F5 强制刷新页面再试'));
         }
 
-        const fd = new FormData();
-        fd.append('target_file', targetFile);
-        const _pwd = _filePasswordsMap[targetFile.name];
-        if (_pwd) fd.append('file_password', _pwd);
+        const names = files.map(file => file.name.replace(/\.(xlsx|xls|xlsm)$/i, '.xlsx'));
+        if (new Set(names.map(name => name.toLowerCase())).size !== names.length) {
+            return reject(new Error('目标文件重名，请修改文件名后重新上传'));
+        }
+        _sheetPickerFiles = null;
+        _sheetPickerResolver = resolve;
+        const confirm = document.getElementById('sheet-picker-confirm');
+        if (confirm) confirm.disabled = true;
 
         // 强制 inline 样式，避免 CSS 缓存（.modal-overlay 类样式没刷新到时）导致弹窗肉眼看不见
         Object.assign(modal.style, {
@@ -1116,7 +1111,7 @@ function _pickTargetSheets(targetFile) {
             Object.assign(dialog.style, {
                 background: '#fff', borderRadius: '12px',
                 boxShadow: '0 8px 32px rgba(0,0,0,0.18)',
-                maxWidth: '560px', width: '90vw', padding: '0',
+                maxWidth: '720px', width: '90vw', padding: '0',
             });
         }
         // header 加点 padding
@@ -1131,57 +1126,85 @@ function _pickTargetSheets(targetFile) {
         const body = modal.querySelector('.modal-body');
         if (body) Object.assign(body.style, { padding: '14px 18px' });
 
-        title.textContent = '正在分析目标文件...';
+        title.textContent = `正在分析 ${files.length} 个目标文件...`;
         list.innerHTML = '<div style="padding:16px;text-align:center;color:#888;">解析中，请稍候...</div>';
         console.log('[sheet picker] modal 已显示，开始 peek',
                     'computed:', getComputedStyle(modal).display, getComputedStyle(modal).position);
 
-        // 用 AUTH.authFetch 携带登录 token
-        AUTH.authFetch('/api/training/chat/peek-template-sheets', {
-            method: 'POST', body: fd,
-        })
-        .then(r => r.ok ? r.json() : r.json().then(j => Promise.reject(new Error(j.detail || ('HTTP ' + r.status)))))
-        .then(data => {
-            const sheets = (data && data.sheets) || [];
-            if (sheets.length === 0) {
-                modal.style.display = 'none';
-                return reject(new Error('目标文件没有可用 sheet'));
+        // 每份文件独立解析、携带自己的密码；取消后忽略迟到的解析结果。
+        Promise.all(files.map(async (file, index) => {
+            try {
+                const fd = new FormData();
+                fd.append('target_file', file);
+                if (_filePasswordsMap[file.name]) fd.append('file_password', _filePasswordsMap[file.name]);
+                const response = await AUTH.authFetch('/api/training/chat/peek-template-sheets', {method: 'POST', body: fd});
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.detail || ('HTTP ' + response.status));
+                if (!data.sheets || !data.sheets.length) throw new Error('没有可用 Sheet');
+                return {name: names[index], sheets: data.sheets};
+            } catch (err) {
+                throw new Error(`${file.name}：${err.message}`);
             }
-            title.textContent = `选择需要处理的 Sheet（共 ${sheets.length} 个）`;
-            list.innerHTML = sheets.map((s, i) => {
-                const previewStr = (s.preview || []).slice(0, 2).map(row => row.filter(x => x).slice(0, 6).join(' | ')).join(' / ') || '(空)';
-                const safeName = String(s.name).replace(/"/g, '&quot;');
+        }))
+        .then(workbooks => {
+            if (_sheetPickerResolver !== resolve) return;
+            const safe = value => _escapeHtml(String(value)).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+            title.textContent = `选择需要处理的 Sheet（${files.length} 个文件，共 ${workbooks.reduce((n, file) => n + file.sheets.length, 0)} 个 Sheet）`;
+            list.innerHTML = workbooks.map((file, fileIndex) => `
+                <section style="margin-bottom:14px;" aria-label="${safe(files[fileIndex].name)}">
+                    <div style="display:flex;align-items:center;gap:8px;padding:8px 4px;background:#f4f6f8;">
+                        <strong style="flex:1;overflow-wrap:anywhere;">${safe(files[fileIndex].name)}</strong>
+                        <button type="button" onclick="sheetPickerToggleAll(true, ${fileIndex})">全选</button>
+                        <button type="button" onclick="sheetPickerToggleAll(false, ${fileIndex})">全不选</button>
+                    </div>
+                    ${file.sheets.map(s => {
+                const previewStr = (s.preview || []).slice(0, 2).map(row => row.filter(x => x !== null && x !== '').slice(0, 6).join(' | ')).join(' / ') || '(空)';
+                const safeName = safe(s.name);
                 return `
                 <label style="display:block;padding:6px 4px;border-bottom:1px solid #f0f0f0;cursor:pointer;">
-                    <input type="checkbox" class="sheet-picker-chk" data-name="${safeName}" checked style="width:auto;margin-right:8px;">
+                    <input type="checkbox" class="sheet-picker-chk" data-file-index="${fileIndex}" data-name="${safeName}" checked style="width:auto;margin-right:8px;">
                     <span style="font-weight:500;">${safeName}</span>
-                    <div style="margin-left:24px;font-size:12px;color:#888;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${previewStr}</div>
+                    <div style="margin-left:24px;font-size:12px;color:#888;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${safe(previewStr)}</div>
                 </label>`;
-            }).join('');
-            _sheetPickerResolver = resolve;
+            }).join('')}</section>`).join('');
+            _sheetPickerFiles = {workbooks, multiple};
+            if (confirm) confirm.disabled = false;
         })
         .catch(err => {
+            if (_sheetPickerResolver !== resolve) return;
+            _sheetPickerResolver = null;
+            _sheetPickerFiles = null;
             modal.style.display = 'none';
             reject(err);
         });
     });
 }
 
-function sheetPickerToggleAll(checked) {
-    document.querySelectorAll('#sheet-picker-list .sheet-picker-chk').forEach(c => { c.checked = !!checked; });
+function sheetPickerToggleAll(checked, fileIndex) {
+    document.querySelectorAll('#sheet-picker-list .sheet-picker-chk').forEach(c => {
+        if (fileIndex === undefined || c.getAttribute('data-file-index') === String(fileIndex)) c.checked = !!checked;
+    });
 }
 
 function closeSheetPicker(cancelled) {
     const modal = document.getElementById('sheet-picker-modal');
     let result = null;
     if (!cancelled) {
+        if (!_sheetPickerFiles) return;
         const checked = document.querySelectorAll('#sheet-picker-list .sheet-picker-chk:checked');
-        result = Array.from(checked).map(c => c.getAttribute('data-name'));
-        if (result.length === 0) {
-            alert('请至少勾选一个 Sheet');
-            return;
+        const selection = Object.create(null);
+        for (const [index, file] of _sheetPickerFiles.workbooks.entries()) {
+            selection[file.name] = Array.from(checked)
+                .filter(c => c.getAttribute('data-file-index') === String(index))
+                .map(c => c.getAttribute('data-name'));
+            if (!selection[file.name].length) {
+                alert(`请为「${file.name}」至少勾选一个 Sheet`);
+                return;
+            }
         }
+        result = _sheetPickerFiles.multiple ? selection : selection[_sheetPickerFiles.workbooks[0].name];
     }
+    _sheetPickerFiles = null;
     modal.style.display = 'none';
     if (typeof _sheetPickerResolver === 'function') {
         const r = _sheetPickerResolver;
@@ -1734,7 +1757,8 @@ function _renderIterationCodeSummary(iteration, target) {
 
     const label = document.createElement('div');
     label.className = 'message-label';
-    label.textContent = `第 ${iteration.iteration_num} 轮代码`;
+    label.textContent = iteration.execution_result?.source === 'solution_import'
+        ? '导入方案代码' : `第 ${iteration.iteration_num} 轮代码`;
 
     const contentDiv = document.createElement('div');
     contentDiv.className = 'message-content iteration-code-summary';
@@ -1765,7 +1789,8 @@ function _renderIterationCodeSummary(iteration, target) {
 function _renderOrphanIteration(iteration, target) {
     // 显示迭代结果
     const acc = iteration.accuracy;
-    let resultText = `第 ${iteration.iteration_num} 轮`;
+    let resultText = iteration.execution_result?.source === 'solution_import'
+        ? '已导入方案代码，可直接执行修正（尚未在本环境验证）' : `第 ${iteration.iteration_num} 轮`;
     if (acc != null) {
         resultText += ` — 准确率 ${(acc * 100).toFixed(1)}%`;
     }

@@ -208,13 +208,17 @@ class DocumentParser:
                 try:
                     for ws in wb.worksheets:
                         parts.append(f'=== Sheet: {ws.title} ===')
+                        parts.append(f'工作表状态: {ws.sheet_state}')
                         if ws.merged_cells.ranges:
                             parts.append('合并单元格: ' + ', '.join(str(r) for r in ws.merged_cells.ranges))
                         for row in ws.iter_rows():
                             cells = []
                             for cell in row:
                                 if cell.value is not None:
-                                    cells.append(f'{cell.coordinate}: {cell.value}')
+                                    value = cell.value
+                                    if cell.data_type == 'f' and not isinstance(value, str):
+                                        value = value.text
+                                    cells.append(f'{cell.coordinate}: {value}')
                                 if cell.comment:
                                     cells.append(f'{cell.coordinate}批注: {cell.comment.text}')
                             if cells:
@@ -234,6 +238,7 @@ class DocumentParser:
                     for si in range(wb.Worksheets.Count):
                         ws = wb.Worksheets[si]
                         parts.append(f'=== Sheet: {ws.Name} ===')
+                        parts.append('工作表状态: ' + ('visible' if ws.IsVisible else 'hidden'))
                         for area in ws.Cells.MergedCells:
                             parts.append(f'合并区域: R{area.StartRow+1}C{area.StartColumn+1}:R{area.EndRow+1}C{area.EndColumn+1}')
                         it = ws.Cells.GetEnumerator()
@@ -242,6 +247,9 @@ class DocumentParser:
                             value = cell.Formula if cell.IsFormula else cell.Value
                             if value is not None:
                                 parts.append(f'{cell.Name}: {value}')
+                        for ci in range(ws.Comments.Count):
+                            comment = ws.Comments[ci]
+                            parts.append(f'R{comment.Row+1}C{comment.Column+1}批注: {comment.Note}')
                         if ws.Shapes.Count:
                             parts.append('[本 Sheet 含图形对象，需核对原文件中的图示规则]')
                     return '\n'.join(parts)

@@ -122,13 +122,15 @@ def prepare_source_dir(
     original_names = json.loads(names_path.read_text(encoding='utf-8')) if names_path.exists() else {}
     candidates = [(str(fp.resolve()), fp.name) for fp in src.iterdir()
                   if fp.is_file() and fp.suffix.lower() in _EXCEL_EXTS]
-    if template_override_path:
-        template_name = Path(template_override_path).name
+    template_paths = (list(template_override_path.values()) if isinstance(template_override_path, dict)
+                      else [template_override_path] if template_override_path else [])
+    for template_path in template_paths:
+        template_name = Path(template_path).name
         template_key = 'template::' + template_name
         # Older clients used bare names; do not reuse a source password for a same-named template.
         if template_key not in passwords_dict and not any(name == template_name for _, name in candidates):
             passwords_dict[template_key] = passwords_dict.get(template_name)
-        candidates.append((template_override_path, template_key))
+        candidates.append((template_path, template_key))
 
     encrypted_names = set(detect_encrypted_files(candidates))
     blocked = [name for name in encrypted_names if not passwords_dict.get(name)]
@@ -162,7 +164,9 @@ def prepare_source_dir(
             if converted.name != fp.name:
                 original_names[converted.name] = original_names.get(fp.name, fp.name)
     names_path.write_text(json.dumps(original_names, ensure_ascii=False), encoding='utf-8')
-    if template_override_path:
+    if isinstance(template_override_path, dict):
+        template_override_path = {name: convert_xls_to_xlsx(path) for name, path in template_override_path.items()}
+    elif template_override_path:
         template_override_path = convert_xls_to_xlsx(template_override_path)
     return [], template_override_path
 
@@ -190,6 +194,7 @@ def ingest_source_dir(
     confirmed_renames: Optional[Dict[str, str]] = None,
     confirmed_mapping: Optional[Dict[str, Any]] = None,
     defer_base_fill: bool = False,
+    reuse_session_dir: Optional[str] = None,
 ) -> Tuple[IngestMeta, Dict[tuple, Any]]:
     """解析一次源目录，产出表头层元数据 + 内存解析结果。
 
@@ -215,6 +220,20 @@ def ingest_source_dir(
     input_files = collect_input_files(source_dir)
     parsed_sheets_map: Dict[tuple, Any] = {}
     input_sheets: List[Dict[str, Any]] = []
+    if reuse_session_dir:
+        cached_meta = read_meta(reuse_session_dir)
+        if (cached_meta and not cached_meta.auto_filled
+                and cached_meta.source_structure == structure
+                and cached_meta.manual_headers == manual_headers
+                and cached_meta.expected_structure == expected_structure
+                and getattr(cached_meta, '_source_file_stats', None) == _source_file_stats(source_dir)):
+            cached_sources = read_sources(reuse_session_dir)
+            if cached_sources:
+                input_sheets = deepcopy(cached_meta.input_sheets)
+                parsed_sheets_map = cached_sources
+                input_files = []
+                meta._reused_source_parse = True
+                logger.info('[Ingest] 复用已上传文件的解析缓存，仅解析后续新增的基础资料')
     if input_files:
         try:
             input_sheets, parsed_sheets_map = matcher.parse_inputs(
@@ -535,7 +554,8 @@ def resolve_with_confirmations(
         match_result = FastHeaderMatcher().match_headers_only(
             train_remaining, virtual_sheets, active_ai_provider,
             {'script_content': script_content or '',
-             'template_name': os.path.basename(template_override_path or ''),
+             'template_name': (', '.join(template_override_path) if isinstance(template_override_path, dict)
+                               else os.path.basename(template_override_path or '')),
              'target_sheets': list((meta.expected_structure or {}).get('sheets', {})),
              'target_columns': {name: list(info.get('headers') or {}) for name, info in
                                 (meta.expected_structure or {}).get('sheets', {}).items()
@@ -831,9 +851,15 @@ def _dump(path: Path, obj: Any) -> None:
 def write_ingest(session_dir: str, meta: IngestMeta, parsed_sheets_map: Dict[tuple, Any]) -> None:
     """meta 与 sources 分文件落盘：确认轮只读 meta，大表不进 API 进程。"""
     base = Path(session_dir)
+    meta._source_file_stats = _source_file_stats(meta.source_dir)
     _dump(base / _META_NAME, meta)
     _dump(base / _SOURCES_NAME, parsed_sheets_map)
     logger.info(f"[Ingest] 会话产物已写入 {base}（sheet 数 {len(parsed_sheets_map)}）")
+
+
+def _source_file_stats(source_dir):
+    return {str(Path(path).resolve()): (Path(path).stat().st_size, Path(path).stat().st_mtime_ns)
+            for path in collect_input_files(source_dir)}
 
 
 def _load(path: Path) -> Optional[Any]:

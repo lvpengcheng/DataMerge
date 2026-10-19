@@ -16,7 +16,10 @@ function environment() {
     ], matched_schemes: []};
     let validation = {ok: true, resolved_scheme: {id: 12, config: {}}};
     const context = vm.createContext({
-        console, FormData: class {append() {}},
+        console, FormData: class {
+            constructor() {this.fields = {};}
+            append(key, value) {this.fields[key] = value;}
+        },
         document: {addEventListener() {}, getElementById: element, querySelectorAll: () => []},
         AUTH: {async authFetch(url, options) {
             calls.push({url, body: options?.body});
@@ -49,6 +52,8 @@ function environment() {
     const env = environment();
     await env.tools._analyzeIntegrate();
     assert.deepEqual(env.calls.map(c => c.url.split('/').pop()), ['analyze', 'reparse-headers', 'apply-validate']);
+    assert.equal(env.calls[0].body.fields.scheme_id, 12, 'analysis must target the selected scheme');
+    assert.equal(JSON.parse(env.calls[1].body).scheme_id, 12, 'header restoration must target the selected scheme');
     assert.equal(JSON.parse(env.calls[1].body).header_ranges['main.xlsx'].end_row, 3);
     assert.equal(env.filled.length, 1, 'analysis must load the selected scheme');
     assert.equal(env.element('int-execute').disabled, false);
@@ -62,6 +67,7 @@ function environment() {
     await env.tools._intReparseHeaders();
     assert.deepEqual(env.calls.map(c => c.url.split('/').pop()), ['reparse-headers', 'apply-validate']);
     assert.equal(JSON.parse(env.calls[0].body).header_ranges['main.xlsx'].end_row, 2, 'manual range must be preserved');
+    assert.equal(JSON.parse(env.calls[0].body).scheme_id, 12);
     assert.equal(env.filled.length, 2, 'manual reparse must reload scheme mappings');
 
     env.setValidation({ok: false, reasons: ['missing required column']});

@@ -358,3 +358,16 @@
 .sa-review-sample-table {
     border: none;
 }
+
+#table-split-settings input,
+#table-split-settings select,
+#table-split-settings textarea {
+    border: 1px solid #c5d2e0;
+    border-radius: 5px;
+    padding: 7px 9px;
+    font: inherit;
+    max-width: 100%;
+    background: #fff;
+}
+#table-split-settings label { display: inline-block; margin: 4px 0; }
+#table-split-settings p { line-height: 1.7; }

@@ -26,6 +26,8 @@ class SopPrivacy:
 
     @classmethod
     def field_kind(cls, label):
+        if re.search(r'\[(?:姓名|证件|地址|电话|邮箱|账户|单位)\d+\]', str(label)):
+            return None
         normalized = re.sub(r"[\s_\-]+", "", str(label).lower())
         if len(normalized) > 45:
             return None
@@ -47,18 +49,23 @@ class SopPrivacy:
 
     def learn_text(self, text):
         fields = {}
+        first_row = True
         for line in str(text).splitlines():
-            if '|' not in line:
+            if '|' not in line or re.match(r'^示例数据\s+\d+[:：]', line):
                 fields = {}
+                first_row = True
                 continue
             cells = [cell.strip().strip('`*') for cell in line.strip().strip('|').split('|')]
-            detected = {i: self.field_kind(cell) for i, cell in enumerate(cells) if self.field_kind(cell)}
-            if detected:
-                fields = detected
-            elif fields and not all(re.fullmatch(r'[:\-\s]*', cell) for cell in cells):
+            values = [re.sub(r'^\$?[A-Z]+\$?\d+[:：]\s*', '', cell) for cell in cells]
+            if first_row:
+                # Only the header row defines fields; rule entries such as "姓名" are not headers.
+                fields = {i: self.field_kind(value) for i, value in enumerate(values) if self.field_kind(value)}
+                first_row = False
+                continue
+            if fields and not all(re.fullmatch(r'[:\-\s]*', cell) for cell in cells):
                 for i, kind in fields.items():
-                    if i < len(cells) and cells[i] and not cells[i].startswith('['):
-                        self.alias(cells[i], kind)
+                    if i < len(values) and values[i] and not values[i].startswith(('[', '=')):
+                        self.alias(values[i], kind)
         for match in self.LABEL.finditer(str(text)):
             value = match["value"].strip().strip('"\'`*')
             if value and not value.startswith("["):

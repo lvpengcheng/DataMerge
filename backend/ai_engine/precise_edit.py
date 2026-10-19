@@ -67,9 +67,23 @@ def apply_precise_edits(code_segment: str, edits: list):
         note = (e.get("note") or "").strip() or (find[:40] if isinstance(find, str) else "")
         if not isinstance(find, str) or not isinstance(repl, str) or not find:
             continue
-        cnt = patched.count(find)
+        # AI JSON commonly uses LF even when a saved/imported script uses CRLF.
+        # Match only that representation difference; indentation and all other
+        # characters must still be exact, and the anchor must remain unique.
+        normalized_find = find.replace('\r\n', '\n')
+        pattern = r'\r?\n'.join(re.escape(part) for part in normalized_find.split('\n'))
+        matches = list(re.finditer(pattern, patched))
+        cnt = len(matches)
         if cnt == 1:
-            patched = patched.replace(find, repl, 1)
+            match = matches[0]
+            newline = '\r\n' if '\r\n' in match.group() else '\n'
+            # Single-line anchors inherit the surrounding script's convention.
+            if '\n' not in match.group():
+                first_newline = re.search(r'\r?\n', patched)
+                if first_newline:
+                    newline = first_newline.group()
+            replacement = repl.replace('\r\n', '\n').replace('\n', newline)
+            patched = patched[:match.start()] + replacement + patched[match.end():]
             applied.append(note)
         else:
             failed.append((note, cnt))
@@ -80,6 +94,7 @@ def build_prompt(code_segment: str, user_feedback: str, code_label: str = "当�
                  extra_context: str = "") -> str:
     from backend.utils.generated_code_check import CODE_CONTRACT
     extra_context = CODE_CONTRACT + '\n' + extra_context
+    code_segment = code_segment.replace('\r\n', '\n')
     return f"""你正在做**外科手术式**精确修改。下面是{code_label}。请**只**根据【修改指示】改动直接相关的代码，
 以 JSON 输出一组精确替换，**严禁重写整段代码**。
 
@@ -184,6 +199,7 @@ def run_precise_edit(
             stream_callback(msg)
 
     def _fail(reason: str):
+        log('[精确编辑] 未提交修改：' + reason)
         if reason_sink is not None:
             reason_sink.append(reason)
         return None
@@ -191,7 +207,7 @@ def run_precise_edit(
     def retry_validation(reason):
         if not _validation_retry:
             return _fail(reason)
-        log('[精确编辑] 完整性检查未通过，携带诊断自动修正一次')
+        log('[精确编辑] 完整性检查未通过，携带诊断自动修正一次。原因：' + reason)
         return run_precise_edit(
             ai_provider, full_code, user_feedback,
             code_segment=code_segment, splice_fn=splice_fn, code_label=code_label,

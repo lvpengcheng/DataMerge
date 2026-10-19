@@ -252,7 +252,7 @@ class TrainingIteration(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     session_id = Column(Integer, ForeignKey("training_sessions.id"), nullable=False, index=True)
     iteration_num = Column(Integer, nullable=False)                 # 第几轮
-    status = Column(String(20), default="running")                  # running / completed / failed
+    status = Column(String(20), default="running")                  # running / completed / failed / imported
     prompt_text = Column(Text, nullable=True)                       # 发给 AI 的 prompt
     ai_response = Column(Text, nullable=True)                       # AI 返回的原始内容
     generated_code = Column(Text, nullable=True)                    # 提取出的代码
@@ -296,6 +296,24 @@ class Script(Base):
 
 
 # ==================== 计算任务 ====================
+
+class CalculationSolution(Base):
+    """An immutable artifact with a tenant-local activation binding."""
+    __tablename__ = "calculation_solutions"
+    id = Column(String(32), primary_key=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    script_id = Column(Integer, nullable=False, index=True)
+    source_session_id = Column(Integer, nullable=True)
+    name = Column(String(200), nullable=False)
+    digest = Column(String(64), nullable=False)
+    status = Column(String(24), nullable=False, default="candidate")
+    # A package is activated only after local validation and explicit approval.
+    is_active = Column(Boolean, nullable=False, default=False)
+    validation = Column(JSON, nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("tenant_id", "script_id", "digest", name="uq_solution_script_digest"),)
+
 
 class ComputeTask(Base):
     __tablename__ = "compute_tasks"
@@ -524,6 +542,23 @@ class IntegrateTemplate(Base):
     __table_args__ = (
         UniqueConstraint("tenant_id", "name", name="uq_integrate_tpl_name"),
     )
+
+
+class TableSplitTemplate(Base):
+    """拆表方案：复用整合角色配置，并独立保存拆分规则和组织权限。"""
+    __tablename__ = "table_split_templates"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    name = Column(String(200), nullable=False)
+    config = Column(JSON, nullable=False)
+    org_id = Column(Integer, index=True, nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    creator = relationship("User", foreign_keys=[created_by])
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    updater = relationship("User", foreign_keys=[updated_by])
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("tenant_id", "name", name="uq_table_split_tpl_name"),)
 
 
 class ScriptMigration(Base):

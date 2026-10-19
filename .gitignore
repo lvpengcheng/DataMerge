@@ -9,6 +9,10 @@
 /temp
 /tmp
 /output
+/outputs
+/tests
+/backend/tests
+/backend/test_data
 /global_assets
 /design_docs
 /docs
@@ -38,3 +42,6 @@ deploy.native.config.json
 # Python编译缓存
 __pycache__/
 *.pyc
+
+# Immutable solution artifacts contain tenant source files and training records.
+/solution_store/

@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>DataMerge - 智训</title>
     <link rel="stylesheet" href="/static/css/training.css?v=20260910-scroll">
+    <link rel="stylesheet" href="/static/css/solutions.css?v=20261015-script-import">
 </head>
 <body>
     <div class="container">
@@ -53,6 +54,7 @@
                         <span class="chat-status" id="chat-status"></span>
                     </div>
                     <div class="chat-actions" id="chat-actions">
+                        <button class="btn btn-action" onclick="openSolutions()">转方案 / 方案管理</button>
                         <button class="btn btn-action" id="btn-set-best" onclick="setBestCode()" style="display:none;" title="将当前代码设为最佳脚本">设为最佳</button>
                         <button class="btn btn-action" id="btn-upload-code" onclick="openUploadCodeModal()" style="display:none;" title="上传代码文件（可同时附带模板）">上传代码</button>
                         <button class="btn btn-action" id="btn-download-code" onclick="downloadCode()" style="display:none;" title="下载当前最佳代码">下载代码</button>
@@ -202,7 +204,7 @@
             </div>
             <div class="modal-body">
                 <div style="margin-bottom:8px;color:#666;font-size:13px;" id="sheet-picker-hint">
-                    勾选目标文件中需要处理的 Sheet。仅勾选的 Sheet 会被发给 AI 用于代码生成，避免无关 Sheet 干扰。
+                    按文件分别勾选需要处理的 Sheet，每个文件至少选择一个。同名 Sheet 按所属文件独立处理。
                 </div>
                 <div style="margin-bottom:8px;display:flex;gap:8px;">
                     <button type="button" onclick="sheetPickerToggleAll(true)" style="font-size:12px;">全选</button>
@@ -218,7 +220,8 @@
     </div>
 
     <script src="/static/js/auth.js?v=20260722b"></script>
-<script src="/static/js/training.js?v=20260918-template-password"></script>
+<script src="/static/js/training.js?v=20261019-multi-target-sheets"></script>
 <script src="/static/js/training_assets.js?v=20260907-assets"></script>
+<script src="/static/js/solutions.js?v=20261015-script-import"></script>
 </body>
 </html>

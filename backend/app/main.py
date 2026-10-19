@@ -131,6 +131,8 @@ app.include_router(compute_api_router)
 app.include_router(rules_api_router)
 app.include_router(dashboard_api_router)
 app.include_router(training_chat_router)
+from backend.solutions.api import router as solutions_router
+app.include_router(solutions_router)
 app.include_router(tools_router)
 app.include_router(assemble_rules_router)
 app.include_router(assemble_router)
@@ -4305,7 +4307,8 @@ def _xlsx_sheet_headers(path: str) -> dict:
     return out
 
 
-def _build_sheet_remap(train_path: str, upload_path: str, manual_map: dict = None) -> dict:
+def _build_sheet_remap(train_path: str, upload_path: str, manual_map: dict = None,
+                       script_content: str = None) -> dict:
     """生成"上传 sheet 名 → 训练 sheet 名"的临时改名映射。
 
     ``manual_map`` 是前端最终确认的反方向关系
@@ -4313,6 +4316,31 @@ def _build_sheet_remap(train_path: str, upload_path: str, manual_map: dict = Non
     只有未被人工决定的训练表，才允许按表头 Jaccard 自动补全。
     返回 {上传sheet名: 训练sheet名}，仅含需要改名的。
     """
+    if script_content:
+        from backend.utils.compute_precheck import _extract_colmap
+        col_map = _extract_colmap(script_content)
+        if col_map:
+            import openpyxl
+            from backend.utils.openpyxl_compat import ensure_custom_filter_compat
+            from backend.utils.target_sheet_resolver import resolve_target_sheets
+            ensure_custom_filter_compat()
+            workbook = openpyxl.load_workbook(upload_path, read_only=True, data_only=True)
+            try:
+                resolved, ambiguous, unresolved = resolve_target_sheets(
+                    workbook, col_map, manual_map=manual_map or {})
+            finally:
+                workbook.close()
+            if ambiguous:
+                raise ValueError('模板目标表尚未完成匹配：' + '、'.join(ambiguous)
+                                 + '。请确认训练目标表与本次模板 Sheet 的对应关系后重新提交')
+            if not resolved:
+                raise ValueError('当前模板没有匹配到任何计算目标表，已停止计算，避免生成未填充的空结果')
+            undecided = [key for key in unresolved
+                         if key not in (manual_map or {}) or str((manual_map or {}).get(key) or '').strip()]
+            if undecided:
+                raise ValueError('模板目标表尚未完成匹配或明确跳过：' + '、'.join(undecided))
+            return {actual: expected for expected, actual in resolved.items() if actual != expected}
+
     train = _xlsx_sheet_headers(train_path)
     up = _xlsx_sheet_headers(upload_path)
     if not train or not up:
@@ -4381,6 +4409,8 @@ def _rename_xlsx_sheets(path: str, name_map: dict) -> bool:
         return False
     import openpyxl as _opx
     try:
+        from backend.utils.openpyxl_compat import ensure_custom_filter_compat
+        ensure_custom_filter_compat()
         keep_vba = str(path).lower().endswith(".xlsm")
         wb = _opx.load_workbook(path, keep_vba=keep_vba)
         changed = False
@@ -4496,8 +4526,11 @@ async def _run_compute_subprocess(task_id: str, buffer, params_file: str, temp_d
         try:
             env = os.environ.copy()
             env.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+            from backend.solutions.execution import launch
+            pinned = json.loads(Path(params_file).read_text(encoding="utf-8")).get("_solution")
+            command = launch(params_file, pinned, "compute") or [sys.executable, "-u", "-m", "backend.compute.compute_worker", params_file]
             proc = subprocess.Popen(
-                [sys.executable, "-u", "-m", "backend.compute.compute_worker", params_file],
+                command,
                 cwd=str(Path(__file__).resolve().parent.parent.parent),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
                 **process_group_options())
@@ -4627,6 +4660,13 @@ async def _run_compute_subprocess_queued(task_id: str, buffer, params_file: str,
                 "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
                 "level": "info", "message": f"已获得执行槽（排队 {int(time.monotonic() - started)} 秒），开始计算",
             }, ensure_ascii=False))
+        from backend.utils.compute_confirmation import prepare_confirmed_compute
+        def emit_check(level, message):
+            buffer.push(task_id, json.dumps({
+                'type': 'log', 'timestamp': datetime.now().strftime('%H:%M:%S'),
+                'level': level, 'message': message,
+            }, ensure_ascii=False))
+        await prepare_confirmed_compute(params_file, emit_check)
         await _run_compute_subprocess(task_id, buffer, params_file, temp_dir)
     except Exception as exc:
         message = "等待执行资源超时，请稍后重试" if isinstance(exc, TimeoutError) else str(exc)
@@ -4672,6 +4712,7 @@ async def run_compute_task(
     target_sheet_manual_map=None,
     unmatched_columns=None,
     mapping_finalized: bool = False,
+    script_display_name: Optional[str] = None,
 ):
     """独立的计算任务函数，由 submit 端点触发后台运行。
 
@@ -4713,9 +4754,22 @@ async def run_compute_task(
         compute_task_id = int(task_id)
         compute_start_time = datetime.now()
 
+        # Load the selected script's metadata before template checks use it.
+        # The same snapshot is reused for source mapping and result delivery.
+        _script_info = _load_script_info_for_precheck(tenant_id, script_id)
+        expected_structure = _script_info.get("expected_structure")
+        if isinstance(expected_structure, str):
+            try:
+                expected_structure = json.loads(expected_structure)
+            except (json.JSONDecodeError, TypeError):
+                expected_structure = None
+
         from backend.utils.multi_workbook import workbook_definitions
+        template_override_paths = template_override_path if isinstance(template_override_path, dict) else {}
+        if template_override_paths:
+            template_override_path = None
         if len(workbook_definitions(expected_structure)) > 1 and template_override_path:
-            raise ValueError("多目标脚本分别复用智训中保存的模板，不支持用一个新模板覆盖多个文件；请在智训会话更新对应目标后重新生成")
+            raise ValueError('多目标脚本的新模板必须按对应目标文件名上传')
 
         # 旧脚本里 baked 的训练模板可能是 .xls（模板模式骨架用 openpyxl 加载，不支持 .xls）。
         # 若未上传新模板且训练模板是 .xls，则转成 .xlsx 并作为 override 注入，救活旧脚本。
@@ -4831,8 +4885,6 @@ async def run_compute_task(
             # 按用户实际选择的 script_id 加载脚本元数据，
             # 复用统一的事前校验加载逻辑（DB→文件系统→active 兜底），
             # 避免误取到同租户下其他脚本的 source_structure。
-            _script_info = _load_script_info_for_precheck(tenant_id, script_id)
-
             source_structure = _script_info.get("source_structure")
             if source_mapping_warning:
                 if mapping_finalized and pre_validated_mapping:
@@ -4844,13 +4896,6 @@ async def run_compute_task(
                         'message': f'源数据自动映射未通过；原因: {source_mapping_warning}'}, ensure_ascii=False))
                     source_structure = None  # 未经人工确认的旧兼容路径不重复调用 AI。
             manual_headers = _script_info.get("manual_headers")
-            expected_structure = _script_info.get("expected_structure")
-            if isinstance(expected_structure, str):
-                try:
-                    expected_structure = json.loads(expected_structure)
-                except (json.JSONDecodeError, TypeError):
-                    expected_structure = None
-
             # 确保从DB读出的JSON列是dict（SQLite可能返回字符串，甚至双重编码）
             for _ in range(2):
                 if isinstance(source_structure, str):
@@ -5300,6 +5345,8 @@ async def run_compute_task(
                 # 当前环境定位并设好 template_override_path），骨架 main() 会优先用它覆盖训练模板。
                 if template_override_path:
                     module._template_override_path = template_override_path
+                if template_override_paths:
+                    module._template_override_paths = template_override_paths
 
                 # 目标表映射（②）：事前校验语义解析/用户人工确认后的 {_COL_MAP键: 实际sheet名}，
                 # 骨架 _resolve_target_sheets 会优先采用它把当月模板表对齐到训练固化的键。
@@ -5394,12 +5441,15 @@ async def run_compute_task(
         if template_override_path:
             try:
                 _train_tpl = _extract_template_path(script_content)
-                if _train_tpl and os.path.exists(_train_tpl):
+                if (_train_tpl and os.path.exists(_train_tpl)) or '_COL_MAP' in script_content:
                     # target_sheet_manual_map 是最终审核关系 {训练目标表: 本次模板 sheet}；
                     # 临时改名必须由它反转得到，不能再按表头重新猜测覆盖人工选择。
                     _remap = _build_sheet_remap(
-                        _train_tpl, template_override_path, target_sheet_manual_map)  # {上传名:训练名}
-                    if _remap and _rename_xlsx_sheets(template_override_path, _remap):
+                        _train_tpl, template_override_path, target_sheet_manual_map,
+                        script_content=script_content)  # {上传名:训练名}
+                    if _remap and not _rename_xlsx_sheets(template_override_path, _remap):
+                        raise ValueError('模板目标表临时对齐失败，已停止计算')
+                    if _remap:
                         _sheet_reverse_map = {v: k for k, v in _remap.items()}  # {训练名:上传名}
                         logger.info(f"[sheet重映射] 改名进：{_remap}")
                         _mapping_source = '最终审核关系' if target_sheet_manual_map else '表头自动匹配'
@@ -5412,8 +5462,10 @@ async def run_compute_task(
                                 f"临时改名（本次模板 Sheet→训练名）：{_remap}"
                             )
                         }, ensure_ascii=False))
+            except ValueError:
+                raise
             except Exception as _rm_e:
-                logger.warning(f"[sheet重映射] 改名进失败（按原名继续）：{_rm_e}")
+                raise ValueError(f'模板目标表映射失败，已停止计算：{_rm_e}') from _rm_e
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             exec_result = await loop.run_in_executor(executor, execute_script)
@@ -5444,8 +5496,8 @@ async def run_compute_task(
                 ensure_ascii=False))
             delivery = await asyncio.to_thread(
                 deliver_workbooks, output_dir, compute_dir, script_content, expected_structure,
-                tenant_id, _resolve_script_display_name(tenant_id, script_id, script_content),
-                salary_year, salary_month)
+                tenant_id, script_display_name or _resolve_script_display_name(tenant_id, script_id, script_content),
+                salary_year, salary_month, template_override_paths)
             package = compute_dir / delivery["output_file"]
             if db_session:
                 _persist_result_file(db_session, compute_task_id, tenant_id, package, package.name,
@@ -5578,7 +5630,7 @@ async def run_compute_task(
         )
         _ext = output_file.suffix or ".xlsx"
         _result_name = build_result_filename(
-            _resolve_script_display_name(tenant_id, script_id, script_content),
+            script_display_name or _resolve_script_display_name(tenant_id, script_id, script_content),
             salary_year, salary_month, _ext)
         saved_file = compute_dir / _result_name
         shutil.copy(output_file, saved_file)
@@ -5850,7 +5902,8 @@ def _precheck_requires_user_action(pc_result, skip_history_check: bool = False) 
         (reviews and (available_sources - locked_sources))
         or (pc_result.rename_candidates or [])
         or (pc_result.missing_files or [])
-        or (pc_result.target_candidates or [])
+        or getattr(pc_result, 'target_confirmation_required', False)
+        or any(item.get('requires_confirmation', True) for item in (pc_result.target_candidates or []))
         or ((pc_result.history_warnings or []) and not skip_history_check)
     )
 
@@ -5947,6 +6000,13 @@ def _compute_pending_payload(pc_result, session_id: Optional[str] = None) -> dic
         "actual_sources": review_actual_sources,
         "history_warnings": pc_result.history_warnings,
         "target_candidates": pc_result.target_candidates,
+        "target_confirmation_required": getattr(pc_result, 'target_confirmation_required', False),
+        "source_mapping_overview": [
+            {"file": file, "sheet": sheet, "expected_file": info.get('expected_file') or file,
+             "expected_sheet": target}
+            for file, info in (pc_result.file_mapping or {}).items()
+            for sheet, target in (info.get('sheet_mapping') or {}).items()
+        ],
         "file_mapping": pc_result.file_mapping,
         "review_file_mapping": review_file_mapping,
         "unmatched_columns": pc_result.unmatched_columns,
@@ -5962,6 +6022,8 @@ def _compute_pending_payload(pc_result, session_id: Optional[str] = None) -> dic
 async def _dispatch_compute_task(sess: dict, pc_result, confirmed_target_map=None,
                                  slot_held: bool = False) -> dict:
     """预检通过 → 复用上传前创建的 DB 任务，写参数并派发 worker。"""
+    if getattr(pc_result, 'target_confirmation_required', False):
+        raise HTTPException(status_code=422, detail='关键目标 Sheet 尚未完成匹配确认，不能开始计算')
     p = sess["params"]
     temp_dir = Path(sess["temp_dir"])
     compute_task_id = p.get("task_id")
@@ -5974,12 +6036,16 @@ async def _dispatch_compute_task(sess: dict, pc_result, confirmed_target_map=Non
     buffer.create_task(task_id_str)
     buffer.push(task_id_str, json.dumps({
         "type": "log", "timestamp": datetime.now().strftime("%H:%M:%S"),
-        "level": "info", "message": "预检完成，任务已进入 Excel 有界并发队列",
+        "level": "info", "message": ("匹配关系已确认，后台校验和计算已加入执行队列"
+                                      if p.get('post_confirmation_checks_pending') else
+                                      "预检完成，任务已进入 Excel 有界并发队列"),
     }, ensure_ascii=False))
 
     compute_params = {
+        "_solution": p.get("_solution"),
         "task_id": task_id_str, "tenant_id": p["tenant_id"], "script_id": p["script_id"],
         "script_content": p["script_content"], "source_dir": p["source_dir"],
+        "script_display_name": p.get("script_display_name"),
         "salary_year": p.get("salary_year"), "salary_month": p.get("salary_month"),
         "standard_hours": p.get("standard_hours"), "file_passwords": p.get("file_passwords"),
         "pre_validated_mapping": pc_result.file_mapping,
@@ -5997,6 +6063,17 @@ async def _dispatch_compute_task(sess: dict, pc_result, confirmed_target_map=Non
         "target_sheet_manual_map": {**(pc_result.target_map or {}),
                                     **(confirmed_target_map or {})},
     }
+    if p.get('post_confirmation_checks_pending'):
+        compute_params['_post_confirmation_checks'] = {
+            key: p.get(key) for key in (
+                '_solution', 'source_dir', 'template_override_path', 'source_structure',
+                'manual_headers', 'script_content', 'tenant_id', 'salary_year', 'salary_month',
+                'confirmed_mapping', 'confirmed_renames', 'confirmed_target_map',
+                'skipped_missing_files', 'use_history', 'expected_structure',
+            )
+        }
+        compute_params['_post_confirmation_checks'].update(
+            session_dir=str(temp_dir), passwords_dict={}, mapping_finalized=True, defer_base_fill=False)
     params_file = temp_dir / "_compute_params.json"
     params_file.write_text(
         json.dumps(compute_params, ensure_ascii=False, default=str), encoding="utf-8")
@@ -6051,6 +6128,7 @@ def _compute_upload_precheck_subprocess(payload: dict) -> dict:
             session_dir=payload.get("session_dir"),
             skipped_missing_files=payload.get("skipped_missing_files"),
             defer_base_fill=bool(payload.get("defer_base_fill")),
+            mapping_finalized=bool(payload.get('mapping_finalized')),
         )
         preloaded = getattr(pc, "_pre_loaded_source_data", None)
         if pc.ok and preloaded:
@@ -6070,6 +6148,7 @@ async def compute_submit(
     script_id: str = Form(...),
     source_files: List[UploadFile] = File(...),
     template_file: Optional[UploadFile] = File(None),
+    template_files: Optional[List[UploadFile]] = File(None),
     salary_year: Optional[int] = Form(None),
     salary_month: Optional[int] = Form(None),
     standard_hours: Optional[float] = Form(None),
@@ -6081,12 +6160,14 @@ async def compute_submit(
     skip_history_check: Optional[bool] = Form(False),
     mapping_finalized: Optional[bool] = Form(False),
     client_submission_id: Optional[str] = Form(None),
+    script_display_name: Optional[str] = Form(None),
     current_user=Depends(get_current_user),
     accessible_tenants: list = Depends(get_operable_tenants),
 ):
     """上传并预检源文件，完成后返回 task_id，计算在后台运行。
 
-    template_file: 模板模式可选上传新模板覆盖训练时模板；不传则用训练时模板。
+    template_files: 模板模式可按目标文件名上传多份新模板；未上传的复用智训模板。
+    template_file: 兼容旧客户端的单模板字段。
     """
     temp_dir = None
     compute_task_id = None
@@ -6097,14 +6178,23 @@ async def compute_submit(
 
         logger.info(f"[compute/submit] 租户={tenant_id}, 脚本={script_id}")
 
+        from backend.solutions.execution import binding, pin_run
+        frozen = await asyncio.to_thread(binding, tenant_id, script_id)
+
         # 0. 拒绝已禁用/删除的脚本
-        if storage_manager.is_script_disabled(tenant_id, script_id):
+        if not frozen and storage_manager.is_script_disabled(tenant_id, script_id):
             raise HTTPException(status_code=400, detail=f"脚本已被禁用或删除: {script_id}")
 
         # 1. 获取脚本内容
-        script_content = storage_manager.get_script_content(tenant_id, script_id)
+        script_content = frozen["code"] if frozen else storage_manager.get_script_content(tenant_id, script_id)
         if not script_content:
             raise HTTPException(status_code=404, detail=f"脚本不存在: {script_id}")
+
+        # 在宿主进程固定选择时的显示名，确认重试和隔离计算都沿用，避免在 worker 内反查数据库。
+        script_display_name = (script_display_name.strip() if isinstance(script_display_name, str) else '')
+        if not script_display_name:
+            script_display_name = _resolve_script_display_name(
+                tenant_id, str(frozen['script_id']) if frozen else script_id, script_content)
 
         try:
             compile(script_content, f"{script_id}.py", "exec")
@@ -6124,6 +6214,7 @@ async def compute_submit(
             raise RuntimeError("无法创建计算任务，未保存上传文件")
         from backend.utils.compute_run_archive import create_tenant_compute_run_dir
         temp_dir = create_tenant_compute_run_dir(storage_manager, tenant_id, compute_task_id)
+        await asyncio.to_thread(pin_run, temp_dir, frozen)
         source_dir = temp_dir / "source"
         source_dir.mkdir(parents=True, exist_ok=True)
 
@@ -6134,14 +6225,13 @@ async def compute_submit(
             await save_upload_file(file, source_dir / filename)
 
         # 模板模式可选新模板：单独存到 temp_dir/template（不放进 source_dir，避免被当成源数据 sheet 追加）
-        template_override_path = None
-        if template_file is not None and template_file.filename:
-            template_dir = temp_dir / "template"
-            template_dir.mkdir(parents=True, exist_ok=True)
-            _tpl_path = template_dir / safe_upload_name(template_file.filename, "template.xlsx")
-            await save_upload_file(template_file, _tpl_path)
-            template_override_path = str(_tpl_path.resolve())
-            logger.info(f"[compute/submit] 收到上传模板，将覆盖训练模板: {template_file.filename}")
+        from backend.utils.compute_templates import save_template_uploads
+        try:
+            template_override_path = await save_template_uploads(
+                list(template_files or []) + ([template_file] if template_file is not None else []),
+                temp_dir, script_content)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         passwords_dict = {}
         if file_passwords:
@@ -6185,7 +6275,7 @@ async def compute_submit(
             except Exception as _cs:
                 logger.warning(f"[compute/submit] skipped_missing_files 解析失败: {_cs}")
 
-        _script_info = _load_script_info_for_precheck(tenant_id, script_id)
+        _script_info = frozen["metadata"] if frozen else _load_script_info_for_precheck(tenant_id, script_id)
         _source_structure = _script_info.get("source_structure")
         _manual_headers = _script_info.get("manual_headers")
         _expected_structure = _script_info.get("expected_structure")
@@ -6198,7 +6288,7 @@ async def compute_submit(
 
         # 自动迁移会把模板绑定重写为目标环境路径。显式上传模板仍有最高优先级；
         # 未上传时优先采用目标 Script.config 的绑定，避免再使用源 Docker /app 或源 Windows 盘符。
-        if not template_override_path:
+        if not template_override_path and len((_expected_structure or {}).get('workbooks') or {}) <= 1:
             _bound_tpl = _script_info.get("template_path")
             if _bound_tpl:
                 _bound_path = Path(str(_bound_tpl))
@@ -6211,6 +6301,7 @@ async def compute_submit(
         # 预处理和 precheck 整体在全新子进程内运行；有界并发、可超时、可超内存强杀。
         from backend.utils.subprocess_runner import run_in_fresh_subprocess_async
         _pre_payload = {
+            "_solution": frozen,
             "source_dir": str(source_dir), "template_override_path": template_override_path,
             "passwords_dict": passwords_dict, "source_structure": _source_structure,
             "manual_headers": _manual_headers, "script_content": script_content,
@@ -6257,9 +6348,16 @@ async def compute_submit(
                             "message": "文件需要有效密码（未提供密码或解密失败），请重新输入"}
 
                 pc_result = _pre["pc_result"]
+                if frozen:
+                    from backend.utils.compute_precheck import _check_target_sheets
+                    await asyncio.to_thread(
+                        _check_target_sheets, script_content, tenant_id, template_override_path,
+                        _confirmed_target_map, pc_result)
                 _session = _register_compute_session(tenant_id, script_id, temp_dir, {
                     "task_id": str(compute_task_id),
+                    "_solution": frozen,
                     "tenant_id": tenant_id, "script_id": script_id,
+                    "script_display_name": script_display_name,
                     "script_content": script_content, "source_dir": str(source_dir),
                     "salary_year": salary_year, "salary_month": salary_month,
                     "standard_hours": standard_hours, "file_passwords": file_passwords,
@@ -6268,6 +6366,7 @@ async def compute_submit(
                     "expected_structure": _expected_structure, "use_history": _use_history_flag,
                     "confirmed_mapping": _confirmed, "confirmed_renames": _confirmed_renames,
                     "confirmed_target_map": _confirmed_target_map, "skipped_missing_files": _skipped_missing,
+                    "target_sheet_reviews": pc_result.target_candidates,
                     "skip_history_check": skip_history_check,
                     "mapping_finalized": bool(mapping_finalized),
                     "ai_provider_name": _pre_payload["ai_provider_name"],
@@ -6280,7 +6379,7 @@ async def compute_submit(
 
                 _needs_user_action = _precheck_requires_user_action(
                     pc_result, bool(skip_history_check))
-                if (not mapping_finalized) and _needs_user_action:
+                if getattr(pc_result, 'target_confirmation_required', False) or ((not mapping_finalized) and _needs_user_action):
                     # 不再删临时目录：上传文件与解析产物留在会话里，确认轮只发 JSON
                     logger.info(f"[compute/submit] 预检待确认，会话保留: {_session['session_id']}")
                     pending = _compute_pending_payload(pc_result, _session["session_id"])
@@ -6369,19 +6468,55 @@ async def compute_session_confirm(
     # another mapping dialog because of precheck warnings.
     mapping_finalized = body.get('mapping_finalized') is True
     sess = _get_compute_session(session_id, accessible_tenants)
+    if sess and mapping_finalized and not refresh_only:
+        # Final approval only writes small JSON and checks the cached Sheet inventory.
+        # Parsing, base-data completion and runtime validation run after task dispatch.
+        from backend.utils.confirmed_source_mapping import save_confirmation_state
+        from backend.utils.compute_confirmation import validate_target_confirmation
+        from backend.utils.compute_precheck import PrecheckResult
+        try:
+            approved = await asyncio.to_thread(
+                save_confirmation_state, sess['temp_dir'], body, sess['params'])
+            rows = (sess.get('pending_payload') or {}).get('target_candidates')
+            if rows is None:
+                rows = sess['params'].get('target_sheet_reviews') or []
+            validate_target_confirmation(sess['params'].get('script_content'), rows,
+                                         approved.get('confirmed_target_map'))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f'确认映射未完成: {exc}') from exc
+        sess['params'].update(approved, mapping_finalized=True, post_confirmation_checks_pending=True)
+        mapping = approved.get('confirmed_mapping') or {}
+        check = PrecheckResult(
+            file_mapping=mapping.get('file_mapping', mapping),
+            unmatched_columns=mapping.get('unmatched_columns', []),
+            target_map=approved.get('confirmed_target_map') or {},
+        )
+        return await _dispatch_compute_task(
+            sess, check, confirmed_target_map=approved.get('confirmed_target_map'))
     from backend.utils.compute_ingest import ingest_ready, read_meta, resolve_with_confirmations
-    if not sess or not ingest_ready(sess["temp_dir"]):
+    if not sess or (not sess["params"].get("_solution") and not ingest_ready(sess["temp_dir"])):
         return {"error_type": "session_expired", "message": "计算会话已过期，请重新提交文件"}
     sess.pop("pending_payload", None)
 
-    meta = await asyncio.to_thread(read_meta, sess["temp_dir"])
-    if meta is None:
+    frozen = sess["params"].get("_solution")
+    meta = None if frozen else await asyncio.to_thread(read_meta, sess["temp_dir"])
+    if meta is None and not frozen:
         return {"error_type": "session_expired", "message": "计算会话已过期，请重新提交文件"}
 
     from backend.utils.confirmed_source_mapping import save_confirmation_state
-    meta.ai_provider_name = await asyncio.to_thread(_resolve_compute_ai_provider)
+    if meta is not None:
+        meta.ai_provider_name = await asyncio.to_thread(_resolve_compute_ai_provider)
     try:
-        body = await asyncio.to_thread(save_confirmation_state, sess['temp_dir'], body, sess['params'])
+        if frozen:
+            from backend.utils.subprocess_runner import run_in_fresh_subprocess_async
+            saved = await run_in_fresh_subprocess_async('backend.solutions.worker:save_confirmation',
+                args=({'_solution': frozen, 'session_dir': sess['temp_dir'], 'body': body, 'params': sess['params']},),
+                timeout=120, max_memory_mb=1536)
+            if not saved.success:
+                raise ValueError(saved.error)
+            body = saved.result
+        else:
+            body = await asyncio.to_thread(save_confirmation_state, sess['temp_dir'], body, sess['params'])
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=f'确认映射冲突: {exc}') from exc
     mapping_finalized = bool(mapping_finalized or body.get('mapping_finalized')
@@ -6407,6 +6542,7 @@ async def compute_session_confirm(
         # source_dir、增量解析并覆盖会话产物；整个阶段禁用 AI。
         from backend.utils.subprocess_runner import run_in_fresh_subprocess_async, default_max_memory_mb
         final_payload = {
+            "_solution": p.get("_solution"),
             'source_dir': p.get('source_dir'),
             'template_override_path': p.get('template_override_path'),
             'passwords_dict': {},
@@ -6442,8 +6578,7 @@ async def compute_session_confirm(
             raise HTTPException(status_code=500, detail='基础资料补全未生成预检结果')
         p['post_match_base_fill_completed'] = True
     else:
-        pc_result = await asyncio.to_thread(lambda: resolve_with_confirmations(
-            meta,
+        confirmation_args = dict(
             confirmed_renames=_confirmed_renames,
             confirmed_mapping=_confirmed,
             confirmed_target_map=_confirmed_target_map,
@@ -6456,7 +6591,25 @@ async def compute_session_confirm(
             skip_history_check=_skip_history,
             skipped_missing_files=_skipped_missing,
             allow_ai_matching=not (refresh_only or mapping_finalized),
-        ))
+        )
+        if p.get("_solution"):
+            from backend.utils.subprocess_runner import run_in_fresh_subprocess_async
+            completed = await run_in_fresh_subprocess_async(
+                "backend.solutions.worker:confirm",
+                args=({"session_dir": sess["temp_dir"], "_solution": p["_solution"], **confirmation_args},),
+                timeout=600, max_memory_mb=1536)
+            if not completed.success:
+                raise HTTPException(status_code=422, detail=completed.error)
+            pc_result = completed.result
+        else:
+            pc_result = await asyncio.to_thread(lambda: resolve_with_confirmations(meta, **confirmation_args))
+
+    if p.get('_solution'):
+        # 确认界面的完整性由当前宿主管理，不修改冻结方案的计算代码。
+        from backend.utils.compute_precheck import _check_target_sheets
+        await asyncio.to_thread(
+            _check_target_sheets, p.get('script_content'), p.get('tenant_id'),
+            p.get('template_override_path'), _confirmed_target_map, pc_result)
 
     if mapping_finalized and pc_result.missing_files:
         sess['params']['mapping_finalized'] = True
@@ -6477,7 +6630,7 @@ async def compute_session_confirm(
         sess['params']['mapping_finalized'] = True
 
     _needs_user_action = _precheck_requires_user_action(pc_result, _skip_history)
-    if refresh_only or ((not mapping_finalized) and _needs_user_action):
+    if refresh_only or getattr(pc_result, 'target_confirmation_required', False) or ((not mapping_finalized) and _needs_user_action):
         logger.info(f"[compute/confirm] 仍有待确认项，会话保留: {session_id}")
         pending = _compute_pending_payload(pc_result, session_id)
         if p.get("task_id"):
@@ -6630,6 +6783,9 @@ async def compute_with_script_stream(
         salary_month: 薪资月份（可选）
         standard_hours: 标准工时（可选）
     """
+    from backend.solutions.execution import binding
+    if binding(tenant_id, script_id):
+        raise HTTPException(status_code=409, detail="此脚本已转为方案，请通过智算页面新版上传入口计算")
     import tempfile
     import shutil
     import io
@@ -7315,6 +7471,9 @@ async def compute_with_script(
         salary_month: 薪资月份（可选）
         standard_hours: 标准工时（可选）
     """
+    from backend.solutions.execution import binding
+    if binding(tenant_id, script_id):
+        raise HTTPException(status_code=409, detail="此脚本已转为方案，请通过智算页面新版上传入口计算")
     import tempfile
     import shutil
     from datetime import datetime
@@ -8051,11 +8210,36 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
             _seen_name_id.add(_k)
             _deduped.append(_e)
         scripts = _deduped
+        from backend.database.models import CalculationSolution
+        from backend.solutions.store import artifact
+        versions = []
+        pending_solutions = []
+        for solution in db.query(CalculationSolution).filter_by(tenant_id=tenant_id).order_by(CalculationSolution.created_at.desc()).all():
+            if solution.status == 'candidate':
+                pending_solutions.append({"id": solution.id, "name": solution.name,
+                                          "version": solution.digest[:12],
+                                          "validation_passed": bool((solution.validation or {}).get('passed'))})
+                continue
+            if solution.status != 'published' or not solution.is_active:
+                continue
+            manifest = json.loads((artifact(solution.digest) / 'manifest.json').read_text(encoding='utf-8'))
+            versions.append({"script_id": "solution_" + solution.id,
+                             "name": solution.name + " · 方案 " + solution.digest[:12],
+                             "is_active": not versions, "solution_id": solution.id,
+                             "solution_digest": solution.digest,
+                             "score": (solution.validation or {}).get('accuracy', 1.0),
+                             "mode": manifest.get('mode')})
+        if versions:
+            for item in scripts:
+                item['is_active'] = False
+            active_script_id = versions[0]['script_id']
+            scripts = versions + scripts
 
         return {
             "tenant_id": tenant_id,
             "active_script_id": active_script_id,
-            "scripts": scripts
+            "scripts": scripts,
+            "pending_solutions": pending_solutions,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

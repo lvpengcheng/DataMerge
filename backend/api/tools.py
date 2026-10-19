@@ -14,13 +14,14 @@ import hashlib
 import secrets
 import asyncio
 import difflib
+import time
 from pathlib import Path
 from typing import List, Optional
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 import pandas as pd
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, Query
+from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
@@ -191,6 +192,8 @@ def _regions_to_df(sd):
         "df": out_df,
         "header_start": int(getattr(base, "head_row_start", 0) or 0),
         "header_end": int(getattr(base, "head_row_end", 0) or 0),
+        "data_row_start": int(getattr(base, "data_row_start", 0) or 0),
+        "data_row_end": int(getattr(base, "data_row_end", 0) or 0),
     }
 
 
@@ -890,6 +893,50 @@ async def merge_template_download(tpl_id: int, current_user=Depends(get_current_
 
 # ==================== 多表整合对比（主表 A + 对照表 B）====================
 
+async def _integration_workflow(request: Request, current_user=Depends(get_current_user)):
+    """Share integration services; split requests have independent permissions/storage."""
+    if not request.url.path.startswith('/api/tools/table-split/'):
+        return 'integrate'
+    for key in ('menu.tools', 'tools.table_split'):
+        if not has_permission(current_user, key):
+            raise HTTPException(403, detail=f'缺少权限: {key}')
+    action = request.url.path.rsplit('/', 1)[-1]
+    if action == 'import':
+        actions = ('create',)
+    elif request.method == 'DELETE':
+        actions = ('delete',)
+    elif action in {'analyze', 'reparse-headers', 'match', 'execute', 'apply-validate'}:
+        actions = ('create', 'apply', 'edit')
+    else:
+        actions = ()
+    if actions and not any(has_permission(current_user, f'tools.table_split.{a}') for a in actions):
+        raise HTTPException(403, detail='缺少拆表操作权限')
+    return 'split'
+
+
+def _integration_model(workflow):
+    from ..database.models import IntegrateTemplate, TableSplitTemplate
+    return TableSplitTemplate if workflow == 'split' else IntegrateTemplate
+
+
+def _integration_permission(workflow, action):
+    return f"tools.{'table_split' if workflow == 'split' else 'data_integrate'}.{action}"
+
+
+def _workflow_session_dir(session_id, workflow, user):
+    if workflow != 'split':
+        return _integrate_session_dir(session_id)
+    if not re.fullmatch(r'[a-f0-9]{32}', str(session_id)):
+        raise HTTPException(400, detail='拆表会话编号无效')
+    path = PROJECT_ROOT / 'temp' / 'table_split_sessions' / session_id
+    meta = path / '_meta.json'
+    if meta.exists():
+        owner = json.loads(meta.read_text(encoding='utf-8')).get('owner_id')
+        if owner != getattr(user, 'id', None):
+            raise HTTPException(403, detail='无权访问此拆表会话，请重新上传文件')
+    return path
+
+
 def _integrate_session_dir(session_id: str) -> Path:
     safe = "".join(ch for ch in str(session_id) if ch.isalnum() or ch in "-_")
     return INTEGRATE_SESSION_ROOT / safe
@@ -1008,6 +1055,8 @@ def _integrate_file_meta(name: str, info: dict, manual: bool = False,
         "header_start": int(info.get("header_start") or 0),
         "header_end": int(info.get("header_end") or 0),
         "header_manual": bool(manual),
+        "data_row_start": int(info.get("data_row_start") or 0),
+        "data_row_end": int(info.get("data_row_end") or 0),
     }
 
 
@@ -1027,24 +1076,28 @@ def _integrate_sheet_table_name(file_name: str, sheet_name: str, used=None) -> s
 
 
 @router.post("/integrate/analyze")
+@router.post("/table-split/analyze")
 async def integrate_analyze(
     files: List[UploadFile] = File(...),
     tenant_id: Optional[str] = Form(None),
     parse_all_sheets: bool = Form(False),
+    scheme_id: Optional[int] = Form(None),
     current_user=Depends(get_current_user),
+    workflow: str = Depends(_integration_workflow),
 ):
     """多表整合对比第一步：上传【≥2 个】文件（1 主表 + 至少 1 对照表）→ 解析激活页
     → 返回各文件列（带来源）+ 列头指纹 + 猜键/猜姓名/猜身份证列。不在此处调用 AI。
     主表由用户在后续步骤从上传文件里选定（不在此处固定）。
     """
-    if not files or (not parse_all_sheets and len(files) < 2):
+    if not files or (workflow != "split" and not parse_all_sheets and len(files) < 2):
         raise HTTPException(status_code=400, detail="请至少上传 2 个文件（1 主表 + 至少 1 对照表）")
 
     session_id = uuid.uuid4().hex
-    sdir = _integrate_session_dir(session_id)
+    sdir = _workflow_session_dir(session_id, workflow, current_user)
     sdir.mkdir(parents=True, exist_ok=True)
 
     files_meta = []
+    started = time.perf_counter()
     try:
         for uf in files:
             name = safe_upload_name(uf.filename, "unnamed.xlsx")
@@ -1071,20 +1124,25 @@ async def integrate_analyze(
                     table_name, info, physical_file=name,
                     sheet_explicit=parse_all_sheets))
 
-        if len(files_meta) < 2:
+        if len(files_meta) < (1 if workflow == "split" else 2):
             raise HTTPException(
                 status_code=400,
                 detail="至少需要解析出 2 张可见且含有效列头的 Sheet（1 主表 + 至少 1 对照表）",
             )
 
         (sdir / "_meta.json").write_text(json.dumps({
+            "owner_id": getattr(current_user, "id", None),
             "files": files_meta,
             "parse_all_sheets": bool(parse_all_sheets),
             "header_ranges": {
                 f["name"]: [f["header_start"], f["header_end"]] for f in files_meta
             },
         }, ensure_ascii=False), encoding="utf-8")
-        matched_schemes = _match_integrate_schemes(current_user, files_meta)
+        parse_elapsed = time.perf_counter() - started
+        matched_schemes = (_match_integrate_schemes(current_user, files_meta, scheme_id, workflow)
+                           if workflow == 'split' else _match_integrate_schemes(current_user, files_meta, scheme_id))
+        logger.info("[integrate] analyze session=%s tables=%d parse=%.3fs total=%.3fs",
+                    session_id, len(files_meta), parse_elapsed, time.perf_counter() - started)
         return {"session_id": session_id, "files": files_meta,
                 "parse_all_sheets": bool(parse_all_sheets),
                 "matched_schemes": matched_schemes}
@@ -1100,15 +1158,18 @@ async def integrate_analyze(
 class IntegrateReparseRequest(BaseModel):
     session_id: str
     header_ranges: dict  # {file: {start_row, end_row}}
+    scheme_id: Optional[int] = None
 
 
 @router.post("/integrate/reparse-headers")
+@router.post("/table-split/reparse-headers")
 async def integrate_reparse_headers(
     req: IntegrateReparseRequest,
     current_user=Depends(get_current_user),
+    workflow: str = Depends(_integration_workflow),
 ):
     """按人工指定的表头起止行重新解析主表/对照表，并刷新方案匹配结果。"""
-    sdir = _integrate_session_dir(req.session_id)
+    sdir = _workflow_session_dir(req.session_id, workflow, current_user)
     meta_path = sdir / "_meta.json"
     if not meta_path.exists():
         raise HTTPException(status_code=400, detail="会话已过期，请重新上传分析")
@@ -1118,6 +1179,8 @@ async def integrate_reparse_headers(
         raise HTTPException(status_code=400, detail="会话中没有可重新解析的文件")
 
     new_meta = []
+    started = time.perf_counter()
+    parsed_count = 0
     for name, old in old_files.items():
         spec = (req.header_ranges or {}).get(name) or {}
         try:
@@ -1131,10 +1194,16 @@ async def integrate_reparse_headers(
         path = sdir / physical_file
         if not path.exists() or path.suffix.lower() not in EXCEL_EXTS:
             raise HTTPException(status_code=400, detail=f"文件不存在: {name}")
+        if (old.get("columns") and old.get("header_start") == start
+                and old.get("header_end") == end):
+            # 本会话上传文件不可修改；范围未变时沿用已有列头，无须再启动解析子进程。
+            new_meta.append({**old, "header_manual": True})
+            continue
         async with get_excel_work_semaphore():
             info = await _parse_file_to_df_fresh(
                 str(path), [start, end], old.get("sheet") or None,
                 calculate_formulas=False)
+        parsed_count += 1
         if not info.get("columns"):
             raise HTTPException(status_code=400, detail=f"{name}: 指定的第 {start}-{end} 行未解析出有效列头")
         new_meta.append(_integrate_file_meta(
@@ -1146,10 +1215,14 @@ async def integrate_reparse_headers(
         f["name"]: [f["header_start"], f["header_end"]] for f in new_meta
     }
     meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    logger.info("[integrate] reparse session=%s parsed=%d reused=%d elapsed=%.3fs",
+                req.session_id, parsed_count, len(new_meta) - parsed_count,
+                time.perf_counter() - started)
     return {
         "session_id": req.session_id,
         "files": new_meta,
-        "matched_schemes": _match_integrate_schemes(current_user, new_meta),
+        "matched_schemes": (_match_integrate_schemes(current_user, new_meta, req.scheme_id, workflow)
+                            if workflow == 'split' else _match_integrate_schemes(current_user, new_meta, req.scheme_id)),
     }
 
 
@@ -1162,13 +1235,14 @@ class IntegrateMatchRequest(BaseModel):
 
 
 @router.post("/integrate/match")
-async def integrate_match(req: IntegrateMatchRequest, current_user=Depends(get_current_user)):
+@router.post("/table-split/match")
+async def integrate_match(req: IntegrateMatchRequest, current_user=Depends(get_current_user), workflow: str = Depends(_integration_workflow)):
     """把对照表候选列匹配到主表 A 的列（覆盖/对比列对建议）：先精确同名（免 AI），
     use_ai 时再用 AI 补差异命名。返回 pairs=[{a_col,source_file,source_col,auto,confidence}]。
     """
     from ..utils.merge_engine import _norm_header, _ai_map_to_canonical
 
-    sdir = _integrate_session_dir(req.session_id)
+    sdir = _workflow_session_dir(req.session_id, workflow, current_user)
     meta_path = sdir / "_meta.json"
     if not meta_path.exists():
         raise HTTPException(status_code=400, detail="会话已过期，请重新上传分析")
@@ -1224,6 +1298,7 @@ class IntegrateExecuteRequest(BaseModel):
     diff_order: str = "id_name"          # id_name | name_id
     normalize_keys: bool = True
     date_key_mode: str = "yearmonthday"  # 日期关联键归一 off|yearmonthday|yearmonth|month|day（默认按年月日）
+    split_config: Optional[dict] = None
     union_source_keys: bool = False       # 把所有对照表主键并集追加到主表
 
 
@@ -1327,7 +1402,7 @@ def _integrate_execute_impl(session_dir: str, request_data: dict) -> dict:
     if errs:
         raise ValueError("；".join(errs))
     n_sources = len(parsed) - 1
-    if n_sources < 1:
+    if n_sources < 1 and not request_data.get("split_config"):
         raise ValueError("至少需要 1 张对照表")
 
     source_indexes = build_source_indexes(
@@ -1336,18 +1411,40 @@ def _integrate_execute_impl(session_dir: str, request_data: dict) -> dict:
         date_key_mode=request_data.get("date_key_mode", "off"),
         include_main=bool(request_data.get("union_source_keys")),
     )
+    split = request_data.get('split_config')
+    # 拆表的模板提供版式，默认补齐数据表的记录；这不等于“主键捏合”中叠加模板原值。
+    include_source_keys = (split.get('include_source_keys', True) if split
+                           else bool(request_data.get('union_source_keys')))
     seed_keys = collect_source_keys(
         parsed, request_data["key_map"], main_file,
         normalize_keys=request_data.get("normalize_keys", True),
         date_key_mode=request_data.get("date_key_mode", "off"),
-    ) if request_data.get("union_source_keys") else None
+    ) if include_source_keys else None
+    data_start = main_info['data_row_start'] or (main_info.get('header_end', 0) + 1)
+    data_end = main_info['data_row_end']
+    if split:
+        from backend.utils.table_split import validate_split_config
+        validate_split_config(split, main_info['head_data'])
+        data_start = split.get('data_row_start') or data_start
+        data_end = split.get('data_row_end') or data_end
+        if data_start <= main_info.get('header_end', 0) or (data_end < data_start and not include_source_keys):
+            raise ValueError('拆表数据范围无效，数据起始行必须在表头之后')
+        # Reject an accidental oversized range before the writer loops over rows.
+        from Aspose.Cells import Workbook
+        range_book = Workbook(str(main_path))
+        try:
+            last_row = int(range_book.Worksheets[main_info['sheet']].Cells.MaxDataRow) + 1
+            if data_end > last_row:
+                raise ValueError(f'数据结束行超出工作表实际内容（最后一行为{last_row}），请重新确认明细范围')
+        finally:
+            range_book.Dispose()
     out_path = sdir / f"整合结果_{main_file}"
     stat = apply_integration(
         main_path=str(main_path), out_path=str(out_path),
         sheet_name=main_info["sheet"], head_data=main_info["head_data"],
         a_key_col=request_data["key_map"].get(main_file),
-        data_row_start=(main_info["data_row_start"] or (main_info.get("header_end", 0) + 1)),
-        data_row_end=main_info["data_row_end"],
+        data_row_start=data_start,
+        data_row_end=data_end,
         overwrite_pairs=request_data.get("overwrite_pairs", []), source_indexes=source_indexes,
         normalize_keys=request_data.get("normalize_keys", True), diff_rows=None,
         diff_order=request_data.get("diff_order", "id_name"),
@@ -1369,15 +1466,29 @@ def _integrate_execute_impl(session_dir: str, request_data: dict) -> dict:
         )
         stat["diff_rows"] = append_diff_sheet(
             str(out_path), diff_rows, request_data.get("diff_order", "id_name"))
+    if split:
+        from backend.utils.table_split import split_workbook
+        stat.update(split_workbook(out_path, sdir / ('split_' + uuid.uuid4().hex), main_info['sheet'],
+            main_info['head_data'], data_start, data_end + stat.get('added_rows', 0), split,
+            main_name=main_meta.get('physical_file') or main_file))
     return stat
 
 
 @router.post("/integrate/execute")
-async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(get_current_user)):
+@router.post("/table-split/execute")
+async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(get_current_user), workflow: str = Depends(_integration_workflow)):
     """按覆盖/对比配置回填主表并输出：原地覆盖主表激活页覆盖列（只写值、保全其余 sheet/公式），
     输出方式2 追加差异 sheet。返回更新后的主表 xlsx。
     """
-    sdir = _integrate_session_dir(req.session_id)
+    if workflow == 'split':
+        from ..utils.table_split import validate_split_config
+        try:
+            validate_split_config(req.split_config)
+        except ValueError as exc:
+            raise HTTPException(400, detail=str(exc))
+    elif req.split_config:
+        raise HTTPException(400, detail='请使用拆表入口执行拆分规则')
+    sdir = _workflow_session_dir(req.session_id, workflow, current_user)
     if not sdir.exists():
         raise HTTPException(status_code=400, detail="会话已过期，请重新上传分析")
 
@@ -1385,8 +1496,13 @@ async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(g
     meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
     selected = next((f for f in meta.get("files", []) if f.get("name") == req.main_file), None)
     main_path = sdir / ((selected or {}).get("physical_file") or req.main_file)
-    if not main_path.exists():
+    if not selected or not main_path.exists():
         raise HTTPException(status_code=400, detail=f"主表文件不存在: {req.main_file}")
+    if workflow == 'split':
+        try:
+            validate_split_config(req.split_config, selected.get('columns') or [])
+        except ValueError as exc:
+            raise HTTPException(400, detail=str(exc))
 
     try:
         out_path = sdir / f"整合结果_{req.main_file}"
@@ -1403,24 +1519,28 @@ async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(g
             reason = "超时" if rr.timed_out else ("内存超限" if rr.killed_by_memory else rr.error)
             raise HTTPException(status_code=500, detail=f"整合执行失败（{reason}）")
         stat = rr.result
+        if workflow == 'split':
+            out_path = Path(stat['archive'])
         if not out_path.exists():
             raise HTTPException(status_code=500, detail="整合未生成输出文件")
 
         from urllib.parse import quote
-        fname = f"整合结果_{req.main_file}"
+        fname = "拆表结果.zip" if workflow == "split" else f"整合结果_{req.main_file}"
         headers = {
             "Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}",
             "X-Integrate-Matched": str(stat.get("matched_rows", 0)),
             "X-Integrate-Cells": str(stat.get("overwritten_cells", 0)),
             "X-Integrate-Diffs": str(stat.get("diff_rows", 0)),
             "X-Integrate-Added": str(stat.get("added_rows", 0)),
+            "X-Split-Groups": str(stat.get("group_count", 0)),
+            "X-Split-Rows": str(stat.get("split_rows", 0)),
         }
         return FileResponse(
             str(out_path),
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            media_type="application/zip" if workflow == "split" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers=headers,
             # 保留上传源文件和会话配置，仅在客户端下载完成后删除本次结果。
-            background=BackgroundTask(out_path.unlink, missing_ok=True),
+            background=(BackgroundTask(shutil.rmtree, out_path.parent, ignore_errors=True) if workflow == "split" else BackgroundTask(out_path.unlink, missing_ok=True)),
         )
     except HTTPException:
         raise
@@ -1444,12 +1564,12 @@ def _user_org_tree_ids(db, current_user) -> List[int]:
     return _get_org_and_children_ids(db, oid)
 
 
-def _visible_integrate_schemes(db, current_user):
+def _visible_integrate_schemes(db, current_user, workflow="integrate"):
     """当前用户可见的整合方案行：
     - admin：全部；
     - 其他：本组织+子组织(org_id) ∪ 本人创建(created_by) ∪ 旧私有方案(tenant_id==user:{id})。
     """
-    from ..database.models import IntegrateTemplate
+    IntegrateTemplate = _integration_model(workflow)
     from sqlalchemy import or_
     q = db.query(IntegrateTemplate)
     if _is_admin(current_user):
@@ -1525,21 +1645,37 @@ def _column_match_score(expected, actual) -> tuple:
     return (round(score, 4), "similar") if score >= 0.72 else (0.0, "")
 
 
-def _suggest_column_map(required_cols, actual_cols) -> dict:
+def _suggest_column_map(required_cols, actual_cols, score_cache=None) -> dict:
     """把方案必需列一对一映射到当前列；返回 mapping/suggestions/missing/score。"""
+    from ..utils.merge_engine import _norm_header
+
     actual = [c for c in (actual_cols or []) if not _PHANTOM_COL.match(str(c))]
     required = list(dict.fromkeys(c for c in (required_cols or [])
                                   if c and not _PHANTOM_COL.match(str(c))))
     mapping, suggestions, missing, used = {}, [], [], set()
+    exact = {}
+    for cur in actual:
+        norm = _norm_header(cur)
+        if norm:
+            exact.setdefault(norm, []).append(cur)
     scores = []
     for expected in required:
-        ranked = []
-        for cur in actual:
-            if cur in used:
-                continue
-            score, method = _column_match_score(expected, cur)
-            if score:
-                ranked.append((score, method, cur))
+        # 精确归一匹配的分数恒为最高值，无须再与所有长列名计算编辑相似度。
+        hits = [cur for cur in exact.get(_norm_header(expected), []) if cur not in used]
+        ranked = [(1.0, "exact", cur) for cur in hits]
+        if not ranked:
+            for cur in actual:
+                if cur in used:
+                    continue
+                key = (expected, cur)
+                if score_cache is not None and key in score_cache:
+                    score, method = score_cache[key]
+                else:
+                    score, method = _column_match_score(expected, cur)
+                    if score_cache is not None:
+                        score_cache[key] = (score, method)
+                if score:
+                    ranked.append((score, method, cur))
         ranked.sort(key=lambda x: (-x[0], str(x[2])))
         if not ranked:
             missing.append(expected)
@@ -1602,6 +1738,13 @@ def _required_cols_by_role(cfg: dict) -> dict:
         for i, role in enumerate(roles):
             add(i, key_by_fp.get(role.get("fp")))
 
+    split_config = cfg.get('split_config') or {}
+    if split_config.get('mode') == 'value':
+        add(0, split_config.get('column'))
+    elif split_config.get('mode') == 'expression':
+        from ..utils.table_split import parse_expression
+        for col in parse_expression(split_config.get('expression'), cols_by_fp.get(cfg.get('main_fp')) or [])[1]:
+            add(0, col)
     add(0, cfg.get("name_col"))
     add(0, cfg.get("id_col"))
     for pair in list(cfg.get("overwrite_pairs") or []) + list(cfg.get("compare_pairs") or []):
@@ -1634,19 +1777,19 @@ def _required_cols_by_role(cfg: dict) -> dict:
     return required
 
 
-def _role_candidate(role: dict, required_cols, file_meta: dict, expected_cols) -> Optional[dict]:
+def _role_candidate(role: dict, required_cols, file_meta: dict, expected_cols, score_cache=None) -> Optional[dict]:
     """评估一个上传文件能否承担方案角色。优先指纹，否则只要求执行所需列可映射。"""
     if file_meta.get("fingerprint") == role.get("fp"):
-        colmap = _suggest_column_map(required_cols or expected_cols, file_meta.get("columns", []))
+        colmap = _suggest_column_map(required_cols or expected_cols, file_meta.get("columns", []), score_cache)
         return {"file": file_meta, "colmap": colmap, "score": 2.0}
     if required_cols:
-        colmap = _suggest_column_map(required_cols, file_meta.get("columns", []))
+        colmap = _suggest_column_map(required_cols, file_meta.get("columns", []), score_cache)
         if not colmap["missing"]:
             return {"file": file_meta, "colmap": colmap, "score": 1.0 + colmap["score"]}
         return None
     # 旧空配置兜底：仍按完整真实列集合判断，避免无依赖信息时误配任意文件。
     if _real_header_set(expected_cols) == _real_header_set(file_meta.get("columns", [])):
-        return {"file": file_meta, "colmap": _suggest_column_map(expected_cols, file_meta.get("columns", [])),
+        return {"file": file_meta, "colmap": _suggest_column_map(expected_cols, file_meta.get("columns", []), score_cache),
                 "score": 1.5}
     return None
 
@@ -1658,11 +1801,12 @@ def _match_scheme_config(cfg: dict, files_meta: List[dict]) -> Optional[dict]:
         return None
     cols_by_fp = cfg.get("cols_by_fp") or {}
     required = _required_cols_by_role(cfg)
+    score_cache = {}  # 同一方案角色共享大量列，只在本次匹配内缓存，避免跨请求积累。
     candidates = []
     for i, role in enumerate(roles):
         cands = []
         for f in files_meta:
-            c = _role_candidate(role, required.get(i) or [], f, cols_by_fp.get(role.get("fp")) or [])
+            c = _role_candidate(role, required.get(i) or [], f, cols_by_fp.get(role.get("fp")) or [], score_cache)
             if c:
                 cands.append(c)
         cands.sort(key=lambda c: (-c["score"], c["file"]["name"]))
@@ -1737,6 +1881,13 @@ def _resolved_scheme_config(cfg: dict, match: dict) -> dict:
         translated_keys[str(idx)] = maps.get(idx, {}).get(col, col)
     resolved["key_map_by_role"] = translated_keys
     main_map = maps.get(0, {})
+    if resolved.get('split_config'):
+        split = resolved['split_config']
+        if split.get('column'):
+            split['column'] = main_map.get(split['column'], split['column'])
+        if split.get('expression'):
+            mapping = {**main_map, **{f'[{old}]': f'[{new}]' for old, new in main_map.items()}}
+            split['expression'] = _replace_expr_tokens(split['expression'], mapping)
     for field in ("name_col", "id_col"):
         if resolved.get(field):
             resolved[field] = main_map.get(resolved[field], resolved[field])
@@ -1766,15 +1917,20 @@ def _resolved_scheme_config(cfg: dict, match: dict) -> dict:
     return resolved
 
 
-def _match_integrate_schemes(current_user, files_meta: List[dict]) -> List[dict]:
+def _match_integrate_schemes(current_user, files_meta: List[dict], scheme_id: Optional[int] = None, workflow="integrate") -> List[dict]:
     """按“执行所需列”匹配可见方案；允许无关列增删，并产出列名变化建议。"""
     from ..database.connection import SessionLocal
 
     out: List[dict] = []
+    started = time.perf_counter()
+    evaluated = 0
     db = SessionLocal()
     try:
-        rows = _visible_integrate_schemes(db, current_user)
+        rows = _visible_integrate_schemes(db, current_user, workflow)
         for row in rows:
+            if scheme_id is not None and row.id != scheme_id:
+                continue
+            evaluated += 1
             cfg = row.config or {}
             match = _match_scheme_config(cfg, files_meta)
             if not match:
@@ -1807,6 +1963,8 @@ def _match_integrate_schemes(current_user, files_meta: List[dict]) -> List[dict]
                         "config": cfg})
     finally:
         db.close()
+    logger.info("[integrate] match target=%s evaluated=%d matched=%d elapsed=%.3fs",
+                scheme_id, evaluated, len(out), time.perf_counter() - started)
     return out
 
 
@@ -1823,20 +1981,22 @@ class IntegrateSchemeSaveRequest(BaseModel):
     output_mode: int = 1
     normalize_keys: bool = True
     date_key_mode: str = "yearmonthday"
+    split_config: Optional[dict] = None
     union_source_keys: bool = False
     scheme_id: Optional[int] = None      # 传则为"修改已有方案"，不传为"新建"
 
 
 @router.post("/integrate/scheme/save")
-async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=Depends(get_current_user)):
+@router.post("/table-split/scheme/save")
+async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=Depends(get_current_user), workflow: str = Depends(_integration_workflow)):
     """保存整合对比方案。新建需 create 权限、方案名在本组织内唯一；修改需 edit 权限且仅创建人/管理员。
     按列头指纹存角色，跨月复用；同时存各角色列名(cols_by_fp)供应用校验时列级 diff。"""
     from ..auth.dependencies import has_permission
     name = (req.name or "").strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="方案名称不能为空")
+    if not name or len(name) > 200:
+        raise HTTPException(status_code=400, detail="方案名称不能为空且不能超过200字")
 
-    sdir = _integrate_session_dir(req.session_id)
+    sdir = _workflow_session_dir(req.session_id, workflow, current_user)
     meta_path = sdir / "_meta.json"
     if not meta_path.exists():
         raise HTTPException(status_code=400, detail="会话已过期，请重新上传分析")
@@ -1845,6 +2005,13 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
     cols_by_file = {f["name"]: f.get("columns", []) for f in meta.get("files", [])}
     if req.main_file not in fp_by_file:
         raise HTTPException(status_code=400, detail="主表选择有误")
+
+    if workflow == "split":
+        from ..utils.table_split import validate_split_config
+        try:
+            validate_split_config(req.split_config, cols_by_file[req.main_file])
+        except ValueError as exc:
+            raise HTTPException(400, detail=str(exc))
 
     main_fp = fp_by_file[req.main_file]
     # 参与映射的对照文件（覆盖对+对比对里出现的 source_file）
@@ -1891,6 +2058,7 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
         files_by_fp[fp_by_file[f]] = f
 
     config = {
+        "split_config": req.split_config if workflow == "split" else None,
         "main_fp": main_fp,
         "source_fps": source_fps,
         "roles": roles,
@@ -1915,7 +2083,7 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
     }
 
     from ..database.connection import SessionLocal
-    from ..database.models import IntegrateTemplate
+    IntegrateTemplate = _integration_model(workflow)
     uid = getattr(current_user, "id", None)
     org_id = getattr(current_user, "org_id", None)
     # 有组织归属到 org:{org_id}（方案名按组织唯一），否则退回旧私有 user:{uid}
@@ -1927,7 +2095,7 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
             row = db.query(IntegrateTemplate).filter_by(id=req.scheme_id).first()
             if not row:
                 raise HTTPException(status_code=404, detail="方案不存在")
-            if not has_permission(current_user, "tools.data_integrate.edit"):
+            if not has_permission(current_user, _integration_permission(workflow, "edit")):
                 raise HTTPException(status_code=403, detail="缺少权限: 修改方案")
             if not _can_edit_scheme(row, current_user):
                 raise HTTPException(status_code=403, detail="只有创建人或管理员可以保存修改到该方案，其他人请使用「另存为」")
@@ -1936,7 +2104,7 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
             row.updated_by = uid
         else:
             # 新建/另存为：需 create 权限 + 组织内方案名唯一（重名提醒）
-            if not has_permission(current_user, "tools.data_integrate.create"):
+            if not has_permission(current_user, _integration_permission(workflow, "create")):
                 raise HTTPException(status_code=403, detail="缺少权限: 新增方案")
             dup = db.query(IntegrateTemplate).filter_by(tenant_id=tenant_id, name=name).first()
             if dup:
@@ -1959,12 +2127,13 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
 
 
 @router.get("/integrate/schemes")
-async def integrate_schemes_list(current_user=Depends(get_current_user)):
+@router.get("/table-split/schemes")
+async def integrate_schemes_list(current_user=Depends(get_current_user), workflow: str = Depends(_integration_workflow)):
     """列出当前用户可见（同组织+子组织，或本人创建）的整合对比方案。"""
     from ..database.connection import SessionLocal
     db = SessionLocal()
     try:
-        rows = _visible_integrate_schemes(db, current_user)
+        rows = _visible_integrate_schemes(db, current_user, workflow)
         rows = sorted(rows, key=lambda r: r.updated_at or r.created_at, reverse=True)
         out = []
         for r in rows:
@@ -2027,17 +2196,18 @@ def _validate_integrate_import_config(config) -> dict:
 
 
 @router.get("/integrate/scheme/{scheme_id}/export")
-async def integrate_scheme_export(scheme_id: int, current_user=Depends(get_current_user)):
+@router.get("/table-split/scheme/{scheme_id}/export")
+async def integrate_scheme_export(scheme_id: int, current_user=Depends(get_current_user), workflow: str = Depends(_integration_workflow)):
     """导出可见方案为可归档/迁移的 JSON 文件（不包含用户及组织信息）。"""
     from urllib.parse import quote
     db = SessionLocal()
     try:
-        visible = {r.id: r for r in _visible_integrate_schemes(db, current_user)}
+        visible = {r.id: r for r in _visible_integrate_schemes(db, current_user, workflow)}
         row = visible.get(scheme_id)
         if not row:
             raise HTTPException(status_code=404, detail="方案不存在或无权访问")
         payload = {
-            "format": "datamerge.integrate-scheme",
+            "format": "datamerge.split-scheme" if workflow == "split" else "datamerge.integrate-scheme",
             "version": 1,
             "exported_at": datetime.utcnow().isoformat() + "Z",
             "name": row.name,
@@ -2054,15 +2224,17 @@ async def integrate_scheme_export(scheme_id: int, current_user=Depends(get_curre
 
 
 @router.post("/integrate/scheme/import")
+@router.post("/table-split/scheme/import")
 async def integrate_scheme_import(
     file: UploadFile = File(...),
     name: Optional[str] = Form(None),
     current_user=Depends(get_current_user),
+    workflow: str = Depends(_integration_workflow),
 ):
     """导入方案归档并归属到当前用户组织；同名时要求用户改名。"""
     from ..auth.dependencies import has_permission
-    from ..database.models import IntegrateTemplate
-    if not has_permission(current_user, "tools.data_integrate.create"):
+    IntegrateTemplate = _integration_model(workflow)
+    if not has_permission(current_user, _integration_permission(workflow, "create")):
         raise HTTPException(status_code=403, detail="缺少权限: 导入/新增方案")
     raw = await file.read(2 * 1024 * 1024 + 1)
     if len(raw) > 2 * 1024 * 1024:
@@ -2072,10 +2244,17 @@ async def integrate_scheme_import(
     except Exception:
         raise HTTPException(status_code=400, detail="方案文件不是有效的 UTF-8 JSON")
     if (not isinstance(payload, dict) or
-            payload.get("format") != "datamerge.integrate-scheme" or
+            payload.get("format") != ("datamerge.split-scheme" if workflow == "split" else "datamerge.integrate-scheme") or
             payload.get("version") != 1):
         raise HTTPException(status_code=400, detail="不支持的方案文件格式或版本")
     config = _validate_integrate_import_config(payload.get("config"))
+    if workflow == 'split':
+        from ..utils.table_split import validate_split_config
+        main_cols = (config.get('cols_by_fp') or {}).get(config['main_fp']) or []
+        try:
+            validate_split_config(config.get('split_config'), main_cols)
+        except ValueError as exc:
+            raise HTTPException(400, detail=str(exc))
     imported_name = (name or payload.get("name") or "").strip()
     if not imported_name or len(imported_name) > 200:
         raise HTTPException(status_code=400, detail="导入后的方案名称不能为空且不能超过 200 字")
@@ -2108,17 +2287,18 @@ async def integrate_scheme_import(
 
 
 @router.delete("/integrate/scheme/{scheme_id}")
-async def integrate_scheme_delete(scheme_id: int, current_user=Depends(get_current_user)):
+@router.delete("/table-split/scheme/{scheme_id}")
+async def integrate_scheme_delete(scheme_id: int, current_user=Depends(get_current_user), workflow: str = Depends(_integration_workflow)):
     """删除整合对比方案：需 delete 权限，且仅创建人/管理员可删。"""
     from ..auth.dependencies import has_permission
     from ..database.connection import SessionLocal
-    from ..database.models import IntegrateTemplate
+    IntegrateTemplate = _integration_model(workflow)
     db = SessionLocal()
     try:
         row = db.query(IntegrateTemplate).filter_by(id=scheme_id).first()
         if not row:
             raise HTTPException(status_code=404, detail="方案不存在")
-        if not has_permission(current_user, "tools.data_integrate.delete"):
+        if not has_permission(current_user, _integration_permission(workflow, "delete")):
             raise HTTPException(status_code=403, detail="缺少权限: 删除方案")
         if not _can_edit_scheme(row, current_user):
             raise HTTPException(status_code=403, detail="只有创建人或管理员可以删除该方案")
@@ -2138,17 +2318,18 @@ class IntegrateApplyValidateRequest(BaseModel):
 
 
 @router.post("/integrate/scheme/apply-validate")
-async def integrate_scheme_apply_validate(req: IntegrateApplyValidateRequest, current_user=Depends(get_current_user)):
+@router.post("/table-split/scheme/apply-validate")
+async def integrate_scheme_apply_validate(req: IntegrateApplyValidateRequest, current_user=Depends(get_current_user), workflow: str = Depends(_integration_workflow)):
     """应用方案前校验：无关列可增删；必需列改名时返回建议映射供用户确认。"""
     from ..auth.dependencies import has_permission
     from ..utils.merge_engine import _norm_header
     from ..database.connection import SessionLocal
 
-    if not (has_permission(current_user, "tools.data_integrate.apply") or
-            has_permission(current_user, "tools.data_integrate.edit")):
+    if not (has_permission(current_user, _integration_permission(workflow, "apply")) or
+            has_permission(current_user, _integration_permission(workflow, "edit"))):
         raise HTTPException(status_code=403, detail="缺少权限: 应用或修改方案")
 
-    sdir = _integrate_session_dir(req.session_id)
+    sdir = _workflow_session_dir(req.session_id, workflow, current_user)
     meta_path = sdir / "_meta.json"
     if not meta_path.exists():
         raise HTTPException(status_code=400, detail="会话已过期，请重新上传分析")
@@ -2158,7 +2339,7 @@ async def integrate_scheme_apply_validate(req: IntegrateApplyValidateRequest, cu
     db = SessionLocal()
     try:
         # 只允许校验用户可见的方案
-        visible_ids = {r.id: r for r in _visible_integrate_schemes(db, current_user)}
+        visible_ids = {r.id: r for r in _visible_integrate_schemes(db, current_user, workflow)}
         row = visible_ids.get(req.scheme_id)
         if not row:
             raise HTTPException(status_code=404, detail="方案不存在或无权访问")
@@ -3497,7 +3678,8 @@ async def sop_rules_download(rule_id: int, current_user=Depends(require_permissi
 SOP_SYSTEM_PROMPT = """你是企业 SOP 合规审核专家。请严格依据给定的【大规则】，逐项核对用户提交的【源文件】、【结果文件】与【本轮规则文件】是否满足规则要求。
 要求：
 0. 源文件和结果文件允许不上传；未提交时只审核已提供的材料，不得推断未提供文件中的列或数据。若大规则明确要求提交某类材料，仍按大规则审核。提交了结果表时逐列检查：每一列都必须在规则文件中有明确规则及详细来源；缺失任一列的规则或来源即判定不通过，并在 issues 中列出列名。
-审核前提：检查全部已提供文件的非隐藏 Sheet 清单，区分结果表、内部源数据表和参考表。每个 Sheet 提供的是表头和少量样本，不是全部数据；不得把未抽取的行或样本中没有出现的字段认定为文件不存在，也不能把抽查表述为全量核对。目标文件内的源数据同样有效，不因未单独上传源文件而驳回。引用隐藏 Sheet 或未提供的外部文件而无法核对时，说明需要补充的材料。姓名、证件、地址等已使用同次审核内一致的代号脱敏；代号不是数据缺失，不得因脱敏而驳回或尝试还原个人信息。金额、公式和人员对应关系用于核对；必须区分已有计算值与独立核算结果。问题用业务人员能看懂的语言说明文件、Sheet、列名及工号或行号，并给出修改建议；样本不足以判断时明确说明“暂时无法核对”。
+规则读取：大规则和本轮规则文档全文提供，Excel 规则包括全部工作表的所有非空行、单元格、批注/备注和公式原文。规则可以按行、按列或写在批注、说明和公式里，不要求每个结果列必须有一条独立的“对应行”。先综合这些证据确认规则是否存在，再判断来源是否齐全、样本结果是否一致。能找到计算方法但缺少源数据时，应说明“已找到规则，但缺少某文件或字段，暂时无法核对”，不得说成“没有规则”。
+审核前提：检查源文件和结果表的非隐藏 Sheet 清单，区分结果表、内部源数据表和参考表。这两类文件每个数据区域提供表头和最多 3 行数据样本，规则文档则全文提供；不得把未抽取的行或样本中没有出现的字段认定为文件不存在，也不能把抽查表述为全量核对。目标文件内的源数据同样有效，不因未单独上传源文件而驳回。引用未读取的隐藏 Sheet 或未提供的外部文件而无法核对时，说明需要补充的材料。姓名、证件、地址等已使用同次审核内一致的代号脱敏；代号不是数据缺失，不得因脱敏而驳回或尝试还原个人信息。金额、公式和人员对应关系用于核对；必须区分已有计算值与独立核算结果。问题用业务人员能看懂的语言说明文件、Sheet、列名及工号或行号，并给出修改建议；样本不足以判断时明确说明“暂时无法核对”。
 1. 只输出一个 JSON 对象，不要任何解释或 Markdown 代码块标记。
 2. JSON 结构：
 {
@@ -3510,13 +3692,13 @@ SOP_SYSTEM_PROMPT = """你是企业 SOP 合规审核专家。请严格依据给�
 }"""
 
 
-def _sop_read_file(path: str, max_chars: int = 180000, privacy=None) -> str:
-    """Read samples from every visible sheet, or text from a rule document."""
+def _sop_read_file(path: str, max_chars: int = 180000, privacy=None, rule_document: bool = False) -> str:
+    """Rule documents use full text; source/result workbooks use structure samples."""
     if not path or not os.path.exists(path):
         raise ValueError(f"审核材料缺失：{Path(path).name if path else '未记录文件'}，请恢复或重新上传后审核")
     ext = Path(path).suffix.lower()
     try:
-        if ext in (".xlsx", ".xls", ".xlsm"):
+        if ext in (".xlsx", ".xls", ".xlsm") and not rule_document:
             from backend.utils.sop_reader import read_sop_excel
             text = read_sop_excel(path, max_chars, privacy=privacy)
         else:
@@ -3582,8 +3764,8 @@ def _run_sop_ai_analysis(round_id: int, entry_id: int, job_id: int, claim_token:
             src_parts.append(f"--- 源文件 {i + 1}: {os.path.basename(p)} ---\n{_sop_read_file(p, privacy=privacy)}")
         source_text = "\n\n".join(src_parts) if src_parts else "（无源文件）"
         result_text = _sop_read_file(r.result_file_path, privacy=privacy) if r.result_file_path else "（未上传目标文件）"
-        rule_text = _sop_read_file(r.rule_file_path, privacy=privacy) if r.rule_file_path else None
-        admin_rule_text = _sop_read_file(rule.file_path, privacy=privacy) if rule else "（无后台规则）"
+        rule_text = _sop_read_file(r.rule_file_path, privacy=privacy, rule_document=True) if r.rule_file_path else None
+        admin_rule_text = _sop_read_file(rule.file_path, privacy=privacy, rule_document=True) if rule else "（无后台规则）"
 
         # 3) 构建 prompt 并落库（排查用）
         r.prompt_text = privacy.redact(_build_sop_prompt(entry, admin_rule_text, source_text, result_text, rule_text))
