@@ -13,6 +13,8 @@
 4. 骨架保存 wb 到 output_folder
 """
 
+from backend.utils.multi_target_rules import limit_rules_content
+
 import os
 import re
 import json
@@ -83,6 +85,8 @@ class TemplateCodeGenerator:
                 thinking_callback=thinking_callback, multi_sheet_source=multi_sheet_source,
                 use_history=use_history, target_sheets=target_sheets))
 
+        from backend.utils.multi_target_rules import rules_for_structure
+        rules_content = rules_for_structure(rules_content, expected_structure, os.path.basename(template_path or ''))
         log("=== 模板填充模式：开始生成代码 ===")
 
         if not template_path or not os.path.exists(template_path):
@@ -312,7 +316,7 @@ class TemplateCodeGenerator:
         use_history: bool,
         reserved_names: Optional[set] = None,
     ) -> str:
-        rules_short = (rules_content or "")[:30000]
+        rules_short = limit_rules_content(rules_content)
 
         # ⚠️ prompt 里展示的结构必须 = 运行时 _COL_MAP/_SOURCE_MAP 的字段名
         col_map_for_prompt = self._build_col_map(template_struct)
@@ -1733,7 +1737,7 @@ if __name__ == "__main__":
 {comparison_result[:30000]}
 {retry_directive}
 {col_map_block}{source_map_block}## 计算规则（参考）
-{(rules_content or '')[:30000]}
+{limit_rules_content(rules_content)}
 
 ## 输出要求
 **只输出修正后的 `def fill_template(...)` 完整函数**，用 ```python 代码块包裹。
@@ -1841,7 +1845,7 @@ if __name__ == "__main__":
         if source_map_str:
             extra += f"## 源数据 _SOURCE_MAP（运行时已注入，可直接引用）\n```python\n_SOURCE_MAP = {source_map_str}\n```\n"
         if rules_content:
-            extra += f"## 计算规则（参考）\n{rules_content[:20000]}\n"
+            extra += f"## 计算规则（参考）\n{limit_rules_content(rules_content)}\n"
 
         # 直接对整份脚本精确编辑：填充逻辑(fill_template)、源数据读取(_append_source_sheets/
         # load_source_data)、辅助函数等任意部分都可被点名修改。

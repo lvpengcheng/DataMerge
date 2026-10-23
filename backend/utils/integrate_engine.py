@@ -335,12 +335,12 @@ def eval_source_expr(expr, rows: List[dict], cols: List[str]):
 
     - expr 是纯单列名：数值列→跨行求和；含非数值→取首个非空原值（保住姓名/备注等文本列）。
     - expr 是公式：每个被引用列跨行求和(非数值按 0)，按受控 Excel 子集求值。
-    空/无行/公式非法/引用列不存在 → 返回 None（调用方据此保留原值/跳过）。
+    纯固定值不依赖来源行；字段映射无行、公式非法或引用列不存在时返回 None。
     """
     expr = str(expr or "").strip()
-    if not expr or not rows:
+    if not expr:
         return None
-    if '&' in expr:
+    if not rows or '&' in expr or '"' in expr or validate_formula_remainder(expr):
         return eval_source_expr_cross(expr, '', {'': {'cols': cols, 'rows': {'key': rows}}}, 'key')
     is_formula = _expr_has_operator(expr, cols)
 
@@ -395,6 +395,7 @@ def eval_source_expr_cross(expr: str, default_file: str,
     每列跨行求和后代入公式。纯单列引用：数值列→跨行求和；含非数值→取首个非空原值。
     跨表公式中部分引用无行/空值时按 0，全部引用均无行/空值时返回 None；
     公式非法或引用列头不存在也返回 None（调用方据此保留原值/跳过）。
+    不引用列的固定文本、数字及受控常量公式可独立计算，不要求来源有匹配行。
     """
     expr = str(expr or "").strip()
     if not expr:
@@ -485,7 +486,13 @@ def eval_source_expr_cross(expr: str, default_file: str,
 
     cols = [t for t in toks if t[0] == "col"]
     if not cols:
-        return None
+        # Constants do not depend on a source row or column. Still validate the
+        # same restricted grammar before evaluating, so unknown references and
+        # unsupported functions cannot masquerade as fixed values.
+        if not validate_formula_remainder(expr):
+            return None
+        val = _safe_arith_eval(expr)
+        return round(val, 6) if isinstance(val, (int, float)) else val
 
     # 2) 纯单列引用（无运算符、无杂字符）：数值→求和，文本→首非空
     has_formula = has_op or any(_re.search(rf"\b{name}\s*\(", expr, _re.IGNORECASE)

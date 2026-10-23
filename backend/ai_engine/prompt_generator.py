@@ -2,6 +2,8 @@
 提示词生成器 - 为AI生成训练和修正提示词（精简版）
 """
 
+from backend.utils.multi_target_rules import limit_rules_content
+
 import json
 import logging
 import re
@@ -1306,7 +1308,7 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
 {compressed_expected}
 
 ## 计算规则
-{rules_content[:70000]}
+{limit_rules_content(rules_content)}
 
 ## 手动表头映射
 {manual_headers_str}

@@ -1363,13 +1363,19 @@ if __name__ == "__main__":
         thinking_callback: 推理模型思考过程逐块回调（DeepSeek reasoning_content），
         与正式内容(chunk_callback)分开，避免污染最终结果。
         """
+        require_complete = kwargs.pop('require_complete', False)
         full_content = ""
+        finish_reason = None
         for text_chunk, _fr in self._openai_chat_stream(
                 messages, thinking_callback=thinking_callback, **kwargs):
+            if _fr:
+                finish_reason = _fr
             if text_chunk:
                 full_content += text_chunk
                 if chunk_callback:
                     chunk_callback(text_chunk)
+        if require_complete and finish_reason == 'length':
+            raise ValueError('AI_RESPONSE_TRUNCATED: AI 输出达到长度上限，结果不完整')
         return full_content
 
     def generate_completion(self, prompt: str, **kwargs) -> str:
@@ -2124,6 +2130,7 @@ if __name__ == "__main__":
 
         thinking_callback: Claude thinking_delta 逐块回调，与正式内容分开。
         """
+        require_complete = kwargs.pop('require_complete', False)
         anthropic_messages = []
         system_message = ""
         for msg in messages:
@@ -2136,15 +2143,20 @@ if __name__ == "__main__":
         filtered_kwargs = {k: v for k, v in kwargs.items()
                            if k not in ("model", "messages", "max_tokens", "system", "thinking_callback")}
         full_content = ""
+        stop_reason = None
         for text_chunk, _sr in self._claude_chat_stream(
             system_message or "", anthropic_messages,
             max_tokens=requested_max_tokens, thinking_callback=thinking_callback,
             **filtered_kwargs,
         ):
+            if _sr:
+                stop_reason = _sr
             if text_chunk:
                 full_content += text_chunk
                 if chunk_callback:
                     chunk_callback(text_chunk)
+        if require_complete and stop_reason == 'max_tokens':
+            raise ValueError('AI_RESPONSE_TRUNCATED: AI 输出达到长度上限，结果不完整')
         return full_content
 
     def generate_completion(self, prompt: str, **kwargs) -> str:

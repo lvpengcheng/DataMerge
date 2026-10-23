@@ -103,6 +103,7 @@ def _apply_integration_impl(
     diff_order: str = "id_name",
     date_key_mode: str = "off",
     seed_keys: Optional[List[dict]] = None,
+    selected_keys: Optional[List[dict]] = None,
 ) -> Dict[str, Any]:
     """（子进程执行体）原地回填主表并（可选）追加差异 sheet，另存到 out_path。
 
@@ -198,6 +199,23 @@ def _apply_integration_impl(
             added_rows = len(missing)
             de = (de + added_rows) if had_data else (ds + added_rows - 1)
 
+    removed_rows = 0
+    if selected_keys is not None:
+        # Resize the data region only; retain template rows for matching keys and
+        # keep their formulas/styles. Delete bottom-up so footer references move.
+        from backend.utils.table_split import deletion_ranges
+        allowed = {item['normalized'] for item in selected_keys}
+        seen, keep = set(), []
+        for row1 in range(ds, de + 1):
+            key = normalize_key(_read_cell_str(cells[row1 - 1, key_ci]), normalize_keys, date_key_mode)
+            if key in allowed and key not in seen:
+                keep.append(row1)
+                seen.add(key)
+        for start, count in deletion_ranges(ds, de, keep):
+            cells.DeleteRows(start, count, True)
+            removed_rows += count
+        de -= removed_rows
+
     for row1 in range(ds, de + 1):
         r0 = row1 - 1
         raw_key = _read_cell_str(cells[r0, key_ci])
@@ -240,7 +258,8 @@ def _apply_integration_impl(
         pass
     logger.info(f"[integrate] 回填完成: 新增 {added_rows} 行, 命中 {matched} 行, 覆盖 {overwritten} 格, 差异 {n_diff} 行 → {out_path}")
     return {"overwritten_cells": overwritten, "matched_rows": matched,
-            "added_rows": added_rows, "diff_rows": n_diff}
+            "added_rows": added_rows, "removed_rows": removed_rows,
+            "data_row_end": de, "diff_rows": n_diff}
 
 
 def apply_integration(
@@ -258,6 +277,7 @@ def apply_integration(
     diff_order: str = "id_name",
     date_key_mode: str = "off",
     seed_keys: Optional[List[dict]] = None,
+    selected_keys: Optional[List[dict]] = None,
 ) -> Dict[str, Any]:
     """原地回填主表并（可选）追加差异 sheet，另存到 out_path（在【独立子进程】执行）。
 
@@ -279,6 +299,7 @@ def apply_integration(
             "diff_order": diff_order,
             "date_key_mode": date_key_mode,
             "seed_keys": seed_keys,
+            "selected_keys": selected_keys,
         },
         timeout=default_timeout("write"), max_memory_mb=default_max_memory_mb(),
     )

@@ -163,6 +163,9 @@ def _migrate_add_columns():
     insp = inspect(engine)
 
     migrations = [
+        # ---------- rule_sessions（多目标规则整理，旧单目标字段继续保留）----------
+        ("rule_sessions", "target_file_names", "JSON"),
+        ("rule_sessions", "rules_bundle", "JSON"),
         # ---------- compute_tasks ----------
         ("compute_tasks", "salary_year", "INTEGER"),
         ("compute_tasks", "salary_month", "INTEGER"),

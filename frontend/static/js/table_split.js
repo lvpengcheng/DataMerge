@@ -48,7 +48,7 @@
     // Do not let a late response populate a wizard for the other workflow.
     for (const name of ['loadIntegrateSchemes', '_analyzeIntegrate', '_intReparseHeaders',
         '_intSaveScheme', '_doIntegrateExecute', '_intDeleteSchemeRow', '_intExportScheme',
-        '_intImportScheme', '_intPrefillForApply', '_intPrefillForEdit']) {
+        '_intImportScheme', '_intPrefillForApply', '_intPrefillForEdit', '_intMatchSection']) {
         const original = Tools[name];
         if (!original) continue;
         Tools[name] = async function(...args) {
@@ -92,7 +92,7 @@
             <h3 style="margin-top:0;">⑦ 拆表规则</h3>
             <p>整合完成后按本规则分组，每组生成一个 Excel；只删除该组以外的数据行，保留上下方内容并更新相关公式引用。</p>
             <label style="display:block;margin-bottom:10px;"><input id="split-include-source-keys" type="checkbox" ${config.include_source_keys !== false ? 'checked' : ''} style="width:auto;"> 纳入数据表中模板未包含的记录（默认启用）</label>
-            <p style="font-size:13px;color:#555;">例如模板只有苏州、数据表还有深圳：启用后两地都会生成文件；关闭后仅拆模板已有记录。按关联键补入新记录，字段值仍按上方映射回填，不会自动累加模板金额。结果命名为“分组值_主表名称.xlsx”。</p>
+            <p style="font-size:13px;color:#555;">默认并集时，例如模板只有苏州、数据表还有深圳，启用后两地都会生成文件；关闭且未开启主键捏合时仅拆模板已有记录。也可在上方“数据范围”指定主数据表或表达式。字段仍按上方映射回填，结果命名为“分组值_主表名称.xlsx”。</p>
             <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px;">
                 <label>数据起始行 <input id="split-data-start" type="number" min="1" step="1" value="${config.data_row_start || ''}" placeholder="自动识别" style="width:110px;"></label>
                 <label>数据结束行 <input id="split-data-end" type="number" min="1" step="1" value="${config.data_row_end || ''}" placeholder="自动识别" style="width:110px;"></label>
@@ -118,6 +118,8 @@
         };
         mode.addEventListener('change', refresh);
         refresh();
+        document.getElementById('split-include-source-keys').addEventListener('change', () => this._refreshDataScope?.());
+        this._refreshDataScope?.();
         document.getElementById('split-insert-column').addEventListener('click', () => {
             const input = document.getElementById('split-group-expression');
             const value = document.getElementById('split-group-column').value;

@@ -22,12 +22,12 @@ document.addEventListener('DOMContentLoaded', function () {
     // 文件监听
     document.getElementById('source-files').addEventListener('change', function () {
         _renderFileList('source-file-list', this.files);
-        _checkEncryption(Array.from(this.files));
+        _checkEncryption(Array.from(this.files), 'source');
         _updateAttachBadge();
     });
     document.getElementById('target-file').addEventListener('change', function () {
         _renderFileList('target-file-list', this.files);
-        _checkEncryption(Array.from(this.files));
+        _checkEncryption(Array.from(this.files), 'target');
         _updateAttachBadge();
     });
     document.getElementById('design-docs').addEventListener('change', function () {
@@ -243,7 +243,7 @@ function _promptFilePasswords(encryptedFiles) {
     });
 }
 
-async function _checkEncryption(filesToCheck) {
+async function _checkEncryption(filesToCheck, category) {
     if (!filesToCheck || filesToCheck.length === 0) return;
     try {
         const formData = new FormData();
@@ -254,7 +254,11 @@ async function _checkEncryption(filesToCheck) {
         const encrypted = data.encrypted_files || [];
         if (encrypted.length === 0) return;
         const passwords = await _promptFilePasswords(encrypted);
-        if (passwords) _filePasswordsMap = { ..._filePasswordsMap, ...passwords };
+        if (passwords) {
+            Object.entries(passwords).forEach(([name, password]) => {
+                _filePasswordsMap[category ? `${category}:${name}` : name] = password;
+            });
+        }
     } catch (e) {
         console.warn('加密检测失败:', e);
     }
@@ -262,6 +266,8 @@ async function _checkEncryption(filesToCheck) {
 
 // ==================== Markdown 渲染 ====================
 function _renderMarkdown(text) {
+    // Portable file boundaries stay in the downloaded rules, not in the chat UI.
+    text = String(text || '').replace(/<!-- DM_RULES [\s\S]*? -->/g, '');
     let html = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => `<pre><code>${code}</code></pre>`);
     html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
@@ -342,6 +348,8 @@ function _updateStreamingMessage(contentDiv, text, thinkingText, thinkingDirty) 
         }
         body.innerHTML = _renderMarkdown(text || '');
     }
+    // 思考区有独立滚动条，需要与外层对话一起跟随最新内容。
+    if (tb) tb.scrollTop = tb.scrollHeight;
     const container = document.getElementById('chat-messages');
     container.scrollTop = container.scrollHeight;
 }
@@ -367,11 +375,11 @@ function sendMessage() {
     if (!text || _isStreaming) return;
 
     const sourceFiles = document.getElementById('source-files').files;
-    const targetFile = document.getElementById('target-file').files[0];
+    const targetFiles = document.getElementById('target-file').files;
     const isFirstOrganize = sourceFiles.length > 0 && _chatMessages.length === 0;
 
     if (isFirstOrganize) {
-        _startOrganizeWithMessage(text, sourceFiles, targetFile);
+        _startOrganizeWithMessage(text, sourceFiles, targetFiles);
     } else if (_chatMessages.length > 0 || _currentSessionId) {
         _sendChatMessage(text);
     } else {
@@ -382,15 +390,13 @@ function sendMessage() {
     input.style.height = '';
 }
 
-function _startOrganizeWithMessage(userText, sourceFiles, targetFile) {
+function _startOrganizeWithMessage(userText, sourceFiles, targetFiles) {
     const designDocs = document.getElementById('design-docs').files;
     const aiProvider = document.getElementById('ai-provider').value;
 
     const formData = new FormData();
     Array.from(sourceFiles).forEach(f => formData.append('source_files', f));
-    if (targetFile) {
-        formData.append('target_file', targetFile);
-    }
+    Array.from(targetFiles || []).forEach(file => formData.append('target_files', file));
     if (designDocs.length > 0) {
         Array.from(designDocs).forEach(f => formData.append('design_docs', f));
     }
@@ -447,6 +453,9 @@ async function _fetchSSE(url, options) {
     let streamingDiv = null;
     let fullContent = '';
     let thinkingText = '';   // DeepSeek 推理模型思考过程（灰色区显示，不进入最终内容）
+    let _thinkingTimer = null;
+    let completed = false;
+    let isRulesDocument;
 
     try {
         if (!options.headers) options.headers = {};
@@ -469,7 +478,6 @@ async function _fetchSSE(url, options) {
         let buffer = '';
         // thinking 渲染节流：思考 token 逐块到达（每 token 一个 SSE 事件），
         // 合并为每 100ms 渲染一次，避免密集 DOM 写；完成/出错时立即 flush。
-        let _thinkingTimer = null;
 
         while (true) {
             const { done, value } = await reader.read();
@@ -504,6 +512,8 @@ async function _fetchSSE(url, options) {
                                 `AI 正在思考…（已等待 ${data.elapsed || ''} 秒）`);
                         }
                     } else if (data.type === 'complete') {
+                        completed = true;
+                        isRulesDocument = data.is_rules_document;
                         fullContent = data.content;
                         if (_thinkingTimer) { clearTimeout(_thinkingTimer); _thinkingTimer = null; }
                         _updateStreamingMessage(streamingDiv, fullContent, thinkingText, true);
@@ -521,6 +531,7 @@ async function _fetchSSE(url, options) {
             }
         }
         if (_thinkingTimer) { clearTimeout(_thinkingTimer); _thinkingTimer = null; }
+        if (!completed) throw new Error('规则整理尚未完整完成，请重试；已保留之前的规则。');
     } catch (e) {
         console.error('SSE error:', e);
         if (_thinkingTimer) { clearTimeout(_thinkingTimer); _thinkingTimer = null; }
@@ -528,10 +539,12 @@ async function _fetchSSE(url, options) {
         _addMessage('assistant', '请求失败: ' + e.message);
     } finally {
         if (streamingDiv) _finishStreamingMessage(streamingDiv);
-        if (fullContent) {
+        if (completed && fullContent) {
             _chatMessages.push({ role: 'assistant', content: fullContent });
-            _lastAIContent = fullContent;
-            document.getElementById('download-btn').style.display = '';
+            if (isRulesDocument === true || (isRulesDocument !== false && /## (基本信息|列级规则|列处理分层|公共规则)/.test(fullContent))) {
+                _lastAIContent = fullContent;
+                document.getElementById('download-btn').style.display = '';
+            }
         }
         _setUIStreaming(false);
     }

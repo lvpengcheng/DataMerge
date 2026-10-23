@@ -2,6 +2,8 @@
 主应用入口 - FastAPI应用
 """
 
+from backend.utils.multi_target_rules import limit_rules_content
+
 # Aspose.Cells 全局初始化（必须在 excel_parser 等模块之前）
 import aspose_init  # noqa: F401
 
@@ -178,6 +180,7 @@ async def check_files_encrypted(
 async def organize_rules_endpoint(
     source_files: List[UploadFile] = File(...),
     target_file: Optional[UploadFile] = File(None),
+    target_files: List[UploadFile] = File(default=[]),
     design_docs: List[UploadFile] = File(default=[]),
     ai_provider: Optional[str] = Form(None),
     file_passwords: Optional[str] = Form(None),
@@ -200,36 +203,18 @@ async def organize_rules_endpoint(
     temp_dir = str(Path(temp_dir).resolve())
 
     try:
-        # 保存源文件
-        source_paths = []
-        for f in source_files:
-            path = os.path.join(temp_dir, f.filename)
-            with open(path, "wb") as fp:
-                fp.write(await f.read())
-            source_paths.append(path)
-
-        # 保存目标文件（可选）
-        target_path = None
-        if target_file is not None and target_file.filename:
-            target_path = os.path.join(temp_dir, target_file.filename)
-            with open(target_path, "wb") as fp:
-                fp.write(await target_file.read())
-
-        # 保存设计文档
-        doc_paths = []
-        for f in design_docs:
-            path = os.path.join(temp_dir, f.filename)
-            with open(path, "wb") as fp:
-                fp.write(await f.read())
-            doc_paths.append(path)
-
+        from ..utils.rule_uploads import save_rule_attachments
+        attachments = await save_rule_attachments(temp_dir, source_files,
+            target_files or ([target_file] if target_file else []), design_docs)
+        source_paths = attachments['source_paths']
+        target_paths = attachments['target_paths']
+        doc_paths = attachments['design_paths']
         # 解密加密的 Excel 文件
         all_excel = [(p, os.path.basename(p)) for p in source_paths]
-        if target_path:
-            all_excel.append((target_path, target_file.filename))
+        all_excel.extend((p, os.path.basename(p)) for p in target_paths)
         for fpath, fname in all_excel:
             if is_encrypted(fpath):
-                pwd = passwords_dict.get(fname)
+                pwd = passwords_dict.get(f'{Path(fpath).parent.name}:{fname}') or passwords_dict.get(fname)
                 if not pwd:
                     raise HTTPException(
                         status_code=422,
@@ -248,15 +233,16 @@ async def organize_rules_endpoint(
         # 创建 AI 提供者并执行规则整理
         provider = AIProviderFactory.create_provider(ai_provider)
         organizer = RuleOrganizer(provider)
-        content = organizer.organize_rules(
+        content = await asyncio.to_thread(organizer.organize_rules,
             source_files=source_paths,
-            target_file=target_path,
+            target_files=target_paths,
             design_doc_files=doc_paths,
             file_passwords=passwords_dict,
             user_message=user_message,
         )
 
-        return {"success": True, "content": content}
+        return {"success": True, "content": content, "target_file_names": attachments["target_names"],
+                "rules_bundle": getattr(organizer, "last_rule_bundle", None)}
 
     except HTTPException:
         raise
@@ -271,6 +257,7 @@ async def organize_rules_endpoint(
 async def organize_rules_stream_endpoint(
     source_files: List[UploadFile] = File(...),
     target_file: Optional[UploadFile] = File(None),
+    target_files: List[UploadFile] = File(default=[]),
     design_docs: List[UploadFile] = File(default=[]),
     ai_provider: Optional[str] = Form(None),
     file_passwords: Optional[str] = Form(None),
@@ -291,48 +278,42 @@ async def organize_rules_stream_endpoint(
         except Exception:
             pass
 
+    if session_id:
+        with SessionLocal() as db:
+            saved = db.query(db_models.RuleSession).filter(
+                db_models.RuleSession.id == session_id, db_models.RuleSession.user_id == current_user.id).first()
+            if not saved:
+                raise HTTPException(404, detail='会话不存在')
+
     temp_dir = tempfile.mkdtemp(prefix="rule_org_stream_")
     temp_dir = str(Path(temp_dir).resolve())
 
-    # 保存上传文件
-    source_paths = []
-    source_names = []
-    for f in source_files:
-        path = os.path.join(temp_dir, f.filename)
-        with open(path, "wb") as fp:
-            fp.write(await f.read())
-        source_paths.append(path)
-        source_names.append(f.filename)
-
-    target_path = None
-    target_name = None
-    if target_file is not None and target_file.filename:
-        target_path = os.path.join(temp_dir, target_file.filename)
-        with open(target_path, "wb") as fp:
-            fp.write(await target_file.read())
-        target_name = target_file.filename
-
-    doc_paths = []
-    doc_names = []
-    for f in design_docs:
-        path = os.path.join(temp_dir, f.filename)
-        with open(path, "wb") as fp:
-            fp.write(await f.read())
-        doc_paths.append(path)
-        doc_names.append(f.filename)
-
+    try:
+        from ..utils.rule_uploads import save_rule_attachments
+        attachments = await save_rule_attachments(temp_dir, source_files,
+            target_files or ([target_file] if target_file else []), design_docs)
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+    source_paths, source_names = attachments['source_paths'], attachments['source_names']
+    target_paths, target_names = attachments['target_paths'], attachments['target_names']
+    doc_paths, doc_names = attachments['design_paths'], attachments['design_names']
+    target_name = target_names[0] if target_names else None
     # 解密
     all_excel = [(p, os.path.basename(p)) for p in source_paths]
-    if target_path:
-        all_excel.append((target_path, target_name))
-    for fpath, fname in all_excel:
-        if is_encrypted(fpath):
-            pwd = passwords_dict.get(fname)
-            if not pwd:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                raise HTTPException(status_code=422, detail=f"文件 '{fname}' 有密码保护，请提供密码")
-            decrypted = decrypt_excel(fpath, password=pwd)
-            shutil.move(decrypted, fpath)
+    all_excel.extend((p, os.path.basename(p)) for p in target_paths)
+    try:
+        for fpath, fname in all_excel:
+            if is_encrypted(fpath):
+                pwd = passwords_dict.get(f'{Path(fpath).parent.name}:{fname}') or passwords_dict.get(fname)
+                if not pwd:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    raise HTTPException(status_code=422, detail=f"文件 '{fname}' 有密码保护，请提供密码")
+                decrypted = decrypt_excel(fpath, password=pwd)
+                shutil.move(decrypted, fpath)
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
 
     # 多区域 sheet 预处理（banner 拆分 / 头一致合并 / 头不一致 best-region）
     try:
@@ -374,7 +355,7 @@ async def organize_rules_stream_endpoint(
             organizer = RuleOrganizer(provider)
             full_content = organizer.organize_rules_stream(
                 source_files=source_paths,
-                target_file=target_path,
+                target_files=target_paths,
                 design_doc_files=doc_paths,
                 file_passwords=passwords_dict,
                 user_message=user_message,
@@ -386,7 +367,7 @@ async def organize_rules_stream_endpoint(
             saved_session_id = None
             try:
                 db = SessionLocal()
-                _user_msg_target = f"和目标文件({target_name})" if target_name else "（未提供目标文件）"
+                _user_msg_target = f"和目标文件({', '.join(target_names)})" if target_names else "（未提供目标文件）"
                 _user_msg_text = (user_message or "").strip() or f"请根据源文件({', '.join(source_names)}){_user_msg_target}整理数据处理规则"
                 initial_messages = [
                     {"role": "user", "content": _user_msg_text},
@@ -394,26 +375,30 @@ async def organize_rules_stream_endpoint(
                 ]
                 if _session_id:
                     sess = db.query(db_models.RuleSession).filter(
-                        db_models.RuleSession.id == _session_id
+                        db_models.RuleSession.id == _session_id, db_models.RuleSession.user_id == _user_id
                     ).first()
                     if sess:
                         sess.messages = initial_messages
                         sess.final_result = full_content
                         sess.source_file_names = source_names
                         sess.target_file_name = target_name
+                        sess.target_file_names = target_names
+                        sess.rules_bundle = getattr(organizer, "last_rule_bundle", None)
                         sess.design_doc_names = doc_names or None
                         sess.ai_provider = ai_provider or "deepseek"
                         sess.updated_at = datetime.utcnow()
                         db.commit()
                         saved_session_id = sess.id
                 if not saved_session_id:
-                    _title = f"规则整理 - {target_name}" if target_name else f"规则整理 - {source_names[0] if source_names else '无源文件'}"
+                    _title = f"规则整理 - {target_name}" + (f" 等{len(target_names)}个目标" if len(target_names) > 1 else "") if target_name else f"规则整理 - {source_names[0] if source_names else '无源文件'}"
                     sess = db_models.RuleSession(
                         user_id=_user_id,
                         title=_title,
                         ai_provider=ai_provider or "deepseek",
                         source_file_names=source_names,
                         target_file_name=target_name,
+                        target_file_names=target_names,
+                        rules_bundle=getattr(organizer, "last_rule_bundle", None),
                         design_doc_names=doc_names or None,
                         messages=initial_messages,
                         final_result=full_content,
@@ -425,6 +410,8 @@ async def organize_rules_stream_endpoint(
                 db.close()
             except Exception as db_err:
                 logger.error(f"规则会话持久化失败: {db_err}", exc_info=True)
+                if getattr(organizer, 'last_rule_bundle', None):
+                    raise RuntimeError('多目标规则会话保存失败，请检查数据库升级及连接状态') from db_err
 
             loop.call_soon_threadsafe(
                 logs_queue.put_nowait,
@@ -493,6 +480,21 @@ async def rules_chat_endpoint(
         raise HTTPException(status_code=400, detail="消息列表不能为空")
 
     _user_id = current_user.id
+    previous_multi_bundle = False
+    if _session_id:
+        with SessionLocal() as db:
+            saved = db.query(db_models.RuleSession).filter(
+                db_models.RuleSession.id == int(_session_id), db_models.RuleSession.user_id == _user_id).first()
+            if not saved:
+                raise HTTPException(404, detail='会话不存在')
+            previous_multi_bundle = bool(saved.rules_bundle)
+            if saved.rules_bundle:
+                # The saved full rules are authoritative; do not overwrite a
+                # newer revision using a stale browser's copy of the document.
+                latest_user = next((m for m in reversed(messages) if m.get('role') == 'user'), None)
+                if not latest_user:
+                    raise HTTPException(400, detail='请提供本次要修改或询问的内容')
+                messages = [{'role': 'assistant', 'content': saved.final_result}, latest_user]
 
     logs_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
     loop = asyncio.get_event_loop()
@@ -523,6 +525,9 @@ async def rules_chat_endpoint(
             organizer = RuleOrganizer(provider)
             full_content = organizer.chat_followup(
                 messages, chunk_callback=chunk_cb, thinking_callback=thinking_cb)
+            changed_bundle = getattr(organizer, 'last_rule_bundle', None)
+            is_rules_document = bool(changed_bundle) or (not previous_multi_bundle and any(
+                marker in full_content for marker in ('## 列级规则', '## 基本信息', '## 列处理分层')))
 
             # 追问后，如果AI重新生成了完整规则文档但缺少源数据格式段落，
             # 从历史消息中恢复该段落（首次生成时已追加在第一个assistant回复中）
@@ -555,7 +560,7 @@ async def rules_chat_endpoint(
                 if _session_id:
                     db = SessionLocal()
                     sess = db.query(db_models.RuleSession).filter(
-                        db_models.RuleSession.id == int(_session_id)
+                        db_models.RuleSession.id == int(_session_id), db_models.RuleSession.user_id == _user_id
                     ).first()
                     if sess:
                         updated_messages = list(messages) + [
@@ -564,17 +569,17 @@ async def rules_chat_endpoint(
                         sess.messages = updated_messages
                         # 只在AI重新输出完整规则文档时更新 final_result，
                         # 普通对话回复（如"好的，已修改"）不应覆盖
-                        _is_rules_doc = any(
-                            marker in full_content
-                            for marker in ("## 列级规则", "## 基本信息", "## 列处理分层")
-                        )
+                        _is_rules_doc = is_rules_document
                         if _is_rules_doc:
                             sess.final_result = full_content
+                            sess.rules_bundle = changed_bundle
                         sess.updated_at = datetime.utcnow()
                         db.commit()
                     db.close()
             except Exception as db_err:
                 logger.error(f"规则会话更新失败: {db_err}", exc_info=True)
+                if changed_bundle:
+                    raise RuntimeError('多目标规则更新未保存，已保留原规则，请稍后重试') from db_err
 
             loop.call_soon_threadsafe(
                 logs_queue.put_nowait,
@@ -582,6 +587,7 @@ async def rules_chat_endpoint(
                     "type": "complete",
                     "content": full_content,
                     "session_id": saved_session_id,
+                    "is_rules_document": is_rules_document,
                 }, ensure_ascii=False),
             )
         except Exception as e:
@@ -3493,7 +3499,7 @@ async def adjust_code(
 ```
 
 ## 原始计算规则
-{rules_content[:70000]}
+{limit_rules_content(rules_content)}
 
 ## 用户的调整要求
 {adjustment_request}
@@ -5500,8 +5506,10 @@ async def run_compute_task(
                 salary_year, salary_month, template_override_paths)
             package = compute_dir / delivery["output_file"]
             if db_session:
-                _persist_result_file(db_session, compute_task_id, tenant_id, package, package.name,
-                                     sheet_summary=[])
+                for filename in dict.fromkeys([delivery['output_file'], *delivery['output_files']]):
+                    result_path = compute_dir / filename
+                    _persist_result_file(db_session, compute_task_id, tenant_id, result_path, filename,
+                                         sheet_summary=[])
             try:
                 from backend.utils.compute_run_archive import finalize_compute_run
                 archived_run_dir = await asyncio.to_thread(

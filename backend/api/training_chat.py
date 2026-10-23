@@ -2,6 +2,8 @@
 对话式训练 API - 支持交互式代码调试
 """
 
+from backend.utils.multi_target_rules import limit_rules_content
+
 from backend.utils.desensitize import mask_ai_samples
 
 import os
@@ -782,7 +784,7 @@ def _build_chat_system_prompt(context: Dict, config: Dict, rules: str) -> str:
 
     # 规则
     if rules:
-        parts.append(f"\n计算规则（参考）:\n{rules[:70000]}")
+        parts.append(f"\n计算规则（参考）:\n{limit_rules_content(rules)}")
 
     # 源数据结构
     src_desc = config.get("source_structure_desc", "") or json.dumps(context.get('source_structure', {}), ensure_ascii=False)
@@ -1770,7 +1772,7 @@ async def start_training(
                     "expected_file": expected_file,
                     "expected_files": expected_files,
                     "work_dir": work_dir,
-                    "rules_content": rules_content[:70000],
+                    "rules_content": limit_rules_content(rules_content),
                     "expected_structure": expected_struct_dict,
                     "ai_provider": ai_provider,
                     "salary_year": salary_year,
@@ -1796,7 +1798,7 @@ async def start_training(
                 ts.salary_year = salary_year
                 ts.salary_month = salary_month
                 ts.manual_headers = manual_headers_dict
-                ts.rules_content = rules_content[:70000] if rules_content else None
+                ts.rules_content = limit_rules_content(rules_content) if rules_content else None
                 ts.expected_structure = expected_struct_dict or None
                 db.commit()
 
@@ -2505,7 +2507,7 @@ async def send_message(
             rules = config.get("rules_content", "")
             if new_rules:
                 rules = new_rules + "\n" + rules
-                config["rules_content"] = rules[:70000]
+                config["rules_content"] = limit_rules_content(rules)
                 session.config = config
                 flag_modified(session, "config")
                 db.commit()
@@ -2577,7 +2579,7 @@ async def send_message(
             rules = config.get("rules_content", "")
             if new_rules:
                 rules = new_rules + "\n" + rules
-                config["rules_content"] = rules[:70000]
+                config["rules_content"] = limit_rules_content(rules)
                 session.config = config
                 flag_modified(session, "config")
                 db.commit()
@@ -2710,7 +2712,7 @@ async def send_message(
                 else:
                     # 公式 / 自动模式：对整份代码做精确替换（模式无关共享工具）
                     from ..ai_engine.precise_edit import run_precise_edit
-                    _rules_extra = f"## 计算规则（参考）\n{(rules or '')[:20000]}\n" if rules else ""
+                    _rules_extra = f"## 计算规则（参考）\n{limit_rules_content(rules)}\n" if rules else ""
                     code = run_precise_edit(
                         provider,
                         original_code,
@@ -3056,7 +3058,7 @@ async def send_message(
             if had_new_rules:
                 old_rules = config.get("rules_content", "")
                 merged = (new_rules + "\n" + old_rules) if old_rules else new_rules
-                config["rules_content"] = merged[:70000]
+                config["rules_content"] = limit_rules_content(merged)
                 # 同步规则文件
                 try:
                     (session_persist_dir / "rules.txt").write_text(config["rules_content"], encoding="utf-8")

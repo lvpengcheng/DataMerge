@@ -33,6 +33,7 @@ class SessionListItem(BaseModel):
     ai_provider: str
     source_file_names: Optional[list] = None
     target_file_name: Optional[str] = None
+    target_file_names: Optional[list] = None
     design_doc_names: Optional[list] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
@@ -64,6 +65,7 @@ def list_sessions(
             "ai_provider": r.ai_provider or "",
             "source_file_names": r.source_file_names,
             "target_file_name": r.target_file_name,
+            "target_file_names": r.target_file_names or ([r.target_file_name] if r.target_file_name else []),
             "design_doc_names": r.design_doc_names,
             "created_at": r.created_at.isoformat() if r.created_at else None,
             "updated_at": r.updated_at.isoformat() if r.updated_at else None,
@@ -95,6 +97,8 @@ def get_session(
         "ai_provider": session.ai_provider or "",
         "source_file_names": session.source_file_names,
         "target_file_name": session.target_file_name,
+        "target_file_names": session.target_file_names or ([session.target_file_name] if session.target_file_name else []),
+        "rules_bundle": session.rules_bundle,
         "design_doc_names": session.design_doc_names,
         "messages": session.messages or [],
         "final_result": session.final_result,

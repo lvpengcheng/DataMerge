@@ -14,6 +14,8 @@
 - 避免Python计算的各种陷阱
 """
 
+from backend.utils.multi_target_rules import RULES_CONTENT_LIMIT, limit_rules_content
+
 import os
 import re
 import logging
@@ -37,6 +39,11 @@ def replace_source_data_format_in_rules(rules_content: str, new_source_structure
     """
     if not new_source_structure:
         return rules_content
+    from backend.utils.multi_target_rules import parse_bundle, render_bundle
+    bundle = parse_bundle(rules_content)
+    if bundle:
+        bundle['source_format'] = new_source_structure.strip()
+        return render_bundle(bundle)
     section = f"## 源数据格式\n\n{new_source_structure.strip()}\n"
     if not rules_content:
         return section
@@ -122,6 +129,8 @@ class FormulaCodeGenerator:
                 multi_sheet_source=multi_sheet_source, analysis=analysis,
                 skip_load=skip_load, use_history=use_history))
 
+        from backend.utils.multi_target_rules import rules_for_structure
+        rules_content = rules_for_structure(rules_content, expected_structure)
         log("=== 公式模式：开始生成代码 ===")
         self.last_prompt = None  # 记录实际提示词，供调用方获取
         self._multi_sheet_source = multi_sheet_source  # 记录给 _build_complete_code 使用
@@ -1120,9 +1129,9 @@ class FormulaCodeGenerator:
 
         result = '\n'.join(relevant_lines).strip()
         # 限制长度
-        if len(result) > 70000:
-            result = result[:70000] + "\n... (规则过长已截断)"
-        return result if result else rules_content[:70000]
+        if len(result) > RULES_CONTENT_LIMIT:
+            result = result[:RULES_CONTENT_LIMIT] + "\n... (规则过长已截断)"
+        return result if result else limit_rules_content(rules_content)
 
     @staticmethod
     def _extract_defined_variables_with_context(code: str) -> str:
@@ -2779,7 +2788,7 @@ def main():
 {comparison_result}
 {retry_directive}
 ## 计算规则（参考）
-{rules_content[:70000]}
+{limit_rules_content(rules_content)}
 
 {source_structure}
 

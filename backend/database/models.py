@@ -370,6 +370,8 @@ class RuleSession(Base):
     ai_provider = Column(String(50), default="deepseek")
     source_file_names = Column(JSON, nullable=True)                 # ["file1.xlsx", ...]
     target_file_name = Column(String(200), nullable=True)
+    target_file_names = Column(JSON, nullable=True)
+    rules_bundle = Column(JSON, nullable=True)
     design_doc_names = Column(JSON, nullable=True)                  # ["design.docx", ...]
     messages = Column(JSON, nullable=False, default=list)           # OpenAI 格式对话历史
     final_result = Column(Text, nullable=True)                      # 最终 rules.md 内容

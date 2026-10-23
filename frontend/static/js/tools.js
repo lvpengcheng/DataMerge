@@ -525,12 +525,15 @@ const Tools = {
         }
         const btn = document.getElementById('btn-integrate-analyze');
         btn.disabled = true;
+        _intApplyReady = false;
+        document.getElementById('integrate-config').style.display = 'none';
         this._setIntegrateStatus('解析中...');
         try {
             const fd = new FormData();
             _integrateFiles.forEach(f => fd.append('files', f));
             fd.append('tenant_id', '__tools_integrate__');
             fd.append('parse_all_sheets', parseAllSheets ? 'true' : 'false');
+            fd.append('stream', 'true');
             const schemeId = this._intTargetSchemeId();
             if (schemeId != null) fd.append('scheme_id', schemeId);
             const resp = await this._intFetch('/api/tools/integrate/analyze', { method: 'POST', body: fd });
@@ -540,8 +543,30 @@ const Tools = {
                 return;
             }
             _integrateAnalysis = await resp.json();
+            if (_integrateAnalysis.error) {
+                this._setIntegrateStatus(String(_integrateAnalysis.error), 'error');
+                _integrateAnalysis = null;
+                return;
+            }
+            if (parseAllSheets) {
+                const selected = await this._intChooseSheets(_integrateAnalysis);
+                if (!selected) {
+                    _integrateAnalysis = null;
+                    _intApplyReady = false;
+                    document.getElementById('integrate-config').style.display = 'none';
+                    this._setIntegrateStatus('已取消Sheet选择，请重新解析', '');
+                    return;
+                }
+                const selection = await this._intFetch('/api/tools/integrate/select-sheets', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({session_id: _integrateAnalysis.session_id,
+                        selected_tables: selected, scheme_id: this._intTargetSchemeId()}),
+                });
+                if (!selection.ok) {await _alertErr(selection, 'Sheet选择失败'); return;}
+                _integrateAnalysis = await selection.json();
+            }
             this._renderIntegrateConfig(_integrateAnalysis);
-            if (_intMode === 'apply' || _intMode === 'edit') {
+            if ((_intMode === 'apply' || _intMode === 'edit') && !parseAllSheets) {
                 await this._intRestoreSchemeHeaders();
             }
             if (_intMode === 'apply') {
@@ -677,6 +702,8 @@ const Tools = {
                         pair.source_expr = expr; pair.source_col = expr;
                     });
                 });
+                this._remapDataScopeFiles?.(scheme.config?.data_scope,
+                    Object.fromEntries(Object.entries(fileRemap).map(([oldFile, newFile]) => [oldFile.slice(0, -1), newFile.slice(0, -1)])));
                 Object.assign(scheme.fp_to_file, mapping);
                 this.closeModal();
                 resolve(true);
@@ -721,7 +748,7 @@ const Tools = {
                 body: JSON.stringify({ session_id: _integrateAnalysis.session_id, scheme_id: _intApplyTarget.id }),
             });
             if (!resp.ok) { await _alertErr(resp, '校验失败'); return; }
-            const res = await resp.json();
+            let res = await resp.json();
             if (!res.ok) {
                 if (rz) {
                     rz.style.display = 'block';
@@ -733,6 +760,11 @@ const Tools = {
                 return;
             }
             if (rz) { rz.style.display = 'none'; rz.innerHTML = ''; }
+            const usedSheetMapping = !!res.sheet_mapping?.required;
+            if (usedSheetMapping && this._intValidateChosenSheets) {
+                res = await this._intValidateChosenSheets(res, _intApplyTarget.id);
+                if (!res) {this._setIntegrateStatus('未确认Sheet对应关系，尚未应用方案', ''); return;}
+            }
             const matched = this._intFindMatched(_intApplyTarget.id);
             const scheme = res.resolved_scheme || matched;
             if (!scheme) { this._setIntegrateStatus('方案未能匹配到上传文件', 'error'); return; }
@@ -741,7 +773,7 @@ const Tools = {
                 if (!confirmed) { this._setIntegrateStatus('已取消列名映射', ''); return; }
             }
             const ambiguous = ((matched && matched.ambiguous) || []).filter(a => (a.candidates || []).length > 0);
-            if (ambiguous.length) {
+            if (ambiguous.length && !usedSheetMapping) {
                 const ok = await this._intAskMatchMapping(scheme, ambiguous);
                 if (!ok) { this._setIntegrateStatus('已取消应用', ''); return; }
             }
@@ -765,10 +797,14 @@ const Tools = {
                 body: JSON.stringify({ session_id: _integrateAnalysis.session_id, scheme_id: _intEditingSchemeId }),
             });
             if (!resp.ok) { await _alertErr(resp, '方案匹配失败'); return; }
-            const res = await resp.json();
+            let res = await resp.json();
             if (!res.ok || !res.resolved_scheme) {
                 this._setIntegrateStatus('上传文件缺少方案必需列，请调整列头或从当前配置重新设置', 'error');
                 return;
+            }
+            if (res.sheet_mapping?.required && this._intValidateChosenSheets) {
+                res = await this._intValidateChosenSheets(res, _intEditingSchemeId);
+                if (!res) {this._setIntegrateStatus('未确认Sheet对应关系', ''); return;}
             }
             if (res.requires_confirmation) {
                 const confirmed = await this._intConfirmColumnMappings(res.mapping_suggestions || []);
@@ -854,8 +890,8 @@ const Tools = {
             <h3 style="margin-top:16px;">③ 关联键（每个文件）</h3>
             <div id="int-key-map"></div>
             <div class="form-group" style="margin-top:8px;padding:9px 10px;background:#f4f8ff;border:1px solid #dce8f8;border-radius:6px;">
-                <label style="font-size:13px;"><input type="checkbox" id="int-union-source-keys" style="width:auto;"> 主键捏合：将所有对照表的关联键并入主表</label>
-                <span style="color:#777;font-size:12px;margin-left:8px;">主表为空也可生成数据行；相同主键只生成一行，主表已有行不会删除。</span>
+                <label style="font-size:13px;"><input type="checkbox" id="int-union-source-keys" style="width:auto;"> 主键捏合：按数据范围补齐或生成主表记录</label>
+                <span style="color:#777;font-size:12px;margin-left:8px;">默认保留主表并补齐各表主键；也可设置以指定表或表达式的数据范围为准。</span>
             </div>
             <div class="form-group" style="margin-top:6px;">
                 <label style="font-size:13px;">日期关联键归一：</label>
@@ -1066,6 +1102,7 @@ const Tools = {
             normalize_keys: true,
             date_key_mode: document.getElementById('int-date-mode')?.value || 'off',
             union_source_keys: !!document.getElementById('int-union-source-keys')?.checked,
+            data_scope: this._readDataScope?.() || null,
             split_config: this._integrationKind === 'split' ? this._readSplitConfig() : null,
         };
         // 另存为不带 scheme_id（走新建分支）；保存修改才带
@@ -1299,6 +1336,10 @@ const Tools = {
                 if (picks.length !== 1) return;
                 const expr = this._intUnifiedExpr(picks[0]);
                 if (!expr) return;
+                // Fixed values have no column references and must stay fixed
+                // when the user enables or disables key union.
+                const references = this._intTokenize(expr, defaultFile).filter(t => t.t === 'col');
+                if (!references.length) return;
                 const token = `${main}.${tr.dataset.aCol}`;
                 const present = this._intTokenize(expr, defaultFile)
                     .some(t => t.t === 'col' && t.v === token);
@@ -1382,15 +1423,25 @@ const Tools = {
         const st = document.getElementById(`int-${kind}-status`);
         if (!rows.length) { st.textContent = '请先在上方勾选基准字段'; st.className = 'status error'; return; }
         const source_cols = [];
+        const target_cols = rows.filter(row => {
+            try { return !JSON.parse(row.dataset.src || '[]').length; } catch (_) { return true; }
+        }).map(row => row.dataset.aCol);
+        const key_map = {};
+        document.querySelectorAll('.int-key').forEach(select => { key_map[select.dataset.file] = select.value; });
+        const submittedSession = _integrateAnalysis.session_id;
+        const submittedMain = this._intMainFile();
         this._intNonMainFiles().forEach(f => (f.columns || []).forEach(c => source_cols.push({ file: f.name, col: c })));
         st.textContent = '匹配中...'; st.className = 'status';
         try {
             const resp = await this._intFetch('/api/tools/integrate/match', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ session_id: _integrateAnalysis.session_id, main_file: this._intMainFile(), source_cols, use_ai: !!useAi }),
+                body: JSON.stringify({ session_id: _integrateAnalysis.session_id, main_file: this._intMainFile(), source_cols, target_cols, key_map, use_ai: !!useAi }),
             });
             if (!resp.ok) { await _alertErr(resp, '匹配失败'); st.textContent = '匹配失败'; st.className = 'status error'; return; }
             const data = await resp.json();
+            if (data.error) throw new Error(data.error);
+            if (submittedSession !== _integrateAnalysis?.session_id || submittedMain !== this._intMainFile()
+                || rows.some(row => !row.isConnected)) return;
             const matchesByA = {};
             (data.pairs || []).forEach(p => {
                 const items = matchesByA[p.a_col] = matchesByA[p.a_col] || [];
@@ -1415,7 +1466,7 @@ const Tools = {
                 else { tr.dataset.src = '[]'; miss++; }   // 匹配不到 → 留空，人工点选
                 this._intUpdateSrcCell(tr);
             });
-            st.textContent = `智能匹配填充 ${hit} 个目标字段（共 ${matchedCols} 个来源列），保留已选 ${kept} 个${miss ? `，${miss} 个未匹配请手动选` : ''}`;
+            st.textContent = `智能匹配填充 ${hit} 个目标字段（共 ${matchedCols} 个来源列），保留已选 ${kept} 个${miss ? `，${miss} 个不匹配` : ''}`;
             st.className = 'status ok';
         } catch (e) { st.textContent = '失败: ' + e.message; st.className = 'status error'; }
     },
@@ -1458,6 +1509,7 @@ const Tools = {
             normalize_keys: true,
             date_key_mode: document.getElementById('int-date-mode')?.value || 'off',
             union_source_keys: !!document.getElementById('int-union-source-keys')?.checked,
+            data_scope: this._readDataScope?.() || null,
             split_config: this._integrationKind === 'split' ? this._readSplitConfig() : null,
         };
         const st = document.getElementById('int-exec-status');

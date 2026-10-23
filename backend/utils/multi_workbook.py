@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import zipfile
 from pathlib import Path
+from .multi_target_rules import rules_for_workbook
 
 
 def workbook_definitions(structure):
@@ -56,7 +57,7 @@ def generate_workbooks(generator, kwargs):
         structure["reserved_source_sheet_names"] = list((kwargs["expected_structure"].get("sheets") or {}).keys())
         options = dict(kwargs)
         options["expected_structure"] = structure
-        options["rules_content"] = (kwargs.get("rules_content", "") +
+        options["rules_content"] = (rules_for_workbook(kwargs.get("rules_content", ""), name) +
             f"\n\n本次只生成交付文件【{name}】。请遵循规则中该文件的生成要求及公共规则。"
             "其他交付文件由平台分别生成，不要将其 sheet 混入本文件。")
         if "template_path" in options:
@@ -82,7 +83,7 @@ def correct_workbooks(generator, kwargs):
         # Formula corrections rebuild the skeleton from generator state.
         generator._expected_structure = target["structure"]
         if "rules_content" in options:
-            options["rules_content"] = (options.get("rules_content") or "") + f"\n只修正交付文件【{name}】。"
+            options["rules_content"] = rules_for_workbook(options.get("rules_content"), name) + f"\n只修正交付文件【{name}】。"
         code = generator.generate_correction_code(**options)
         if not code:
             raise ValueError(f"{name}: 修正未生成有效脚本")
@@ -162,7 +163,7 @@ def precise_edit_workbooks(provider, code, feedback, **kwargs):
         if named and name not in named:
             continue
         edited = run_precise_edit(provider, target["code"], feedback,
-            **{**kwargs, "extra_context": kwargs.get("extra_context", "") + f"\n当前交付文件: {name}"})
+            **{**kwargs, "extra_context": rules_for_workbook(kwargs.get("extra_context", ""), name) + f"\n当前交付文件: {name}"})
         if not edited:
             return None
         target["code"] = edited
@@ -182,9 +183,10 @@ def select_outputs(files, structure, template_path=None):
     return [available[name] for name in definitions]
 
 
-def create_zip(destination, files):
+def create_zip(destination, files, *, values_files=None):
     """Publish an atomic ZIP containing only explicit deliverables, never inputs."""
     files = [Path(path) for path in files]
+    value_paths = {Path(path) for path in values_files} if values_files is not None else None
     names = [path.name.casefold() for path in files]
     if not files or len(set(names)) != len(names):
         raise ValueError("交付文件清单为空或存在重名")
@@ -197,7 +199,8 @@ def create_zip(destination, files):
             for path in files:
                 if not path.is_file():
                     raise ValueError(f"交付文件不存在: {path.name}")
-                archive.write(path, arcname=path.name)
+                folder = ('纯值版' if path in value_paths else '原版') if value_paths is not None else None
+                archive.write(path, arcname=f'{folder}/{path.name}' if folder else path.name)
         os.replace(staged, destination)
     finally:
         if os.path.exists(staged):
@@ -225,7 +228,7 @@ def validate_workbooks(output_dir, code, structure, rules_content=None, tenant_i
         diff = Path(output_dir) / f"_diff_{index + 1}.xlsx"
         comparison = compare_excel_files_multi_sheet(
             str(result), expected["expected_file"], str(diff),
-            primary_keys=extract_primary_keys_from_rules(rules_content) if rules_content else None,
+            primary_keys=extract_primary_keys_from_rules(rules_for_workbook(rules_content, result.name)) if rules_content else None,
             result_calculated=True, calculate_expected_formulas=True)
         require_complete_comparison(comparison)
         total += comparison.get("total_cells", 0)
@@ -256,6 +259,7 @@ def deliver_workbooks(output_dir, destination_dir, code, structure, tenant_id, d
     destination_dir = Path(destination_dir)
     destination_dir.mkdir(parents=True, exist_ok=True)
     rows, reports, summaries, paths = 0, {}, {}, []
+    original_paths, value_paths = [], []
     values_failed = False
     package_name = Path(build_result_filename(display_name, salary_year, salary_month, ".zip"))
     import uuid
@@ -276,6 +280,7 @@ def deliver_workbooks(output_dir, destination_dir, code, structure, tenant_id, d
             path = Path(staged) / output.name
             shutil.copy2(output, path)
             paths.append(path)
+            original_paths.append(path)
             if dual_output_enabled():
                 value_path = Path(staged) / values_only_name(output.name)
                 reserved = {name.casefold() for name in definitions} | {path.name.casefold() for path in paths}
@@ -288,10 +293,20 @@ def deliver_workbooks(output_dir, destination_dir, code, structure, tenant_id, d
                                          fill_report_path=str(Path(output_dir) / (output.name + ".fill_report.json")),
                                          recalculate=False):
                     paths.append(value_path)
+                    value_paths.append(value_path)
                 else:
                     values_failed = True
-        archive = create_zip(destination_dir / package_name, paths)
-    return {"output_file": archive.name, "output_files": [archive.name],
+        # Never offer an incomplete values-only package as a successful delivery.
+        if values_failed:
+            value_paths = []
+        originals = create_zip(destination_dir / package_name.with_stem(package_name.stem + '_原版'), original_paths)
+        downloads = [originals.name]
+        if value_paths:
+            values = create_zip(destination_dir / package_name.with_stem(package_name.stem + '_纯值'), value_paths)
+            downloads.append(values.name)
+        archive = create_zip(destination_dir / package_name, original_paths + value_paths,
+                             values_files=value_paths)
+    return {"output_file": archive.name, "output_files": downloads,
             "business_files": [path.name for path in outputs], "delivery_type": "zip",
             "rows_processed": rows, "formula_report": {"workbooks": reports},
             "formula_warning": any(report.get(key) for report in reports.values() for key in (

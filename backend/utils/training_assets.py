@@ -236,5 +236,6 @@ def prepare_revision(config, revision_path, changed_categories):
             if not parsed.strip():
                 raise ValueError(f'规则文件未能解析: {path.name}')
             parts.append(f'=== 规则文件: {path.name} ===\n{parsed}')
-        cfg['rules_content'] = '\n\n'.join(parts)
+        from backend.utils.multi_target_rules import limit_rules_content
+        cfg['rules_content'] = limit_rules_content('\n\n'.join(parts))
     return {'config': cfg, 'source_structure': sources}

@@ -2225,7 +2225,8 @@ function showResult(data) {
         ? data.output_files
         : (data.output_file ? [data.output_file] : []);
 
-    const _label = (fn) => fn && fn.toLowerCase().endsWith('.zip') ? 'ZIP交付包'
+    const _label = (fn) => fn && fn.toLowerCase().endsWith('.zip')
+        ? (fn.endsWith('_纯值.zip') ? '纯值版压缩包' : fn.endsWith('_原版.zip') ? '原版压缩包' : '全部结果压缩包')
         : fn && fn.includes('_纯值') ? '纯值版' : '原版';
 
     resultCard.className = 'result-card result-success';
@@ -2255,7 +2256,10 @@ function showResult(data) {
     const dlBtns = files.length
         ? files.map(f => `<button class="btn btn-download" onclick="downloadResult('${f}')">下载${_label(f)}</button>`).join('')
         : '';
-    const dlAll = files.length > 1
+    const combinedPackage = data.delivery_type === 'zip' && data.output_file && !files.includes(data.output_file);
+    const dlAll = combinedPackage
+        ? `<button class="btn btn-download" onclick="downloadResult('${data.output_file}')">下载全部结果压缩包</button>`
+        : files.length > 1
         ? `<button class="btn btn-download" onclick="downloadAllResults(${JSON.stringify(files).replace(/"/g, '&quot;')})">下载全部</button>`
         : '';
     resultDownloads.innerHTML = `

@@ -176,7 +176,8 @@ class AutoCodeGenerator:
         use_history: bool,
     ) -> str:
         import json
-        rules_short = (rules_content or "")[:30000]
+        from backend.utils.multi_target_rules import limit_rules_content
+        rules_short = limit_rules_content(rules_content)
 
         exp_block = ""
         if expected_structure and isinstance(expected_structure, dict) and expected_structure.get("sheets"):

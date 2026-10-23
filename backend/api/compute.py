@@ -324,12 +324,14 @@ async def execute_compute(
                     deliver_workbooks, output_dir, tenant_output_dir, script_code,
                     script.expected_structure, task.tenant_id, script.name,
                     task.salary_year, task.salary_month)
-                package = tenant_output_dir / delivery["output_file"]
-                db.add(DataAsset(tenant_id=task.tenant_id, asset_type="result",
-                    name=f"计算结果_{package.name}", file_path=str(package), file_name=package.name,
-                    file_size=package.stat().st_size, source_task_id=task.id,
-                    uploaded_by=current_user.id, sheet_summary=[]))
-                delivery["saved_assets"] = [package.name]
+                saved_assets = list(dict.fromkeys([delivery['output_file'], *delivery['output_files']]))
+                for filename in saved_assets:
+                    package = tenant_output_dir / filename
+                    db.add(DataAsset(tenant_id=task.tenant_id, asset_type="result",
+                        name=f"计算结果_{package.name}", file_path=str(package), file_name=package.name,
+                        file_size=package.stat().st_size, source_task_id=task.id,
+                        uploaded_by=current_user.id, sheet_summary=[]))
+                delivery["saved_assets"] = saved_assets
                 delivery["execution_time"] = duration
                 task.status = "completed"
                 task.result_summary = delivery
