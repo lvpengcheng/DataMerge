@@ -72,6 +72,7 @@ class ExcelFormulaBuilder:
             源数据信息字典
         """
         from excel_parser import IntelligentExcelParser
+        from backend.utils.template_pipeline import source_origin
 
         parser = IntelligentExcelParser()
         source_info = {
@@ -129,20 +130,21 @@ class ExcelFormulaBuilder:
                         merged_df = pd.concat(dfs, ignore_index=True)
 
                     _collected.append((file_base, sheet_data.sheet_name, merged_df, first_columns,
-                                       filename, first_schemas or {}, first_formats or {}))
+                                       filename, first_schemas or {}, first_formats or {},
+                                       source_origin(file_path, sheet_data.sheet_name, sheet_data.regions)))
 
             except Exception as e:
                 logger.error(f"加载文件失败 {filename}: {e}")
 
         # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 / 撞目标 sheet → 加文件名前缀
         key_map = assign_sheet_keys(
-            ((fb, sn) for fb, sn, _, _, _, _, _ in _collected),
+            ((item[0], item[1]) for item in _collected),
             reserved_names=reserved_sheet_names,
         )
         # 已分配的 key 同步给实例集合，便于后续可能的扩展
         self._used_sheet_keys.update(key_map.values())
 
-        for file_base, sheet_name, merged_df, first_columns, filename, column_schemas, column_formats in _collected:
+        for file_base, sheet_name, merged_df, first_columns, filename, column_schemas, column_formats, origin in _collected:
             final_key = key_map[(file_base, sheet_name)]
 
             self.source_sheets[final_key] = {
@@ -152,6 +154,7 @@ class ExcelFormulaBuilder:
                 "source_sheet": sheet_name,
                 "column_schemas": column_schemas,
                 "column_formats": column_formats,
+                "source_origins": [origin],
             }
 
             source_info["sheets"][final_key] = {
@@ -385,7 +388,8 @@ class ExcelFormulaBuilder:
 
         return unique_keys[:5]  # 最多返回5个可能的主键列
 
-    def get_source_structure_for_prompt(self, main_table_name: str = None, analysis=None) -> str:
+    def get_source_structure_for_prompt(self, main_table_name: str = None, analysis=None,
+                                        original_coordinates: Optional[bool] = None) -> str:
         """生成用于AI提示词的源数据结构描述，包含主键识别信息
 
         Args:
@@ -394,6 +398,16 @@ class ExcelFormulaBuilder:
             analysis: TableAnalysisResult 对象。如果提供，使用预分析结果确定主表和VLOOKUP信息。
         """
         lines = ["## 源数据Sheet结构\n"]
+        if original_coordinates is None:
+            original_coordinates = getattr(self, 'original_source_coordinates', False)
+        def positions(info):
+            if not original_coordinates:
+                return {name: i for i, name in enumerate(info['columns'], 1)}
+            from openpyxl.utils import column_index_from_string
+            regions = (info.get('source_origins') or [{}])[0].get('regions') or []
+            if not regions:
+                raise ValueError('源表缺少真实坐标，请重新解析源文件')
+            return {col['name']: column_index_from_string(col['letter']) for col in regions[0]['columns']}
 
         # 收集所有表的主键信息，用于后面的汇总
         all_key_info = {}
@@ -432,6 +446,7 @@ class ExcelFormulaBuilder:
             columns = sheet_info["columns"]
             row_count = len(sheet_info["df"])
             df = sheet_info["df"]
+            column_positions = positions(sheet_info)
             is_main = (sheet_name == confirmed_main or sheet_name in confirmed_main_sheets)
             is_candidate = (not confirmed_main and sheet_name in main_candidate_names)
 
@@ -442,6 +457,9 @@ class ExcelFormulaBuilder:
             lines.append(f"### {sheet_name}")
             lines.append(f"- 来源文件: {sheet_info['source_file']}")
             lines.append(f"- 行数: {row_count}")
+            if original_coordinates:
+                region = sheet_info['source_origins'][0]['regions'][0]
+                lines.append(f"- 原表整张复制，表头行: {region.get('header_row')}，数据起始行: {region.get('data_start_row')}；空白列保留")
 
             if is_main:
                 lines.append(f"- **⭐ 确认主表（规则指定），所有列属于L1同源层，用 main_df.iloc[i].get('列名','') 直接复制，禁止VLOOKUP/INDEX+MATCH**")
@@ -458,6 +476,7 @@ class ExcelFormulaBuilder:
 
             schemas = sheet_info.get("column_schemas") or {}
             for col_idx, col_name in enumerate(columns, 1):
+                col_idx = column_positions[col_name]
                 col_letter = get_column_letter(col_idx)
                 # 标记主键列
                 key_marker = " 🔑" if col_name in key_columns else ""
@@ -481,6 +500,7 @@ class ExcelFormulaBuilder:
 
         for sheet_name, key_cols in all_key_info.items():
             columns = self.source_sheets[sheet_name]["columns"]
+            column_positions = positions(self.source_sheets[sheet_name])
 
             # 已确认主表：完全跳过VLOOKUP指南
             if sheet_name == confirmed_main:
@@ -501,12 +521,12 @@ class ExcelFormulaBuilder:
             if not key_cols:
                 lines.append(f"### {sheet_name}")
                 lines.append(f"- 主键列: (未识别到常见主键列，需根据数据内容判断)")
-                last_col_idx = len(columns)
+                last_col_idx = max(column_positions.values(), default=1)
                 last_col_letter = get_column_letter(last_col_idx) if last_col_idx > 0 else "A"
                 lines.append(f"- 列范围: $A:${last_col_letter}")
                 lines.append(f"- 列 (按顺序):")
                 for col_idx_0, col_name in enumerate(columns):
-                    col_idx = col_idx_0 + 1
+                    col_idx = column_positions[col_name]
                     col_letter = get_column_letter(col_idx)
                     lines.append(f"  - {col_letter}列: {col_name}")
                 lines.append("")
@@ -517,9 +537,9 @@ class ExcelFormulaBuilder:
             if primary_key not in columns:
                 continue
 
-            key_col_idx = columns.index(primary_key) + 1
+            key_col_idx = column_positions[primary_key]
             key_col_letter = get_column_letter(key_col_idx)
-            last_col_idx = len(columns)
+            last_col_idx = max(column_positions.values(), default=1)
             last_col_letter = get_column_letter(last_col_idx)
 
             lines.append(f"### {sheet_name}")
@@ -533,7 +553,7 @@ class ExcelFormulaBuilder:
             for col_idx_0, col_name in enumerate(columns):
                 if col_name == primary_key:
                     continue
-                col_idx = col_idx_0 + 1
+                col_idx = column_positions[col_name]
                 col_letter = get_column_letter(col_idx)
                 vlookup_col_num = col_idx - key_col_idx + 1
                 if vlookup_col_num <= 0:

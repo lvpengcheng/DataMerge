@@ -1,19 +1,20 @@
 """
-模板填充模式代码生成器 — AI 直接写公式，骨架预追加源 sheet（前缀 `源_`）
+模板局部填充代码生成器 — 保留模板，按规则填充，源工作表默认整表复制。
 
 工作流：
 1. 用户上传**带公式/格式/合并单元格的目标文件**作为模板
 2. 骨架预处理：
    - shutil.copy 模板 → openpyxl 加载副本（保留公式/格式/合并）
-   - 把源数据 DataFrame 追加为 wb 的新 sheet，命名前缀 `源_`（避免与模板 sheet 重名）
+   - 记录原始源 sheet 的真实坐标及类型/格式，预留 `源_` 名称供公式引用
 3. AI 写 `fill_template(wb, source_sheets, ...)`：
    - 只在**规则文档要求**的列上写入；规则没提到的列绝不触碰
    - 优先写**跨 sheet 公式**（`=VLOOKUP/IF/SUMIFS('源_xxx'!...)`）
    - 跳过模板里 `has_formula=True` 的列（保留模板原公式）
-4. 骨架保存 wb 到 output_folder
+4. 保存目标后原样复制所需源 sheet，再统一重算保存；源表重建仅按明确规则启用
 """
 
 from backend.utils.multi_target_rules import limit_rules_content
+from backend.utils.script_source_scope import source_scoped_generation
 
 import os
 import re
@@ -42,6 +43,7 @@ class TemplateCodeGenerator:
 
     # ==================== 主入口 ====================
 
+    @source_scoped_generation
     def generate_code(
         self,
         input_folder: str,
@@ -87,6 +89,8 @@ class TemplateCodeGenerator:
 
         from backend.utils.multi_target_rules import rules_for_structure
         rules_content = rules_for_structure(rules_content, expected_structure, os.path.basename(template_path or ''))
+        from backend.utils.template_pipeline import source_mode_from_rules
+        self._source_sheet_mode = source_mode_from_rules(rules_content)
         log("=== 模板填充模式：开始生成代码 ===")
 
         if not template_path or not os.path.exists(template_path):
@@ -223,6 +227,7 @@ class TemplateCodeGenerator:
                         "name": col_name,
                         "column_letter": self._guess_column_letter(region, col_name),
                         "has_formula_in_data": has_formula,
+                        "schema": dict((getattr(region, 'column_schemas', None) or {}).get(head.get(col_name)) or {}),
                     })
                 # ⚠️ ExcelRegion 的真实字段名是 head_row_start/head_row_end/data_row_start/data_row_end
                 #    （不是 header_rows/data_start_row），早期误用 getattr 取到 None → 退化成硬编码 2 → 写穿表头
@@ -239,10 +244,14 @@ class TemplateCodeGenerator:
     def _region_col_has_formula(self, region, col_name: str) -> bool:
         """检查某列在数据行内是否有公式（保护性判断）"""
         try:
+            letter = (region.head_data or {}).get(col_name)
+            if letter and any(re.fullmatch(re.escape(letter) + r'\d+', str(addr))
+                              for addr in (getattr(region, 'formula', None) or {})):
+                return True
             data = getattr(region, "data", None) or []
             for row in data[:5]:
                 if isinstance(row, dict):
-                    v = row.get(col_name)
+                    v = row.get(letter, row.get(col_name))
                     if isinstance(v, str) and v.startswith("="):
                         return True
         except Exception:
@@ -253,6 +262,8 @@ class TemplateCodeGenerator:
         """从 head_data 推断列字母（如 'D'）"""
         try:
             head = region.head_data or {}
+            if isinstance(head.get(col_name), str):
+                return head[col_name]
             keys = list(head.keys())
             if col_name in keys:
                 idx = keys.index(col_name)
@@ -283,7 +294,7 @@ class TemplateCodeGenerator:
                 continue
             try:
                 sheets_data = parser.parse_excel_file(
-                    fp, max_data_rows=2, read_formulas=False,
+                    fp, max_data_rows=2, read_formulas=True,
                     active_sheet_only=not multi_sheet_source,
                     best_region_only=True,   # 取每 sheet 的最优(主数据)区域，与执行时 _load_full_source_data 一致
                     manual_headers=manual_headers,
@@ -291,15 +302,16 @@ class TemplateCodeGenerator:
                 fdesc = {}
                 for sd in sheets_data:
                     # best_region_only=True 时每 sheet 只剩最优区域，regions[0] 即主数据区的列。
-                    # ⚠️ 不取 region 的 data_start_row：骨架 _append_source_sheets 会把 DataFrame
-                    #    重写为「row1=表头, row2+=数据」的干净 sheet，所以追加后源 sheet 的数据
-                    #    恒从第 2 行开始，与原文件结构无关。data_start_row 固定为 2。
+                    # 原表复制模式必须保留真实坐标；重建模式另用规范化坐标。
                     regions = sd.regions or []
                     cols: List[str] = []
                     if regions:
                         head = (regions[0].head_data or {})
                         cols.extend(list(head.keys()))
-                    fdesc[sd.sheet_name] = {"columns": cols}
+                    from backend.utils.template_pipeline import region_layout
+                    layouts = [region_layout(r) for r in regions]
+                    fdesc[sd.sheet_name] = {"columns": cols, "regions": layouts,
+                                          "layout": layouts[0] if layouts else {}}
                 out["files"][fname] = fdesc
             except Exception as e:
                 logger.warning(f"源文件 {fname} 解析失败: {e}")
@@ -327,14 +339,17 @@ class TemplateCodeGenerator:
 
 ## 工作流（骨架已为你完成的部分）
 1. 模板已经被加载为 openpyxl Workbook（保留全部公式/格式/合并单元格）
-2. **源数据已被骨架追加为 wb 的新 sheet**，统一加 `源_` 前缀（如 `源_考勤明细`、`源_津贴`），与模板 sheet 区分
+2. 源表处理方式为 **{getattr(self, '_source_sheet_mode', 'copy')}**。copy 模式会在目标填充保存后整表复制原始源 sheet，避免原始源表经过 openpyxl 重写；rebuild 模式才逐行生成规范化源表。
 3. 公式可用的**两类查找数据源**：
    - (a) 骨架追加的源文件 sheet（`_SOURCE_MAP`，带 `源_` 前缀）
    - (b) 模板自带的 sheet（`_COL_MAP` 里的 sheet 本身也可当查找表/数据源，用真实 sheet 名引用）
-4. 你的工作：**只在规则文档要求的列**上写入公式；其他列（含纯数据源 sheet）绝不触碰
+4. 模板已有内容默认保留，**不自动清空、不自动重建人员名单、不改变行数**。仅按规则修改指定区域。
+5. 默认使用 `write_template_cell(ws, row, column, value)` 仅填空白；规则明确要求覆盖时传 `overwrite=True`。明确要求清空时才调用 `clear_template_cells(ws, "D5:D20")`。公式默认保留，明确要求替换时才覆盖。
+6. 需要筛选清洗或合并后的源工作表时，在规则明确 SOURCE_SHEET_MODE: rebuild，并生成可选 `clean_source_data(source_data)`；不要在 copy 模式修改源 DataFrame 后仍用原表公式当成清洗结果。
+7. 原始源表保持实际值类型，不能假定主键已经转成文本；文本/数值主键差异由查找公式或 Python 规则显式处理，不通过重刷源表类型解决。
 
 ## 严格约束（违反必败）
-1. **只写规则要求的列**：规则没提到的列、模板里 `has_formula=true` 的列**一律跳过**
+1. **只写规则要求的列**：其他内容、格式、公式、备注、汇总和辅助表默认保留；只有规则明确要求时才覆盖或清空指定位置。
 2. **【起始行强约束 + 多区域必读】每个 sheet 的可写区域来自 `_COL_MAP[sheet]["regions"]`（列表，可能不止一个）：**
    - 每个 region 各有自己的 `data_start_row`，必须**逐区域**从各自的 `data_start_row` 写起
    - **绝不**用第一个区域的行号套到全表，**绝不**硬编码 1 / 2 / 3
@@ -349,7 +364,8 @@ class TemplateCodeGenerator:
              ...
      ```
    - **错误**：`for r in range(2, n+2): ...`（硬编码起始 2，会写穿表头）
-   - 读源 sheet 时用 `_SOURCE_MAP[源_xxx]["data_start_row"]`（恒为 2，骨架已把源表头重写到第 1 行）
+   - 源表行列必须使用 `_SOURCE_MAP` 的真实 `header_row/data_start_row/data_end_row/columns`；copy 模式数据不一定从第 2 行或 A 列开始。
+   - copy 模式源 sheet 尚未加入 wb，**不要 `wb[源表名]`、不要判断源表名是否在 `wb.sheetnames`**；Python 查找使用 source_data 的 DataFrame，Excel 公式使用 _SOURCE_MAP 的名字和坐标。
 3. **优先写公式**：用 `cell.value = "=VLOOKUP(...)"` 等跨 sheet 公式让 Excel 重算
    - 写值也行（`cell.value = 100`），但能写公式就别写值
 4. **公式的查找数据源分两类，必须按类型用对 sheet 名**：
@@ -432,7 +448,7 @@ CLEANING_SPEC = {{
 ```python
 def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
     \"\"\"
-    wb: openpyxl Workbook（已加载模板 + 已追加 `源_xxx` sheet）
+    wb: openpyxl Workbook（完整保留模板；copy 模式源表会在保存后复制）
     source_data: dict[sheet_key -> {{'df': DataFrame, 'columns': [...]}}]，原始 DataFrame（如果你要 Python 直接计算）
     salary_year/salary_month/monthly_hours: 上下文参数
 
@@ -458,22 +474,24 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
             if sheet_name not in wb.sheetnames: continue
             ws = wb[sheet_name]
 
-            # 取源 sheet 的真实 sheet 名 + 数据起始行（恒为 2）
+            # 取源表名与真实位置，不读取尚未复制到结果中的源 sheet。
             src_key = "源_考勤明细"   # 来自 _SOURCE_MAP 的 key
-            if src_key not in wb.sheetnames: continue
-            src_data_start = _SOURCE_MAP[src_key]["data_start_row"]   # = 2
-            src_ws = wb[src_key]
+            src_info = _SOURCE_MAP[src_key]
+            src_data_start = src_info["data_start_row"]
 
             # 逐区域写：每个区域用自己的 data_start_row，绝不套用第一个区域
             for region in sinfo["regions"]:
                 data_start = region["data_start_row"]   # ← 必须从这取，不要硬编码！
-                row_count = src_ws.max_row - src_data_start + 1   # 源数据行数
-                for i in range(row_count):
-                    r = data_start + i              # ← 目标行：本区域 data_start 起步
-                    src_r = src_data_start + i      # ← 源行：源 data_start(=2) 起步
-                    ws.cell(row=r, column=column_index_from_string("D")).value = (
-                        f"=VLOOKUP(B{{r}},'{{src_key}}'!A:Z,5,FALSE)"
-                    )
+                data_end = region.get("data_end_row")
+                if data_end is None:
+                    continue  # 不凭源表行数扩大目标数据区；动态增行须有明确规则
+                target_col = next(c["letter"] for c in region["columns"] if c["name"] == "出勤天数")
+                key_col = next(c["letter"] for c in region["columns"] if c["name"] == "工号")
+                src_key_col = next(c["letter"] for c in src_info["columns"] if c["name"] == "工号")
+                src_value_col = next(c["letter"] for c in src_info["columns"] if c["name"] == "出勤天数")
+                for r in range(data_start, data_end + 1):
+                    formula = f"=IFERROR(INDEX('{{src_key}}'!{{src_value_col}}:{{src_value_col}},MATCH({{key_col}}{{r}},'{{src_key}}'!{{src_key_col}}:{{src_key_col}},0)),{{EMPTY}})"
+                    write_template_cell(ws, r, column_index_from_string(target_col), formula)
     \"\"\"
     from openpyxl.utils import column_index_from_string
     ...
@@ -483,7 +501,7 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
 **结构**：`{{ sheet_name: {{ "regions": [ {{ "header_row": int, "data_start_row": int, "data_end_row": int|None, "columns": [ {{ "letter": "A", "name": "列名", "has_formula": bool }}, ... ] }}, ... ] }} }}`
 - 一个 sheet 的 `regions` 可能有多个（上下堆叠的多张子表），**每个区域各自从它的 `data_start_row` 写起**
 - `letter` 是目标列字母（写公式时用 `column_index_from_string(letter)` 转列号）
-- `has_formula=true` 的列**一律跳过**（保留模板原公式）
+- `has_formula=true` 的列默认保留原公式；仅在规则明确要求替换时才覆盖指定单元格
 - **这些 sheet 本身也可当查找数据源**：若规则要求从某模板 sheet 里查数据，直接用它的真实 sheet 名引用（如 `'员工基础表'!A:Z`），**不加 `源_` 前缀**
 
 ```json
@@ -492,7 +510,7 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
 
 ## _SOURCE_MAP（运行时已注入；**已带 `源_` 前缀**的源 sheet 结构）
 **结构**：`{{ "<源_sheet名>": {{ "header_row": int, "data_start_row": int, "columns": [ {{ "letter": "A", "name": "列名" }}, ... ] }} }}`
-- key 已经是骨架追加到 wb 后的真实 sheet 名（带 `源_` 前缀），可直接 `wb[key]` 访问
+- key 是最终结果中的源 sheet 名（带 `源_` 前缀）；copy 模式在目标保存后才复制，填充时不可直接 `wb[key]` 访问
 - 公式中 sheet 名也用这个 key（如 `'源_考勤明细'!A:Z`）
 - `letter` 是源 sheet 中该列的列字母，写 VLOOKUP 时用得上
 - `data_start_row`：源数据真实起始行；遍历源数据务必从这行开始，**不要硬编码 2**
@@ -617,9 +635,13 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
             region_list = []
             for r in regions:
                 ds = r.get("data_start_row")
-                # 只有表头没有数据的区域：data_row_start 为 0/None，跳过
+                # Empty templates retain their column map; creating rows still
+                # requires an explicit rule, rather than following source length.
                 if ds is None or (isinstance(ds, int) and ds <= 0):
-                    continue
+                    header_end = r.get('header_row_end') or r.get('header_row')
+                    if not header_end or not r.get('columns'):
+                        continue
+                    ds = header_end + 1
                 hr = r.get("header_row")
                 de = r.get("data_end_row")
                 cols_brief = []
@@ -628,6 +650,7 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
                         "letter": c.get("column_letter"),
                         "name": c.get("name"),
                         "has_formula": bool(c.get("has_formula_in_data", False)),
+                        **(c.get('schema') or {}),
                     })
                 region_list.append({
                     "header_row": int(hr) if isinstance(hr, int) and hr > 0 else None,
@@ -675,7 +698,7 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
            调用方应把同一个 expected_structure 传进来；缺省才退化为模板自身 sheet 名。
 
         - source_map key 已是最终 `源_` sheet 名，AI 直接用作公式中的 sheet 名。
-        - data_start_row 恒为 2：骨架把源 DataFrame 重写为 row1=表头/row2+=数据。
+        - copy 使用原始坐标；rebuild 才使用表头第 1 行、数据第 2 行。
         """
         from openpyxl.utils import get_column_letter
         from backend.utils.data_helpers import assign_sheet_keys, build_prefixed_sheet_names
@@ -684,6 +707,7 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
         # 1) 收集 (file_base, sheet_name) 与列，稳定排序（与智算 sorted 一致）
         pairs: List[Tuple[str, str]] = []
         cols_by_pair: Dict[Tuple[str, str], List[str]] = {}
+        info_by_pair = {}
         for fname, fdesc in files.items():
             if not isinstance(fdesc, dict) or "error" in fdesc:
                 continue
@@ -692,6 +716,7 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
                 cols = list(sinfo.get("columns") or []) if isinstance(sinfo, dict) else list(sinfo or [])
                 pairs.append((file_base, sn))
                 cols_by_pair[(file_base, sn)] = cols
+                info_by_pair[(file_base, sn)] = (fname, sinfo)
         pairs.sort(key=lambda p: (str(p[0]), str(p[1])))
 
         # 2) 分配 source key（reserved = 结果 sheet 名，与智算完全一致）
@@ -721,6 +746,13 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
                     for i, c in enumerate(cols)
                 ],
             }
+            fname, sinfo = info_by_pair[(fb, sn)]
+            if getattr(self, '_source_sheet_mode', 'copy') == 'copy':
+                layout = sinfo.get('layout') if isinstance(sinfo, dict) else None
+                if not layout or not layout.get('columns') or not layout.get('data_start_row'):
+                    raise ValueError(f'复制源工作表需要真实行列信息: {fname}/{sn}')
+                out[final_name] = {**layout, 'regions': sinfo.get('regions') or [layout],
+                                   'source_file': fname, 'source_sheet': sn}
         return out, sk_to_sheet
 
     # ==================== 完整脚本拼接 ====================
@@ -758,9 +790,9 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
         sk_to_sheet_literal = _pprint.pformat(sk_to_sheet, width=120, sort_dicts=False)
 
         skeleton = f'''"""
-DataMerge 自动生成 — 模板填充模式（AI 写公式 + 骨架预追加 `源_xxx` sheet）
-- 加载训练时的模板（含公式/格式），骨架先把源数据追加为 `源_*` sheet，AI 在目标列写公式
-- 不创建新 Workbook，不动单元格样式
+DataMerge 自动生成 — v2 模板局部填充（保留已有内容，按规则修改）
+- 保留模板的公式、格式和布局；源 sheet 默认在目标保存后整表复制
+- 未授权不清空、不覆盖、不重建行；显式格式设置在写入时生效
 """
 import os
 import shutil
@@ -776,12 +808,18 @@ from datetime import datetime
 from backend.utils.source_sheet_writer import is_date_keyword_column, dt_to_excel_serial, is_long_digit_text, coerce_source_date
 from backend.utils.data_helpers import assign_sheet_keys, build_prefixed_sheet_names
 from backend.utils.target_sheet_resolver import resolve_target_sheets as _resolve_target_sheets_core
+from backend.utils.template_pipeline import (
+    plan_original_sources, copy_original_source_sheets, write_template_cell, clear_template_cells, source_origin,
+    rebuilt_source_layouts,
+)
 
 # 模板持久化路径（训练时确定，智算复用）。仅作遗留兜底：跨环境时优先用
 # 运行时注入的 _template_override_path（由 template_resolver 按名/哈希在当前环境定位）。
 TEMPLATE_PATH = {tpl_repr}
 TEMPLATE_NAME = {tpl_name!r}
 TEMPLATE_HASH = {tpl_hash!r}
+TEMPLATE_PIPELINE_VERSION = 2
+SOURCE_SHEET_MODE = {getattr(self, '_source_sheet_mode', 'copy')!r}
 
 # ==================== Excel 公式辅助常量（避免 f-string 引号嵌套 SyntaxError） ====================
 # AI 写跨 sheet 公式时常需在 f-string 里嵌入 "" 作为 IFERROR 默认值，统一用 EMPTY 常量替代。
@@ -797,8 +835,8 @@ SOURCE_PREFIX = "源_"
 _COL_MAP = {col_map_literal}
 
 # 源 sheet 结构（key 已带 "源_" 前缀，与骨架 _append_source_sheets 追加后的实际 sheet 名一致）：
-#   骨架把源 DataFrame 重写为 row1=表头/row2+=数据，故 data_start_row 恒为 2。
-#   _SOURCE_MAP["源_考勤明细"] = {{"header_row": 1, "data_start_row": 2,
+#   copy 保留源工作表真实行列；rebuild 才使用规范化行列。
+#   _SOURCE_MAP["源_考勤明细"] = {{"header_row": int, "data_start_row": int,
 #                                  "columns": [{{"letter": "A", "name": "工号"}}, ...]}}
 _SOURCE_MAP = {source_map_literal}
 # 源 sheet key(assign_sheet_keys 输出) -> 实际写入的 `源_` sheet 名。
@@ -895,6 +933,7 @@ def load_source_data():
     # 两趟：先收集 (file_base, sheet, merged_df, columns, formats)，再用 assign_sheet_keys 统一分配 key
     # （与智训 _build_source_map_with_letters / 智算 fast_header_matcher 同一套逻辑）。
     _collected = []
+    _source_origins = {{}}
     for fname in sorted(os.listdir(input_folder)):
         if not fname.lower().endswith((".xlsx", ".xls", ".xlsm")):
             continue
@@ -915,6 +954,8 @@ def load_source_data():
             if not _results:
                 raise ValueError(f"文件 {{fname}} 没有可读取的数据区域")
             for _sheet_data in (_results or []):
+                _source_origins[(Path(fname).stem, _sheet_data.sheet_name)] = [
+                    source_origin(fp, _sheet_data.sheet_name, _sheet_data.regions)]
                 _dfs = []
                 _cols = None
                 _fmts = None
@@ -950,7 +991,9 @@ def load_source_data():
     _key_map = assign_sheet_keys([(fb, sn) for fb, sn, _, _, _, _ in _collected], reserved_names=_reserved)
     for fb, sn, _merged, _cols, _fmts, _schemas in _collected:
         key = _key_map[(fb, sn)]
-        _entry = {{"df": _merged, "columns": _cols if _cols is not None else list(_merged.columns)}}
+        _entry = {{"df": _merged, "columns": _cols if _cols is not None else list(_merged.columns),
+                   "source_file": fb, "source_sheet": sn,
+                   "source_origins": _source_origins[(fb, sn)]}}
         if _fmts:
             _entry["column_formats"] = _fmts
         if _schemas:
@@ -970,6 +1013,8 @@ def _append_source_sheets(wb, source_data):
     - 写表头 + 所有数据行；不动样式
     - 返回 {{原 source_key: 追加后的 sheet 名}}，便于 fill_template 用
     """
+    if SOURCE_SHEET_MODE != 'rebuild':
+        raise ValueError('copy 模式源表必须整张复制，禁止调用逐行重建方法')
     appended_map = {{}}
     appended = []
     for sk, sv in (source_data or {{}}).items():
@@ -1204,64 +1249,12 @@ def cleaned_rows(sheet_name):
 def _snapshot_workbook(wb):
     snap = {{}}
     for ws in wb.worksheets:
-        try:
-            max_row = ws.max_row or 0
-            max_col = ws.max_column or 0
-        except Exception:
-            max_row, max_col = 0, 0
-        if max_row <= 0 or max_col <= 0:
-            continue
         sheet_snap = {{}}
-        for row in ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col):
-            for cell in row:
-                if cell.value is not None:
-                    sheet_snap[(cell.row, cell.column)] = cell.value
+        for cell in ws._cells.values():
+            if cell.value is not None:
+                sheet_snap[(cell.row, cell.column)] = cell.value
         snap[ws.title] = sheet_snap
     return snap
-
-
-def _snapshot_number_formats(wb):
-    \"\"\"Snapshot every cell number_format (including empty cells), used to restore template formats after fill.\"\"\"
-    snap = {{}}
-    for ws in wb.worksheets:
-        try:
-            max_row = ws.max_row or 0
-            max_col = ws.max_column or 0
-        except Exception:
-            max_row, max_col = 0, 0
-        if max_row <= 0 or max_col <= 0:
-            continue
-        sheet_snap = {{}}
-        for row in ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col):
-            for cell in row:
-                sheet_snap[(cell.row, cell.column)] = cell.number_format
-        snap[ws.title] = sheet_snap
-    return snap
-
-
-def _restore_number_formats(wb, fmt_snapshot):
-    \"\"\"Template-fill mode: strictly keep the template original cell formats.
-
-    openpyxl auto-changes a General cell to a date format when a datetime value is
-    written, turning the template's plain/numeric columns into date columns in the
-    output. Restore each cell's number_format from the snapshot (date stays date,
-    general stays general).\"\"\"
-    restored = 0
-    for ws in wb.worksheets:
-        before = fmt_snapshot.get(ws.title)
-        if not before:
-            continue
-        for (r, c), fmt in before.items():
-            try:
-                cell = ws.cell(row=r, column=c)
-                if cell.number_format != fmt:
-                    cell.number_format = fmt
-                    restored += 1
-            except Exception:
-                continue
-    if restored:
-        print(f"  [fmt-guard] restored {{restored}} cells to template format")
-    return restored
 
 
 def _safe_repr(v):
@@ -1281,97 +1274,25 @@ def _build_fill_report(wb, snapshot_before):
 
     for ws in wb.worksheets:
         before = snapshot_before.get(ws.title, {{}})
-        try:
-            max_row = ws.max_row or 0
-            max_col = ws.max_column or 0
-        except Exception:
-            max_row, max_col = 0, 0
-        if max_row <= 0 or max_col <= 0:
-            continue
-        for row in ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col):
-            for cell in row:
-                key = (cell.row, cell.column)
-                old_v = before.get(key)
-                new_v = cell.value
-                if old_v == new_v:
-                    continue
-                col_letter = get_column_letter(cell.column)
-                summary.setdefault(ws.title, {{}}).setdefault(col_letter, 0)
-                summary[ws.title][col_letter] += 1
-                filled_addresses.setdefault(ws.title, []).append(f"{{col_letter}}{{cell.row}}")
-                if len(filled_cells) < 200:
-                    filled_cells.append({{
-                        "sheet": ws.title,
-                        "address": f"{{col_letter}}{{cell.row}}",
-                        "old": _safe_repr(old_v),
-                        "new": _safe_repr(new_v),
-                    }})
+        for key in sorted(set(before) | set(ws._cells)):
+            cell = ws._cells.get(key)
+            old_v = before.get(key)
+            new_v = cell.value if cell else None
+            if old_v == new_v:
+                continue
+            col_letter = get_column_letter(key[1])
+            summary.setdefault(ws.title, {{}}).setdefault(col_letter, 0)
+            summary[ws.title][col_letter] += 1
+            filled_addresses.setdefault(ws.title, []).append(f"{{col_letter}}{{key[0]}}")
+            if len(filled_cells) < 200:
+                filled_cells.append({{
+                    "sheet": ws.title,
+                    "address": f"{{col_letter}}{{key[0]}}",
+                    "old": _safe_repr(old_v),
+                    "new": _safe_repr(new_v),
+                }})
     return {{"filled_cells": filled_cells, "filled_addresses": filled_addresses, "summary": summary,
             "total_changed": sum(sum(v.values()) for v in summary.values())}}
-
-
-def _shrink_inflated_columns(path):
-    """删掉各 sheet「数据末列之后」的空列。整列刷格式/筛选会把维度撑到 XFC(16384 列)，
-    openpyxl 的 max_column 随之虚高，后续快照/报告的 iter_rows(行×列) 会内存溢出/卡死。
-    只删 MaxDataColumn 之后的列（那之后必然无数据），安全、不动任何数据/公式。
-
-    先廉价预检 <dimension>（解压+正则，几毫秒）：正常文件（列号不大）直接跳过、
-    几乎零开销；仅维度明显偏大时才真正开 Aspose 删列。"""
-    # 1) 廉价预检：读各 sheet 的 <dimension> 末列号，都不大就直接返回（不开 Aspose）
-    try:
-        import zipfile as _zf, re as _re2
-        _inflated = False
-        with _zf.ZipFile(str(path)) as _z:
-            for _n in _z.namelist():
-                if not (_n.startswith("xl/worksheets/") and _n.endswith(".xml")):
-                    continue
-                _head = _z.read(_n)[:4096].decode("utf-8", "ignore")
-                _m = _re2.search(r'<dimension\s+ref="([^"]+)"', _head)
-                if not _m:
-                    _inflated = True   # 无 dimension → 交给 Aspose 复核
-                    break
-                _last = _m.group(1).split(":")[-1]
-                _lm = _re2.match(r'([A-Za-z]+)', _last)
-                if not _lm:
-                    continue
-                _col = 0
-                for _ch in _lm.group(1).upper():
-                    _col = _col * 26 + (ord(_ch) - 64)
-                if _col > 256:         # 列号明显偏大 → 疑似虚高
-                    _inflated = True
-                    break
-        if not _inflated:
-            return
-    except Exception:
-        pass   # 预检失败不阻断，继续走 Aspose（内部还有 MaxDataColumn 安全判定）
-
-    # 2) 确有虚高：Aspose 删掉数据末列之后的空列
-    _wb = None
-    try:
-        import aspose_init
-        aspose_init.ensure_license()
-        from Aspose.Cells import Workbook as _WB
-        _wb = _WB(str(path))
-        touched = False
-        for _i in range(_wb.Worksheets.Count):
-            _c = _wb.Worksheets[_i].Cells
-            _mdc = _c.MaxDataColumn      # 0based 数据末列，-1=空
-            _mc = _c.MaxColumn           # 0based 含样式的末列
-            if _mc > _mdc and (_mc - _mdc) >= 5:   # 明显虚高才动，留余量避免误伤
-                _first = _mdc + 1 if _mdc >= 0 else 0
-                _c.DeleteColumns(_first, _mc - _first + 1, True)
-                touched = True
-        if touched:
-            _wb.Save(str(path))
-            print("[列去虚高] 已删除数据末列之后的空样式列（防 openpyxl 维度虚高致溢出）")
-    except Exception as _e:
-        print(f"[列去虚高] 处理异常（不阻断）：{{_e}}")
-    finally:
-        try:
-            if _wb is not None:
-                _wb.Dispose()
-        except Exception:
-            pass
 
 
 class _TargetSheetManualRequired(Exception):
@@ -1407,7 +1328,7 @@ def _resolve_target_sheets(wb):
 
 def main():
     print("=" * 60)
-    print("模板填充模式 — 开始（AI 写公式 + 骨架追加 `源_xxx` sheet）")
+    print("模板局部填充 — 保留已有内容，按规则修改，源表原样复制")
     print("=" * 60)
 
     # 有效模板：优先用运行时注入的 _template_override_path（由 template_resolver 在当前环境
@@ -1432,11 +1353,15 @@ def main():
     shutil.copy2(_eff_template, out_path)
     print(f"模板已复制至：{{out_path}}")
 
-    # 列去虚高：整列刷格式/筛选会把模板维度撑到上万列（XFC），openpyxl 随之虚高，
-    # 后续快照/报告按 iter_rows(行×列) 遍历会内存溢出。删掉数据末列之后的空列。
-    _shrink_inflated_columns(out_path)
-
     source_data = load_source_data()
+    if callable(globals().get('clean_source_data')):
+        if SOURCE_SHEET_MODE != 'rebuild':
+            raise ValueError('源表需要清洗/合并时，请按规则使用 SOURCE_SHEET_MODE: rebuild 并重新生成脚本')
+        _cleaned = clean_source_data(source_data)
+        if _cleaned is not None:
+            if not isinstance(_cleaned, dict):
+                raise ValueError('clean_source_data 必须返回源数据字典或原地修改后返回 None')
+            source_data = _cleaned
 
     # 阶段0（可选）：AI 输出了 CLEANING_SPEC 时，在 openpyxl 打开前先做结构化增删行
     # （Aspose 独立 pass，含跨表引用更新；无 CLEANING_SPEC 则完全跳过，模板行结构不变）。
@@ -1451,11 +1376,25 @@ def main():
     _keep_vba = out_path.lower().endswith(".xlsm")
     wb = openpyxl.load_workbook(out_path, keep_vba=_keep_vba, data_only=False)
 
-    print("步骤：追加源数据 sheet（前缀 `源_`，供 AI 公式引用）...")
-    try:
-        _append_source_sheets(wb, source_data)
-    except Exception as _ap_e:
-        print(f"[append_source_sheets] 异常（不阻断）：{{_ap_e}}")
+    _source_copy_plan = []
+    if SOURCE_SHEET_MODE == "copy":
+        print("步骤：确定原始源工作表及真实行列位置（填充后整表复制）...")
+        _source_copy_plan, _source_layouts = plan_original_sources(
+            source_data, _SOURCE_MAP, _SK_TO_SHEET, input_folder, wb.sheetnames)
+        _SOURCE_MAP.clear()
+        _SOURCE_MAP.update(_source_layouts)
+        # Reserve empty sheet names before formulas are loaded by the native
+        # engine; originals replace these placeholders after target filling.
+        for _spec in _source_copy_plan:
+            wb.create_sheet(_spec['destination'])
+            _spec['placeholder'] = True
+    elif SOURCE_SHEET_MODE == "rebuild":
+        print("步骤：按规则重建源数据工作表...")
+        _SK_TO_SHEET.update(_append_source_sheets(wb, source_data))
+        _SOURCE_MAP.clear()
+        _SOURCE_MAP.update(rebuilt_source_layouts(source_data, _SK_TO_SHEET))
+    else:
+        raise ValueError("SOURCE_SHEET_MODE 必须为 copy 或 rebuild")
 
     # 目标表语义解析 + 改名对齐：模板主表常按月份等动态命名（如 202604），与训练时
     # 固化的 _COL_MAP 键（如 本月）对不上，会导致 fill_template（按键名访问 sheet）
@@ -1487,7 +1426,6 @@ def main():
         raise RuntimeError("TARGET_SHEET_MANUAL_REQUIRED:" + _msg)
 
     snapshot_before = _snapshot_workbook(wb)
-    _fmt_snapshot = _snapshot_number_formats(wb)
 
     # 人工复核修正映射覆盖：必须在 fill_template 调用前（此时模块级 AI 输出的 FIELD_MAPPING
     # 已赋值，此处再覆盖才生效；模块顶层覆盖会被 AI 赋值语句顶掉）。
@@ -1501,21 +1439,21 @@ def main():
     print("步骤：调用 AI 生成的 fill_template 写入规则要求的列...")
     fill_template(wb, source_data, salary_year, salary_month, monthly_standard_hours)
 
-    # Template-fill mode: restore template original cell formats
-    # (prevent openpyxl auto-changing General to date format when datetime is written)
-    try:
-        _restore_number_formats(wb, _fmt_snapshot)
-    except Exception as _fe:
-        print(f"[fmt-guard] restore format error (ignored): {{_fe}}")
-
     try:
         import json as _json
         from datetime import datetime as _dt
         report = _build_fill_report(wb, snapshot_before)
+        # Reports follow the final target names, including monthly templates.
+        for _field in ('filled_addresses', 'summary'):
+            report[_field] = {{_rename_back.get(_name, _name): _value
+                              for _name, _value in report[_field].items()}}
+        for _changed_cell in report['filled_cells']:
+            _changed_cell['sheet'] = _rename_back.get(_changed_cell['sheet'], _changed_cell['sheet'])
         report.update({{
             "mode": "template",
+            "pipeline_version": TEMPLATE_PIPELINE_VERSION,
             "timestamp": _dt.now().isoformat(timespec="seconds"),
-            "template": Path(TEMPLATE_PATH).name,
+            "template": Path(_eff_template).name,
         }})
         report_path = os.path.join(output_folder, "fill_report.json")
         with open(report_path, "w", encoding="utf-8") as fp:
@@ -1537,6 +1475,9 @@ def main():
             print(f"[目标表对齐] 改回原名失败（不阻断）: {{_key}}→{{_actual}}: {{_rn_e}}")
 
     wb.save(out_path)
+    wb.close()
+    if _source_copy_plan:
+        copy_original_source_sheets(out_path, _source_copy_plan)
     print(f"保存成功：{{out_path}}")
 
     # 结构化字段映射导出（智能组表）：AI 输出了 FIELD_MAPPING 时写 JSON 供引擎落库
@@ -1641,6 +1582,7 @@ if __name__ == "__main__":
             i += 1
         return ""
 
+    @source_scoped_generation
     def generate_correction_code(
         self,
         original_code: str,
@@ -1693,6 +1635,12 @@ if __name__ == "__main__":
         # 2. 抽出 _COL_MAP / _SOURCE_MAP 给 AI 看（让它知道有哪些列/sheet 可用）
         col_map_str = self._extract_map_block(original_code, "_COL_MAP")
         source_map_str = self._extract_map_block(original_code, "_SOURCE_MAP")
+        from backend.utils.template_pipeline import is_template_pipeline_v2
+        pipeline_notes = ("当前为 v2 模板局部填充流程：默认保留已有内容，write_template_cell 默认仅填空白，"
+                          "规则明确覆盖才传 overwrite=True；不得自动清空或扩大数据区。copy 模式源表在目标保存后"
+                          "才原样复制，不得访问 wb[源表名] 或因源表不在 wb.sheetnames 而跳过填充；Python 查找用"
+                          "source_data，Excel 公式用 _SOURCE_MAP 的真实行列位置。不得恢复旧格式修正。"
+                          if is_template_pipeline_v2(original_code) else "旧脚本保留原有源表重建布局和兼容处理。")
 
         # 3. 第 2 轮起加"换思路"指令
         is_retry = iteration_num >= 2
@@ -1736,6 +1684,7 @@ if __name__ == "__main__":
 ## 与预期结果的差异 + 用户修正指示
 {comparison_result[:30000]}
 {retry_directive}
+{pipeline_notes}
 {col_map_block}{source_map_block}## 计算规则（参考）
 {limit_rules_content(rules_content)}
 
@@ -1781,6 +1730,8 @@ if __name__ == "__main__":
 
         # 7. 拼回完整脚本
         complete_code = self._replace_fill_block(original_code, span, new_fill)
+        from backend.utils.template_pipeline import sync_source_mode
+        complete_code = sync_source_mode(complete_code, rules_content)
 
         # 8. 完整脚本再过一遍 ai_provider 修复（防 f-string 残留）
         try:

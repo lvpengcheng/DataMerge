@@ -313,7 +313,9 @@ class CodeSandbox:
                         call_kwargs['monthly_standard_hours'] = execution_env.get('monthly_standard_hours')
 
                     output_buffer.write(f"调用 process_excel_files({call_kwargs})\n")
-                    return_value = exec_globals['process_excel_files'](**call_kwargs)
+                    from backend.utils.script_entry import invoke_script_main
+                    return_value = invoke_script_main(exec_globals['process_excel_files'], {
+                        **execution_env, **call_kwargs})
                     output_buffer.write(f"process_excel_files 执行完成，返回值: {return_value}\n")
                     result["return_value"] = return_value
                 else:

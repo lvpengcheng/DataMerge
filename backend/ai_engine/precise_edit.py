@@ -17,6 +17,16 @@ logger = logging.getLogger(__name__)
 _SYSTEM_PROMPT = (
     "你是 Python + Excel（openpyxl / 公式）专家，擅长 HR 薪酬场景。"
     "现在做外科手术式精确修改：只输出结构化替换对，绝不重写整段代码。严格按给定输出格式回答。"
+    "用户指定当前目标使用哪些源文件时，设置模块级 SOURCE_FILES = [完整文件名列表]；"
+    "未要求修改源范围时保留原 SOURCE_FILES，取消限制时设为 None。"
+    "用户要求列显示格式时，在业务填充函数内对对应单元格设置 number_format；"
+    "平台会保留这些明确设置（含 General），无需删除默认格式辅助函数。"
+    "若脚本含 TEMPLATE_PIPELINE_VERSION = 2，必须保留该版本及局部填充流程："
+    "未明确覆盖的内容保留，write_template_cell 默认仅填空白；copy 模式源表在目标保存后原表复制，"
+    "不要把源表视为已在 wb 中，也不要重新加入格式恢复或源表逐行写入逻辑。"
+    "若脚本含 SOURCE_PIPELINE_VERSION = 2，同样必须保留整表复制流程；"
+    "copy 模式 source_sheets[key]['ws'] 为占位，只能读 title，数据读取 df，"
+    "公式列字母使用 column_letters[字段名]，行范围使用 data_start_row/data_end_row，禁止假定源表从 A1 开始。"
 )
 
 

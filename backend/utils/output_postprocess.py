@@ -211,7 +211,7 @@ class _OutputSession:
             handle.workbook.Dispose()
 
 
-def _apply_expected_schemas_in_workbook(wb, structure):
+def _apply_expected_schemas_in_workbook(wb, structure, explicit_formats=None):
     """Apply target types in Aspose, keeping formula caches and numeric date serials."""
     import json
     import math
@@ -238,6 +238,8 @@ def _apply_expected_schemas_in_workbook(wb, structure):
             kind = schema.get("field_type")
             for ri in range(header_row + 1, cells.MaxDataRow + 1):
                 cell = cells[ri, ci]
+                if str(cell.Name) in (explicit_formats or {}).get(str(ws.Name), {}):
+                    continue
                 value = cell.Value
                 if value is None and not cell.IsFormula:
                     continue
@@ -308,18 +310,26 @@ def finalize_output_workbook(output_path, template_path=None, expected_structure
     session = _OutputSession()
     token = _workbook_session.set(session)
     staged = None
+    from backend.utils.script_formats import (
+        read_explicit_formats, apply_explicit_formats, write_explicit_formats, prefer_script_column_schemas)
+    from backend.utils.template_pipeline import is_template_pipeline_v2, is_source_pipeline_v2
     try:
+        version2 = is_template_pipeline_v2(script_code)
+        script_formats = version2 or is_source_pipeline_v2(script_code)
+        expected_structure = prefer_script_column_schemas(expected_structure, script_code) if not script_formats else expected_structure
+        explicit_formats = read_explicit_formats(output_path) if not version2 else {}
         handle = session.open(output_path)
         wb = handle.workbook
-        normalize_key_columns_to_text(output_path)
         template_ok = bool(template_path and os.path.exists(template_path))
-        if template_ok:
-            restore_formats_from_template(output_path, template_path)
-        _normalize_source_sheet_formats_impl(output_path, template_path if template_ok else None)
-        if not template_ok and expected_structure:
-            _apply_expected_schemas_in_workbook(wb, expected_structure)
-        if template_ok and restore_summary_format_enabled():
-            restore_template_region_format(output_path, template_path, script_code)
+        if not script_formats:
+            normalize_key_columns_to_text(output_path, explicit_formats=explicit_formats)
+            if template_ok:
+                restore_formats_from_template(output_path, template_path)
+            _normalize_source_sheet_formats_impl(output_path, template_path if template_ok else None)
+            if not template_ok and expected_structure:
+                _apply_expected_schemas_in_workbook(wb, expected_structure, explicit_formats)
+            if template_ok and restore_summary_format_enabled():
+                restore_template_region_format(output_path, template_path, script_code)
         # Rename via Aspose so cross-sheet formula references follow the names.
         if sheet_name_map:
             import uuid
@@ -332,6 +342,7 @@ def finalize_output_workbook(output_path, template_path=None, expected_structure
                     pending.append((ws, replacement))
             for ws, replacement in pending:
                 ws.Name = replacement
+        apply_explicit_formats(wb, explicit_formats, sheet_name_map)
         wb.Settings.ForceFullCalculate = True
         wb.Settings.ReCalculateOnOpen = True
         wb.CalculateFormula()  # failure propagates; never publish a partial calculation
@@ -342,6 +353,9 @@ def finalize_output_workbook(output_path, template_path=None, expected_structure
                                       dir=os.path.dirname(os.path.abspath(str(output_path))))
         os.close(fd)
         wb.Save(staged)
+        if sheet_name_map:
+            explicit_formats = {sheet_name_map.get(name, name): cells for name, cells in explicit_formats.items()}
+        write_explicit_formats(staged, explicit_formats)
         os.replace(staged, output_path)
         staged = None
         return {"calculated": True, "rows_processed": rows, "sheet_summary": summary}
@@ -1160,7 +1174,7 @@ def _canon_key_text(v):
     return s or None
 
 
-def normalize_key_columns_to_text(output_path, source_sheet_prefix="源_") -> int:
+def normalize_key_columns_to_text(output_path, source_sheet_prefix="源_", explicit_formats=None) -> int:
     """把所有 sheet（源_ 与结果表）里的主键/ID 列统一成规范文本，解决跨源主键
     类型不一致导致 VLOOKUP 精确匹配 #N/A 的问题（两端一致，与匹配键归一同规则）。
 
@@ -1209,6 +1223,8 @@ def normalize_key_columns_to_text(output_path, source_sheet_prefix="源_") -> in
             for ci in key_cols:
                 for ri in range(1, mr + 1):  # 跳过表头
                     cell = cells[ri, ci]
+                    if str(cell.Name) in (explicit_formats or {}).get(str(ws.Name), {}):
+                        continue
                     if cell.IsFormula:
                         # PutValue 会删除原公式；主键归一仅处理源值，保留结果公式及依赖。
                         continue

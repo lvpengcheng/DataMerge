@@ -26,6 +26,9 @@ def json_response(raw):
 
 
 def validate_target(target):
+    if 'source_files' in target:
+        from backend.utils.script_source_scope import validate_source_files
+        validate_source_files(target['source_files'])
     if not isinstance(target.get('rules'), str) or not target['rules'].strip():
         raise ValueError(f'{target.get("file_name")}: 目标规则为空')
     if '<!-- DM_RULES' in target['rules']:
@@ -125,6 +128,18 @@ def parse_bundle(content):
 def rules_for_workbook(content, name):
     bundle = parse_bundle(content)
     if not bundle:
+        # Human-authored rules may use the same visible per-file headings.
+        text = str(content or '')
+        headings = list(re.finditer(r'^(?:#{1,6}\s*)?目标文件\s*[:：]\s*([^\n]+)\s*$', text, re.M))
+        if headings and re.search(r'使用源(?:文件)?\s*[:：]|SOURCE_FILES\s*[:=]', text):
+            normalized = Path(name).with_suffix('.xlsx').name.casefold()
+            matches = [(i, h) for i, h in enumerate(headings)
+                       if Path(h.group(1).strip().strip('`')).with_suffix('.xlsx').name.casefold() == normalized]
+            if len(matches) != 1:
+                raise ValueError(f'源文件配置没有唯一对应的目标: {name}')
+            i, heading = matches[0]
+            end = headings[i + 1].start() if i + 1 < len(headings) else len(text)
+            return text[:headings[0].start()] + '\n' + text[heading.start():end]
         return content or ''
     normalized = Path(name).with_suffix('.xlsx').name.casefold()
     matches = [t for t in bundle['targets'] if Path(t['file_name']).with_suffix('.xlsx').name.casefold() == normalized]
@@ -133,16 +148,18 @@ def rules_for_workbook(content, name):
     target = matches[0]
     if target.get('external_output_dependencies'):
         raise ValueError(f'{name}需要其他结果文件作为输入，当前仅支持独立目标，请先改为从源数据计算或提供上游结果作为源文件')
+    source_rule = ('SOURCE_FILES: ' + json.dumps(target['source_files'], ensure_ascii=False)
+                   if 'source_files' in target else '')
     return '\n\n'.join(part for part in [bundle.get('supplemental', ''), '## 公共规则\n' + bundle['common_rules'],
-        f'## 本次目标文件：{name}', target['rules'], '## 源数据格式\n' + bundle.get('source_format', '')] if part)
+        f'## 本次目标文件：{name}', source_rule, target['rules'], '## 源数据格式\n' + bundle.get('source_format', '')] if part)
 
 
 def rules_for_structure(content, structure, fallback_name=None):
-    if START not in str(content or ''):
-        return content
     info = json.loads(structure) if isinstance(structure, str) else (structure or {})
     name = info.get('file_name') or fallback_name
     if not name:
+        if START not in str(content or ''):
+            return content
         raise ValueError('多目标规则需要明确当前目标文件名，不能按第一个目标默认套用')
     return rules_for_workbook(content, name)
 
@@ -159,7 +176,7 @@ def patch_bundle(bundle, patch):
         if tid not in targets or tid in changed:
             raise ValueError('修改引用了未知或重复的目标文件')
         changed.add(tid)
-        for key in ('rules', 'covered_field_ids', 'external_output_dependencies'):
+        for key in ('rules', 'covered_field_ids', 'external_output_dependencies', 'source_files'):
             if key in update:
                 targets[tid][key] = update[key]
     for key in ('common_rules', 'cross_target_checks'):

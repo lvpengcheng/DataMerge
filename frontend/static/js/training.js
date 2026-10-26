@@ -14,7 +14,7 @@ let _filePasswordsMap = {};
 let _chatStreamEl = null;   // AI 对话流式输出的 DOM 元素
 let _chatStreamBuf = '';    // AI 对话流式输出的文本缓冲
 let _chatThinkingBuf = '';  // DeepSeek 推理模型思考过程缓冲（灰色区显示，不进入正式内容）
-let _chatThinkingTimer = null;  // 思考渲染节流器（100ms 合并一次 DOM 更新，防 O(n²) 卡死页面）
+let _chatThinkingTimer = null;  // 正文和思考共用的流式刷新定时器
 let _pendingScriptName = null;  // 新建训练时由用户命名的脚本名（仅新建会话首次提交时使用）
 
 // ===== 对话历史分页（B 方案：初始最近 5 轮，上划加载更早）=====
@@ -699,8 +699,8 @@ function _addMessage(role, content, isStreaming, target) {
     contentDiv.className = 'message-content';
     if (isStreaming) contentDiv.classList.add('streaming-cursor');
 
-    if (role === 'assistant') {
-        contentDiv.innerHTML = _renderMarkdown(content);
+    if (role === 'assistant' && content) {
+        _renderCompletedText(contentDiv, content, true);
     } else {
         contentDiv.textContent = content;
     }
@@ -779,9 +779,7 @@ function _scrollStreamingToBottom(contentDiv) {
 }
 
 function _updateStreamingMessage(contentDiv, text, thinkingText, thinkingDirty) {
-    // 思考过程用【增量 textContent】更新（不重解析 HTML/markdown）：DeepSeek 思考 token 逐块
-    // 到达且思考可能长达数分钟/数万字，每 token 全量 _escapeHtml(全部思考)+markdown 重建是
-    // O(n²)，思考越长页面越卡（表现为无响应）。textContent 赋值 O(1) 且自动转义。
+    if (!contentDiv) return;
     let tb = contentDiv.querySelector('.thinking-block');
     if (thinkingDirty && thinkingText) {
         if (!tb) {
@@ -789,24 +787,98 @@ function _updateStreamingMessage(contentDiv, text, thinkingText, thinkingDirty) 
             tb.className = 'thinking-block';
             contentDiv.prepend(tb);
         }
-        tb.textContent = thinkingText;
+        _appendStreamText(tb, thinkingText);
     }
     if (text !== undefined) {
         let body = contentDiv.querySelector('.msg-content-body');
         if (!body) {
             body = document.createElement('div');
-            body.className = 'msg-content-body';
+            body.className = 'msg-content-body stream-plain-text';
             contentDiv.textContent = '';      // 清除占位文本（连带移除子元素，重建顺序）
             if (tb) contentDiv.appendChild(tb);
             contentDiv.appendChild(body);
         }
-        body.innerHTML = _renderMarkdown(text || '');
+        _appendStreamText(body, text || '');
     }
     _scrollStreamingToBottom(contentDiv);
 }
 
 function _finishStreamingMessage(contentDiv) {
     contentDiv.classList.remove('streaming-cursor');
+}
+
+// 流式只展示最近一段；完整内容由缓冲保存，结束后可展开查看。
+const _streamVisibleLimit = 16000;
+function _appendStreamText(element, text) {
+    const previousLength = element._streamLength || 0;
+    const next = text.slice(previousLength);
+    if (text.length < previousLength || !element.firstChild || next.length >= _streamVisibleLimit) {
+        element.textContent = text.slice(-_streamVisibleLimit);
+    } else if (next) {
+        const node = element.firstChild;
+        node.appendData(next);
+        if (node.length > _streamVisibleLimit) node.deleteData(0, node.length - _streamVisibleLimit);
+    }
+    element._streamLength = text.length;
+    element.dataset.streamTruncated = String(text.length > _streamVisibleLimit);
+}
+
+// 折叠时不创建全文 DOM；展开时才解析，收起时释放，完整原文保留在闭包中。
+function _renderCompletedText(element, text, markdown, forceCollapse = false) {
+    text = text || '';
+    element.classList.remove('stream-plain-text');
+    const render = target => {
+        if (markdown) target.innerHTML = _renderMarkdown(text);
+        else {
+            const pre = document.createElement('pre');
+            const code = document.createElement('code');
+            code.textContent = text;
+            pre.appendChild(code);
+            target.replaceChildren(pre);
+        }
+    };
+    if (!forceCollapse && text.length <= 12000) { render(element); return; }
+    const details = document.createElement('details');
+    details.className = 'completed-long-text';
+    const summary = document.createElement('summary');
+    summary.textContent = `展开查看${markdown ? '完整回复' : '完整内容'}（${text.length.toLocaleString()} 字符）`;
+    const body = document.createElement('div');
+    details.append(summary, body);
+    details.addEventListener('toggle', () => {
+        if (details.open) render(body);
+        else body.replaceChildren();
+    });
+    element.replaceChildren(details);
+}
+
+function _scheduleChatRender() {
+    if (_chatThinkingTimer) return;
+    _chatThinkingTimer = setTimeout(() => {
+        _chatThinkingTimer = null;
+        _updateStreamingMessage(_chatStreamEl, _chatStreamBuf, _chatThinkingBuf, true);
+    }, 100);
+}
+
+function _completeChatStream(finalText) {
+    if (_chatThinkingTimer) { clearTimeout(_chatThinkingTimer); _chatThinkingTimer = null; }
+    if (!_chatStreamEl) return;
+    const element = _chatStreamEl;
+    _finishStreamingMessage(element);
+    element.replaceChildren();
+    if (_chatThinkingBuf) {
+        const thinking = document.createElement('div');
+        thinking.className = 'thinking-block';
+        _renderCompletedText(thinking, _chatThinkingBuf, false, true);
+        element.appendChild(thinking);
+    }
+    const body = document.createElement('div');
+    body.className = 'msg-content-body';
+    _renderCompletedText(body, finalText === undefined ? _chatStreamBuf : finalText, true);
+    element.appendChild(body);
+    _scrollStreamingToBottom(element);
+    _chatStreamEl = null;
+    _chatStreamBuf = '';
+    _chatThinkingBuf = '';
 }
 
 // 代码流式追加：将 AI 生成的代码片段逐步显示。
@@ -856,6 +928,8 @@ function _replaceCodeStream(code) {
         _appendCodeStream(code || '');
     } else {
         _codeStreamBuf = code || '';
+        const rendered = _codeStreamEl.querySelector('pre code');
+        if (rendered) { rendered.textContent = ''; rendered._streamLength = 0; }
     }
     if (_codeStreamTimer) {
         clearTimeout(_codeStreamTimer);
@@ -874,20 +948,16 @@ function _renderCodeStreamOnce() {
         _codeStreamEl.replaceChildren(pre);
     }
     // 保留 DOM，仅追加新字符；普通请求回退替换时重置文本。
-    const previous = code.textContent;
-    if (_codeStreamBuf.startsWith(previous) && code.firstChild) {
-        code.firstChild.appendData(_codeStreamBuf.slice(previous.length));
-    } else {
-        code.textContent = _codeStreamBuf;
-    }
+    _appendStreamText(code, _codeStreamBuf);
     _scrollStreamingToBottom(_codeStreamEl);
 }
 
 function _finishCodeStream() {
     if (_codeStreamEl) {
         if (_codeStreamTimer) { clearTimeout(_codeStreamTimer); _codeStreamTimer = null; }
-        _renderCodeStreamOnce();   // flush：渲染完整最终代码
+        _renderCodeStreamOnce();
         _codeStreamEl.classList.remove('streaming-cursor');
+        _renderCompletedText(_codeStreamEl, _codeStreamBuf, false, true);
         _codeStreamEl = null;
         _codeStreamBuf = '';
     }
@@ -1074,6 +1144,7 @@ function _submitStartTraining(userText, sourceFiles, targetFiles, ruleFiles,
 
 let _sheetPickerResolver = null;  // Promise resolve 函数
 let _sheetPickerFiles = null;
+let _sheetPickerControllers = [];
 
 function _pickTargetSheets(targetFiles) {
     const multiple = Array.isArray(targetFiles);
@@ -1094,6 +1165,7 @@ function _pickTargetSheets(targetFiles) {
         }
         _sheetPickerFiles = null;
         _sheetPickerResolver = resolve;
+        _sheetPickerControllers = [];
         const confirm = document.getElementById('sheet-picker-confirm');
         if (confirm) confirm.disabled = true;
 
@@ -1126,52 +1198,84 @@ function _pickTargetSheets(targetFiles) {
         const body = modal.querySelector('.modal-body');
         if (body) Object.assign(body.style, { padding: '14px 18px' });
 
-        title.textContent = `正在分析 ${files.length} 个目标文件...`;
-        list.innerHTML = '<div style="padding:16px;text-align:center;color:#888;">解析中，请稍候...</div>';
+        const workbooks = files.map((file, index) => ({name: names[index], sheets: null}));
+        const safe = value => _escapeHtml(String(value)).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        const render = () => {
+            if (_sheetPickerResolver !== resolve) return;
+            // Keep choices already made while another file is still uploading.
+            const choices = new Map(Array.from(document.querySelectorAll('#sheet-picker-list .sheet-picker-chk'))
+                .map(c => [JSON.stringify([c.getAttribute('data-file-index'), c.getAttribute('data-name')]), c.checked]));
+            const loaded = workbooks.filter(file => file.sheets !== null).length;
+            title.textContent = loaded === files.length
+                ? `选择需要处理的 Sheet（${files.length} 个文件，共 ${workbooks.reduce((n, file) => n + file.sheets.length, 0)} 个 Sheet）`
+                : `正在读取工作表（已完成 ${loaded}/${files.length} 个文件）`;
+            list.innerHTML = workbooks.map((file, fileIndex) => `
+                <section style="margin-bottom:14px;" aria-label="${safe(files[fileIndex].name)}">
+                    <div style="display:flex;align-items:center;gap:8px;padding:8px 4px;background:#f4f6f8;">
+                        <strong style="flex:1;overflow-wrap:anywhere;">${safe(files[fileIndex].name)}</strong>
+                        ${file.sheets === null ? '' : `<button type="button" onclick="sheetPickerToggleAll(true, ${fileIndex})">全选</button>
+                        <button type="button" onclick="sheetPickerToggleAll(false, ${fileIndex})">全不选</button>`}
+                    </div>
+                    ${file.sheets === null ? '<div style="padding:10px;color:#888;">正在上传并读取工作表...</div>' : file.sheets.map(s => {
+                        const previewStr = (s.preview || []).slice(0, 2).map(row => row.filter(x => x !== null && x !== '').slice(0, 6).join(' | ')).join(' / ') || '(空)';
+                        return `<label style="display:block;padding:6px 4px;border-bottom:1px solid #f0f0f0;cursor:pointer;">
+                            <input type="checkbox" class="sheet-picker-chk" data-file-index="${fileIndex}" data-name="${safe(s.name)}" checked style="width:auto;margin-right:8px;">
+                            <span style="font-weight:500;">${safe(s.name)}</span>
+                            <div style="margin-left:24px;font-size:12px;color:#888;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${safe(previewStr)}</div>
+                        </label>`;
+                    }).join('')}</section>`).join('');
+            document.querySelectorAll('#sheet-picker-list .sheet-picker-chk').forEach(c => {
+                const key = JSON.stringify([c.getAttribute('data-file-index'), c.getAttribute('data-name')]);
+                if (choices.has(key)) c.checked = choices.get(key);
+            });
+        };
+        render();
         console.log('[sheet picker] modal 已显示，开始 peek',
                     'computed:', getComputedStyle(modal).display, getComputedStyle(modal).position);
 
         // 每份文件独立解析、携带自己的密码；取消后忽略迟到的解析结果。
         Promise.all(files.map(async (file, index) => {
+            const controller = new AbortController();
+            _sheetPickerControllers.push(controller);
+            let timer;
             try {
                 const fd = new FormData();
                 fd.append('target_file', file);
                 if (_filePasswordsMap[file.name]) fd.append('file_password', _filePasswordsMap[file.name]);
-                const response = await AUTH.authFetch('/api/training/chat/peek-template-sheets', {method: 'POST', body: fd});
-                const data = await response.json();
-                if (!response.ok) throw new Error(data.detail || ('HTTP ' + response.status));
-                if (!data.sheets || !data.sheets.length) throw new Error('没有可用 Sheet');
-                return {name: names[index], sheets: data.sheets};
+                const request = (async () => {
+                    const response = await AUTH.authFetch('/api/training/chat/peek-template-sheets', {
+                        method: 'POST', body: fd, signal: controller.signal});
+                    const data = await response.json();
+                    if (!response.ok) throw new Error(data.detail || ('HTTP ' + response.status));
+                    if (!data.sheets || !data.sheets.length) throw new Error('没有可用 Sheet');
+                    return {name: names[index], sheets: data.sheets};
+                })();
+                const result = await Promise.race([request, new Promise((_, fail) => {
+                    timer = setTimeout(() => {
+                        fail(new Error('工作表读取超时，请重试；旧版或加密文件可稍后重试'));
+                        controller.abort();
+                    }, 120000);
+                })]);
+                if (_sheetPickerResolver === resolve) {
+                    workbooks[index] = result;
+                    render();
+                }
+                return result;
             } catch (err) {
                 throw new Error(`${file.name}：${err.message}`);
+            } finally {
+                clearTimeout(timer);
             }
         }))
-        .then(workbooks => {
+        .then(() => {
             if (_sheetPickerResolver !== resolve) return;
-            const safe = value => _escapeHtml(String(value)).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-            title.textContent = `选择需要处理的 Sheet（${files.length} 个文件，共 ${workbooks.reduce((n, file) => n + file.sheets.length, 0)} 个 Sheet）`;
-            list.innerHTML = workbooks.map((file, fileIndex) => `
-                <section style="margin-bottom:14px;" aria-label="${safe(files[fileIndex].name)}">
-                    <div style="display:flex;align-items:center;gap:8px;padding:8px 4px;background:#f4f6f8;">
-                        <strong style="flex:1;overflow-wrap:anywhere;">${safe(files[fileIndex].name)}</strong>
-                        <button type="button" onclick="sheetPickerToggleAll(true, ${fileIndex})">全选</button>
-                        <button type="button" onclick="sheetPickerToggleAll(false, ${fileIndex})">全不选</button>
-                    </div>
-                    ${file.sheets.map(s => {
-                const previewStr = (s.preview || []).slice(0, 2).map(row => row.filter(x => x !== null && x !== '').slice(0, 6).join(' | ')).join(' / ') || '(空)';
-                const safeName = safe(s.name);
-                return `
-                <label style="display:block;padding:6px 4px;border-bottom:1px solid #f0f0f0;cursor:pointer;">
-                    <input type="checkbox" class="sheet-picker-chk" data-file-index="${fileIndex}" data-name="${safeName}" checked style="width:auto;margin-right:8px;">
-                    <span style="font-weight:500;">${safeName}</span>
-                    <div style="margin-left:24px;font-size:12px;color:#888;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${safe(previewStr)}</div>
-                </label>`;
-            }).join('')}</section>`).join('');
             _sheetPickerFiles = {workbooks, multiple};
             if (confirm) confirm.disabled = false;
         })
         .catch(err => {
             if (_sheetPickerResolver !== resolve) return;
+            _sheetPickerControllers.forEach(controller => controller.abort());
+            _sheetPickerControllers = [];
             _sheetPickerResolver = null;
             _sheetPickerFiles = null;
             modal.style.display = 'none';
@@ -1205,6 +1309,8 @@ function closeSheetPicker(cancelled) {
         result = _sheetPickerFiles.multiple ? selection : selection[_sheetPickerFiles.workbooks[0].name];
     }
     _sheetPickerFiles = null;
+    _sheetPickerControllers.forEach(controller => controller.abort());
+    _sheetPickerControllers = [];
     modal.style.display = 'none';
     if (typeof _sheetPickerResolver === 'function') {
         const r = _sheetPickerResolver;
@@ -1414,37 +1520,25 @@ function _handleSSEEvent(event) {
                 _chatThinkingBuf = '';
             }
             _chatStreamBuf += event.content;
-            _updateStreamingMessage(_chatStreamEl, _chatStreamBuf, _chatThinkingBuf);
+            _scheduleChatRender();
             break;
 
         case 'thinking':
             // DeepSeek 推理模型思考过程：灰色区流式显示（不进入正式内容）。
-            // 思考 token 逐块到达（可能数分钟/数万字），每 token 全量重渲染是 O(n²) 页面卡死源；
-            // 改为累积 + 100ms 节流 + 增量 textContent（_updateStreamingMessage 已优化）。
+            // 与正文合并刷新，保留完整缓冲，仅增量更新可见尾部。
             if (!_chatStreamEl) {
                 _chatStreamEl = _addMessage('assistant', '', true);
                 _chatStreamBuf = '';
                 _chatThinkingBuf = '';
             }
             _chatThinkingBuf += event.content;
-            if (!_chatThinkingTimer) {
-                _chatThinkingTimer = setTimeout(() => {
-                    _chatThinkingTimer = null;
-                    _updateStreamingMessage(_chatStreamEl, undefined, _chatThinkingBuf, true);
-                }, 100);
-            }
+            _scheduleChatRender();
             break;
 
         case 'chat_done':
             // AI 对话完成
             if (_chatStreamEl) {
-                if (_chatThinkingTimer) { clearTimeout(_chatThinkingTimer); _chatThinkingTimer = null; }
-                _finishStreamingMessage(_chatStreamEl);
-                // 用最终完整内容重新渲染（确保 markdown 完整；思考过程保留在灰色区）
-                _updateStreamingMessage(_chatStreamEl, _chatStreamBuf || event.content, _chatThinkingBuf, true);
-                _chatStreamEl = null;
-                _chatStreamBuf = '';
-                _chatThinkingBuf = '';
+                _completeChatStream(event.content || _chatStreamBuf);
             } else {
                 _addMessage('assistant', event.content);
             }
@@ -1763,20 +1857,7 @@ function _renderIterationCodeSummary(iteration, target) {
     const contentDiv = document.createElement('div');
     contentDiv.className = 'message-content iteration-code-summary';
 
-    const codeLines = iteration.generated_code.split('\n');
-    const lineCount = codeLines.length;
-    const preview = codeLines.slice(0, 6).join('\n');
-
-    const toggleId = `code-toggle-${iteration.iteration_num}`;
-    contentDiv.innerHTML = `
-        <div class="code-summary-header" onclick="document.getElementById('${toggleId}').classList.toggle('expanded')">
-            <span>生成代码（${lineCount} 行）</span>
-            <span class="code-toggle-icon">▶ 展开/收起</span>
-        </div>
-        <div id="${toggleId}" class="code-collapse">
-            <pre><code>${_escapeHtml(iteration.generated_code)}</code></pre>
-        </div>
-    `;
+    _renderCompletedText(contentDiv, iteration.generated_code, false, true);
 
     msgDiv.appendChild(label);
     msgDiv.appendChild(contentDiv);
@@ -1988,6 +2069,9 @@ function _setUIStreaming(streaming) {
         sendBtn.textContent = '处理中...';
     } else {
         sendBtn.textContent = '发送';
+        // 断流也必须收尾，取消尚未执行的刷新并保留已收到的内容。
+        _completeChatStream();
+        _finishCodeStream();
         // 对话流式状态也要重置
         _chatStreamEl = null;
         _chatStreamBuf = '';

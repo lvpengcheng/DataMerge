@@ -161,41 +161,18 @@ def validate(payload):
         output = Path(temp) / 'output'
         output.mkdir()
         metadata = materialize(manifest['metadata'], package)
-        source_structure = metadata.get('source_structure')
-        if isinstance(source_structure, str):
-            source_structure = json.loads(source_structure)
         headers = metadata.get('manual_headers') or {}
         if isinstance(headers, str):
             headers = json.loads(headers)
-        preload = None
-        execution_source = str(source_copy)
-        if source_structure:
-            # Replay the same frozen parsing, mapping and execution-copy builders
-            # used by compute; do not validate only the generated script body.
-            from backend.utils.compute_precheck import precheck_compute, _extract_colmap
-            from backend.utils.compute_ingest import read_meta, read_sources, build_preload
-            from backend.utils.confirmed_source_mapping import write_execution_sources
-            from backend.database.connection import SessionLocal
-            with SessionLocal() as db:
-                check = precheck_compute(str(source_copy), source_structure, headers, code,
-                    payload['tenant_id'], cfg.get('salary_year', session.get('salary_year')),
-                    cfg.get('salary_month', session.get('salary_month')), db,
-                    use_history=metadata.get('use_history'), expected_structure=structure,
-                    # 验收回放使用训练原模板，目标关系固定为训练表自身；
-                    # 智算上传的本月模板仍必须经过完整人工确认。
-                    confirmed_target_map={key: key for key in (_extract_colmap(code) or {})},
-                    in_worker=True, session_dir=temp, defer_base_fill=True)
-            if not check.ok:
-                raise ValueError('冻结版本的源文件预检未通过，请补齐原始训练资料后重新转方案')
-            if check.file_mapping:
-                preload = build_preload(read_meta(temp), read_sources(temp), check.file_mapping)
-                execution_source = write_execution_sources(Path(temp) / 'confirmed_source',
-                    check.file_mapping, preload, source_structure, structure)
+        # Acceptance replays training inputs, whose names and layout are already
+        # those used by the saved script. Upload matching is for new compute
+        # inputs: stale source metadata or a pending mapping review must not
+        # prevent executing the script and comparing its actual output.
         spec = importlib.util.spec_from_file_location('solution_business', package / 'business/script.py')
         module = importlib.util.module_from_spec(spec)
         import backend.app.main as app
         app._inject_sandbox_helpers(module)
-        env = {'input_folder': str(execution_source), 'output_folder': str(output),
+        env = {'input_folder': str(source_copy), 'output_folder': str(output),
                'source_files': [p.name for p in source_copy.iterdir() if p.is_file()],
                'manual_headers': headers,
                'file_passwords': {},
@@ -214,10 +191,6 @@ def validate(payload):
         module.history_provider = HistoricalDataProvider(payload['tenant_id'])
         spec.loader.exec_module(module)
         module.__dict__.update(env)
-        if preload:
-            module._pre_loaded_source_data = preload
-            if hasattr(module, 'load_source_data'):
-                module.load_source_data = lambda *a, **k: preload
         tpl = manifest['templates'].get(hashlib.sha256(code.encode()).hexdigest())
         template = str(package / tpl) if tpl else None
         if template:

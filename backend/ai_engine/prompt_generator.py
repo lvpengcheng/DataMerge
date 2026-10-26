@@ -495,6 +495,19 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
 
     # ============ 集中规则辅助方法 ============
 
+    def _formula_source_overview(self):
+        if getattr(self, 'source_sheet_mode', 'rebuild') == 'copy':
+            return '''只生成 fill_result_sheets 函数，创建结果表并填充数据和 Excel 公式。
+源 Sheet 在目标保存后整张原样复制，禁止定义 clean_source_data、逐行重写源表或自动移动原始行列。
+source_sheets[key]['df'] 供 Python 读取，['ws'] 是空占位只能取 title；禁止读取或写入源 ws 单元格。
+源列使用 source_sheets[key]['column_letters'][字段名]；源范围使用 data_start_row、data_end_row，不能按 DataFrame 列序或行数推算。
+筛选、汇总等业务规则在结果生成中应用，源表保持原样。
+参数 Sheet 已创建（参数!$B$2=年份，$B$3=月份，$B$4=月标准工时）。'''
+        return '''1. 生成 clean_source_data 函数，按规则清洗数据。
+2. 清洗后源数据逐行写入 Excel，供公式引用。
+3. 参数 Sheet 已创建（参数!$B$2=年份，$B$3=月份，$B$4=月标准工时）。
+4. 生成 fill_result_sheets 函数，创建结果表并填充数据和公式。'''
+
     def _build_formula_rules(self, detail: str = "compact", include_extra: bool = False) -> str:
         """组装公式模式规则段落
 
@@ -505,9 +518,12 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
         lines = ["# ==================== 核心规则（违反=失败）===================="]
         for rule in self.FORMULA_RULES.values():
             lines.append(rule[detail])
+        source_order = ('源表保留原始值、类型、格式与坐标，业务筛选汇总仅用于生成目标表；'
+                        if getattr(self, 'source_sheet_mode', 'rebuild') == 'copy' else
+                        'clean_source_data 先清洗原始源表，再执行配置的纵向/横向合并；')
         lines.append(
             '【运行顺序与准确度】日期列已按字段定义统一为 Excel 日期；禁止把数字序列号直接交给 '
-            'pd.to_datetime（会当纳秒）。clean_source_data 先清洗原始源表，再执行配置的纵向/横向合并；'
+            'pd.to_datetime（会当纳秒）。' + source_order +
             '如右表一键多行，必须先按明确的业务规则汇总，或配置复合键，不能随意取第一条。'
             '缺失匹配、无效日期与真实零值须区分；默认补零需要规则依据。'
             '源表名称用于公式时要将单引号转义成两个单引号。'
@@ -526,13 +542,30 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
             total_columns: 总列数，替换 __TOTAL_COLUMNS__
             escape_braces: 是否将{/}转义为{{/}}（用于f-string上下文）
         """
+        native_copy = getattr(self, 'source_sheet_mode', 'rebuild') == 'copy'
+        native_example = '''## 整表复制模式示例（按实际规则选择字段）
+def fill_result_sheets(wb, source_sheets, salary_year=None, salary_month=None, monthly_standard_hours=174):
+    key = find_source_sheet(source_sheets, target_columns=['工号', '天数'])
+    source = source_sheets[key]
+    sheet = source['ws'].title.replace("'", "''")
+    key_col = source['column_letters']['工号']
+    val_col = source['column_letters']['天数']
+    start, end = source['data_start_row'], source['data_end_row']
+    ws = wb.create_sheet('结果')
+    ws['A1'], ws['B1'] = '工号', '天数'
+    for i, identifier in enumerate(source['df']['工号'], 2):
+        write_cell(ws, i, 1, identifier)
+        if end is not None:
+            ws.cell(i, 2, f"=INDEX('{sheet}'!{val_col}{start}:{val_col}{end},MATCH(A{i},'{sheet}'!{key_col}{start}:{key_col}{end},0))")
+'''
         parts = [
-            self.GOLDEN_EXAMPLE,
+            native_example if native_copy else self.GOLDEN_EXAMPLE,
             self.SUPPLEMENTARY_RULES.replace("__TOTAL_COLUMNS__", str(total_columns)),
-            self.FUNCTION_SIGNATURES.replace("__TOTAL_COLUMNS__", str(total_columns)),
+            ('只生成完整 fill_result_sheets，覆盖全部目标列；禁止生成 clean_source_data。' if native_copy
+             else self.FUNCTION_SIGNATURES.replace("__TOTAL_COLUMNS__", str(total_columns))),
         ]
         result = "\n\n".join(parts)
-        if escape_braces:
+        if escape_braces and not native_copy:
             # 将 {xxx} 转为 {{xxx}}，但保留已转义的 {{xxx}}
             # 先保护已有的 {{ }}
             result = result.replace("{{", "\x00\x00").replace("}}", "\x01\x01")
@@ -564,6 +597,11 @@ def fill_result_sheets(wb, source_sheets, salary_year=None,
                 "文本列和日期列用first取值。禁止使用pivot_table，不允许改变原表的列结构（表头必须和清洗前完全一致）。\n"
             )
             result["data_cleaning"] = text
+            if getattr(self, 'source_sheet_mode', 'rebuild') == 'copy':
+                result['data_cleaning'] = ('\n## 目标生成时应用的筛选和汇总规则（原始源表不改动）\n'
+                    + '\n'.join(rule['original_text'] for rule in extracted['data_cleaning_rules']
+                                if rule.get('original_text') and not rule['original_text'].startswith('--'))
+                    + '\n在 fill_result_sheets 内处理目标数据，禁止生成 clean_source_data 或修改源表。\n')
 
         if extracted.get("warning_rules"):
             text = "\n## 警告信息规则\n"
@@ -1722,20 +1760,12 @@ input_folder, output_folder, manual_headers: {manual_headers_json}
 
 ## 任务概览
 本次共 __TOTAL_COLUMNS__ 列，必须全部生成，不允许省略。
-1. 生成 clean_source_data 函数：应用数据清洗规则过滤源数据
-2. 生成 fill_result_sheets 函数：创建结果sheet，填充数据和Excel公式
-
-## 执行流程
-1. 源数据已加载到 source_data 字典（DataFrame格式）
-2. 你生成clean_source_data函数，应用清洗规则过滤数据
-3. 清洗后的数据写入Excel供公式引用
-4. 参数sheet已创建（参数!$B$2=年份, $B$3=月份, $B$4=月标准工时）
-5. 你生成fill_result_sheets函数，创建结果sheet并填充公式
+__SOURCE_OVERVIEW__
 
 ## 已有变量
 - wb: openpyxl Workbook
 - source_data: {"sheet名": {"df": DataFrame, "columns": [列名]}} （清洗前；sheet名跨文件不冲突时即为原 sheet 名，冲突时形如 文件名_sheet名）
-- source_sheets: {"sheet名": {"df": DataFrame, "ws": worksheet}} （清洗后，写入Excel；命名规则同上）
+- source_sheets: {"sheet名": {"df": DataFrame, "ws": worksheet}} （源表处理方式遵循上面的任务概览）
 - 已导入模块：os, pandas(pd), openpyxl(Workbook, Comment, PatternFill, Font, CellIsRule, FormulaRule, get_column_letter, column_index_from_string)
 - 已定义常量：EMPTY = Excel空字符串""
 - 已定义函数：excel_text('文本') = Excel文本值"文本"
@@ -1784,6 +1814,7 @@ __RULES__
 
         return (template
                 .replace('__TOTAL_COLUMNS__', str(total_columns))
+                .replace('__SOURCE_OVERVIEW__', self._formula_source_overview())
                 .replace('__INTERMEDIATE_SECTION__', intermediate_section)
                 .replace('__MULTI_SHEET_SOURCE_GUIDANCE__', multi_sheet_guidance)
                 .replace('__COMPRESSED_EXPECTED__', compressed_expected)
@@ -2077,20 +2108,12 @@ def fill_columns_batch_{batch_index + 1}(ws, r, source_sheets):
 
 ## 任务概览
 本次共 {total_columns} 列，必须全部生成，不允许省略。
-1. 生成 clean_source_data 函数：应用数据清洗规则过滤源数据
-2. 生成 fill_result_sheets 函数：创建结果sheet，填充数据和Excel公式
-
-## 执行流程
-1. 源数据已加载到 source_data 字典（DataFrame格式）
-2. 你生成clean_source_data函数，应用清洗规则过滤数据
-3. 清洗后的数据写入Excel供公式引用
-4. 参数sheet已创建（参数!$B$2=年份, $B$3=月份, $B$4=月标准工时）
-5. 你生成fill_result_sheets函数，创建结果sheet并填充公式
+{self._formula_source_overview()}
 
 ## 已有变量
 - wb: openpyxl Workbook
 - source_data: {{"sheet名": {{"df": DataFrame, "columns": [列名]}}}} （清洗前；sheet 名跨文件不冲突时即为原 sheet 名，冲突时形如 文件名_sheet名）
-- source_sheets: {{"sheet名": {{"df": DataFrame, "ws": worksheet}}}} （清洗后，写入Excel；命名规则同上）
+- source_sheets: {{"sheet名": {{"df": DataFrame, "ws": worksheet}}}} （源表处理方式遵循上面的任务概览）
 - 已导入模块：os, pandas(pd), openpyxl(Workbook, Comment, PatternFill, Font, CellIsRule, FormulaRule, get_column_letter, column_index_from_string)
 - 已定义常量：EMPTY = Excel空字符串""
 - 已定义函数：excel_text('文本') = Excel文本值"文本"

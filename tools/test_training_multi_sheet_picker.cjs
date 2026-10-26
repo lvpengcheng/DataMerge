@@ -31,13 +31,15 @@ const document = {
     querySelectorAll(selector) { return selector.endsWith(':checked') ? checkboxes.filter(c => c.checked) : checkboxes; },
     createElement() { return {set textContent(value) { this.innerHTML = escape(value); }}; },
 };
-const alerts = [], requests = [], submissions = [];
+const alerts = [], requests = [], submissions = [], signals = [];
 let responses;
 const ctx = vm.createContext({
+    AbortController, setTimeout, clearTimeout,
     document, window: {}, console: {log() {}, warn() {}}, FormData: FormDataStub,
     getComputedStyle: () => ({}), alert: text => alerts.push(text),
     AUTH: {authFetch: async (url, options) => {
         requests.push(options.body);
+        signals.push(options.signal);
         return responses(options.body.get('target_file').name);
     }},
 });
@@ -89,6 +91,7 @@ const simple = value => JSON.parse(JSON.stringify(value));
     responses = () => new Promise(resolve => { completeOld = resolve; });
     const cancelled = ctx._pickTargetSheets(files[0]);
     ctx.closeSheetPicker(true);
+    assert.equal(signals.at(-1).aborted, true, '取消选择应中止对应上传/预览请求');
     assert.equal(await cancelled, null);
     responses = async () => response([{name: '新选择', preview: []}]);
     const newer = ctx._pickTargetSheets(files[1]);
@@ -106,6 +109,41 @@ const simple = value => JSON.parse(JSON.stringify(value));
     await assert.rejects(ctx._pickTargetSheets(files), /部门汇总.xlsx：密码错误/);
     assert.equal(nodes.get('sheet-picker-modal').style.display, 'none');
     await assert.rejects(ctx._pickTargetSheets([{name: '明细.xls'}, {name: '明细.XLSX'}]), /重名/);
+
+    // File names are visible before any response; fast files are selectable
+    // while a slow file is pending, and updates retain the user's choices.
+    let finishSlow;
+    responses = name => name === files[1].name
+        ? new Promise(resolve => { finishSlow = resolve; })
+        : Promise.resolve(response([{name: '先完成'}, {name: '保留取消勾选'}]));
+    const incremental = ctx._pickTargetSheets(files);
+    assert.match(list.html, /员工明细.xls/);
+    assert.match(list.html, /部门汇总.xlsx/);
+    await flush();
+    assert.match(list.html, /先完成/);
+    assert.match(list.html, /正在上传并读取工作表/);
+    assert.equal(nodes.get('sheet-picker-confirm').disabled, true);
+    checkboxes[1].checked = false;
+    finishSlow(response([{name: '后完成'}]));
+    await flush();
+    assert.equal(checkboxes[1].checked, false);
+    assert.equal(nodes.get('sheet-picker-confirm').disabled, false);
+    ctx.closeSheetPicker(false);
+    assert.deepEqual(simple(await incremental), {'员工明细.xlsx': ['先完成'], '部门汇总.xlsx': ['后完成']});
+
+    // A stalled network/body parse must produce an actionable error, not an
+    // indefinitely pending selector. Trigger the timer without a real wait.
+    let timeout;
+    ctx.setTimeout = callback => { timeout = callback; return 1; };
+    ctx.clearTimeout = () => {};
+    responses = () => new Promise(() => {});
+    const stalled = ctx._pickTargetSheets(files[0]);
+    timeout();
+    await assert.rejects(stalled, /工作表读取超时/);
+    assert.equal(signals.at(-1).aborted, true);
+    assert.equal(nodes.get('sheet-picker-modal').style.display, 'none');
+    ctx.setTimeout = setTimeout;
+    ctx.clearTimeout = clearTimeout;
 
     // Exercise the real start + multipart submission path, rather than only the picker helpers.
     for (const [id, value] of Object.entries({

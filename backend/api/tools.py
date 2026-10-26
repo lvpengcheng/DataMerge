@@ -923,7 +923,7 @@ async def _integration_workflow(request: Request, current_user=Depends(get_curre
         actions = ('create',)
     elif request.method == 'DELETE':
         actions = ('delete',)
-    elif action in {'analyze', 'select-sheets', 'suggest-sheet-mapping', 'reparse-headers', 'match', 'execute', 'apply-validate'}:
+    elif action in {'analyze', 'select-sheets', 'suggest-sheet-mapping', 'reparse-headers', 'match', 'execute', 'apply-validate', 'result'}:
         actions = ('create', 'apply', 'edit')
     else:
         actions = ()
@@ -1131,7 +1131,7 @@ async def _stream_integrate_analysis(work):
         try:
             result = await task
         except HTTPException as exc:
-            result = {'error': exc.detail}
+            result = {'error': exc.detail, 'status_code': exc.status_code}
         except Exception:
             logger.exception('integrate analysis stream failed')
             result = {'error': '解析失败，请稍后重试'}
@@ -1272,7 +1272,14 @@ async def integrate_reparse_headers(
     req: IntegrateReparseRequest,
     current_user=Depends(get_current_user),
     workflow: str = Depends(_integration_workflow),
+    stream: bool = Query(False),
 ):
+    if stream is True:
+        return _integration_heartbeat_response(_integrate_reparse_headers_impl(req, current_user, workflow))
+    return await _integrate_reparse_headers_impl(req, current_user, workflow)
+
+
+async def _integrate_reparse_headers_impl(req, current_user, workflow):
     """按人工指定的表头起止行重新解析主表/对照表，并刷新方案匹配结果。"""
     sdir = _workflow_session_dir(req.session_id, workflow, current_user)
     meta_path = sdir / "_meta.json"
@@ -1632,7 +1639,60 @@ def _integrate_execute_impl(session_dir: str, request_data: dict) -> dict:
 
 @router.post("/integrate/execute")
 @router.post("/table-split/execute")
-async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(get_current_user), workflow: str = Depends(_integration_workflow)):
+async def integrate_execute(req: IntegrateExecuteRequest, current_user=Depends(get_current_user), workflow: str = Depends(_integration_workflow), stream: bool = Query(False)):
+    if stream is True:
+        return _integration_heartbeat_response(_integrate_prepare_download(req, current_user, workflow))
+    return await _integrate_execute_response(req, current_user, workflow)
+
+
+def _integration_heartbeat_response(work):
+    return StreamingResponse(_stream_integrate_analysis(work), media_type='application/json',
+        headers={'Cache-Control': 'no-store, no-transform', 'X-Accel-Buffering': 'no'})
+
+
+async def _integrate_prepare_download(req, current_user, workflow):
+    # The binary file cannot contain heartbeat bytes. Finish processing with JSON
+    # heartbeats, then let the browser fetch the ready file in a separate request.
+    response = await _integrate_execute_response(req, current_user, workflow)
+    sdir = _workflow_session_dir(req.session_id, workflow, current_user)
+    token = uuid.uuid4().hex
+    record = {'file': str(Path(response.path).resolve().relative_to(sdir.resolve())),
+              'owner_id': current_user.id, 'media_type': response.media_type,
+              'headers': dict(response.headers)}
+    (sdir / f'_download_{token}.json').write_text(json.dumps(record, ensure_ascii=False), encoding='utf-8')
+    prefix = 'table-split' if workflow == 'split' else 'integrate'
+    return {'download_url': f'/api/tools/{prefix}/result?session_id={req.session_id}&token={token}'}
+
+
+@router.get('/integrate/result')
+@router.get('/table-split/result')
+async def integrate_download_result(session_id: str, token: str, current_user=Depends(get_current_user),
+                                    workflow: str = Depends(_integration_workflow)):
+    if not re.fullmatch(r'[a-f0-9]{32}', session_id) or not re.fullmatch(r'[a-f0-9]{32}', token):
+        raise HTTPException(400, detail='下载凭据无效')
+    sdir = _workflow_session_dir(session_id, workflow, current_user)
+    manifest = sdir / f'_download_{token}.json'
+    if not manifest.is_file():
+        raise HTTPException(404, detail='结果不存在或已下载，请重新生成')
+    record = json.loads(manifest.read_text(encoding='utf-8'))
+    if record.get('owner_id') != current_user.id:
+        raise HTTPException(403, detail='无权下载此结果')
+    path = (sdir / record['file']).resolve()
+    if not path.is_relative_to(sdir.resolve()) or not path.is_file():
+        raise HTTPException(404, detail='结果不存在或已下载，请重新生成')
+
+    def cleanup():
+        if workflow == 'split':
+            shutil.rmtree(path.parent, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+        manifest.unlink(missing_ok=True)
+
+    return FileResponse(path, media_type=record['media_type'], headers={**record['headers'], 'Cache-Control': 'no-store'},
+                        background=BackgroundTask(cleanup))
+
+
+async def _integrate_execute_response(req, current_user, workflow):
     """按覆盖/对比配置回填主表并输出：原地覆盖主表激活页覆盖列（只写值、保全其余 sheet/公式），
     输出方式2 追加差异 sheet。返回更新后的主表 xlsx。
     """
@@ -2641,7 +2701,13 @@ class IntegrateApplyValidateRequest(BaseModel):
 
 @router.post("/integrate/scheme/apply-validate")
 @router.post("/table-split/scheme/apply-validate")
-async def integrate_scheme_apply_validate(req: IntegrateApplyValidateRequest, current_user=Depends(get_current_user), workflow: str = Depends(_integration_workflow)):
+async def integrate_scheme_apply_validate(req: IntegrateApplyValidateRequest, current_user=Depends(get_current_user), workflow: str = Depends(_integration_workflow), stream: bool = Query(False)):
+    if stream is True:
+        return _integration_heartbeat_response(_integrate_scheme_apply_validate_impl(req, current_user, workflow))
+    return await _integrate_scheme_apply_validate_impl(req, current_user, workflow)
+
+
+async def _integrate_scheme_apply_validate_impl(req, current_user, workflow):
     """应用方案前校验：无关列可增删；必需列改名时返回建议映射供用户确认。"""
     from ..auth.dependencies import has_permission
     from ..utils.merge_engine import _norm_header

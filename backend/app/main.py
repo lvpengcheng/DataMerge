@@ -5219,7 +5219,8 @@ async def run_compute_task(
         # 直接读 Excel 的定制脚本也必须使用人工确认后的文件/Sheet/列。
         # 从最终 DataFrame 生成独立执行目录，上传文件保持不变。
         execution_source_dir = str(source_dir)
-        if pre_validated_mapping and (
+        from backend.utils.template_pipeline import uses_original_template_sources
+        if not uses_original_template_sources(script_content) and pre_validated_mapping and (
                 mapping_finalized or any(info.get('confirmed') for info in pre_validated_mapping.values())):
             if not pre_loaded_source_data:
                 if mapping_finalized:
@@ -7261,24 +7262,11 @@ async def compute_with_script_stream(
 
                             # 调用main函数
                             if hasattr(module, 'main'):
-                                import inspect
-                                sig = inspect.signature(module.main)
-                                params = list(sig.parameters.keys())
-
-                                kwargs = {}
-                                if len(params) >= 2:
-                                    args = [str(source_dir), str(output_dir)]
-                                    if 'salary_year' in params and salary_year is not None:
-                                        kwargs['salary_year'] = salary_year
-                                    if 'salary_month' in params and salary_month is not None:
-                                        kwargs['salary_month'] = salary_month
-                                    if 'monthly_standard_hours' in params and standard_hours is not None:
-                                        kwargs['monthly_standard_hours'] = standard_hours
-                                    result = module.main(*args, **kwargs)
-                                elif len(params) == 0:
-                                    result = module.main()
-                                else:
-                                    result = module.main(str(source_dir))
+                                from backend.utils.script_entry import invoke_script_main
+                                result = invoke_script_main(module.main, {
+                                    'input_folder': str(source_dir), 'output_folder': str(output_dir),
+                                    'salary_year': salary_year, 'salary_month': salary_month,
+                                    'monthly_standard_hours': standard_hours})
                             else:
                                 raise Exception("脚本缺少main函数")
 
@@ -7609,23 +7597,11 @@ async def compute_with_script(
                 if not hasattr(module, 'main'):
                     return {"_kind": "no_main"}
 
-                import inspect
-                sig = inspect.signature(module.main)
-                params = list(sig.parameters.keys())
-                kwargs = {}
-                if len(params) >= 2:
-                    args = [str(source_dir), str(output_dir)]
-                    if 'salary_year' in params and salary_year is not None:
-                        kwargs['salary_year'] = salary_year
-                    if 'salary_month' in params and salary_month is not None:
-                        kwargs['salary_month'] = salary_month
-                    if 'monthly_standard_hours' in params and standard_hours is not None:
-                        kwargs['monthly_standard_hours'] = standard_hours
-                    module.main(*args, **kwargs)
-                elif len(params) == 0:
-                    module.main()
-                else:
-                    module.main(str(source_dir))
+                from backend.utils.script_entry import invoke_script_main
+                invoke_script_main(module.main, {
+                    'input_folder': str(source_dir), 'output_folder': str(output_dir),
+                    'salary_year': salary_year, 'salary_month': salary_month,
+                    'monthly_standard_hours': standard_hours})
 
                 if passwords_dict:
                     try:

@@ -1297,6 +1297,7 @@ class FastHeaderMatcher:
 
         # 先采集所有 (file_base, train_sheet, merged_df, columns)，最后统一分配 key
         _collected = []
+        _source_origins = {}
 
         for input_file_name, mapping_info in file_mapping.items():
             expected_file = mapping_info.get("expected_file", input_file_name)
@@ -1313,6 +1314,9 @@ class FastHeaderMatcher:
                 sheet_data = parsed_sheets_map.get((file_path, input_sheet))
                 if not sheet_data:
                     raise ValueError(f"映射表缺少解析数据: {input_file_name}/{input_sheet}")
+                from backend.utils.template_pipeline import source_origin
+                _source_origins[(file_base, train_sheet)] = [
+                    source_origin(file_path, input_sheet, sheet_data.regions, header_mapping)]
 
                 dfs = []
                 first_columns = None
@@ -1390,7 +1394,9 @@ class FastHeaderMatcher:
             key = key_map[(file_base, train_sheet)]
             if key in source_data:
                 raise ValueError(f"多个上传 Sheet 映射到同一训练表 {key}，请明确纵向合并规则")
-            entry = {"df": merged_df, "columns": first_columns}
+            entry = {"df": merged_df, "columns": first_columns,
+                     "source_file": file_base, "source_sheet": train_sheet,
+                     "source_origins": _source_origins[(file_base, train_sheet)]}
             if first_formats:
                 entry["column_formats"] = first_formats
             if first_schemas:

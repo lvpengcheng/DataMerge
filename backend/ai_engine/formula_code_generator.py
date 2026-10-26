@@ -15,6 +15,7 @@
 """
 
 from backend.utils.multi_target_rules import RULES_CONTENT_LIMIT, limit_rules_content
+from backend.utils.script_source_scope import source_scoped_generation
 
 import os
 import re
@@ -82,6 +83,7 @@ class FormulaCodeGenerator:
         self.formula_builder = ExcelFormulaBuilder()
         self._indent_fixer = IndentationFixer()
 
+    @source_scoped_generation
     def generate_code(
         self,
         input_folder: str,
@@ -137,6 +139,11 @@ class FormulaCodeGenerator:
         self._use_history = bool(use_history)  # 记录给 _build_complete_code 使用，控制是否创建历史数据 sheet
         self._analysis = analysis  # 保存analysis供 _build_complete_code 使用
         self._expected_structure = expected_structure  # 供 _build_complete_code 注入 reserved sheet 名
+        from backend.utils.template_pipeline import source_mode_from_rules
+        self._source_pipeline_v2 = True
+        self._source_sheet_mode = source_mode_from_rules(rules_content)
+        self.formula_builder.original_source_coordinates = self._source_sheet_mode == 'copy'
+        self.prompt_generator.source_sheet_mode = self._source_sheet_mode
 
         # 1. 加载源数据获取结构信息
         if not skip_load:
@@ -165,8 +172,11 @@ class FormulaCodeGenerator:
                 log(f"步骤2: 规则指定主表: {main_table_name}")
 
         source_structure = self.formula_builder.get_source_structure_for_prompt(
-            main_table_name=main_table_name, analysis=analysis
+            main_table_name=main_table_name, analysis=analysis,
+            original_coordinates=self._source_sheet_mode == 'copy',
         )
+        if self._source_sheet_mode == 'copy':
+            source_structure += self._original_source_instructions()
         log("步骤2: 生成源数据结构描述完成")
 
         # 2.5 把当前训练数据的源数据结构同步到规则文档中（无该段落则追加），
@@ -1696,6 +1706,33 @@ class FormulaCodeGenerator:
         except SyntaxError:
             return line  # 修不了，返回原样
 
+    @staticmethod
+    def _original_source_instructions():
+        return '''
+## 本次源表复制约定（优先于通用样例）
+源 Sheet 整张原样复制，保留标题、空白行列、多个区域、格式和原始坐标，禁止假定表头在第1行或数据从第2行开始。
+source_sheets[key]['df'] 仅供 Python 读取数据，不会逐行写回源表；['ws'] 是空占位，仅能读 title，禁止读写其单元格。
+公式源列必须动态使用 source_sheets[key]['column_letters'][字段名]（如 C、F），禁止按 DataFrame 列序号推算字母。
+公式数据范围使用 source_sheets[key]['data_start_row'] 和 ['data_end_row']，运行时可能与训练文件不同；不得用 len(df)+1 猜末行。
+禁止在 copy 模式定义 clean_source_data 或自动合并重建源表；如规则明确需要重建源表，使用 SOURCE_SHEET_MODE: rebuild。
+'''
+
+    def _restore_source_pipeline(self, original_code, rules_content):
+        """Corrections preserve old script coordinates; new scripts retain native copying."""
+        import ast
+        from backend.utils.template_pipeline import is_source_pipeline_v2, source_mode_from_rules
+        self._source_pipeline_v2 = is_source_pipeline_v2(original_code)
+        mode = 'copy' if self._source_pipeline_v2 else 'rebuild'
+        for node in ast.parse(original_code).body:
+            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'SOURCE_SHEET_MODE' for t in node.targets):
+                mode = ast.literal_eval(node.value)
+        if self._source_pipeline_v2 and re.search(r'^[ \t]*(?:SOURCE_SHEET_MODE|源表处理方式)[ \t]*[:：=]', rules_content or '', re.M):
+            mode = source_mode_from_rules(rules_content)
+        self._source_sheet_mode = mode
+        if getattr(self, 'prompt_generator', None) is not None:
+            self.prompt_generator.source_sheet_mode = mode
+        return self._original_source_instructions() if mode == 'copy' else ''
+
     def _build_complete_code(self, fill_function_code: str, merge_config: dict = None, l1_code: str = None) -> str:
         """将AI生成的fill_result_sheet函数与固定代码模板拼接
 
@@ -1732,6 +1769,10 @@ from openpyxl.utils import get_column_letter, column_index_from_string
 from excel_parser import IntelligentExcelParser
 from backend.utils.source_sheet_writer import dt_to_excel_serial, is_long_digit_text
 from backend.utils.data_helpers import apply_dataframe_column_schemas, region_schemas_by_name, assign_sheet_keys
+from backend.utils.template_pipeline import source_origin, prepare_formula_source_sheets, copy_original_source_sheets
+
+SOURCE_PIPELINE_VERSION = __SOURCE_PIPELINE_VERSION__
+SOURCE_SHEET_MODE = __SOURCE_SHEET_MODE__
 
 
 # Excel公式中的特殊值常量（在f-string中使用，避免引号冲突）
@@ -1893,6 +1934,7 @@ def load_source_data(input_folder, manual_headers):
 
     # 先采集所有 (file_base, sheet_name, merged_df, columns)，最后统一分配 key
     _collected = []
+    _source_origins = {}
 
     for filename in sorted(os.listdir(input_folder)):
         if not filename.lower().endswith((".xlsx", ".xls", ".xlsm")) or filename.startswith('~'):
@@ -1908,7 +1950,7 @@ def load_source_data(input_folder, manual_headers):
                 best_region_only=True,  # 只取有效区域（与merge_source_to_target逻辑一致）
                 read_formulas=False,    # 智算阶段不需要公式，使用批量读取提升性能
                 calculate_formulas=True,
-                normalize_source=True,
+                normalize_source=SOURCE_SHEET_MODE == 'rebuild',
                 raise_errors=True,
                 # 不限制 max_data_rows → 执行时加载全量数据
                 # （训练时通过 _pre_loaded_source_data 注入预解析的全量数据，通常不会走到这里）
@@ -1918,6 +1960,8 @@ def load_source_data(input_folder, manual_headers):
                 raise ValueError(f"文件 {filename} 没有可读取的数据区域")
 
             for sheet_data in results:
+                _source_origins[(file_base, sheet_data.sheet_name)] = [
+                    source_origin(file_path, sheet_data.sheet_name, sheet_data.regions)]
                 # 收集同sheet下所有region的DataFrame并合并（处理同列头多区域合并场景）
                 dfs = []
                 columns = None
@@ -1967,9 +2011,12 @@ def load_source_data(input_folder, manual_headers):
 
         source_data[sheet_name] = {
             "df": merged_df,
+            "source_file": file_base,
+            "source_sheet": sheet_name_orig,
             "columns": columns,
             "column_formats": col_formats or {},
-            "column_schemas": col_schemas or {}
+            "column_schemas": col_schemas or {},
+            "source_origins": _source_origins[(file_base, sheet_name_orig)]
         }
         if len(merged_df) > 0:
             print(f"加载源数据: {sheet_name}, 列: {columns}, 行数: {len(merged_df)}")
@@ -2021,6 +2068,8 @@ def _normalize_date_columns(source_data):
 
 
 def write_source_sheets(wb, source_data):
+    if SOURCE_SHEET_MODE != 'rebuild':
+        raise ValueError('copy 模式源表必须整张复制，禁止调用逐行重建方法')
     if not source_data:
         raise ValueError(
             "write_source_sheets: source_data 为空，未加载到任何源数据。"
@@ -2262,6 +2311,8 @@ def main():
 
     # 步骤1.5: 应用数据清洗规则（如果定义了clean_source_data函数）
     if 'clean_source_data' in globals():
+        if SOURCE_SHEET_MODE != 'rebuild':
+            raise ValueError('源表清洗重建需要在规则中明确 SOURCE_SHEET_MODE: rebuild')
         print("步骤1.5: 应用数据清洗规则...")
         cleaned = clean_source_data(source_data)
         if cleaned is not None:
@@ -2272,7 +2323,7 @@ def main():
 
     # 步骤1.2: 合并源数据表（由TableAnalyzer预分析，None表示无需合并）
     _merge_cfg = __MERGE_CONFIG__
-    if _merge_cfg:
+    if _merge_cfg and SOURCE_SHEET_MODE == 'rebuild':
         print("步骤1.2: 合并源数据表...")
         source_data = _merge_source_tables(source_data, _merge_cfg)
         print(f"合并完成，共 {len(source_data)} 个源数据sheet")
@@ -2284,7 +2335,14 @@ def main():
 
     # 步骤2: 把源数据写入sheet（供公式引用）
     print("步骤2: 写入源数据sheet...")
-    source_sheets = write_source_sheets(wb, source_data)
+    _source_copy_plan = []
+    if SOURCE_SHEET_MODE == 'copy':
+        source_sheets, _source_copy_plan = prepare_formula_source_sheets(
+            wb, source_data, globals().get('input_folder', ''))
+    elif SOURCE_SHEET_MODE == 'rebuild':
+        source_sheets = write_source_sheets(wb, source_data)
+    else:
+        raise ValueError('SOURCE_SHEET_MODE 必须为 copy 或 rebuild')
 
     # 步骤2.5: 创建参数sheet（存储薪资年、月、月标准工时）
     # 这些参数可以在公式中引用：=参数!$B$2 (薪资年份), =参数!$B$3 (薪资月份), =参数!$B$4 (月标准工时)
@@ -2335,6 +2393,9 @@ def main():
     # 保存文件（公式由 compare_excel_files 在沙箱外用 Aspose 计算，避免占用沙箱执行时间）
     output_path = os.path.join(globals().get('output_folder', ''), "薪资汇总表.xlsx")
     wb.save(output_path)
+    wb.close()
+    if _source_copy_plan:
+        copy_original_source_sheets(output_path, _source_copy_plan)
     print(f"保存成功: {output_path}")
     print("=" * 60)
     print("处理完成!")
@@ -2350,6 +2411,10 @@ def main():
             fill_function_code = self._clean_after_function_body(fill_function_code)
 
         complete_code = template + fill_function_code + main_template
+        complete_code = complete_code.replace('__SOURCE_PIPELINE_VERSION__',
+            '2' if getattr(self, '_source_pipeline_v2', True) else '1')
+        complete_code = complete_code.replace('__SOURCE_SHEET_MODE__',
+            repr(getattr(self, '_source_sheet_mode', 'copy')))
 
         # 替换模板中的 active_sheet_only 占位符
         _aso_value = "False" if getattr(self, "_multi_sheet_source", False) else "True"
@@ -2687,6 +2752,7 @@ def main():
 
         return '\n'.join(cleaned_lines)
 
+    @source_scoped_generation
     def generate_correction_code(
         self,
         original_code: str,
@@ -2736,6 +2802,7 @@ def main():
         if not original_code:
             log("警告: 原始代码为空，无法进行修正")
             return None
+        source_structure += self._restore_source_pipeline(original_code, rules_content)
 
         # 从原始代码中提取fill_result_sheets函数
         original_fill_function = self._extract_fill_result_sheets_function(original_code)
@@ -2877,6 +2944,7 @@ def main():
 
         return complete_code
 
+    @source_scoped_generation
     def generate_column_level_correction(
         self,
         full_code: str,
@@ -2914,6 +2982,7 @@ def main():
                 stream_callback(msg)
 
         # 1. 提取目标列和构建修正请求
+        source_structure += self._restore_source_pipeline(full_code, rules_content)
         target_columns = list(field_diff_samples.keys())
 
         # 替换规则中的源数据格式为当前训练数据结构

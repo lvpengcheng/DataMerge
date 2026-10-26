@@ -23,7 +23,7 @@ def _signature(source_dir, context):
         return value
     # 解析逻辑/产物结构变化时（INGEST_VERSION 递增）旧缓存自动失效
     from .compute_ingest import INGEST_VERSION
-    canonical = json.dumps([files, [normalize(x) for x in context], INGEST_VERSION],
+    canonical = json.dumps([files, [normalize(x) for x in context], INGEST_VERSION, 'source-provenance-v2'],
                            sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
 

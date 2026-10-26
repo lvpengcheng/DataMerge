@@ -247,9 +247,19 @@ const Tools = {
     },
 
     // ==================== 多表数据合并 ====================
-    _intFetch(url, options) {
+    async _intFetch(url, options) {
         if (this._integrationKind === 'split') url = url.replace('/api/tools/integrate/', '/api/tools/table-split/');
-        return AUTH.authFetch(url, options);
+        const heartbeat = /\/(?:reparse-headers|apply-validate|execute)$/.test(url);
+        if (heartbeat) url += '?stream=true';
+        const response = await AUTH.authFetch(url, options);
+        if (!heartbeat || !response.ok || !(response.headers.get('Content-Type') || '').includes('application/json')) return response;
+        const data = await response.json();
+        // Once heartbeat headers have been sent, errors arrive in the JSON body.
+        // Restore the HTTP error contract used by every existing scheme caller.
+        return new Response(JSON.stringify(data.error ? {detail: data.error} : data), {
+            status: data.error ? (data.status_code || 500) : response.status,
+            headers: {'Content-Type': 'application/json'},
+        });
     },
     _intPerm(action) {
         return `tools.${this._integrationKind === 'split' ? 'table_split' : 'data_integrate'}.${action}`;
@@ -1518,7 +1528,7 @@ const Tools = {
         // 与套用方案入口的状态元素统一（#integrate-status），避免"正在生成结果"永不更新
         this._setIntegrateStatus('正在生成结果...', 'ok');
         try {
-            const resp = await this._intFetch('/api/tools/integrate/execute', {
+            let resp = await this._intFetch('/api/tools/integrate/execute', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload),
             });
@@ -1527,6 +1537,12 @@ const Tools = {
                 st.textContent = '生成失败'; st.className = 'status error';
                 this._setIntegrateStatus('生成失败', 'error');
                 return;
+            }
+            if ((resp.headers.get('Content-Type') || '').includes('application/json')) {
+                const result = await resp.json();
+                if (!result.download_url) throw new Error('未返回结果下载地址，请重新生成');
+                resp = await this._intFetch(result.download_url);
+                if (!resp.ok) throw new Error(await _alertErr(resp, '下载失败'));
             }
             const blob = await resp.blob();
             const url = URL.createObjectURL(blob);

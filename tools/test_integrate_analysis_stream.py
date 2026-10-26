@@ -8,8 +8,9 @@ from types import SimpleNamespace
 
 
 class HTTPException(Exception):
-    def __init__(self, detail):
+    def __init__(self, detail, status_code=400):
         self.detail = detail
+        self.status_code = status_code
 
 
 source = Path(__file__).resolve().parents[1] / 'backend/api/tools.py'
@@ -22,7 +23,7 @@ stream_default = dict(zip(
 assert isinstance(stream_default, ast.Call) and stream_default.args[0].value is True, (
     'Cached clients that omit stream must receive gateway heartbeats')
 template = source.parents[2] / 'frontend/templates/tools.html'
-assert 'tools.js?v=20261022-analyze-heartbeat' in template.read_text(encoding='utf-8')
+assert 'tools.js?v=20261023-apply-heartbeat' in template.read_text(encoding='utf-8')
 function = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)
                 and node.name == '_stream_integrate_analysis')
 
@@ -50,7 +51,7 @@ async def main():
     async def failure():
         raise HTTPException('解析超时')
 
-    assert json.loads(''.join([part async for part in stream(failure())])) == {'error': '解析超时'}
+    assert json.loads(''.join([part async for part in stream(failure())])) == {'error': '解析超时', 'status_code': 400}
     cancelled = asyncio.Event()
 
     async def pending():

@@ -669,6 +669,40 @@ header {
 }
 
 /* ========== Chat Input ========== */
+.chat-messages > .message {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 120px;
+}
+
+.stream-plain-text {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+[data-stream-truncated="true"]::before {
+    content: '正在显示最新部分，输出结束后可展开查看全文。';
+    display: block;
+    color: #8a8a8a;
+    font-size: 12px;
+    margin-bottom: 6px;
+}
+
+.streaming-cursor pre {
+    max-height: 420px;
+    overflow: auto;
+}
+
+.completed-long-text > summary {
+    cursor: pointer;
+    color: #546e7a;
+    padding: 6px 0;
+}
+
+.completed-long-text > div {
+    max-height: 560px;
+    overflow: auto;
+}
+
 .chat-input-area {
     padding: 16px 24px;
     border-top: 1px solid #eee;

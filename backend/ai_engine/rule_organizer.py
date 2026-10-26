@@ -587,6 +587,10 @@ class RuleOrganizer:
                 '{"rules":"本目标的完整规则Markdown", "covered_field_ids":["输入清单中的每一个字段id"],'
                 '"external_output_dependencies":[],"summary":"本目标数据范围、主键、粒度、公共规则例外及依据的摘要"}。'
                 'covered_field_ids必须覆盖当前目标所有Sheet的所有字段；正文必须包含每个Sheet名和字段名。'
+                '用户明确指定当前目标使用哪些源文件时，额外返回source_files完整文件名列表；'
+                '未明确指定则省略source_files，不自行推断白名单；正文如需列出白名单，使用“使用源文件：”加文件名项目列表。'
+                '模板已有内容默认保留；逐项区分仅填空白、覆盖指定字段、明确清空区域和动态增删行，未要求的操作不得添加。'
+                '需要清洗、合并后重建源工作表时，在目标规则正文明确写 SOURCE_SHEET_MODE: rebuild；否则原表复制。'
                 '只能以源文件和明确的公共中间计算为输入。若业务明确要求读取其他目标的生成结果，'
                 '在external_output_dependencies中列出对应目标ID，并在正文标为待确认，禁止悄悄假设已支持。')
             messages[1]['content'] += (f'\n## 公共规则\n{common["common_rules"]}\n## 本次目标字段清单\n'
@@ -595,6 +599,8 @@ class RuleOrganizer:
             result = self._json_analysis(messages, lambda row: validate_target({**target, **row}), progress)
             target.update({key: result.get(key, [] if key == 'external_output_dependencies' else '')
                            for key in ('rules', 'covered_field_ids', 'external_output_dependencies')})
+            if 'source_files' in result:
+                target['source_files'] = result['source_files']
             summaries.append({'id': target['id'], 'file_name': target['file_name'], 'summary': str(result.get('summary') or '')})
         report('正在检查跨目标口径与规则完整性…')
         review = self._json_analysis([
@@ -619,6 +625,8 @@ class RuleOrganizer:
             '目标不明确时返回澄清回复且不修改。若是询问而非修改，只回答，不修改。保持目标身份与字段清单不变。'
             '修改某个目标时提供该目标完整rules正文及完整covered_field_ids，不能只给差异片段。'
             '公共变更若影响个别目标，应在回复中说明冲突，不能未经要求改变其他目标。'
+            '用户指定源文件范围时，在对应目标补充source_files完整文件名列表并同步正文；'
+            '取消源限制时source_files设为null并删除正文白名单，未修改源范围时省略此字段。'
             '输出JSON：{"reply":"回答或澄清", "targets":[{"id":"T0001","rules":"本目标完整规则",'
             '"covered_field_ids":[],"external_output_dependencies":[]}]}。'
             '没有改动则targets为空；仅当用户明确要求时添加common_rules或cross_target_checks字段替换对应章节。'},

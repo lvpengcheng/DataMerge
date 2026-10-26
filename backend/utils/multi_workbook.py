@@ -119,7 +119,8 @@ def execute_workbooks(targets, environment):
                               "tenant_id", "manual_headers", "file_passwords", "history_provider",
                               "report_progress", "SYNONYM_GROUPS", "find_column", "safe_get_column",
                               "convert_region_to_dataframe", "normalize_emp_code", "print_available_columns",
-                              "load_files_to_dataframes", "EMPTY", "ZERO", "excel_text", "write_cell")}
+                              "load_files_to_dataframes", "EMPTY", "ZERO", "excel_text", "write_cell",
+                              "_pre_loaded_source_data")}
             env.update(output_folder=str(child_dir), __name__="multi_workbook_child")
             overrides = environment.get('_template_override_paths') or {}
             template = overrides.get(name) or resolve_child_template(target["code"], environment.get("tenant_id"))
@@ -130,6 +131,9 @@ def execute_workbooks(targets, environment):
             if manual_map:
                 env['_target_sheet_manual_map'] = manual_map
             exec(compile(target["code"], name + ".py", "exec"), env)
+            # Optional target-level configuration overrides the child declaration.
+            if 'source_files' in target:
+                env['SOURCE_FILES'] = target['source_files']
             for key in ("salary_year", "salary_month", "monthly_standard_hours", "tenant_id"):
                 if environment.get(key) is not None:
                     env[key] = environment[key]

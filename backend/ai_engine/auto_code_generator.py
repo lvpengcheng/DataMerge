@@ -17,6 +17,7 @@ vs 模板模式：从零生成 wb，不需要预存模板
 """
 
 import os
+from backend.utils.script_source_scope import source_scoped_generation
 import re
 import logging
 from typing import Dict, List, Any, Optional, Tuple
@@ -42,6 +43,7 @@ class AutoCodeGenerator:
 
     # ==================== 主入口 ====================
 
+    @source_scoped_generation
     def generate_code(
         self,
         input_folder: str,
@@ -412,7 +414,8 @@ def load_source_data():
                 df = pd.read_excel(fp, sheet_name=sn, dtype=object)
                 _normalize_key_columns(df)
                 key = sn if sn not in out else f"{{Path(fname).stem}}_{{sn}}"
-                out[key] = {{"df": df, "columns": list(df.columns)}}
+                out[key] = {{"df": df, "columns": list(df.columns),
+                             "source_file": fname, "source_sheet": sn}}
         except Exception as e:
             print(f"[源数据加载警告] {{fname}}: {{e}}")
     print(f"加载完成：{{len(out)}} 个 sheet")

@@ -183,30 +183,10 @@ def _parse_training_rule_files_subprocess(paths: list) -> str:
 
 
 def _peek_template_sheets_subprocess(file_path: str, password: str = None) -> list:
-    """目标模板 sheet 预览子进程执行体。"""
-    if password:
-        from backend.utils.aspose_helper import is_encrypted, decrypt_excel
-        if is_encrypted(file_path):
-            decrypted = decrypt_excel(file_path, password=password)
-            shutil.move(decrypted, file_path)
-    from backend.utils.source_normalizer import convert_xls_to_xlsx
-    file_path = convert_xls_to_xlsx(file_path)
-    from openpyxl import load_workbook
-    wb = load_workbook(file_path, read_only=True, data_only=True)
-    try:
-        sheets = []
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            preview = []
-            for index, row in enumerate(ws.iter_rows(values_only=True, max_row=3)):
-                preview.append([(str(value).strip() if value is not None else "")
-                                for value in row[:30]])
-                if index >= 2:
-                    break
-            sheets.append({"name": sheet_name, "preview": preview})
-        return sheets
-    finally:
-        wb.close()
+    """兼容旧调用；新接口直接走轻量目录读取，不导入整个 API 到子进程。"""
+    import zipfile
+    from backend.utils.workbook_preview import peek_xlsx_sheets, peek_legacy_sheets
+    return peek_xlsx_sheets(file_path) if zipfile.is_zipfile(file_path) else peek_legacy_sheets(file_path, password)
 
 
 def _create_sse_stream(loop):
@@ -325,6 +305,9 @@ def _build_source_structure_from_generator(generator, multi_sheet_source: bool =
             else:
                 letter = chr(64 + i // 26) + chr(65 + i % 26)
             headers[col] = letter
+        origins = sheet_info.get('source_origins') or []
+        if origins and origins[0].get('regions'):
+            headers = {col['name']: col['letter'] for col in origins[0]['regions'][0]['columns']}
 
         structure["files"][filename]["sheets"][sheet_name] = {
             "sheet_name": sheet_name,
@@ -519,6 +502,7 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None,
     parser = IntelligentExcelParser()
     _passwords = file_passwords or {}
     _collected: list = []  # [(file_base, sheet_name, merged_df, columns)]
+    _source_origins = {}
 
     for filename in sorted(os.listdir(source_dir)):
         if not filename.lower().endswith((".xlsx", ".xls", ".xlsm")) or filename.startswith('~'):
@@ -553,6 +537,9 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None,
                 raise ValueError(f"源文件没有可用结构: {filename}")
 
             for sheet_data in results:
+                from backend.utils.template_pipeline import source_origin
+                _source_origins[(file_base, sheet_data.sheet_name)] = [
+                    source_origin(file_path, sheet_data.sheet_name, sheet_data.regions)]
                 dfs = []
                 columns = None
                 column_schemas = None
@@ -605,9 +592,12 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None,
         final_key = key_map[(file_base, sheet_name)]
         entry = {
             "df": merged_df,
+            "source_file": file_base,
+            "source_sheet": sheet_name,
             "columns": columns,
             "column_schemas": column_schemas,
             "column_formats": column_formats,
+            "source_origins": _source_origins[(file_base, sheet_name)],
         }
         source_data[final_key] = entry
         logger.info(f"[后台全量加载] {final_key}: {len(merged_df)} 行")
@@ -1561,17 +1551,17 @@ async def peek_template_sheets(
     fp_path = os.path.join(work_dir, safe_upload_name(target_file.filename, "template.xlsx"))
     try:
         await save_upload_file(target_file, fp_path)
-        from ..utils.subprocess_runner import run_in_fresh_subprocess_async
-        from ..utils.upload_stream import get_excel_work_semaphore
-        async with get_excel_work_semaphore():
-            result = await run_in_fresh_subprocess_async(
-                "backend.api.training_chat:_peek_template_sheets_subprocess",
-                args=(fp_path, file_password), timeout=180,
-                max_memory_mb=int(os.getenv("TRAINING_UPLOAD_MAX_MEMORY_MB", "1536")),
-            )
-        if not result.success:
-            raise HTTPException(status_code=400, detail=f"目标文件解析失败: {result.error}")
-        return {"file_name": target_file.filename, "sheets": result.result or []}
+        from ..utils.workbook_preview import preview_uploaded_workbook
+        started = time.perf_counter()
+        try:
+            sheets = await preview_uploaded_workbook(fp_path, file_password)
+        except TimeoutError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"目标文件目录读取失败: {exc}") from exc
+        logger.info('[训练目标预览] file=%r seconds=%.3f sheets=%d',
+                    target_file.filename, time.perf_counter() - started, len(sheets))
+        return {"file_name": target_file.filename, "sheets": sheets}
     finally:
         try:
             shutil.rmtree(work_dir, ignore_errors=True)
