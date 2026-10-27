@@ -9,6 +9,8 @@ import copy
 import json
 import os
 import zipfile
+import dis
+from functools import lru_cache
 from contextlib import contextmanager
 from contextvars import ContextVar
 from threading import Lock
@@ -22,6 +24,44 @@ _DEFAULT_HELPERS = {
     '_restore_number_formats', 'apply_target_column_schemas', '_normalize_key_columns',
     'write_source_sheets', '_append_source_sheets', '_snapshot_number_formats', 'write_source_dataframe',
 }
+
+
+@lru_cache(maxsize=128)
+def _format_instructions(code):
+    instructions = tuple(dis.get_instructions(code))
+    offsets = set()
+    for index, item in enumerate(instructions):
+        if index < 3 or item.opname != 'STORE_ATTR' or item.argval != 'number_format':
+            continue
+        # STORE_ATTR consumes value then target. Skip the entire target
+        # expression, which can be ws['H7'] or ws.cell(row, col), not just a name.
+        needed, start = 1, index
+        for cursor in range(index - 1, max(-1, index - 40), -1):
+            target = instructions[cursor]
+            needed -= (dis.stack_effect(target.opcode, target.arg) if target.arg is not None
+                       else dis.stack_effect(target.opcode))
+            if needed <= 0:
+                start = cursor
+                break
+        if start < 1 or start == index:
+            continue
+        rhs = instructions[start - 1]
+        if ((rhs.opname == 'LOAD_ATTR' and rhs.argval == 'number_format')
+                or (rhs.opname == 'BINARY_SUBSCR' and start >= 2
+                    and instructions[start - 2].opname == 'LOAD_CONST'
+                    and instructions[start - 2].argval == 'number_format')):
+            offsets.add(item.offset)
+    return frozenset(offsets)
+
+
+def _copies_existing_format(frame):
+    """Style cloning is inheritance, not an explicit display-format override.
+
+    Generated functions are exec'd, so source lines are not always available.
+    Inspect only the assignment's RHS: src.number_format or style['number_format'].
+    Literal format writes and normal variables still count as explicit choices.
+    """
+    return frame.f_lasti in _format_instructions(frame.f_code)
 
 
 def prefer_script_column_schemas(structure, script_code):
@@ -176,6 +216,12 @@ def _install_tracking():
                         if cursor.f_code.co_name == 'invoke_script_main':
                             break
                         cursor = cursor.f_back
+                    if _copies_existing_format(frame):
+                        # Cloning replaces any prior temporary reset (often
+                        # General while clearing/rebuilding rows). That reset
+                        # must not survive as a later export override either.
+                        state.pop(id(instance), None)
+                        return
                     state.pop(id(instance), None)
                     state[id(instance)] = (instance, value)
                 finally:

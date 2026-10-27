@@ -3888,25 +3888,8 @@ def _load_script_info_for_precheck(tenant_id: str, script_id: str) -> dict:
     db = None
     try:
         db = SessionLocal()
-        row = None
-        # 数字主键直接查 DB
-        try:
-            sid = int(script_id)
-            row = db.query(db_models.Script).filter_by(id=sid, tenant_id=tenant_id).first()
-        except (ValueError, TypeError):
-            row = None
-        # 字符串型 script_id 也尝试按 name 精确匹配查 DB(主要为读 config.use_history;
-        # is_active=True 保证不会拿到旧版本)
-        if row is None:
-            try:
-                row = (
-                    db.query(db_models.Script)
-                    .filter_by(tenant_id=tenant_id, name=script_id, is_active=True)
-                    .order_by(db_models.Script.version.desc())
-                    .first()
-                )
-            except Exception:
-                row = None
+        from backend.utils.script_lookup import find_script
+        row = find_script(db, db_models.Script, tenant_id, script_id)
         if row:
             if row.manual_headers:
                 info["manual_headers"] = row.manual_headers
@@ -8195,24 +8178,10 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
             _deduped.append(_e)
         scripts = _deduped
         from backend.database.models import CalculationSolution
-        from backend.solutions.store import artifact
-        versions = []
-        pending_solutions = []
-        for solution in db.query(CalculationSolution).filter_by(tenant_id=tenant_id).order_by(CalculationSolution.created_at.desc()).all():
-            if solution.status == 'candidate':
-                pending_solutions.append({"id": solution.id, "name": solution.name,
-                                          "version": solution.digest[:12],
-                                          "validation_passed": bool((solution.validation or {}).get('passed'))})
-                continue
-            if solution.status != 'published' or not solution.is_active:
-                continue
-            manifest = json.loads((artifact(solution.digest) / 'manifest.json').read_text(encoding='utf-8'))
-            versions.append({"script_id": "solution_" + solution.id,
-                             "name": solution.name + " · 方案 " + solution.digest[:12],
-                             "is_active": not versions, "solution_id": solution.id,
-                             "solution_digest": solution.digest,
-                             "score": (solution.validation or {}).get('accuracy', 1.0),
-                             "mode": manifest.get('mode')})
+        from backend.solutions.catalog import tenant_versions
+        versions, pending_solutions, unavailable_solutions = tenant_versions(
+            db.query(CalculationSolution).filter_by(tenant_id=tenant_id)
+            .order_by(CalculationSolution.created_at.desc()).all())
         if versions:
             for item in scripts:
                 item['is_active'] = False
@@ -8224,6 +8193,7 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
             "active_script_id": active_script_id,
             "scripts": scripts,
             "pending_solutions": pending_solutions,
+            "unavailable_solutions": unavailable_solutions,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

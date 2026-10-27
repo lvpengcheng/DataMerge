@@ -98,9 +98,9 @@ EOF
         fc-cache -f >/dev/null
     fi
 
-    mkdir -p "${APP_DIR}"/{tenants,data,logs,output,compare_results,temp,global_assets}
+    mkdir -p "${APP_DIR}"/{tenants,data,logs,output,compare_results,temp,global_assets,solution_store}
     chown -R "${APP_USER}:${APP_GROUP}" \
-        "${APP_DIR}"/{tenants,data,logs,output,compare_results,temp,global_assets} "${VENV_DIR}"
+        "${APP_DIR}"/{tenants,data,logs,output,compare_results,temp,global_assets,solution_store} "${VENV_DIR}"
 
     if [[ ! -f "${APP_DIR}/.env" ]]; then
         [[ -f "${APP_DIR}/.env.example" ]] || die "缺少 .env 和 .env.example"

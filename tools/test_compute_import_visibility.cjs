@@ -6,6 +6,7 @@ const elements = new Map();
 function element() {
     return {style: {}, disabled: false, textContent: '', value: '', children: [],
         appendChild(child) {this.children.push(child);},
+        insertBefore(child) {this.children.unshift(child);},
         set innerHTML(value) {this.children = []; this.html = value;},
         get innerHTML() {return this.html;}};
 }
@@ -33,6 +34,19 @@ vm.runInContext("let currentScriptId = 'old'; let scriptsCache = []; let _tenant
     await ctx.loadTenantScripts('山东太保');
     assert.equal(vm.runInContext('currentScriptId', ctx), 'solution_new');
     assert.equal(elements.get('script-selector').disabled, false);
+    payload = {scripts: [], unavailable_solutions: [{name: '缺失方案'}]};
+    await ctx.loadTenantScripts('山东太保');
+    assert.equal(elements.get('script-selector-group').style.display, 'none');
+    assert.equal(elements.get('script-selector').disabled, true);
+    assert.equal(elements.get('script-info').textContent, '');
+    assert.ok(!logs.some(text => /方案文件缺失|恢复完整方案|重新导入原方案/.test(text)));
+    payload = {scripts: [{script_id: 'legacy', name: '旧脚本', is_active: true}],
+        unavailable_solutions: [{name: '缺失方案'}], requires_script_selection: true};
+    await ctx.loadTenantScripts('山东太保');
+    assert.equal(vm.runInContext('currentScriptId', ctx), 'legacy', 'unavailable packages must not block a listed script');
+    assert.equal(elements.get('script-selector').value, 'legacy');
+    assert.equal(elements.get('script-selector').disabled, false);
+    assert.ok(!elements.get('script-selector').innerHTML.includes('原方案不可用'));
     let resolveSlow;
     fetcher = () => new Promise(resolve => {resolveSlow = resolve;});
     const slow = ctx.loadTenantScripts('old-tenant');

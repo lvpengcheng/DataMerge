@@ -20,10 +20,12 @@ def resolve_column_format(schema=None, source_format=None):
 def _builtin_format_id(schema, code):
     schema = schema or {}
     number_id = schema.get("number_format_id")
-    # 只有格式码仍与解析定义一致时才能复用编号；自定义编号不能跨工作簿复制。
+    # The format string is authoritative. IDs can remain stale after a script
+    # edits the schema, or represent a locale-specific display code. Never let
+    # an ID replace an explicit yyyy-mm-dd with built-in 14's mm-dd-yy.
     if (schema.get("is_builtin_format")
             and isinstance(number_id, int) and 0 <= number_id < 164
-            and code == schema.get("number_format")):
+            and BUILTIN_FORMATS.get(number_id) == code):
         return number_id
     # 旧 schema 没有编号元数据：仅完全匹配内置格式码时恢复编号。
     # 新 schema 明确标为自定义时，不凭格式字符串覆盖该定义。
@@ -46,5 +48,5 @@ def apply_openpyxl_column_format(cell, schema, source_format=None):
     cell.number_format = code
     number_id = _builtin_format_id(schema, code)
     if number_id is not None:
-        # openpyxl 没有设置内置编号的公开接口；地区专用编号不能仅靠格式字符串还原。
+        # Only reuse an ID whose standard definition matches the requested code.
         cell._style.numFmtId = number_id

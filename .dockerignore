@@ -49,6 +49,26 @@ data.db
 output/
 compare_results/
 temp/
+tmp/
+outputs/
+solution_store/
+global_assets/
+_deploy_backups/
+
+# 本机开发依赖与调试产物，不发送到 Docker 构建上下文
+.codex/
+.codex-build/
+.agents/
+.cache/
+tests/
+backend/tests/
+backend/test_data/
+tools/
+build_iis/
+design_docs/
+参考/
+datamerge_deploy_*.tar.gz
+datamerge_backup_*.tar.gz
 
 # 构建脚本和文档（镜像内不需要）
 build_*.bat

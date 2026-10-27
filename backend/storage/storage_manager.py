@@ -237,9 +237,13 @@ class StorageManager:
     def get_script_content(self, tenant_id: str, script_id: str) -> Optional[str]:
         """获取脚本内容（磁盘优先，DB 兜底）"""
         tenant_dir = self.get_tenant_dir(tenant_id)
-        script_file = tenant_dir / "scripts" / f"{script_id}.py"
-
-        if script_file.exists():
+        from backend.utils.script_lookup import canonical_script_id, find_script
+        script_id = canonical_script_id(script_id)
+        script_files = [tenant_dir / "scripts" / f"{script_id}.py",
+                        tenant_dir / 'training' / script_id / f'{script_id}.py']
+        for script_file in script_files:
+            if not script_file.is_file():
+                continue
             try:
                 with open(script_file, 'r', encoding='utf-8') as f:
                     return f.read()
@@ -252,16 +256,7 @@ class StorageManager:
             from backend.database.models import Script
             db = SessionLocal()
             try:
-                db_script = (
-                    db.query(Script)
-                    .filter(
-                        Script.tenant_id == tenant_id,
-                        Script.is_active == True,
-                        Script.name == script_id,
-                    )
-                    .order_by(Script.version.desc())
-                    .first()
-                )
+                db_script = find_script(db, Script, tenant_id, script_id)
                 if db_script and db_script.code:
                     self.logger.info(f"从 DB 加载脚本: tenant={tenant_id}, name={script_id}, id={db_script.id}")
                     return db_script.code
@@ -539,7 +534,9 @@ class StorageManager:
         return ids
 
     def is_script_disabled(self, tenant_id: str, script_id: str) -> bool:
-        return script_id in self.get_disabled_script_ids(tenant_id)
+        from backend.utils.script_lookup import canonical_script_id
+        disabled = self.get_disabled_script_ids(tenant_id)
+        return script_id in disabled or canonical_script_id(script_id) in disabled
 
     def delete_script_files_by_code(self, tenant_id: str, script_code: str) -> Optional[str]:
         """按脚本代码物理删除 FS 上的脚本文件。

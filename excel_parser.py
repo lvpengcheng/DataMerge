@@ -3399,13 +3399,18 @@ class IntelligentExcelParser:
                 code = str(style.Custom or "").strip()
                 is_builtin = not code or BUILTIN_FORMATS.get(number_id) == code
                 if not code:
-                    # 内置格式的 Custom 为空，必须从编号恢复格式码，不能直接当作 General。
+                    # Built-in dates are locale-dependent. Capture their actual
+                    # display code rather than substituting the US definition
+                    # of ID 14 (mm-dd-yy) for a yyyy/M/d example.
                     code = BUILTIN_FORMATS.get(number_id)
+                    if number_id in self._DATE_BUILTIN_FMT_IDS | self._TIME_BUILTIN_FMT_IDS:
+                        code = str(style.CultureCustom or "").strip() or code
                     if code is None:
                         # 部分地区专用日期/时间编号没有通用格式码，使用稳定的标准格式。
                         code = str(style.CultureCustom or "").strip() or ("yyyy-mm-dd" if number_id in self._DATE_BUILTIN_FMT_IDS
                                 else "h:mm:ss" if number_id in self._TIME_BUILTIN_FMT_IDS
                                 else "General")
+                    is_builtin = BUILTIN_FORMATS.get(number_id) == code
                 key = (number_id, code, is_builtin)
                 value = cell.Value
                 # 空模板数据格仍可能预设 @/日期/金额格式；非 General 样式必须纳入字段定义。

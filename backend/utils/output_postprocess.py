@@ -324,12 +324,12 @@ def finalize_output_workbook(output_path, template_path=None, expected_structure
         if not script_formats:
             normalize_key_columns_to_text(output_path, explicit_formats=explicit_formats)
             if template_ok:
-                restore_formats_from_template(output_path, template_path)
+                restore_formats_from_template(output_path, template_path, expected_structure)
             _normalize_source_sheet_formats_impl(output_path, template_path if template_ok else None)
             if not template_ok and expected_structure:
                 _apply_expected_schemas_in_workbook(wb, expected_structure, explicit_formats)
             if template_ok and restore_summary_format_enabled():
-                restore_template_region_format(output_path, template_path, script_code)
+                restore_template_region_format(output_path, template_path, script_code, expected_structure)
         # Rename via Aspose so cross-sheet formula references follow the names.
         if sheet_name_map:
             import uuid
@@ -474,7 +474,25 @@ def _template_format_row(output_row, shifted_tail, template_max_row):
     return output_row
 
 
-def restore_formats_from_template(output_path, template_path) -> int:
+def _declared_date_columns(cells, structure, sheet_name):
+    """Legacy date columns use one declared code, including inserted data rows."""
+    import json
+    if isinstance(structure, str):
+        structure = json.loads(structure)
+    schemas = ((structure or {}).get('sheets', {}).get(sheet_name, {}).get('column_schemas') or {})
+    dates = {str(name).strip(): schema for name, schema in schemas.items()
+             if (schema or {}).get('field_type') in ('date', 'datetime', 'time')}
+    columns = {}
+    if dates:
+        for ri in range(min(30, cells.MaxDataRow + 1)):
+            for ci in range(cells.MaxDataColumn + 1):
+                name = str(cells[ri, ci].Value or '').strip()
+                if name in dates and ci not in columns:
+                    columns[ci] = (ri, dates[name])
+    return columns
+
+
+def restore_formats_from_template(output_path, template_path, expected_structure=None) -> int:
     """把输出文件的单元格 number_format 刷回模板原格式。
 
     解决 openpyxl 写入 datetime 值时自动把 General 改成日期格式、导致模板常规列
@@ -520,6 +538,13 @@ def restore_formats_from_template(output_path, template_path) -> int:
             ocells = ows.Cells
             tcells = tws.Cells
             shifted_tail = _shifted_summary_tail(ocells, tcells)
+            date_columns = _declared_date_columns(ocells, expected_structure, str(ows.Name))
+            date_end = ocells.MaxDataRow + 1
+            if date_columns:
+                summaries = _scan_summary_rows(ocells, ocells.MaxDataRow, ocells.MaxDataColumn,
+                                              min(row for row, _ in date_columns.values()) + 1)
+                if summaries:
+                    date_end = min(summaries)
             template_last_col = tcells.MaxDataColumn
             # 只遍历输出中"实际存在"的单元格（GetEnumerator 不含空格 → 不会给输出灌空单元格）
             # 同列唯一且公式相同的单元格可作为移动锚点（如汇总行 TODAY）。
@@ -535,6 +560,19 @@ def restore_formats_from_template(output_path, template_path) -> int:
             while it.MoveNext():
                 ocell = it.Current
                 try:
+                    declared = date_columns.get(ocell.Column)
+                    if (declared and declared[0] < ocell.Row < date_end
+                            and (ocell.Value is not None or ocell.IsFormula)):
+                        # A date column must not inherit a different old format
+                        # for every template row. Do not coerce values/formulas.
+                        style = ocell.GetStyle()
+                        before = (style.Number, str(style.Custom or ''))
+                        apply_aspose_column_format(style, declared[1])
+                        if before != (style.Number, str(style.Custom or '')):
+                            ocell.SetStyle(style)
+                            restored += 1
+                            touched = True
+                        continue
                     if template_last_col is None or ocell.Column > template_last_col:
                         continue  # 模板没有的新列保留脚本写入的数字格式。
                     template_row = _template_format_row(ocell.Row, shifted_tail, tcells.MaxDataRow)
@@ -731,7 +769,7 @@ def _scan_summary_rows(cells, max_row, max_col, data_start=1):
     return rows
 
 
-def restore_template_region_format(output_path, template_path, script_code=None) -> int:
+def restore_template_region_format(output_path, template_path, script_code=None, expected_structure=None) -> int:
     """把"汇总行 + 数据区"的格式按模板重刷，让汇总行格式随行数变化正确跟随（模版模式兜底）。
 
     背景：老脚本在 openpyxl 里手动 insert_rows/delete_rows 改行数，openpyxl 插删行**只搬
@@ -826,6 +864,12 @@ def restore_template_region_format(output_path, template_path, script_code=None)
             t_de = t_sr - 1
             t_sample = ds + (t_de - ds) // 2 if t_de > ds else ds
             data_styles = [tcells[t_sample, c].GetStyle() for c in range(style_last_col + 1)]
+            for column, (_, schema) in _declared_date_columns(ocells, expected_structure, str(ows.Name)).items():
+                if column <= style_last_col:
+                    style = out.CreateStyle()
+                    style.Copy(data_styles[column])
+                    apply_aspose_column_format(style, schema)
+                    data_styles[column] = style
             sum_styles = [tcells[t_sr, c].GetStyle() for c in range(style_last_col + 1)]
             try:
                 sum_h = tcells.GetRowHeight(t_sr)
@@ -855,8 +899,9 @@ def restore_template_region_format(output_path, template_path, script_code=None)
             for r in range(o_sr + 1, (o_maxr or 0) + 1):
                 has_val = False
                 for c in range(o_maxc + 1):
-                    v = ocells[r, c].Value
-                    if v is not None and str(v).strip() != "":
+                    cell = ocells[r, c]
+                    v = cell.Value
+                    if cell.IsFormula or (v is not None and str(v).strip() != ""):
                         has_val = True
                         break
                 if has_val:

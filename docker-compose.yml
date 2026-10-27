@@ -20,6 +20,7 @@ services:
       - ./email_config.json:/app/email_config.json
       - ./tenants:/app/tenants
       - ./global_assets:/app/global_assets
+      - ./solution_store:/app/solution_store
       - ./data:/app/data
       - ./logs:/app/logs
       - ./output:/app/output

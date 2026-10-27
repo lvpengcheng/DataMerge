@@ -140,6 +140,32 @@ def main():
         # Implicit datetime formatting and schema defaults must not become overrides.
         self.assertEqual(read_explicit_formats(path), {'结果': {'A2': 'General'}})
 
+    def test_inherited_row_formats_are_not_explicit_script_overrides(self):
+        template = self.root / 'template.xlsx'
+        wb = Workbook()
+        wb.active['H6'] = datetime(2023, 6, 1)
+        wb.active['H6'].number_format = 'mm-dd-yy'
+        wb.save(template)
+        wb.close()
+        self.run_code('''
+from openpyxl import load_workbook
+def main():
+    wb = load_workbook(template_path)
+    ws = wb.active
+    ws['H7'].value = ws['H6'].value
+    ws['H7'].number_format = 'General'
+    ws['H7'].number_format = ws['H6'].number_format
+    snapshot = {'number_format': ws['H6'].number_format}
+    ws['H8'].value = ws['H6'].value
+    ws['H8'].number_format = snapshot['number_format']
+    ws['H9'].value = ws['H6'].value
+    custom_format = 'yyyy-mm-dd'
+    ws['H9'].number_format = custom_format
+    wb.save(output_folder + '/inherited.xlsx')
+''', template_path=str(template))
+        self.assertEqual(read_explicit_formats(self.output / 'inherited.xlsx'),
+                         {'Sheet': {'H9': 'yyyy-mm-dd'}})
+
     def test_moved_cells_follow_new_coordinates_and_no_cross_run_leak(self):
         self.run_code('''
 from openpyxl import Workbook

@@ -31,6 +31,7 @@ import sys
 import json
 import time
 import fnmatch
+import shlex
 import tarfile
 import getpass
 import argparse
@@ -42,9 +43,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 # 注意 global_assets/ 也在 docker-compose 里卷挂载，属运行时数据，不随发布覆盖。
 EXCLUDE_DIRS = {
     ".git", ".venv", "venv", "env", "ENV", "__pycache__", "node_modules",
-    "tenants", "data", "logs", "output", "compare_results", "temp",
+    "tenants", "data", "logs", "output", "outputs", "compare_results", "temp", "tmp",
+    "solution_store", "_deploy_backups",
     "global_assets", "releases", ".claude", ".idea", ".vscode",
     ".pytest_cache", "htmlcov",
+    ".codex", ".codex-build", ".agents", ".cache",
+    "build", "build_iis", "dist", "tests", "test_data", "tools",
+    "docs", "design_docs", "examples", "参考",
 }
 # --code-only 时额外排除的"大而少变"目录（首次全量发布后，服务器已有，无需重传）
 CODE_ONLY_EXTRA_DIRS = {"libs", "fonts"}
@@ -53,6 +58,7 @@ EXCLUDE_PATTERNS = [
     ".env", ".env.*", "data.db", "*.db-journal",
     "deploy.config.json", "deploy.config.*.json", "deploy.py",  # 脚本与配置不必上服务器
     "deploy.native.config.json",  # Ubuntu 原生发布连接信息/密码，绝不进发布包
+    "datamerge_deploy_*.tar.gz", "datamerge_backup_*.tar.gz",
 ]
 
 
@@ -70,13 +76,18 @@ def _excluded(rel_path: str, exclude_dirs: set) -> bool:
 def build_tarball(out_path: Path, exclude_dirs: set) -> int:
     """打包 PROJECT_ROOT 下未被排除的文件到 out_path，返回文件数。"""
     count = 0
-    with tarfile.open(out_path, "w:gz") as tar:
+    # Deployment favors quick compression; runtime libraries already compress
+    # poorly and higher gzip levels waste CPU on every publish.
+    out_path = Path(out_path).resolve()
+    with tarfile.open(out_path, "w:gz", compresslevel=1) as tar:
         for root, dirs, files in os.walk(PROJECT_ROOT):
             rel_root = os.path.relpath(root, PROJECT_ROOT)
             dirs[:] = [d for d in dirs if not _excluded(os.path.join(rel_root, d) if rel_root != "." else d, exclude_dirs)]
             for f in files:
                 rel = os.path.normpath(os.path.join(rel_root, f)) if rel_root != "." else f
                 if _excluded(rel, exclude_dirs):
+                    continue
+                if Path(root, f).resolve() == out_path:
                     continue
                 tar.add(os.path.join(root, f), arcname=rel.replace("\\", "/"))
                 count += 1
@@ -254,9 +265,11 @@ def main():
 
     print("=" * 60)
     print("打包本地代码..." + ("（code-only：跳过 libs/fonts）" if args.code_only else ""))
+    started = time.perf_counter()
     n = build_tarball(local_tar, exclude_dirs)
     size_mb = local_tar.stat().st_size / 1e6
     print(f"  已打包 {n} 个文件，{size_mb:.1f} MB → {local_tar.name}")
+    print(f"  打包耗时：{time.perf_counter() - started:.1f} 秒")
     print(f"  排除目录：{', '.join(sorted(exclude_dirs))}")
     print(f"  排除文件：{', '.join(EXCLUDE_PATTERNS)}")
 
@@ -287,12 +300,12 @@ def main():
         print("  上传完成。")
 
         # 2) 发布前备份：当前代码打 code_时间戳.tar.gz（保留最近10份）+ 当前镜像打 :prev
+        backup_excludes = ' '.join(shlex.quote('--exclude=' + name) for name in sorted(EXCLUDE_DIRS))
         backup_cmd = (
             f"BK='{remote_path}/_deploy_backups'; mkdir -p \"$BK\"; "
             f"if [ -e '{remote_path}/docker-compose.yml' ]; then "
             f"tar czf \"$BK/code_{ts}.tar.gz\" -C '{remote_path}' "
-            "--exclude=_deploy_backups --exclude=tenants --exclude=data --exclude=logs "
-            "--exclude=output --exclude=temp --exclude=global_assets . 2>/dev/null || true; "
+            f"{backup_excludes} . 2>/dev/null || true; "
             "fi; "
             "ls -1t \"$BK\"/code_*.tar.gz 2>/dev/null | tail -n +11 | xargs -r rm -f || true; "
             f"docker image inspect {cfg['image_name']}:latest >/dev/null 2>&1 && docker tag {cfg['image_name']}:latest {cfg['image_name']}:prev || true; "

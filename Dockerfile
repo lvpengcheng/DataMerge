@@ -110,7 +110,7 @@ COPY frontend/ ./frontend/
 # ========== 8. 运行时目录 ==========
 # global_assets 与 tenants/data/... 同为 docker-compose 卷挂载的运行时目录（发布时不上传），
 # 运行时由宿主机目录遮盖镜像内容，故只需 mkdir 建目录，不 COPY（避免全新环境构建时源目录不存在而失败）。
-RUN mkdir -p tenants data logs output compare_results temp global_assets
+RUN mkdir -p tenants data logs output compare_results temp global_assets solution_store
 
 # ========== 9. 环境变量 ==========
 ENV PYTHONPATH=/app
