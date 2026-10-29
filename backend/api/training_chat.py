@@ -3818,6 +3818,7 @@ def get_current_code(
     session_id: int,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    download: bool = False,
 ):
     """获取会话最新代码（最近一次迭代/上传的代码，而非历史最高分）"""
     session = db.query(TrainingSession).filter_by(id=session_id).first()
@@ -3828,8 +3829,13 @@ def get_current_code(
     if not best:
         raise HTTPException(status_code=404, detail="暂无代码")
 
+    from ..utils.multi_workbook import readable_script
+    if download:
+        from ..utils.multi_workbook import script_download_response
+        filename = re.sub(r'[\\/:*?"<>|]+', '_', f'script_{session.tenant_id}') + '.py'
+        return script_download_response(best.generated_code, filename, _NO_STORE_HEADERS)
     return {
-        "code": best.generated_code,
+        "code": readable_script(best.generated_code),
         "accuracy": best.accuracy,
         "iteration": best.iteration_num,
     }
@@ -3920,6 +3926,10 @@ def download_iteration_file(
     if Path(file_path).suffix.lower() == ".zip":
         media_type = "application/zip"
         filename = str(Path(filename).with_suffix(".zip"))
+
+    if file_type == 'script':
+        from ..utils.multi_workbook import script_download_response
+        return script_download_response(Path(file_path).read_text(encoding='utf-8'), filename, _NO_STORE_HEADERS)
 
     # no-store: 下载 URL 不带迭代号（同一 URL 每轮指向不同文件），禁缓存防浏览器/代理返回旧结果
     return FileResponse(

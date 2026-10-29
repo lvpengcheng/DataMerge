@@ -1,11 +1,14 @@
 # syntax=docker/dockerfile:1
 # ========== Stage 1: 从微软官方镜像获取 .NET 9 运行时 ==========
-FROM mcr.microsoft.com/dotnet/runtime:9.0 AS dotnet-runtime
+FROM mcr.microsoft.com/dotnet/runtime:9.0.21 AS dotnet-runtime
 
 # ========== Stage 2: Python 主镜像 ==========
-FROM python:3.11-slim
+FROM python:3.11.17-slim
 
 WORKDIR /app
+
+# 固定补丁版本，避免 Docker 重建时随浮动标签升级运行环境。
+RUN python -c "import platform; assert platform.python_version() == '3.11.17', platform.python_version()"
 
 # ========== 1. 系统依赖 ==========
 # libgdiplus: Aspose.Cells 渲染图片/PDF 的核心依赖
@@ -36,7 +39,8 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
 # ========== 2. 从 Stage 1 复制 .NET 9 运行时（免去手动安装） ==========
 COPY --from=dotnet-runtime /usr/share/dotnet /usr/share/dotnet
 RUN ln -s /usr/share/dotnet/dotnet /usr/local/bin/dotnet \
-    && dotnet --list-runtimes
+    && dotnet --list-runtimes \
+    && dotnet --list-runtimes | grep -q '^Microsoft.NETCore.App 9\.0\.21 '
 
 ENV DOTNET_ROOT=/usr/share/dotnet
 ENV PATH="${DOTNET_ROOT}:${PATH}"
@@ -52,9 +56,10 @@ RUN fc-cache -fv
 # 可选：构建时传国内镜像源加速下载（清华源示例）：
 #   DOCKER_BUILDKIT=1 docker build --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple .
 ARG PIP_INDEX_URL=""
-COPY requirements.txt .
+# 同时锁定间接依赖；修改依赖时须明确同步更新锁文件，防止镜像重建自动升级。
+COPY requirements.txt requirements.docker.lock ./
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install ${PIP_INDEX_URL:+-i $PIP_INDEX_URL} -r requirements.txt
+    pip install ${PIP_INDEX_URL:+-i $PIP_INDEX_URL} -r requirements.txt -r requirements.docker.lock
 
 # ========== 5. 复制应用代码 ==========
 COPY libs/ ./libs/
@@ -70,7 +75,7 @@ RUN cp /app/libs/libSkiaSharp.so /usr/lib/libSkiaSharp.so \
     && echo "OK: libSkiaSharp.so installed"
 
 # 生成 Linux 专用 runtimeconfig.json（含 additionalProbingPaths）
-RUN printf '{\n  "runtimeOptions": {\n    "tfm": "net9.0",\n    "framework": {\n      "name": "Microsoft.NETCore.App",\n      "version": "9.0.11"\n    },\n    "additionalProbingPaths": ["/app/libs"]\n  }\n}\n' > /app/libs/runtimeconfig.json
+RUN printf '{\n  "runtimeOptions": {\n    "tfm": "net9.0",\n    "framework": {\n      "name": "Microsoft.NETCore.App",\n      "version": "9.0.21"\n    },\n    "additionalProbingPaths": ["/app/libs"]\n  }\n}\n' > /app/libs/runtimeconfig.json
 
 COPY excel_parser.py aspose_init.py run.py split_by_banner.py ./
 

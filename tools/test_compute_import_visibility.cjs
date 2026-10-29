@@ -27,9 +27,8 @@ vm.runInContext("let currentScriptId = 'old'; let scriptsCache = []; let _tenant
     await ctx.loadTenantScripts('山东太保');
     assert.equal(vm.runInContext('currentScriptId', ctx), '');
     assert.equal(elements.get('script-selector').disabled, true);
-    assert.match(elements.get('script-info').textContent, /汇总.*验收并启用/);
-    assert.equal(elements.get('script-info').children[0].href, '/training');
-    assert.ok(!logs.some(text => text.includes('没有可用')));
+    assert.equal(elements.get('script-info').textContent, '');
+    assert.ok(!logs.some(text => /验收|启用/.test(text)));
     payload = {scripts: [{script_id: 'solution_new', name: '汇总', is_active: true}], pending_solutions: []};
     await ctx.loadTenantScripts('山东太保');
     assert.equal(vm.runInContext('currentScriptId', ctx), 'solution_new');

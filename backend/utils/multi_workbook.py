@@ -23,23 +23,144 @@ def combine_structures(structures):
     return {"workbooks": structures, "sheets": sheets, "delivery": "zip"}
 
 
+def _target_assignment(tree):
+    return next((node for node in tree.body if isinstance(node, ast.Assign) and any(
+        isinstance(t, ast.Name) and t.id == "MULTI_WORKBOOK_SCRIPTS" for t in node.targets)), None)
+
+
+def _entry_block(node, entry):
+    return (isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name) and node.test.left.id == '__name__'
+            and len(node.test.ops) == 1 and isinstance(node.test.ops[0], ast.Eq)
+            and len(node.test.comparators) == 1
+            and isinstance(node.test.comparators[0], ast.Constant)
+            and node.test.comparators[0].value == entry)
+
+
+def _section_indent(source, remove=False):
+    """Move code into/out of a section without changing multiline string values."""
+    import io
+    import tokenize
+    protected, fstrings = set(), []
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        kind = tokenize.tok_name[token.type]
+        if token.type == tokenize.STRING:
+            protected.update(range(token.start[0] + 1, token.end[0] + 1))
+        elif kind == 'FSTRING_START':
+            fstrings.append(token.start[0])
+        elif kind == 'FSTRING_END':
+            protected.update(range(fstrings.pop() + 1, token.end[0] + 1))
+    lines = []
+    for row, line in enumerate(source.splitlines(keepends=True), 1):
+        if row not in protected:
+            line = line[4:] if remove and line.startswith('    ') else line if remove else '    ' + line
+        lines.append(line)
+    return ''.join(lines)
+
+
 def script_targets(code):
-    for node in ast.parse(code or "").body:
-        if isinstance(node, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id == "MULTI_WORKBOOK_SCRIPTS" for t in node.targets):
-            return ast.literal_eval(node.value)
-    return {}
+    tree = ast.parse(code or "")
+    assignment = _target_assignment(tree)
+    if assignment is None:
+        return {}
+    targets = ast.literal_eval(assignment.value)
+    for name, target in targets.items():
+        if 'entry' not in target:
+            continue  # Legacy dictionary containing source strings.
+        block = next((n for n in tree.body if _entry_block(n, target['entry'])), None)
+        if block is None:
+            raise ValueError(f'{name}: 缺少目标文件的代码段')
+        source = ast.get_source_segment(code, block).split('\n', 1)[1]
+        source = _section_indent(source + '\n', remove=True)
+        future = target.get('future_imports') or []
+        target['code'] = ('\n'.join(future) + '\n' if future else '') + source
+        for key in ('entry', 'future_imports'):
+            target.pop(key, None)
+    return targets
 
 
-def build_script(targets):
-    for name in targets:
+def script_wrapper(code):
+    """Inspect outer code without counting child template paths a second time."""
+    tree = ast.parse(code or '')
+    assignment = _target_assignment(tree)
+    if assignment is None:
+        return code
+    entries = [t.get('entry') for t in ast.literal_eval(assignment.value).values() if t.get('entry')]
+    tree.body = [n for n in tree.body if n is not assignment
+                 and not any(_entry_block(n, entry) for entry in entries)]
+    return ast.unparse(tree)
+
+
+def build_script(targets, wrapper=None):
+    """One Python module with visible executable code sections for all targets."""
+    import textwrap
+    import pprint
+    metadata, sections, futures = {}, [], []
+    for index, (name, target) in enumerate(targets.items(), 1):
         validate_name(name)
-        compile(targets[name]["code"], name + ".py", "exec")
-    return ('"""多个目标工作簿：按文件独立执行规则，全部成功后交付。"""\n'
-            'from backend.utils.multi_workbook import execute_workbooks\n'
-            'MULTI_WORKBOOK_SCRIPTS = ' + repr(targets) + '\n\n'
-            'def main():\n'
-            '    return execute_workbooks(MULTI_WORKBOOK_SCRIPTS, globals())\n')
+        source = target['code'].replace('\r\n', '\n').replace('\r', '\n')
+        compile(source, name + '.py', 'exec')
+        lines = source.splitlines(keepends=True)
+        child_futures = []
+        for node in ast.parse(source).body:
+            if isinstance(node, ast.ImportFrom) and node.module == '__future__':
+                declaration = ast.get_source_segment(source, node)
+                child_futures.append(declaration)
+                if declaration not in futures:
+                    futures.append(declaration)
+                for row in range(node.lineno - 1, node.end_lineno):
+                    lines[row] = '\n'
+        source = ''.join(lines).rstrip('\n') + '\n'
+        entry = f'_dm_workbook_{index}'
+        info = {key: value for key, value in target.items() if key != 'code'}
+        info.update(entry=entry)
+        if child_futures:
+            info['future_imports'] = child_futures
+        metadata[name] = info
+        sections.append('# ' + '=' * 18 + ' ' + name + ' ' + '=' * 18 + '\n'
+                        + 'if __name__ == ' + repr(entry) + ':\n'
+                        + _section_indent(source))
+    if wrapper is None:
+        wrapper = ('def main():\n'
+                   '    return execute_workbooks(MULTI_WORKBOOK_SCRIPTS, globals())\n')
+    # Future imports are module-wide in a single Python file.
+    outer = ast.parse(wrapper)
+    for node in outer.body:
+        if isinstance(node, ast.ImportFrom) and node.module == '__future__':
+            declaration = ast.unparse(node)
+            if declaration not in futures:
+                futures.append(declaration)
+    outer.body = [n for n in outer.body if not (isinstance(n, ast.ImportFrom) and n.module == '__future__')]
+    wrapper = ast.unparse(outer) + '\n'
+    data = 'MULTI_WORKBOOK_SCRIPTS = ' + pprint.pformat(metadata, width=100, sort_dicts=False) + '\n'
+    return (('\n'.join(futures) + '\n' if futures else '')
+            + '# 多目标文件脚本：各目标代码直接在下方编辑，统一由 main 生成全部文件。\n'
+            + 'from backend.utils.multi_workbook import execute_workbooks\n'
+            + 'import sys as _dm_sys\n'
+            + '_DM_WORKBOOK_PROGRAM = _dm_sys._getframe().f_code\n\n'
+            + data + '\n' + '\n'.join(sections) + '\n'
+            + 'if __name__ not in ' + repr(tuple(info['entry'] for info in metadata.values())) + ':\n'
+            + textwrap.indent(wrapper, '    '))
+
+
+def readable_script(code):
+    """Upgrade old dictionary bundles on download; new visible sections stay intact."""
+    tree = ast.parse(code or '')
+    assignment = _target_assignment(tree)
+    if assignment is None:
+        return code
+    targets = ast.literal_eval(assignment.value)
+    if all('entry' in target for target in targets.values()):
+        return code
+    return build_script(script_targets(code), wrapper=script_wrapper(code))
+
+
+def script_download_response(code, filename, headers=None):
+    from fastapi.responses import Response
+    from urllib.parse import quote
+    return Response(readable_script(code), media_type='text/x-python; charset=utf-8',
+                    headers={**(headers or {}),
+                             'Content-Disposition': "attachment; filename*=utf-8''" + quote(filename)})
 
 
 def validate_name(name):
@@ -102,6 +223,14 @@ def resolve_child_template(code, tenant_id=None):
     return path
 
 
+def template_reference_code(code):
+    """Stable template-only identity shared by visible sections and frozen packages."""
+    from .template_resolver import extract_template_ref
+    name, digest, path = extract_template_ref(code)
+    return '\n'.join(key + ' = ' + repr(value) for key, value in (
+        ('TEMPLATE_NAME', name), ('TEMPLATE_HASH', digest), ('TEMPLATE_PATH', path)) if value)
+
+
 def execute_workbooks(targets, environment):
     from backend.utils.script_entry import invoke_script_main
     from backend.utils.result_selection import pick_result_output
@@ -121,16 +250,31 @@ def execute_workbooks(targets, environment):
                               "convert_region_to_dataframe", "normalize_emp_code", "print_available_columns",
                               "load_files_to_dataframes", "EMPTY", "ZERO", "excel_text", "write_cell",
                               "_pre_loaded_source_data")}
-            env.update(output_folder=str(child_dir), __name__="multi_workbook_child")
+            env.update(output_folder=str(child_dir), __name__=target.get('entry', 'multi_workbook_child'))
             overrides = environment.get('_template_override_paths') or {}
-            template = overrides.get(name) or resolve_child_template(target["code"], environment.get("tenant_id"))
+            template = overrides.get(name)
+            if not target.get('entry'):
+                template = template or resolve_child_template(target['code'], environment.get('tenant_id'))
             if template:
                 env["_template_override_path"] = template
             from .compute_templates import workbook_target_map
             manual_map = workbook_target_map(environment.get('_target_sheet_manual_map'), name)
             if manual_map:
                 env['_target_sheet_manual_map'] = manual_map
-            exec(compile(target["code"], name + ".py", "exec"), env)
+            if target.get('entry'):
+                program = environment.get('_DM_WORKBOOK_PROGRAM')
+                if program is None:
+                    raise ValueError(f'{name}: 缺少多文件脚本的统一入口')
+                exec(program, env)
+            else:
+                exec(compile(target["code"], name + ".py", "exec"), env)
+            if target.get('entry'):
+                # Read the actual edited declarations, never a stale metadata copy.
+                ref_code = '\n'.join(key + ' = ' + repr(env[key]) for key in (
+                    'TEMPLATE_NAME', 'TEMPLATE_HASH', 'TEMPLATE_PATH') if env.get(key))
+                template = template or resolve_child_template(template_reference_code(ref_code), environment.get('tenant_id'))
+                if template:
+                    env['_template_override_path'] = template
             # Optional target-level configuration overrides the child declaration.
             if 'source_files' in target:
                 env['SOURCE_FILES'] = target['source_files']
@@ -266,8 +410,8 @@ def deliver_workbooks(output_dir, destination_dir, code, structure, tenant_id, d
     original_paths, value_paths = [], []
     values_failed = False
     package_name = Path(build_result_filename(display_name, salary_year, salary_month, ".zip"))
-    import uuid
-    package_name = package_name.with_stem(package_name.stem + "_" + uuid.uuid4().hex[:8])
+    from datetime import datetime
+    package_name = package_name.with_stem(package_name.stem + datetime.now().strftime('%f'))
     # A per-delivery staging folder avoids exposing a half-built result package.
     with tempfile.TemporaryDirectory(prefix="delivery_", dir=destination_dir) as staged:
         for output in outputs:

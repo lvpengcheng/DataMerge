@@ -2280,17 +2280,12 @@ async function _doUploadCode(codeFile, templateFile) {
 async function downloadCode() {
     if (!_currentSessionId) return;
     try {
-        const resp = await AUTH.authFetch(`/api/training/chat/sessions/${_currentSessionId}/code`);
+        const resp = await AUTH.authFetch(`/api/training/chat/sessions/${_currentSessionId}/code?download=true`);
         if (!resp.ok) {
             alert('获取代码失败');
             return;
         }
-        const data = await resp.json();
-        if (!data.code) {
-            alert('暂无可下载的代码');
-            return;
-        }
-        const blob = new Blob([data.code], { type: 'text/x-python; charset=utf-8' });
+        const blob = await resp.blob();
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;

@@ -12,6 +12,8 @@ def tenant_versions(rows):
             continue
         if row.status != 'published' or not row.is_active:
             continue
+        if any(version['name'] == row.name for version in versions):
+            continue
         try:
             manifest = json.loads((artifact(row.digest) / 'manifest.json').read_text(encoding='utf-8'))
             if not isinstance(manifest, dict) or manifest.get('digest') != row.digest:
@@ -20,7 +22,7 @@ def tenant_versions(rows):
             unavailable.append({**identity, 'reason': '方案文件缺失或清单无效，请恢复完整方案包或重新导入原方案'})
             continue
         versions.append({'script_id': 'solution_' + row.id,
-                         'name': row.name + ' · 方案 ' + row.digest[:12],
+                         'name': row.name,
                          'is_active': not versions, 'solution_id': row.id,
                          'solution_digest': row.digest,
                          'score': (row.validation or {}).get('accuracy', 1.0),

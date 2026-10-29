@@ -31,7 +31,7 @@ def binding(tenant, script_id, db=None):
         root = artifact(row.digest)
         manifest = verify(root)
         require_environment(manifest['environment'], ROOT)
-        return {'id': row.id, 'digest': row.digest, 'tenant_id': tenant, 'script_id': row.script_id,
+        return {'id': row.id, 'digest': row.digest, 'tenant_id': tenant, 'script_id': row.script_id, 'name': row.name,
                 'metadata': materialize(manifest['metadata'], root),
                 'code': (root / 'business/script.py').read_bytes().decode('utf-8')}
     finally:

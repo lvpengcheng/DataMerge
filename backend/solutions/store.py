@@ -170,10 +170,8 @@ def build(db, script, user_id):
         for code in codes:
             checked = code
             if script_targets(code):
-                tree = ast.parse(code)
-                tree.body = [n for n in tree.body if not (isinstance(n, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id == 'MULTI_WORKBOOK_SCRIPTS' for t in n.targets))]
-                checked = ast.unparse(tree)
+                from ..utils.multi_workbook import script_wrapper
+                checked = script_wrapper(code)
             if find_nonportable_absolute_paths(checked):
                 raise ValueError('脚本含模板以外的固定绝对路径，请改为运行参数后转方案')
             name, _, baked = extract_template_ref(code)
@@ -186,7 +184,13 @@ def build(db, script, user_id):
                 if not resolved:
                     raise ValueError(f'必要模板缺失: {name or baked}')
                 key = hashlib.sha256(code.encode()).hexdigest()
-                templates[key] = copy_file(resolved, 'assets/templates/' + key + Path(resolved).suffix)
+                # Business scripts may use the template basename to select the
+                # workbook's data scope. Isolate by hash directory, keep its name.
+                templates[key] = copy_file(resolved, 'assets/templates/' + key + '/' + Path(resolved).name)
+                from ..utils.multi_workbook import template_reference_code
+                reference = template_reference_code(code)
+                if reference:
+                    templates[hashlib.sha256(reference.encode()).hexdigest()] = templates[key]
         # Include the entire Python application closure; no current-project fallback.
         suffixes = {'.py', '.json', '.txt', '.md', '.yaml', '.yml', '.j2', '.xlsx', '.xltx'}
         sources = [p for p in (ROOT / 'backend').rglob('*') if p.is_file() and p.suffix in suffixes]

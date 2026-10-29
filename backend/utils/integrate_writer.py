@@ -33,8 +33,17 @@ def _col_idx(letter: str) -> int:
     return column_index_from_string(str(letter).strip().upper()) - 1
 
 
-def _read_cell_str(cell) -> str:
-    """读单元格显示/字符串值（用于关联键）：优先 StringValue，回退 Value。"""
+def _read_cell_str(cell):
+    """Use the date value for keys; localized display text is not a stable key."""
+    try:
+        from Aspose.Cells import CellValueType
+        if cell.Type == CellValueType.IsDateTime:
+            from datetime import datetime
+            value = cell.DateTimeValue
+            return datetime(value.Year, value.Month, value.Day,
+                            value.Hour, value.Minute, value.Second)
+    except Exception:
+        pass
     try:
         sv = cell.StringValue
         if sv is not None:

@@ -79,17 +79,17 @@ async function openSolutions() {
     const importArea = solutionElement('section', '', body);
     importArea.className = 'solutions-card';
     solutionElement('h3', '导入完整方案包', importArea);
-    solutionElement('p', '选择目标脚本导入一个方案版本，或输入新脚本名称创建。租户仅用于确定脚本归属。原方案版本仍保留，导入版本验收后启用。', importArea).className = 'solutions-muted';
+    solutionElement('p', '选择目标脚本或填写脚本名称导入。相同租户下同名脚本自动覆盖，导入后立即启用。', importArea).className = 'solutions-muted';
     const targetRow = solutionElement('div', '', importArea);
     targetRow.className = 'solutions-form-row';
     const targetLabel = solutionElement('label', '目标脚本', targetRow);
     const targetScript = solutionElement('select', '', targetLabel);
     targetScript.id = 'solutions-import-script';
-    solutionElement('option', '创建新脚本', targetScript).value = '';
-    const nameLabel = solutionElement('label', '新脚本名称', targetRow);
+    solutionElement('option', '按名称导入（同名覆盖）', targetScript).value = '';
+    const nameLabel = solutionElement('label', '脚本名称', targetRow);
     const scriptName = solutionElement('input', '', nameLabel);
     scriptName.id = 'solutions-import-name';
-    scriptName.placeholder = '输入尚未创建的脚本名称';
+    scriptName.placeholder = '输入脚本名称，同名则覆盖';
     function updateImportTarget() { nameLabel.hidden = !!targetScript.value; }
     targetScript.onchange = updateImportTarget;
     const importRow = solutionElement('div', '', importArea);
@@ -157,7 +157,7 @@ async function openSolutions() {
         convert.onclick = () => action('正在保存代码和训练资料…', async () => {
             if (!select.value) throw new Error('请先在智训中将代码设为最佳脚本');
             const row = await (await solutionRequest('/api/solutions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({script_id:select.value, tenant_id:tenant.value.trim()})})).json();
-            await refresh(); status.textContent = '方案 ' + row.version + ' 已保存，请验收后启用。';
+            await refresh(); status.textContent = '方案已保存并启用，智算将使用当前冻结的代码。';
         });
         if (!data.scripts.length) solutionElement('p', '暂无已保存脚本，请先将需要的代码设为最佳，再转方案。', convertCard).className = 'solutions-muted';
         const versions = solutionElement('section', '', content);
@@ -171,9 +171,7 @@ async function openSolutions() {
             const box = solutionElement('article', '', versions);
             box.className = 'solutions-card';
             solutionElement('h4', row.name, box);
-            solutionElement('p', '版本 ' + row.version, box).className = 'solutions-muted';
-            solutionElement('p', row.is_active ? '已启用：智算可直接选择此版本' : '待验收 / 启用', box);
-            if (row.validation) solutionElement('p', row.validation.error || (row.validation.passed ? '验收通过：结果与训练期望一致' : '验收未通过，请检查训练结果'), box);
+            solutionElement('p', row.is_active ? '已启用：智算可直接选择此版本' : '历史方案', box);
             if (row.validation?.completed) {
                 solutionElement('p', '实测准确率：' + (row.validation.accuracy * 100).toFixed(2) + '%；差异单元格：' + row.validation.total_differences, box);
                 const details = solutionElement('details', '', box);
@@ -188,28 +186,10 @@ async function openSolutions() {
                 b.onclick = () => action('正在' + label + '，请稍候…', fn);
             }
             button('进入修正', () => openSolutionTraining(row));
-            button('验收', async () => {
-                await solutionRequest('/api/solutions/' + row.id + '/validate', {method:'POST'});
-                await refresh(); status.textContent = '验收完成，请查看结果。';
-            });
-            if (!row.is_active && row.validation?.passed) button('启用此版本', async () => {
-                await solutionRequest('/api/solutions/' + row.id + '/publish', {method:'POST'});
-                await refresh(); status.textContent = '已启用，智算将使用此方案冻结的代码。';
-            });
-            if (!row.is_active && row.validation?.completed && !row.validation.passed && !row.validation.formula_warning && !(row.validation.missing_sheets || []).length) {
-                const reason = solutionElement('textarea', '', box);
-                box.insertBefore(reason, actions);
-                reason.placeholder = '如果这些业务差异符合预期，请填写认可原因（保留实测分数）';
-                button('确认接受差异并启用', async () => {
-                    if (!reason.value.trim()) throw new Error('请先查看差异证据并填写认可原因');
-                    await solutionRequest('/api/solutions/' + row.id + '/publish', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({accept_differences:true, reason:reason.value.trim()})});
-                    await refresh(); status.textContent = '已记录差异认可并启用，实测分数保持不变。';
-                });
-            }
             button('导出完整包', async () => {
                 const blob = await (await solutionRequest('/api/solutions/' + row.id + '/export')).blob();
                 const url = URL.createObjectURL(blob), a = document.createElement('a');
-                a.href = url; a.download = 'solution_' + row.version + '.zip'; a.click();
+                a.href = url; a.download = row.name.replace(/[\\/:*?"<>|]+/g, '_') + '.zip'; a.click();
                 setTimeout(() => URL.revokeObjectURL(url), 30000);
                 status.textContent = '完整方案包已导出。';
             });
@@ -230,7 +210,7 @@ async function openSolutions() {
         else form.append('script_name', scriptName.value.trim());
         const row = await (await solutionRequest('/api/solutions/import', {method:'POST', body:form})).json();
         await refresh();
-        status.textContent = '导入完成。请在本环境验收后启用。';
+        status.textContent = '导入完成，已自动启用。';
         await openSolutionTraining(row);
     });
     if (!solutionDialog.open) solutionDialog.showModal();

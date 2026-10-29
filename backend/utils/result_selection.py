@@ -3,6 +3,13 @@ import hashlib
 from pathlib import Path
 
 
+def result_display_name(filename):
+    """Hide internal scheme/hash labels, also for results from older frozen runtimes."""
+    import re
+    name = re.sub(r'\s*·\s*方案\s+[0-9a-f]{12}(?=_|\.)', '', filename, flags=re.I)
+    return re.sub(r'(_\d{14})_[0-9a-f]{8}((?:_原版|_纯值)?\.zip)$', r'\1\2', name, flags=re.I)
+
+
 def pick_result_output(output_files, template_path=None):
     files = sorted({Path(path) for path in output_files}, key=lambda p: p.name.casefold())
     files = [p for p in files if p.is_file() and p.suffix.lower() == '.xlsx'

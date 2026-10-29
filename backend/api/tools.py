@@ -1617,7 +1617,8 @@ def _integrate_execute_impl(session_dir: str, request_data: dict) -> dict:
 
     if request_data.get("output_mode") == 2 and request_data.get("compare_pairs"):
         # apply_integration 已 CalculateFormula + Save；此处读取的就是最终计算缓存值。
-        final_info = _parse_file_full_impl(str(out_path), sheet_name=main_info["sheet"])
+        final_info = _parse_file_full_impl(str(out_path),
+            [main_info['header_start'], main_info['header_end']], sheet_name=main_info["sheet"])
         diff_rows = compute_diffs(
             final_info["df"], source_indexes,
             a_key_col=request_data["key_map"].get(main_file),

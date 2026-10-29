@@ -6,7 +6,6 @@ import tempfile
 import uuid
 import hashlib
 import re
-from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Body
 from fastapi.responses import FileResponse
@@ -18,6 +17,7 @@ from ..auth.dependencies import get_current_user, get_operable_tenants, has_perm
 from .store import ROOT, STORE, artifact, build, tenant_name
 from .package import verify, export_zip, extract_zip
 from .environment import require_environment
+from .lifecycle import activate as activate_row
 
 router = APIRouter(prefix='/api/solutions', tags=['计算方案'])
 
@@ -39,6 +39,11 @@ def describe(row):
     return {'id': row.id, 'name': row.name, 'tenant_id': row.tenant_id, 'digest': row.digest,
             'version': row.digest[:12], 'status': row.status, 'is_active': row.is_active,
             'script_id': row.script_id, 'session_id': row.source_session_id, 'validation': row.validation}
+
+
+def activate(db, row):
+    """The converted/imported snapshot becomes the current scheme for this name."""
+    return describe(activate_row(db, row))
 
 
 def validation_result(data, digest):
@@ -106,7 +111,7 @@ def convert(body: dict = Body(...), db: Session = Depends(get_db), user=Depends(
                     raise ValueError('磁盘脚本与数据库版本不同，请先在智训中保存为最佳脚本后再转换')
                 from .legacy import register_legacy_script
                 script = register_legacy_script(db, ROOT, script.tenant_id, legacy_id, user.id)
-        return describe(build(db, script, user.id))
+        return activate(db, build(db, script, user.id))
     except ValueError as exc:
         db.rollback()
         raise HTTPException(422, str(exc)) from exc
@@ -139,22 +144,11 @@ def validate(identity: str, db: Session = Depends(get_db), user=Depends(get_curr
 @router.post('/{identity}/publish')
 def publish(identity: str, db: Session = Depends(get_db), user=Depends(get_current_user), tenants=Depends(get_operable_tenants), body: dict = Body(None)):
     row = get_row(db, identity, tenants, user)
-    result = row.validation or {}
-    body = body if isinstance(body, dict) else {}
-    accepted = (body.get('accept_differences') is True and bool(str(body.get('reason') or '').strip())
-                and result.get('completed') and not result.get('formula_warning') and not result.get('missing_sheets'))
-    if (not result.get('passed') and not accepted) or result.get('digest') != row.digest:
-        raise HTTPException(409, '请先完成本环境验收，结果与训练期望完全一致后再启用')
     try:
         require_environment(verify(artifact(row.digest))['environment'], ROOT)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
-    # Existing versions remain selectable. Aliases resolve the newest published version.
-    row.status, row.is_active = 'published', True
-    row.validation = {**result, 'accepted_by': user.id, 'accepted_at': datetime.now(timezone.utc).isoformat(),
-                      'accepted_differences': bool(accepted and not result.get('passed')), 'acceptance_reason': body.get('reason')}
-    db.commit()
-    return describe(row)
+    return activate(db, row)
 
 
 @router.get('/{identity}/export')
@@ -257,12 +251,14 @@ async def import_package(file: UploadFile = File(...), tenant_id: str = Form(...
             # Import stores the package without executing any of its Python.
             name = target.name if target else new_name or manifest['name']
             matching = db.query(Script).filter_by(tenant_id=tenant, name=name).all() if target is None else [target]
+            if target is None and matching:
+                target = max(matching, key=lambda script: (bool(script.is_active), script.version or 0, script.id))
             existing = (db.query(CalculationSolution).filter_by(tenant_id=tenant, digest=manifest['digest'])
-                        .filter(CalculationSolution.script_id.in_([s.id for s in matching])).first())
-            if existing and existing.source_session_id and db.get(TrainingSession, existing.source_session_id):
-                return describe(existing)
-            if target is None and matching and not existing:
-                raise ValueError('脚本名称已存在，请选择该脚本导入，或使用新的脚本名称')
+                        .filter(CalculationSolution.script_id.in_([target.id] if target else [])).first())
+            if (existing and existing.source_session_id and db.get(TrainingSession, existing.source_session_id)
+                    and target.code == (temp / 'package/business/script.py').read_bytes().decode('utf-8')
+                    and target.source_session_id == existing.source_session_id):
+                return activate(db, existing)
             if existing and target is None:
                 target = db.get(Script, existing.script_id)
             destination = artifact(manifest['digest'])
@@ -284,8 +280,8 @@ async def import_package(file: UploadFile = File(...), tenant_id: str = Form(...
             row.source_session_id = script.source_session_id
             row.name = script.name
             db.add(row)
-            db.commit()
-            return describe(row)
+            db.flush()
+            return activate(db, row)
         except Exception as exc:
             db.rollback()
             if restored:

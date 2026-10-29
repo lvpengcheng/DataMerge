@@ -122,6 +122,13 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],  # 允许所有HTTP方法
     allow_headers=["*"],  # 允许所有HTTP头
+    # 前端（独立域/端口）需要读取统计类自定义响应头：X-Split-* / X-Merge-* / X-Integrate-*
+    expose_headers=[
+        "X-Split-Groups", "X-Split-Rows", "X-Split-Errors",
+        "X-Merge-Conflicts", "X-Merge-Rows",
+        "X-Integrate-Added", "X-Integrate-Matched", "X-Integrate-Cells", "X-Integrate-Diffs",
+        "Content-Disposition",
+    ],
 )
 
 # 注册认证和管理路由
@@ -1499,11 +1506,8 @@ async def download_script(
         if not script_file.exists():
             raise HTTPException(status_code=404, detail=f"脚本文件不存在: {script_id}")
 
-        return FileResponse(
-            str(script_file),
-            filename=f"{script_id}.py",
-            media_type="text/x-python"
-        )
+        from backend.utils.multi_workbook import script_download_response
+        return script_download_response(script_file.read_text(encoding='utf-8'), f'{script_id}.py')
 
     except HTTPException:
         raise
@@ -6184,6 +6188,8 @@ async def compute_submit(
 
         # 在宿主进程固定选择时的显示名，确认重试和隔离计算都沿用，避免在 worker 内反查数据库。
         script_display_name = (script_display_name.strip() if isinstance(script_display_name, str) else '')
+        if frozen:
+            script_display_name = frozen.get('name') or _resolve_script_display_name(tenant_id, str(frozen['script_id']), script_content)
         if not script_display_name:
             script_display_name = _resolve_script_display_name(
                 tenant_id, str(frozen['script_id']) if frozen else script_id, script_content)
@@ -7700,9 +7706,10 @@ async def download_compute_result(tenant_id: str, filename: str):
         if not file_path.exists():
             raise HTTPException(status_code=404, detail="文件不存在")
 
+        from backend.utils.result_selection import result_display_name
         return FileResponse(
             path=str(file_path),
-            filename=filename,
+            filename=result_display_name(filename),
             media_type=('application/zip' if file_path.suffix.lower() == '.zip' else
                         'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
         )
@@ -7858,11 +7865,8 @@ async def download_script_by_tenant(tenant_id: str):
         if not script_file.exists():
             raise HTTPException(status_code=404, detail=f"脚本文件不存在: {script_id}")
 
-        return FileResponse(
-            str(script_file),
-            filename=f"{tenant_id}_{script_id}.py",
-            media_type="text/x-python"
-        )
+        from backend.utils.multi_workbook import script_download_response
+        return script_download_response(script_file.read_text(encoding='utf-8'), f'{tenant_id}_{script_id}.py')
     except HTTPException:
         raise
     except Exception as e:
@@ -8183,6 +8187,8 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
             db.query(CalculationSolution).filter_by(tenant_id=tenant_id)
             .order_by(CalculationSolution.created_at.desc()).all())
         if versions:
+            frozen_names = {item['name'] for item in versions}
+            scripts = [item for item in scripts if item.get('name') not in frozen_names]
             for item in scripts:
                 item['is_active'] = False
             active_script_id = versions[0]['script_id']

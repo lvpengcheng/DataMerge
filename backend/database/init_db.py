@@ -158,7 +158,7 @@ def _migrate_add_columns():
     """安全地为已有表添加新列（列已存在时跳过）"""
     from sqlalchemy import text, inspect
     _migrate_sop_rule_versions()
-    from backend.solutions.migration import migrate_script_scope
+    from backend.solutions.migration import migrate_script_scope, activate_pending_solutions
     migrate_script_scope(engine)
     insp = inspect(engine)
 
@@ -288,6 +288,8 @@ def _migrate_add_columns():
         db.commit()
     finally:
         db.close()
+
+    activate_pending_solutions(engine)
 
 
 def seed_roles(db):

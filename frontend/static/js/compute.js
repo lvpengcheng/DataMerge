@@ -1501,24 +1501,7 @@ async function loadTenantScripts(tenantId) {
         const data = await resp.json();
         if (loadId !== _tenantScriptsLoadId) return;
         if (!data.scripts || data.scripts.length === 0) {
-            if ((data.pending_solutions || []).length) {
-                group.style.display = 'block';
-                const option = document.createElement('option');
-                option.value = '';
-                option.textContent = '已导入，待验收启用';
-                selector.appendChild(option);
-                const names = data.pending_solutions.map(s => s.name).join('、');
-                info.textContent = `已保存方案：${names}。请到智训页面的「计算方案」完成验收并启用，再返回刷新版本列表。`;
-                const link = document.createElement('a');
-                link.href = '/training';
-                link.target = '_blank';
-                link.rel = 'noopener';
-                link.textContent = ' 前往智训';
-                info.appendChild(link);
-                addLog('warning', '该租户已有导入方案，尚未验收启用，暂不能用于智算');
-            } else {
-                addLog('warning', '该租户没有可用的训练脚本');
-            }
+            addLog('warning', '该租户没有可用的训练脚本');
             return;
         }
         selector.disabled = false;
@@ -2243,7 +2226,7 @@ function showResult(data) {
             </div>
             <div class="result-item">
                 <div class="label">输出文件</div>
-                <div class="value">${files.length ? files.map(f => `${_label(f)}：${f}`).join('<br>') : 'N/A'}</div>
+                <div class="value">${files.length ? files.map(f => `${_label(f)}：${resultDisplayName(f)}`).join('<br>') : 'N/A'}</div>
             </div>
             <div class="result-item">
                 <div class="label">处理行数</div>
@@ -2324,6 +2307,11 @@ function fullReset() {
 }
 
 // ==================== 下载 ====================
+
+function resultDisplayName(filename) {
+    return filename.replace(/\s*·\s*方案\s+[0-9a-f]{12}(?=_|\.)/gi, '')
+        .replace(/(_\d{14})_[0-9a-f]{8}((?:_原版|_纯值)?\.zip)$/i, '$1$2');
+}
 
 async function downloadResult(filename) {
     if (!filename) {

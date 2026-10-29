@@ -3,6 +3,36 @@ from sqlalchemy import inspect
 from sqlalchemy.schema import CreateTable, CreateIndex
 
 
+def activate_pending_solutions(engine):
+    """Upgrade the latest old candidate per tenant/name to the automatic policy."""
+    if 'calculation_solutions' not in inspect(engine).get_table_names():
+        return
+    from sqlalchemy.orm import Session
+    from ..database.models import CalculationSolution, Script
+    from .store import artifact
+    from .package import verify
+    from .lifecycle import activate
+    with Session(engine) as db:
+        rows = db.query(CalculationSolution).order_by(
+            CalculationSolution.created_at.desc(), CalculationSolution.id.desc()).all()
+        seen = set()
+        for row in rows:
+            key = (row.tenant_id, row.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            # A newer disabled published version remains disabled.
+            if row.status != 'candidate':
+                continue
+            if not db.query(Script).filter_by(id=row.script_id, tenant_id=row.tenant_id).first():
+                continue
+            try:
+                verify(artifact(row.digest))
+            except (OSError, ValueError):
+                continue
+            activate(db, row)
+
+
 def migrate_script_scope(engine):
     inspector = inspect(engine)
     if 'calculation_solutions' not in inspector.get_table_names():

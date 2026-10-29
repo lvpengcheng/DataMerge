@@ -87,3 +87,59 @@ def repair_compute_startup(package, destination):
     finally:
         if stage.exists():
             shutil.rmtree(stage)
+
+
+def repair_template_names(package, destination):
+    """Create a new version with named templates; never alter business/runtime code."""
+    import hashlib
+    import re
+    from .package import safe_name
+    from ..utils.multi_workbook import script_targets, template_reference_code
+    from ..utils.template_resolver import extract_template_ref, portable_basename
+    package, destination = Path(package), Path(destination)
+    original = verify(package)
+    code = (package / 'business/script.py').read_bytes().decode('utf-8')
+    replacements, copies = {}, {}
+    for source in [code, *(t['code'] for t in script_targets(code).values())]:
+        key = hashlib.sha256(source.encode()).hexdigest()
+        relative = (original.get('templates') or {}).get(key)
+        if not relative or not re.fullmatch(r'[0-9a-f]{64}', Path(relative).stem):
+            continue
+        name, _, baked = extract_template_ref(source)
+        filename = portable_basename(name or baked or '')
+        if not filename or filename == Path(relative).name:
+            continue
+        safe_name(filename)
+        target = 'assets/templates/' + key + '/' + filename
+        # Include aliases used by the visible single-file multi-workbook format.
+        reference_key = hashlib.sha256(template_reference_code(source).encode()).hexdigest()
+        for alias in (key, reference_key):
+            if alias in original['templates']:
+                replacements[alias] = target
+        copies[target] = relative
+    if not replacements:
+        return package, original
+    destination.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix='.repair-', dir=destination))
+    try:
+        shutil.copytree(package, stage, dirs_exist_ok=True)
+        for target, source in copies.items():
+            file = stage / target
+            file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(package / source, file)
+        metadata = {k: v for k, v in original.items() if k not in ('files', 'digest', 'format_version')}
+        metadata['templates'] = {**original['templates'], **replacements}
+        metadata['template_name_repair'] = {
+            'parent_digest': original['digest'], 'created_at': datetime.now(timezone.utc).isoformat(),
+        }
+        manifest = seal(stage, metadata)
+        target = destination / manifest['digest']
+        if target.exists():
+            verify(target)
+        else:
+            os.replace(stage, target)
+        verify(package)
+        return target, verify(target)
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage)
