@@ -76,19 +76,44 @@ def listing(tenant_id: str, db: Session = Depends(get_db), user=Depends(get_curr
     allowed(tenant_id, tenants, user)
     tenant_name(tenant_id)
     rows = db.query(Script).filter_by(tenant_id=tenant_id).all()
+    solutions = db.query(CalculationSolution).filter_by(tenant_id=tenant_id).order_by(CalculationSolution.created_at.desc()).all()
     scripts = [{'id': r.id, 'name': r.name, 'session_id': r.source_session_id} for r in rows]
+    represented = {r.name for r in rows}
+    # A scheme remains usable after its editable session/script is deleted.
+    # Offer its snapshot explicitly; restoration occurs only on the user's action.
+    for row in sorted(solutions, key=lambda r: not r.is_active):
+        if row.name in represented:
+            continue
+        if not (artifact(row.digest) / 'archive/records.json').is_file():
+            continue
+        scripts.append({'id': 'solution_'+row.id, 'name': row.name, 'session_id':row.source_session_id,
+                        'needs_restore':True,'solution_id':row.id,'bound_script_id':row.script_id})
+        represented.add(row.name)
     hashes = {'script_' + hashlib.md5(r.code.encode()).hexdigest()[:12] for r in rows}
     for file in (ROOT / 'tenants' / tenant_id / 'scripts').glob('script_*.py'):
         if re.fullmatch(r'script_[0-9a-f]{12}', file.stem) and file.stem not in hashes:
             scripts.append({'id': file.stem, 'name': file.stem + '（旧脚本）', 'session_id': None})
-    return {'solutions': [describe(r) for r in db.query(CalculationSolution).filter_by(tenant_id=tenant_id)
-                          .order_by(CalculationSolution.created_at.desc()).all()],
+    return {'solutions': [describe(r) for r in solutions],
             'scripts': scripts}
 
 
 @router.post('')
 def convert(body: dict = Body(...), db: Session = Depends(get_db), user=Depends(get_current_user), tenants=Depends(get_operable_tenants)):
     identifier = str(body.get('script_id') or '')
+    recovered = None
+    if identifier.startswith('solution_'):
+        row=get_row(db, identifier[9:], tenants, user)
+        if body.get('tenant_id') and body['tenant_id'] != row.tenant_id:
+            raise HTTPException(403, '方案不属于所选租户')
+        try:
+            from .restore import restore_solution_script
+            script,recovered=restore_solution_script(db,row,user.id)
+            return activate(db,build(db,script,user.id))
+        except Exception as exc:
+            db.rollback()
+            if recovered:
+                shutil.rmtree(recovered,ignore_errors=True)
+            raise HTTPException(422, '恢复方案脚本失败：'+str(exc)) from exc
     script = db.query(Script).filter_by(id=int(identifier)).first() if identifier.isdigit() else None
     if re.fullmatch(r'script_[0-9a-f]{12}', identifier):
         tenant = tenant_name(body.get('tenant_id'))
@@ -171,19 +196,26 @@ async def training_workspace(identity: str, db: Session = Depends(get_db),
     row = get_row(db, identity, tenants, user)
     if row.source_session_id:
         session = db.get(TrainingSession, row.source_session_id)
-        if session and session.tenant_id == row.tenant_id:
+        script = db.query(Script).filter_by(id=row.script_id,tenant_id=row.tenant_id).first()
+        if session and session.tenant_id == row.tenant_id and script:
             return describe(row)
     destination = artifact(row.digest)
     restored = None
     try:
         await asyncio.to_thread(verify, destination)
         from .restore import restore, prepare
-        restored = await asyncio.to_thread(prepare, destination, row.tenant_id)
         target = db.query(Script).filter_by(id=row.script_id, tenant_id=row.tenant_id).first()
+        if target is None:
+            from .restore import restore_solution_script
+            script,restored=restore_solution_script(db,row,user.id)
+            db.commit()
+            return describe(row)
+        restored = await asyncio.to_thread(prepare, destination, row.tenant_id)
         script, restored = restore(db, destination, row.tenant_id, user.id, prepared=restored,
                                    target_script=target, script_name=row.name)
         row.source_session_id = script.source_session_id
         row.script_id = script.id
+        script.is_active = row.is_active
         db.commit()
         return describe(row)
     except Exception as exc:
@@ -208,12 +240,19 @@ async def import_package(file: UploadFile = File(...), tenant_id: str = Form(...
     identifier = str(script_id).strip() if isinstance(script_id, (str, int)) else ''
     target_id = int(identifier) if identifier.isdigit() else None
     legacy_id = identifier if re.fullmatch(r'script_[0-9a-f]{12}', identifier) else None
-    if identifier and target_id is None and legacy_id is None:
+    solution_id = identifier[9:] if re.fullmatch(r'solution_[0-9a-f]{32}', identifier) else None
+    if identifier and target_id is None and legacy_id is None and solution_id is None:
         raise HTTPException(422, '目标脚本标识无效')
     new_name = script_name.strip() if isinstance(script_name, str) else ''
     if len(new_name) > 200:
         raise HTTPException(422, '脚本名称不能超过 200 个字符')
     target = None
+    import_solution = None
+    if solution_id:
+        import_solution = db.query(CalculationSolution).filter_by(id=solution_id, tenant_id=tenant).first()
+        if not import_solution:
+            raise HTTPException(404, '目标方案不存在或不属于所选租户')
+        target = db.query(Script).filter_by(id=import_solution.script_id, tenant_id=tenant).first()
     if target_id is not None:
         target = db.query(Script).filter_by(id=target_id, tenant_id=tenant).first()
         if not target:
@@ -249,18 +288,29 @@ async def import_package(file: UploadFile = File(...), tenant_id: str = Form(...
                                if (s.config or {}).get('solution_import_legacy_id') == legacy_id), None)
                 target = target or register_legacy_script(db, ROOT, tenant, legacy_id, user.id)
             # Import stores the package without executing any of its Python.
-            name = target.name if target else new_name or manifest['name']
+            name = target.name if target else import_solution.name if import_solution else new_name or manifest['name']
+            named_solutions = (db.query(CalculationSolution).filter_by(tenant_id=tenant, name=name)
+                               .order_by(CalculationSolution.is_active.desc(),
+                                         CalculationSolution.created_at.desc(), CalculationSolution.id.desc()).all())
+            # Re-import updates the tenant-local binding; immutable packages and
+            # past training sessions remain available to historical calculations.
+            existing = next((row for row in named_solutions if row.digest == manifest['digest']),
+                            named_solutions[0] if named_solutions else None)
             matching = db.query(Script).filter_by(tenant_id=tenant, name=name).all() if target is None else [target]
             if target is None and matching:
-                target = max(matching, key=lambda script: (bool(script.is_active), script.version or 0, script.id))
-            existing = (db.query(CalculationSolution).filter_by(tenant_id=tenant, digest=manifest['digest'])
-                        .filter(CalculationSolution.script_id.in_([target.id] if target else [])).first())
-            if (existing and existing.source_session_id and db.get(TrainingSession, existing.source_session_id)
+                target = next((script for script in matching if existing and script.id == existing.script_id), None)
+                target = target or max(matching, key=lambda script: (bool(script.is_active), script.version or 0, script.id))
+            if existing is None and target is not None:
+                # A script may have been renamed since its package was saved.
+                existing = db.query(CalculationSolution).filter_by(
+                    tenant_id=tenant, script_id=target.id, digest=manifest['digest']).first()
+            if (existing and existing.digest == manifest['digest'] and target
+                    and existing.name == name
+                    and existing.script_id == target.id
+                    and existing.source_session_id and db.get(TrainingSession, existing.source_session_id)
                     and target.code == (temp / 'package/business/script.py').read_bytes().decode('utf-8')
                     and target.source_session_id == existing.source_session_id):
                 return activate(db, existing)
-            if existing and target is None:
-                target = db.get(Script, existing.script_id)
             destination = artifact(manifest['digest'])
             if destination.exists():
                 verify(destination)
@@ -276,6 +326,10 @@ async def import_package(file: UploadFile = File(...), tenant_id: str = Form(...
                 db.add(TenantAuthorization(tenant_id=tenant, org_id=user.org_id, granted_by=user.id))
             row = existing or CalculationSolution(id=uuid.uuid4().hex, tenant_id=tenant,
                                                   digest=manifest['digest'], created_by=user.id)
+            if row.digest != manifest['digest']:
+                # Validation belongs to an exact package, never to its name.
+                row.validation = None
+            row.digest = manifest['digest']
             row.script_id = script.id
             row.source_session_id = script.source_session_id
             row.name = script.name

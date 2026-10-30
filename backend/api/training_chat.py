@@ -1190,8 +1190,9 @@ def list_chat_sessions(
     return {"sessions": result}
 
 
-def _serialize_iterations(iterations):
+def _serialize_iterations(iterations, session_root=None):
     """迭代记录 → dict 列表（含完整代码，供前端折叠代码摘要用）"""
+    from ..utils.training_outputs import iteration_files
     return [
         {
             "iteration_num": it.iteration_num,
@@ -1200,6 +1201,8 @@ def _serialize_iterations(iterations):
             "generated_code": it.generated_code,
             "ai_response": (it.ai_response or "")[:2000],
             "execution_result": it.execution_result,
+            "files": ({key: bool(value) for key,value in iteration_files(session_root,it.iteration_num).items()}
+                      if session_root is not None else {}),
             "error_details": it.error_details,
             "created_at": it.started_at.isoformat() if it.started_at else None,
         }
@@ -1324,7 +1327,7 @@ def get_session_messages(
             }
             for m in page_messages
         ],
-        "iterations": _serialize_iterations(iterations),
+        "iterations": _serialize_iterations(iterations, _session_asset_root(session)),
         "has_more": has_more,
         "page_start_id": page_start_id,
     }
@@ -3867,31 +3870,12 @@ def download_iteration_file(
 
     # 支持按迭代号下载（不指定则使用最新文件）
     files = {}
-    if iteration:
-        try:
-            from ..storage.storage_manager import StorageManager
-            sm = StorageManager()
-            td = sm.get_tenant_dir(session.tenant_id)
-            iter_dir = td / "training_chat" / str(session_id) / f"iter_{iteration}"
-            if iter_dir.exists():
-                for f in iter_dir.iterdir():
-                    if f.name == "script.py":
-                        files["script_file"] = str(f)
-                    elif f.name == "交付结果.zip":
-                        files["output_file"] = str(f)
-                    elif f.name == "差异对比.zip":
-                        files["diff_file"] = str(f)
-                    elif ("diff" in f.name.lower() or "差异对比" in f.name) and f.suffix in (".xlsx", ".xls"):
-                        files["diff_file"] = str(f)
-                    elif f.suffix in (".xlsx", ".xls") and not f.name.startswith("~"):
-                        files.setdefault("output_file", str(f))
-                # The package wins regardless of directory iteration order.
-                for key, name in (("output_file", "交付结果.zip"), ("diff_file", "差异对比.zip")):
-                    if (iter_dir / name).is_file():
-                        files[key] = str(iter_dir / name)
-        except Exception:
-            pass
-    if not files:
+    if iteration is not None:
+        if iteration < 1:
+            raise HTTPException(400,detail='迭代号无效')
+        from ..utils.training_outputs import iteration_files
+        files=iteration_files(_session_asset_root(session),iteration)
+    else:
         files = config.get("latest_files", {})
 
     # 统一文件名: {租户}_{脚本名}_{时间戳}.{ext}
@@ -3921,7 +3905,7 @@ def download_iteration_file(
         raise HTTPException(status_code=400, detail=f"未知文件类型: {file_type}")
 
     if not file_path or not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail=f"文件不存在: {file_type}")
+        raise HTTPException(status_code=404, detail='该轮未生成或未保留此类文件' if iteration is not None else f"文件不存在: {file_type}")
 
     if Path(file_path).suffix.lower() == ".zip":
         media_type = "application/zip"
@@ -3996,7 +3980,9 @@ def delete_session(
     for s in scripts:
         script_ids.add(s.id)
     if session.final_script_id and session.final_script_id not in script_ids:
-        fs = db.query(Script).filter(Script.id == session.final_script_id).first()
+        fs = db.query(Script).filter(Script.id == session.final_script_id,
+            Script.tenant_id == tenant_id,
+            (Script.source_session_id == session_id) | Script.source_session_id.is_(None)).first()
         if fs:
             scripts.append(fs)
             script_ids.add(fs.id)

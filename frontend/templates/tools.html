@@ -213,7 +213,7 @@
                     </div>
                     <div class="desc">
                         导入多张 Excel，或解析同一 Excel 内的多张可见 Sheet（一张作为主表/模板），把对照表选定列的<strong>值</strong>按关联键回填到主表对应列（覆盖），
-                        可选对比选定列生成差异。输出保留主表整个工作簿（其他 sheet、未涉及列的公式原样保留），仅变更激活页的覆盖列。
+                        每个目标 Sheet 独立设置来源、关联键和公式，可生成一个 Excel 的多个 Sheet 或多个 Excel，保留模板其他 Sheet、格式及未覆盖的公式。
                     </div>
                     <div id="int-apply-reasons" style="display:none;margin:10px 0;padding:10px 12px;background:#fdecec;border:1px solid #f5b5b5;border-radius:6px;color:#a3271f;"></div>
                     <div class="upload-zone" id="integrate-upload-zone">
@@ -481,10 +481,11 @@
         </div>
     </div>
 
-    <script src="/static/js/auth.js?v=20260722a"></script>
-    <script src="/static/js/tools.js?v=20261023-apply-heartbeat"></script>
+    <script src="/static/js/auth.js?v=20261029-utc-display"></script>
+    <script src="/static/js/tools.js?v=20261029-utc-display"></script>
     <script src="/static/js/sheet_selection.js?v=20261020a"></script>
     <script src="/static/js/data_scope.js?v=20261020a"></script>
-    <script src="/static/js/table_split.js?v=20261020-data-scope"></script>
+    <script src="/static/js/table_split.js?v=20261029-target-sheets"></script>
+    <script src="/static/js/integrate_tasks.js?v=20261029-key-scope"></script>
 </body>
 </html>

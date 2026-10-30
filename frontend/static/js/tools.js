@@ -249,7 +249,7 @@ const Tools = {
     // ==================== 多表数据合并 ====================
     async _intFetch(url, options) {
         if (this._integrationKind === 'split') url = url.replace('/api/tools/integrate/', '/api/tools/table-split/');
-        const heartbeat = /\/(?:reparse-headers|apply-validate|execute)$/.test(url);
+        const heartbeat = /\/(?:reparse-headers|apply-validate|execute|generate-formula)$/.test(url);
         if (heartbeat) url += '?stream=true';
         const response = await AUTH.authFetch(url, options);
         if (!heartbeat || !response.ok || !(response.headers.get('Content-Type') || '').includes('application/json')) return response;
@@ -359,7 +359,7 @@ const Tools = {
         const canDelPerm = AUTH.hasPerm(this._intPerm('delete'));
         tbody.innerHTML = pageItems.map(s => {
             // 最后修改时间：有 updated_at 用之，否则回退创建时间
-            const t = ((s.updated_at || s.created_at) || '').replace('T', ' ').slice(0, 19);
+            const t = AUTH.formatDateTime(s.updated_at || s.created_at);
             const btns = [];
             if (canApply) btns.push(`<button class="btn btn-sm btn-primary int-row-apply" data-id="${s.id}">应用</button>`);
             btns.push(`<button class="btn btn-sm int-row-export" data-id="${s.id}">导出</button>`);
@@ -516,7 +516,7 @@ const Tools = {
             _integrateFiles.splice(parseInt(e.target.dataset.i, 10), 1);
             this._renderIntegrateList();
         }));
-        const allSheets = !!document.getElementById('int-parse-all-sheets')?.checked;
+        const allSheets = !!document.getElementById('int-parse-all-sheets')?.checked || this._intTargetSchemeId() != null;
         document.getElementById('btn-integrate-analyze').disabled = (allSheets || this._integrationKind === 'split')
             ? (_integrateFiles.length < 1) : (_integrateFiles.length < 2);
     },
@@ -529,7 +529,7 @@ const Tools = {
 
     async _analyzeIntegrate() {
         const parseAllSheets = !!document.getElementById('int-parse-all-sheets')?.checked;
-        if ((this._integrationKind !== 'split' && !parseAllSheets && _integrateFiles.length < 2) || _integrateFiles.length < 1) {
+        if ((this._integrationKind !== 'split' && !parseAllSheets && this._intTargetSchemeId() == null && _integrateFiles.length < 2) || _integrateFiles.length < 1) {
             this._setIntegrateStatus(parseAllSheets ? '请至少上传 1 个文件' : '请至少上传 2 个文件', 'error');
             return;
         }
@@ -558,7 +558,7 @@ const Tools = {
                 _integrateAnalysis = null;
                 return;
             }
-            if (parseAllSheets) {
+            if ((parseAllSheets || _integrateAnalysis.parse_all_sheets) && _integrateAnalysis.sheet_selection_pending !== false) {
                 const selected = await this._intChooseSheets(_integrateAnalysis);
                 if (!selected) {
                     _integrateAnalysis = null;
@@ -793,8 +793,11 @@ const Tools = {
         } catch (e) {
             this._setIntegrateStatus('应用失败: ' + e.message, 'error');
         } finally {
-            if (btn) btn.disabled = false;
-            if (execBtn) execBtn.disabled = !_intApplyReady;
+            // Loading target tabs may rebuild these controls; update the live DOM.
+            const currentConfirm = document.getElementById('int-apply-confirm');
+            const currentExecute = document.getElementById('int-execute');
+            if (currentConfirm) currentConfirm.disabled = false;
+            if (currentExecute) currentExecute.disabled = !_intApplyReady;
         }
     },
 
@@ -1057,10 +1060,15 @@ const Tools = {
             source_file: (p.source_role != null && roleFiles[p.source_role])
                 ? roleFiles[p.source_role] : f2f[p.source_fp],
             expr: p.source_expr || p.source_col,
+            formula_description: p.formula_description || '',
+            formula_expected_result: p.formula_expected_result || '',
+            formula_exact: !!p.formula_exact,
         })).filter(p => p.source_file);
         const applyPairs = (pairs, kind) => {
             const byA = {};
-            trans(pairs).forEach(p => { (byA[p.a_col] = byA[p.a_col] || []).push({ file: p.source_file, expr: p.expr }); });
+            trans(pairs).forEach(p => { (byA[p.a_col] = byA[p.a_col] || []).push({ file: p.source_file, expr: p.expr,
+                formula_description:p.formula_description, formula_expected_result:p.formula_expected_result,
+                formula_exact:p.formula_exact }); });
             Object.entries(byA).forEach(([a, srcs]) => {
                 const cb = document.querySelector(`.int-${kind}-pick[data-col="${CSS.escape(a)}"]`);
                 if (cb) cb.checked = true;
@@ -1193,6 +1201,9 @@ const Tools = {
         const tr = document.createElement('tr');
         tr.dataset.aCol = col;
         tr.dataset.src = JSON.stringify(presetSources || []);
+        tr.dataset.formulaDescription = presetSources?.[0]?.formula_description || '';
+        tr.dataset.formulaExpectedResult = presetSources?.[0]?.formula_expected_result || '';
+        tr.dataset.formulaExact = presetSources?.[0]?.formula_exact ? 'true' : 'false';
         tr.innerHTML = `
             <td>${_escape(col)}</td>
             <td class="int-src-cell" style="cursor:pointer;min-width:240px;"></td>
@@ -1259,7 +1270,6 @@ const Tools = {
         const cols = [];
         (this._intColsOf(file) || []).forEach(c => { if (c) cols.push(c); });
         this._intFiles().forEach(f => {
-            if (f.name === file) return;
             (f.columns || []).forEach(c => { if (c) cols.push(`${f.name}.${c}`); });
         });
         return cols.slice().sort((a, b) => b.length - a.length);
@@ -1341,6 +1351,7 @@ const Tools = {
         if (!main || !defaultFile) return;
         ['ow', 'cmp'].forEach(kind => {
             document.querySelectorAll(`#int-${kind}-list-rows tr`).forEach(tr => {
+                if (tr.dataset.formulaExact === 'true') return;
                 let picks = [];
                 try { picks = JSON.parse(tr.dataset.src || '[]'); } catch (_) {}
                 if (picks.length !== 1) return;
@@ -1380,24 +1391,40 @@ const Tools = {
     _intOpenSrcPicker(kind, tr) {
         let selected = [];
         try { selected = JSON.parse(tr.dataset.src || '[]'); } catch (_) {}
-        const includeMain = !!document.getElementById('int-union-source-keys')?.checked;
+        const includeMain = !!document.getElementById('int-union-source-keys')?.checked ||
+            (this._integrationKind === 'split' && !this._intNonMainFiles().length);
         const files = includeMain ? this._intFiles() : this._intNonMainFiles();
         const main = this._intMainFile();
         const file = files[0]?.name || '';
         const defaultFile = this._intNonMainFiles()[0]?.name || file;
         // 旧多来源是“首个非空”回退，不能默默转换成相加。
         const preset = selected.length === 1 ? this._intUnifiedExpr(selected[0]) : '';
+        let generated = false;
+        const normalizedToken = token => token.startsWith(defaultFile + '.') ? token.slice(defaultFile.length + 1) : token;
         const body = `
-            <p style="font-size:12px;color:#888;">勾选各表字段，在下方公式框中设置跨表计算。${includeMain ? '捏合模式会自动保留并加入模板目标列原值；' : ''}默认以 + 连接；文本请用 &amp; 拼接，例如：姓名 &amp; " / " &amp; 部门。文本取同一主键首个非空值，数值运算仍跨行求和。</p>
+            <p style="font-size:12px;color:#888;">勾选各表字段，在下方公式框中设置跨表计算。${includeMain ? '可引用模板原值；' : ''}默认以 + 连接；文本请用 &amp; 拼接，例如：姓名 &amp; " / " &amp; 部门。文本取同一主键首个非空值，数值运算仍跨行求和。</p>
             ${selected.length > 1 ? '<p style="color:#b36b00;">旧方案含多个优先级来源，请重新选择字段并确认联合公式；取消将保留旧方案。</p>' : ''}
             ${files.map(f => `<div style="margin-bottom:12px;">
                 <strong>${f.name === main ? '[模板原值] ' : ''}${_escape(f.name)}</strong>
                 <div style="display:flex;flex-wrap:wrap;gap:4px 14px;">
                 ${(f.columns || []).map(c => {
                     const token = f.name === defaultFile ? c : f.name + '.' + c;
-                    const checked = this._intTokenize(preset, defaultFile).some(t => t.t === 'col' && t.v === token);
+                    const checked = this._intTokenize(preset, defaultFile).some(t => t.t === 'col' && normalizedToken(t.v) === token);
                     return `<label><input type="checkbox" class="int-srcpick-cb" data-token="${_escape(token)}" ${checked ? 'checked' : ''} style="width:auto;"> ${_escape(c)}</label>`;
                 }).join('')}</div></div>`).join('')}
+            <details id="int-formula-ai-panel" style="margin:12px 0;padding:12px;background:#f4f8ff;border:1px solid #dce8f8;border-radius:6px;">
+                <summary style="cursor:pointer;font-weight:600;">AI 公式描述与生成${tr.dataset.formulaDescription ? '（已保存描述）' : ''}</summary>
+                <div style="margin-top:12px;">
+                <label for="int-formula-description">公式描述：</label>
+                <textarea id="int-formula-description" rows="10" maxlength="20000" style="width:100%;min-height:240px;box-sizing:border-box;margin:6px 0;resize:vertical;" placeholder="可分段描述业务规则（最多20000字）：&#10;1. 哪个文件、哪个Sheet的哪个字段用于判断；&#10;2. 条件满足时取哪张表的哪一列；&#10;3. 多个来源的优先级，员工不存在和字段为空时分别如何处理；&#10;4. 不满足条件或全部未匹配时的处理。">${_escape(tr.dataset.formulaDescription || '')}</textarea>
+                <div id="int-formula-description-count" style="text-align:right;font-size:12px;color:#777;"></div>
+                <label for="int-formula-expected-result">预期结果 / 核对示例（选填）：</label>
+                <textarea id="int-formula-expected-result" rows="3" maxlength="8000" style="width:100%;min-height:84px;box-sizing:border-box;margin:6px 0;resize:vertical;" placeholder="例如：有转移标记且两张工资表都有此员工时，应取银行卡表；上月两张工资表均没有此员工时，取花名册在职Sheet。也可以填写金额核对示例。">${_escape(tr.dataset.formulaExpectedResult || '')}</textarea>
+                <button type="button" class="btn btn-sm btn-primary" id="int-generate-formula">生成公式</button>
+                <span id="int-formula-generation-status" role="status" aria-live="polite" style="font-size:12px;margin-left:8px;"></span>
+                <div style="font-size:12px;color:#777;margin-top:6px;">AI会结合各表文件名、Sheet名、多层表头、关联键、数据类型摘要、当前公式及预期结果生成，并按内置规则校验。生成后可继续修改，点击确定才应用。</div>
+                </div>
+            </details>
             <label for="int-unified-fx">联合公式：</label>
             <textarea id="int-unified-fx" rows="5" style="width:100%;box-sizing:border-box;resize:vertical;">${_escape(preset)}</textarea>
             <div id="int-unified-error" style="color:#d32f2f;font-size:12px;"></div>`;
@@ -1407,24 +1434,75 @@ const Tools = {
             if (expr && !chk.ok) { alert('公式无法识别：' + chk.rest); return; }
             if (!expr && selected.length > 1) { alert('请确认新的联合公式，或取消保留旧方案'); return; }
             tr.dataset.src = JSON.stringify(expr ? [{file: defaultFile, expr}] : []);
+            tr.dataset.formulaDescription = document.getElementById('int-formula-description').value.trim();
+            tr.dataset.formulaExpectedResult = document.getElementById('int-formula-expected-result').value.trim();
+            tr.dataset.formulaExact = generated || tr.dataset.formulaExact === 'true' ? 'true' : 'false';
             this._intUpdateSrcCell(tr);
             this.closeModal();
         }, {wide: true});
         const fx = document.getElementById('int-unified-fx');
         const error = document.getElementById('int-unified-error');
+        const description = document.getElementById('int-formula-description');
+        const expectedResult = document.getElementById('int-formula-expected-result');
+        const generate = document.getElementById('int-generate-formula');
+        const generationStatus = document.getElementById('int-formula-generation-status');
+        let revision = 0;
         const checkboxes = [...document.querySelectorAll('#modal-body .int-srcpick-cb')];
         const sync = () => {
             const tokens = this._intTokenize(fx.value, defaultFile).filter(t => t.t === 'col').map(t => t.v);
-            checkboxes.forEach(cb => { cb.checked = tokens.includes(cb.dataset.token); });
+            checkboxes.forEach(cb => { cb.checked = tokens.map(normalizedToken).includes(cb.dataset.token); });
             const chk = this._intCheckFx(defaultFile, fx.value);
             error.textContent = chk.ok ? '' : '公式无法识别：' + chk.rest;
         };
         checkboxes.forEach(cb => cb.addEventListener('change', () => {
+            revision++;
+            const existingToken = this._intTokenize(fx.value, defaultFile).find(t => t.t === 'col' && normalizedToken(t.v) === cb.dataset.token)?.v || cb.dataset.token;
             fx.value = cb.checked ? this._intFxAddCol(fx.value, cb.dataset.token, defaultFile)
-                : this._intFxRemoveCol(fx.value, cb.dataset.token, defaultFile);
+                : this._intFxRemoveCol(fx.value, existingToken, defaultFile);
             sync();
         }));
-        fx.addEventListener('input', sync);
+        fx.addEventListener('input', () => {revision++; sync();});
+        const updateDescriptionCount = () => {
+            document.getElementById('int-formula-description-count').textContent = `${description.value.length} / 20000 字`;
+        };
+        updateDescriptionCount();
+        description.addEventListener('input', () => {revision++; updateDescriptionCount();});
+        expectedResult.addEventListener('input', () => {revision++;});
+        generate.addEventListener('click', async () => {
+            const instruction = description.value.trim();
+            if (!instruction) {generationStatus.textContent = '请先输入这一列的公式描述'; description.focus(); return;}
+            const submitted = revision, session = _integrateAnalysis?.session_id;
+            const key_map = {};
+            document.querySelectorAll('.int-key').forEach(select => {key_map[select.dataset.file] = select.value;});
+            generate.disabled = true;
+            generationStatus.textContent = '正在生成并校验公式…';
+            try {
+                const response = await this._intFetch('/api/tools/integrate/generate-formula', {
+                    method:'POST', headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({session_id:session,main_file:main,default_file:defaultFile,target_col:tr.dataset.aCol,
+                        description:instruction,current_formula:fx.value,selected_tokens:checkboxes.filter(cb => cb.checked).map(cb => cb.dataset.token),
+                        active_files:this._intFiles().map(f => f.name),include_main:includeMain,kind,key_map,
+                        expected_result:expectedResult.value.trim(),
+                        output_file:document.getElementById('int-task-output-file')?.value.trim() || '',
+                        output_sheet:document.getElementById('int-task-output-sheet')?.value.trim() || '',
+                        data_scope:this._readDataScope?.() || {mode:'all'},
+                        union_source_keys:!!document.getElementById('int-union-source-keys')?.checked,
+                        date_key_mode:document.getElementById('int-date-mode')?.value || 'off'}),
+                });
+                const data = await response.json();
+                if (!fx.isConnected || !tr.isConnected || session !== _integrateAnalysis?.session_id) return;
+                if (submitted !== revision) {generationStatus.textContent = '已保留你刚才的修改；如需生成新公式，请再次点击生成'; return;}
+                if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : '生成失败，请稍后重试');
+                if (data.needs_clarification || !data.formula) {generationStatus.textContent = data.message || '请补充判断条件和取值规则'; return;}
+                const check = this._intCheckFx(defaultFile, data.formula);
+                if (!check.ok) throw new Error('生成结果未通过公式校验，原公式未改动');
+                fx.value = data.formula;
+                generated = true; revision++; sync();
+                generationStatus.textContent = data.explanation || '公式已生成并通过语法校验，请确认业务逻辑后点击确定';
+            } catch (error) {
+                if (fx.isConnected) generationStatus.textContent = error.message;
+            } finally {generate.disabled = false;}
+        });
     },
 
     // 智能匹配：同一基准列可同时命中多张对照表，默认用 + 组成一个跨表联合公式。
@@ -1492,7 +1570,9 @@ const Tools = {
                 const expr = p.expr || p.col;   // 兼容旧格式 {file,col}
                 if (!expr) return;
                 // source_col 保留(=单列时的列名)，便于旧后端/方案兼容；source_expr 为求值公式
-                out.push({ a_col: tr.dataset.aCol, source_file: p.file, source_expr: expr, source_col: expr });
+                out.push({ a_col: tr.dataset.aCol, source_file: p.file, source_expr: expr, source_col: expr,
+                    formula_description:tr.dataset.formulaDescription || '', formula_expected_result:tr.dataset.formulaExpectedResult || '',
+                    formula_exact:tr.dataset.formulaExact === 'true' });
             });
         });
         return out;
@@ -1547,7 +1627,9 @@ const Tools = {
             const blob = await resp.blob();
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
-            a.href = url; a.download = this._integrationKind === 'split' ? '拆表结果.zip' : '整合结果_' + main;
+            const disposition = resp.headers.get('Content-Disposition') || '';
+            const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+            a.href = url; a.download = encodedName ? decodeURIComponent(encodedName[1]) : (this._integrationKind === 'split' ? '拆表结果.zip' : '整合结果_' + main);
             document.body.appendChild(a); a.click(); a.remove();
             URL.revokeObjectURL(url);
             const info = (this._integrationKind === 'split' ? `拆成${resp.headers.get('X-Split-Groups') || 0}个Excel，共${resp.headers.get('X-Split-Rows') || 0}行；` : '') + `新增${resp.headers.get('X-Integrate-Added') || 0}行 命中${resp.headers.get('X-Integrate-Matched') || 0}行 覆盖${resp.headers.get('X-Integrate-Cells') || 0}格 差异${resp.headers.get('X-Integrate-Diffs') || 0}行`;
@@ -2122,8 +2204,8 @@ const Tools = {
                 <td><span class="status-${s.status}">${s.status}</span></td>
                 <td>${s.total_iterations || 0}</td>
                 <td>${s.best_accuracy != null ? (s.best_accuracy * 100).toFixed(1) + '%' : '-'}</td>
-                <td>${s.started_at ? new Date(s.started_at).toLocaleString() : '-'}</td>
-                <td>${s.finished_at ? new Date(s.finished_at).toLocaleString() : '-'}</td>
+                <td>${s.started_at ? AUTH.formatDateTime(s.started_at) : '-'}</td>
+                <td>${s.finished_at ? AUTH.formatDateTime(s.finished_at) : '-'}</td>
                 <td>
                     <button class="btn btn-sm" onclick="Tools.showTrainingDetail(${s.id})">详情</button>
                 </td>
@@ -2395,12 +2477,21 @@ const Tools = {
     },
 
     // ==================== 下载工具（计算历史共用） ====================
+    async _alertDownloadFailure(resp) {
+        let message = resp.statusText || `HTTP ${resp.status}`;
+        try {
+            const error = await resp.json();
+            if (typeof error.detail === 'string') message = error.detail;
+        } catch (_) {}
+        alert('下载失败: ' + message);
+    },
+
     async downloadAsset(assetId, fileName, format) {
         try {
             let url = `/api/assets/${assetId}/download`;
             if (format) url += `?format=${format}`;
             const resp = await AUTH.authFetch(url);
-            if (!resp.ok) return alert('下载失败: ' + resp.statusText);
+            if (!resp.ok) return this._alertDownloadFailure(resp);
             const blob = await resp.blob();
             const blobUrl = URL.createObjectURL(blob);
             const a = document.createElement('a');
@@ -2435,7 +2526,7 @@ const Tools = {
             const sep = url.includes('?') ? '&' : '?';
             const bustedUrl = `${url}${sep}_=${Date.now()}`;
             const resp = await AUTH.authFetch(bustedUrl, { cache: 'no-store' });
-            if (!resp.ok) return alert('下载失败: ' + resp.statusText);
+            if (!resp.ok) return this._alertDownloadFailure(resp);
             const blob = await resp.blob();
             const blobUrl = URL.createObjectURL(blob);
             const a = document.createElement('a');
@@ -2495,8 +2586,8 @@ const Tools = {
                 <td><span class="status-${t.status}">${t.status}</span></td>
                 <td>${t.inputs ? t.inputs.length : 0}</td>
                 <td>${t.duration_seconds != null ? t.duration_seconds.toFixed(1) : '-'}</td>
-                <td>${t.created_at ? new Date(t.created_at).toLocaleString() : '-'}</td>
-                <td>${t.finished_at ? new Date(t.finished_at).toLocaleString() : '-'}</td>
+                <td>${t.created_at ? AUTH.formatDateTime(t.created_at) : '-'}</td>
+                <td>${t.finished_at ? AUTH.formatDateTime(t.finished_at) : '-'}</td>
                 <td>
                     <button class="btn btn-sm" onclick="Tools.showComputeDetail(${t.id})">详情</button>
                     ${t.status === 'completed' ? `<button class="btn btn-sm btn-primary" style="margin-left:4px;" onclick="Tools.showGenerateReport(${t.id}, '${t.tenant_id}')">下载报表</button>` : ''}
@@ -2777,7 +2868,7 @@ const Tools = {
                 return;
             }
             tbody.innerHTML = items.map(item => `<tr>
-                <td>${item.created_at ? new Date(item.created_at).toLocaleString() : '-'}</td>
+                <td>${item.created_at ? AUTH.formatDateTime(item.created_at) : '-'}</td>
                 <td>${item.source_file || '-'}</td>
                 <td>${item.compare_file || '-'}</td>
                 <td><span style="color:${(item.match_rate || 0) >= 0.95 ? '#4caf50' : '#f44336'}">${(Math.min(1, item.match_rate || 0) * 100).toFixed(1)}%</span></td>
@@ -3382,7 +3473,7 @@ const Tools = {
                 <td>${this._sopStatusHtml(e.status)}</td>
                 <td>${e.round_no || 0}</td>
                 <td>${_escape(e.ai_comment || '-')}</td>
-                <td>${e.updated_at ? new Date(e.updated_at).toLocaleString() : '-'}</td>
+                <td>${e.updated_at ? AUTH.formatDateTime(e.updated_at) : '-'}</td>
                 <td class="actions">${btns.join('')}</td>
             </tr>`;
         }).join('');
@@ -3525,7 +3616,7 @@ const Tools = {
                     </div>`;
                 }
                 const reviewBlock = r.review_status
-                    ? `<div style="margin-top:6px;">最终评价：<span style="color:${r.review_status === 'completed' ? '#4caf50' : '#e91e63'};font-weight:600;">${r.review_status === 'completed' ? '已完成' : '打回重写'}</span>　${_escape(r.review_comment || '')}　（审核人：${_escape(r.reviewer_name || '-')}　${r.reviewed_at ? new Date(r.reviewed_at).toLocaleString() : ''}）</div>`
+                    ? `<div style="margin-top:6px;">最终评价：<span style="color:${r.review_status === 'completed' ? '#4caf50' : '#e91e63'};font-weight:600;">${r.review_status === 'completed' ? '已完成' : '打回重写'}</span>　${_escape(r.review_comment || '')}　（审核人：${_escape(r.reviewer_name || '-')}　${r.reviewed_at ? AUTH.formatDateTime(r.reviewed_at) : ''}）</div>`
                     : '';
                 const errBlock = r.error_message ? `<div style="margin-top:6px;color:#f44336;">错误：${_escape(r.error_message)}</div>` : '';
                 let reviewBtns = '';
@@ -3550,7 +3641,7 @@ const Tools = {
                     <div><strong>客户名称：</strong>${_escape(entry.customer_name)}</div>
                     <div style="margin-top:4px;"><strong>SOP 描述：</strong>${_escape(entry.description || '-')}</div>
                     <div style="margin-top:4px;"><strong>当前状态：</strong>${this._sopStatusHtml(entry.status)}</div>
-                    <div style="margin-top:4px;"><strong>创建人：</strong>${_escape(entry.created_by_name || '-')}　<strong>创建时间：</strong>${entry.created_at ? new Date(entry.created_at).toLocaleString() : '-'}</div>
+                    <div style="margin-top:4px;"><strong>创建人：</strong>${_escape(entry.created_by_name || '-')}　<strong>创建时间：</strong>${entry.created_at ? AUTH.formatDateTime(entry.created_at) : '-'}</div>
                 </div>
                 <hr style="border:none;border-top:1px solid #eee;margin:12px 0;">
                 ${roundsHtml || '<div class="empty-state">暂无上传记录</div>'}

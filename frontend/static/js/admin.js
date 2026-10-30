@@ -1249,7 +1249,7 @@ const Admin = {
             <td>${this._escapeHtml(r.name || '-')}</td>
             <td>${this._escapeHtml(r.file_name)}</td>
             <td><span class="${r.is_active ? 'status-active' : 'status-inactive'}">${r.is_active ? '启用' : '停用'}</span></td>
-            <td>${r.updated_at ? new Date(r.updated_at).toLocaleString() : '-'}</td>
+            <td>${r.updated_at ? AUTH.formatDateTime(r.updated_at) : '-'}</td>
             <td class="actions">
                 <button class="btn btn-sm" onclick="Admin.downloadSopRule(${r.id}, '${r.file_name.replace(/'/g, "\\'")}')">下载</button>
                 <button class="btn btn-sm" style="margin-left:4px;" onclick="Admin.toggleSopRule(${r.id})">${r.is_active ? '停用' : '启用'}</button>
@@ -1353,7 +1353,7 @@ const Admin = {
             <td>${this._escapeHtml(r.name || '-')}</td>
             <td>${(r.file_names || []).length}</td>
             <td>${this._escapeHtml(r.uploader_name || '-')}</td>
-            <td>${r.updated_at ? new Date(r.updated_at).toLocaleString() : '-'}</td>
+            <td>${r.updated_at ? AUTH.formatDateTime(r.updated_at) : '-'}</td>
             <td class="actions">
                 <button class="btn btn-sm" onclick="Admin.reuploadAssembleRule(${r.id}, '${this._escapeHtml(r.name || '')}')">重新上传</button>
                 ${(r.file_names || []).map(fn => `<button class="btn btn-sm" style="margin-left:4px;" onclick="Admin.downloadAssembleRule(${r.id}, '${fn.replace(/'/g, "\\'")}')">下载</button>`).join('')}
@@ -1496,7 +1496,7 @@ const Admin = {
                 <td>${typeLabel}</td>
                 <td>${m.confirm_count != null ? m.confirm_count : 0}</td>
                 <td>${statusHtml}</td>
-                <td>${m.updated_at ? new Date(m.updated_at).toLocaleString() : '-'}</td>
+                <td>${m.updated_at ? AUTH.formatDateTime(m.updated_at) : '-'}</td>
                 <td class="actions">
                     <button class="btn btn-sm" onclick="Admin.setMappingStatus(${m.id}, ${toggle.to})">${toggle.label}</button>
                     <button class="btn btn-sm btn-danger" style="margin-left:4px;" onclick="Admin.deleteMapping(${m.id})">删除</button>

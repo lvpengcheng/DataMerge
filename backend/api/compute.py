@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session, joinedload, selectinload
 from pydantic import BaseModel
 
 from ..database.connection import get_db
+from ..utils.timezone import utc_iso
 from ..database.models import (
     ComputeTask, ComputeTaskInput, DataAsset, Script,
 )
@@ -114,8 +115,8 @@ def _task_to_dict(task: ComputeTask, output_assets_list=None) -> dict:
         "result_summary": task.result_summary,
         "error_message": task.error_message,
         "duration_seconds": task.duration_seconds,
-        "created_at": task.created_at.isoformat() if task.created_at else None,
-        "finished_at": task.finished_at.isoformat() if task.finished_at else None,
+        "created_at": utc_iso(task.created_at) if task.created_at else None,
+        "finished_at": utc_iso(task.finished_at) if task.finished_at else None,
         "inputs": [
             {
                 "id": inp.id,
@@ -142,8 +143,8 @@ def _task_to_summary(task: ComputeTask) -> dict:
         "salary_month": task.salary_month,
         "status": task.status,
         "duration_seconds": task.duration_seconds,
-        "created_at": task.created_at.isoformat() if task.created_at else None,
-        "finished_at": task.finished_at.isoformat() if task.finished_at else None,
+        "created_at": utc_iso(task.created_at) if task.created_at else None,
+        "finished_at": utc_iso(task.finished_at) if task.finished_at else None,
     }
 
 
@@ -495,7 +496,7 @@ def get_compute_result(
             "file_name": a.file_name,
             "file_size": a.file_size,
             "file_path": a.file_path,
-            "created_at": a.created_at.isoformat() if a.created_at else None,
+            "created_at": utc_iso(a.created_at) if a.created_at else None,
         }
         for a in output_assets
     ]

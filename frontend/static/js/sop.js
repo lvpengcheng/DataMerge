@@ -80,7 +80,7 @@ const SOP = {
             return `<tr><td>${this.escape(e.batch_month || '-')}</td><td>${this.escape(e.customer_name)}</td>
                 <td>${this.escape(e.salesperson_name || '-')}</td><td>${this.escape(this.status(e.business_status || e.status))}</td>
                 <td>${e.round_no ? 'v' + e.round_no : '-'}</td><td><span class="sop-ai-summary" title="${this.escape(e.ai_comment || '-')}">${this.escape(e.ai_comment || '-')}</span></td>
-                <td>${e.updated_at ? this.escape(new Date(e.updated_at).toLocaleString()) : '-'}</td>
+                <td>${e.updated_at ? this.escape(AUTH.formatDateTime(e.updated_at)) : '-'}</td>
                 <td><div class="sop-row-actions">${actions.join('')}</div></td></tr>`;
         }).join('');
     },

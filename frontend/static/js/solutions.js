@@ -79,7 +79,7 @@ async function openSolutions() {
     const importArea = solutionElement('section', '', body);
     importArea.className = 'solutions-card';
     solutionElement('h3', '导入完整方案包', importArea);
-    solutionElement('p', '选择目标脚本或填写脚本名称导入。相同租户下同名脚本自动覆盖，导入后立即启用。', importArea).className = 'solutions-muted';
+    solutionElement('p', '选择目标脚本或填写方案名称导入。同一租户下同名方案和脚本自动覆盖，不再新增同名方案，导入后立即启用。', importArea).className = 'solutions-muted';
     const targetRow = solutionElement('div', '', importArea);
     targetRow.className = 'solutions-form-row';
     const targetLabel = solutionElement('label', '目标脚本', targetRow);
@@ -130,9 +130,9 @@ async function openSolutions() {
         const previous = loadedTenant === tenant.value.trim() ? targetScript.value : null;
         loadedTenant = tenant.value.trim();
         targetScript.replaceChildren();
-        solutionElement('option', '创建新脚本', targetScript).value = '';
+        solutionElement('option', '按名称导入（同名覆盖）', targetScript).value = '';
         for (const script of data.scripts) {
-            const option = solutionElement('option', script.name + '（脚本 ' + script.id + '）', targetScript);
+            const option = solutionElement('option', script.name + (script.needs_restore ? '（覆盖并恢复脚本）' : '（脚本 ' + script.id + '）'), targetScript);
             option.value = script.id;
             if (previous === null && typeof _currentSessionId !== 'undefined' && String(script.session_id) === String(_currentSessionId)) option.selected = true;
         }
@@ -147,7 +147,7 @@ async function openSolutions() {
         const scriptLabel = solutionElement('label', '已保存的脚本', convertRow);
         const select = solutionElement('select', '', scriptLabel);
         for (const script of data.scripts) {
-            const option = solutionElement('option', script.name + '（脚本 ' + script.id + '）', select);
+            const option = solutionElement('option', script.name + (script.needs_restore ? '（从迁移方案恢复）' : '（脚本 ' + script.id + '）'), select);
             option.value = script.id;
             if (typeof _currentSessionId !== 'undefined' && String(script.session_id) === String(_currentSessionId)) option.selected = true;
         }
@@ -165,7 +165,9 @@ async function openSolutions() {
         function renderVersions() {
         versions.replaceChildren();
         solutionElement('h3', '所选脚本的方案版本', versions);
-        const rows = data.solutions.filter(row => String(row.script_id) === select.value);
+        const chosen=data.scripts.find(script => String(script.id) === select.value);
+        const rows = data.solutions.filter(row => String(row.script_id) === select.value ||
+            (chosen?.needs_restore && String(row.script_id) === String(chosen.bound_script_id)));
         if (!rows.length) solutionElement('p', '当前脚本尚无方案，可从上方脚本转换或在下方导入。', versions).className = 'solutions-muted';
         for (const row of rows) {
             const box = solutionElement('article', '', versions);

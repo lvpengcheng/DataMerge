@@ -268,7 +268,7 @@ function _renderSessionList() {
         title.className = 'session-item-title';
         // 优先展示用户命名的脚本名 + 时间，没有则退回 session_key
         const versionLabel = s.session_key || '';
-        const time = s.started_at ? new Date(s.started_at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
+        const time = s.started_at ? AUTH.formatDateTime(s.started_at, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
         const scriptLabel = s.script_name && !s.script_name.startsWith('script_') ? s.script_name : '';
         title.textContent = scriptLabel ? `${scriptLabel} · ${time}` : (versionLabel || `${s.mode || 'formula'} - ${time}`);
         title.title = `脚本: ${scriptLabel || '(默认)'} | 版本: ${versionLabel} | 会话 #${s.id}`;
@@ -1605,9 +1605,10 @@ function _formatDiffDetails(diff) {
     return text;
 }
 
-async function _downloadFile(sessionId, fileType) {
+async function _downloadFile(sessionId, fileType, iteration = null) {
     try {
-        const resp = await AUTH.authFetch(`/api/training/chat/sessions/${sessionId}/download/${fileType}`);
+        const revision=iteration == null ? '' : `?iteration=${encodeURIComponent(iteration)}`;
+        const resp = await AUTH.authFetch(`/api/training/chat/sessions/${sessionId}/download/${fileType}${revision}`, {cache:'no-store'});
         if (!resp.ok) {
             const err = await resp.json().catch(() => ({}));
             alert('下载失败: ' + (err.detail || `HTTP ${resp.status}`));
@@ -1845,6 +1846,7 @@ async function _loadEarlierHistory() {
  * 渲染迭代代码摘要（折叠式，可展开查看代码）
  */
 function _renderIterationCodeSummary(iteration, target) {
+    const sessionId = _currentSessionId;
     const container = target || _liveChatContainer();
     const msgDiv = document.createElement('div');
     msgDiv.className = 'message system';
@@ -1862,6 +1864,18 @@ function _renderIterationCodeSummary(iteration, target) {
     msgDiv.appendChild(label);
     msgDiv.appendChild(contentDiv);
     container.appendChild(msgDiv);
+    if (iteration.files?.output_file || iteration.files?.diff_file) {
+        const downloads=document.createElement('div');
+        downloads.className='download-buttons';
+        for (const [key,type,label] of [['output_file','output','生成结果'],['diff_file','diff','差异对比']]) {
+            if (!iteration.files[key]) continue;
+            const button=document.createElement('button');button.className='download-btn';
+            button.textContent=(iteration.files.archived ? '归档' : '')+label+`（第${iteration.iteration_num}轮）`;
+            button.onclick=()=>_downloadFile(sessionId,type,iteration.iteration_num);
+            downloads.appendChild(button);
+        }
+        msgDiv.appendChild(downloads);
+    }
 }
 
 /**

@@ -4016,21 +4016,17 @@ def _file_sha256(path, chunk_size: int = 1024 * 1024) -> Optional[str]:
 
 def _persist_source_file(db, task_id, tenant_id, src_file_path, file_name, file_size,
                          sheet_summary=None, copy_file: bool = False):
-    """注册源文件为数据资产并关联到计算任务（只登记元数据）
+    """注册可下载的源文件数据资产并关联到计算任务。
 
     sheet_summary: 由 ingest 解析结果直接给出时不再打开文件（零额外 Aspose 调用）。
-    copy_file:     默认不再把上传件复制进 tenants/*/assets/source —— 没有任何代码按
-                   asset_type="source" 回读文件，副本只占磁盘。需要留档时显式传 True。
+    copy_file: 永久任务目录直接登记真实路径；旧临时目录自动留档，防止清理后无法下载。
+               显式 True 时即使文件已在永久任务目录也另存副本。
     """
     try:
-        dest_path = None
-        if copy_file:
-            project_root = Path(__file__).resolve().parent.parent.parent
-            asset_dir = project_root / "tenants" / tenant_id / "assets" / "source"
-            asset_dir.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            dest_path = asset_dir / f"{timestamp}_{file_name}"
-            shutil.copy2(src_file_path, dest_path)
+        from backend.utils.compute_source_files import preserve_compute_source
+        dest_path = preserve_compute_source(
+            Path(__file__).resolve().parent.parent.parent, tenant_id, task_id,
+            src_file_path, file_name, copy_file=copy_file)
 
         # 仅读取表头摘要（headers_only + read_formulas=False），避免全量解析大文件
         if sheet_summary is None:
@@ -4056,13 +4052,12 @@ def _persist_source_file(db, task_id, tenant_id, src_file_path, file_name, file_
             tenant_id=tenant_id,
             asset_type="source",
             name=file_name,
-            # 不留副本时记一个来源标记（列非空），并把指纹写进 tags 供追溯
-            file_path=str(dest_path) if dest_path else f"session://{task_id}/{file_name}",
+            file_path=str(dest_path),
             file_name=file_name,
             file_size=file_size,
             sheet_summary=sheet_summary,
             parsed_data=None,
-            tags=None if dest_path else {"sha256": _file_sha256(src_file_path)},
+            tags={"sha256": _file_sha256(dest_path)},
         )
         db.add(asset)
         db.commit()

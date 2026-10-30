@@ -114,7 +114,7 @@ def test_frozen_template_basename_preserves_business_owner_selection(context, mo
     assert (output / '王五.xlsx').read_text(encoding='utf-8') == '王五'
 
 
-def test_import_replaces_same_name_and_deactivates_old_binding(context):
+def test_import_overwrites_same_name_solution_and_script(context):
     db, source, admin, root = context
     row = store.build(db, source, admin.id)
     archive = root / '方案.zip'
@@ -137,12 +137,17 @@ def test_import_replaces_same_name_and_deactivates_old_binding(context):
     assert imported()['id'] == first['id']
     assert db.query(TrainingSession).count() == count  # CRLF code is also idempotent.
     source.code = 'def main(): return 99\n'; db.commit()
+    existing = db.get(CalculationSolution, first['id'])
+    existing.validation = {'digest': first['digest'], 'passed': True}
+    db.commit()
     newer = store.build(db, source, admin.id)
     package.export_zip(store.artifact(newer.digest), archive)
     second = imported()
     assert second['script_id'] == target.id
-    assert second['id'] != first['id'] and second['is_active']
-    assert not db.get(CalculationSolution, first['id']).is_active
+    assert second['id'] == first['id'] and second['is_active']
+    assert second['digest'] == newer.digest and second['digest'] != first['digest']
+    assert second['validation'] is None
+    assert db.query(CalculationSolution).filter_by(tenant_id='正式', name='工资').count() == 1
     assert db.query(Script).filter_by(tenant_id='正式', name='工资').count() == 1
     assert other.code == 'other tenant'
     assert target.code == source.code
@@ -174,3 +179,142 @@ def test_upgrade_activates_latest_pending_once_and_preserves_disabled_versions(c
     activate_pending_solutions(db.get_bind())
     db.expire_all()
     assert pending.is_active and not old.is_active
+
+
+def test_same_name_import_overwrites_even_when_script_binding_is_missing(context):
+    db, source, admin, root = context
+    built = store.build(db, source, admin.id)
+    archive = root / 'migration.zip'
+    package.export_zip(store.artifact(built.digest), archive)
+    (root / 'tenants/正式').mkdir(parents=True)
+
+    def imported():
+        return asyncio.run(api.import_package(
+            UploadFile(filename='migration.zip', file=io.BytesIO(archive.read_bytes())),
+            '正式', False, True, db, admin, ['正式'], script_name='工资'))
+
+    first = imported()
+    old_session = first['session_id']
+    old_script_id = first['script_id']
+    db.delete(db.get(Script, old_script_id)); db.commit()
+    other = Script(id=old_script_id, tenant_id='其他', name='工资', code='other tenant')
+    db.add(other); db.commit()
+    second = imported()
+    assert second['id'] == first['id']
+    assert second['script_id'] != old_script_id
+    assert db.query(CalculationSolution).filter_by(tenant_id='正式', name='工资').count() == 1
+    assert db.get(TrainingSession, old_session)
+    assert other.code == 'other tenant'
+    assert db.get(CalculationSolution, built.id).digest == built.digest
+
+
+def test_failed_overwrite_keeps_existing_solution_and_script(context, monkeypatch):
+    from fastapi import HTTPException
+    db, source, admin, root = context
+    original = store.build(db, source, admin.id)
+    archive = root / 'migration.zip'
+    package.export_zip(store.artifact(original.digest), archive)
+    (root / 'tenants/正式').mkdir(parents=True)
+
+    def imported():
+        return asyncio.run(api.import_package(
+            UploadFile(filename='migration.zip', file=io.BytesIO(archive.read_bytes())),
+            '正式', False, True, db, admin, ['正式'], script_name='工资'))
+
+    first = imported()
+    previous_code = db.get(Script, first['script_id']).code
+    source.code = 'def main(): return 123\n'; db.commit()
+    newer = store.build(db, source, admin.id)
+    package.export_zip(store.artifact(newer.digest), archive)
+    real_restore = restore.restore
+
+    def fail_restore(*args, **kwargs):
+        real_restore(*args, **kwargs)
+        raise ValueError('simulated restore failure')
+
+    monkeypatch.setattr(restore, 'restore', fail_restore)
+    with pytest.raises(HTTPException, match='simulated restore failure'):
+        imported()
+    current = db.get(CalculationSolution, first['id'])
+    assert current.digest == first['digest'] and current.is_active
+    assert db.get(Script, current.script_id).code == previous_code
+    assert db.query(CalculationSolution).filter_by(tenant_id='正式', name='工资').count() == 1
+
+
+def test_import_can_target_missing_script_via_loaded_solution(context):
+    from fastapi import HTTPException
+    db, source, admin, root = context
+    built = store.build(db, source, admin.id)
+    archive = root / 'migration.zip'
+    package.export_zip(store.artifact(built.digest), archive)
+    (root / 'tenants/正式').mkdir(parents=True)
+    first = asyncio.run(api.import_package(
+        UploadFile(filename='migration.zip', file=io.BytesIO(archive.read_bytes())),
+        '正式', False, True, db, admin, ['正式'], script_name='目标工资方案'))
+    db.delete(db.get(Script, first['script_id'])); db.commit()
+    fallback = api.listing('正式', db, admin, ['正式'])['scripts'][0]
+    assert fallback['needs_restore']
+    result = asyncio.run(api.import_package(
+        UploadFile(filename='migration.zip', file=io.BytesIO(archive.read_bytes())),
+        '正式', False, True, db, admin, ['正式'], script_id=fallback['id']))
+    assert result['id'] == first['id']
+    assert result['name'] == '目标工资方案'  # Preserve selected name, not the package's source name.
+    assert db.get(Script, result['script_id']).name == '目标工资方案'
+    assert db.query(CalculationSolution).filter_by(tenant_id='正式').count() == 1
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(api.import_package(
+            UploadFile(filename='migration.zip', file=io.BytesIO(archive.read_bytes())),
+            '训练', False, True, db, admin, ['训练'], script_id=fallback['id']))
+    assert error.value.status_code == 404
+
+
+def test_missing_migrated_script_is_selectable_and_recoverable_without_replaying_source_ids(context):
+    db,source,admin,root=context
+    row=store.build(db,source,admin.id)
+    archive=root/'migration.zip';package.export_zip(store.artifact(row.digest),archive)
+    (root/'tenants/正式').mkdir(parents=True)
+    imported=asyncio.run(api.import_package(UploadFile(filename='migration.zip',file=io.BytesIO(archive.read_bytes())),
+        '正式',False,True,db,admin,['正式'],script_name='迁移脚本'))
+    target=db.get(Script,imported['script_id']);old_id=target.id
+    db.delete(target);db.commit()
+    # A reused id in another tenant must never be rebound or overwritten.
+    other=Script(id=old_id,tenant_id='其他',name='其他脚本',code='unrelated')
+    db.add(other);db.commit()
+    listing=api.listing('正式',db,admin,['正式'])
+    fallback=listing['scripts'][0]
+    assert fallback['needs_restore'] and fallback['id']=='solution_'+imported['id']
+    restored=api.convert({'script_id':fallback['id'],'tenant_id':'正式'},db,admin,['正式'])
+    current=db.get(Script,restored['script_id'])
+    assert current.tenant_id=='正式' and current.code==source.code and current.is_active
+    assert other.code=='unrelated'
+    assert db.get(TrainingSession,current.source_session_id)
+    assert len(api.listing('正式',db,admin,['正式'])['scripts'])==1
+    package.verify(store.artifact(imported['digest']))
+
+
+def test_training_entry_restores_missing_script_even_when_old_session_still_exists(context):
+    db,source,admin,root=context
+    row=store.build(db,source,admin.id)
+    old_session=source.source_session_id
+    db.delete(source);db.commit()
+    assert db.get(TrainingSession,old_session)
+    result=asyncio.run(api.training_workspace(row.id,db,admin,['训练']))
+    script=db.get(Script,result['script_id'])
+    assert script and script.tenant_id=='训练'
+    assert db.get(TrainingSession,result['session_id']).final_script_id==script.id
+
+
+def test_deleting_old_training_session_does_not_delete_reimported_current_script(context,monkeypatch):
+    from backend.api import training_chat
+    from backend.storage import storage_manager
+    db,script,admin,root=context
+    previous=script.source_session_id
+    current=TrainingSession(tenant_id='训练',user_id=admin.id,session_key='reimported',status='completed')
+    db.add(current);db.flush();script.source_session_id=current.id;current.final_script_id=script.id;db.commit()
+    deleted=[]
+    manager=SimpleNamespace(get_tenant_dir=lambda tenant:root/'tenants'/tenant,
+                            delete_script_files_by_code=lambda *args:deleted.append(args))
+    monkeypatch.setattr(storage_manager,'StorageManager',lambda:manager)
+    training_chat.delete_session(previous,db,admin)
+    assert db.get(Script,script.id) and db.get(TrainingSession,current.id)
+    assert not deleted

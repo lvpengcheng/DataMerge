@@ -1,0 +1,13 @@
+const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
+const ctx=vm.createContext({console,Date});
+vm.runInContext(fs.readFileSync('frontend/static/js/auth.js','utf8')+'\nthis.auth=AUTH;',ctx);
+const auth=ctx.auth;
+const naive='2026-10-29T00:15:30.123456';
+assert.equal(auth.parseTimestamp(naive).toISOString(),'2026-10-29T00:15:30.123Z');
+assert.equal(auth.formatDateTime(naive),auth.formatDateTime('2026-10-29T08:15:30.123+08:00'));
+assert.equal(auth.formatDateTime(naive),auth.formatDateTime('2026-10-29T00:15:30.123Z'));
+assert.match(auth.formatDateTime(naive),/08:15:30/);
+assert.match(auth.formatDateTime('2026-10-29T23:15:30Z'),/30.*07:15:30/);
+assert.equal(auth.formatDateTime('not a date'),'-');
+assert.equal(auth.formatDateTime(null),'-');
+console.log('Naive UTC, explicit UTC and +08:00 render the same Beijing time without double conversion');

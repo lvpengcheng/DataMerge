@@ -11,8 +11,8 @@ const SOP_ADMIN = {
             document.getElementById('sop-ai-mode').value = data.mode;
             document.getElementById('sop-ai-hours').value = data.interval_hours;
             document.getElementById('sop-ai-hours').disabled = data.mode !== 'scheduled';
-            const last = data.last_run_at ? new Date(data.last_run_at).toLocaleString() : '尚未扫描';
-            const next = data.mode === 'scheduled' ? `下次扫描：${new Date(data.next_run_at).toLocaleString()}` : '待初审记录将尽快处理';
+            const last = data.last_run_at ? AUTH.formatDateTime(data.last_run_at) : '尚未扫描';
+            const next = data.mode === 'scheduled' ? `下次扫描：${AUTH.formatDateTime(data.next_run_at)}` : '待初审记录将尽快处理';
             document.getElementById('sop-ai-schedule-status').textContent = `已保存：${data.mode === 'scheduled' ? '每 ' + data.interval_hours + ' 小时审核一次' : '立即审核'}。待初审 ${data.pending_count} 条，审核中 ${data.running_count} 条。上次扫描：${last}；${next}。`;
             error.textContent = '';
         } catch (e) { error.textContent = e.message; }

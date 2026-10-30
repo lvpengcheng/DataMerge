@@ -694,13 +694,16 @@ def download_asset(
     if not asset:
         raise HTTPException(status_code=404, detail="资产不存在")
     _assert_can_view(asset.tenant_id, accessible, _is_admin(current_user))
-    if not os.path.exists(asset.file_path):
-        raise HTTPException(status_code=404, detail="文件不存在")
+    from ..utils.compute_source_files import resolve_asset_download_path
+    file_path = resolve_asset_download_path(asset, db, PROJECT_ROOT)
+    if file_path is None:
+        message = '源文件未保留或已清理，无法下载' if asset.asset_type == 'source' else '文件不存在'
+        raise HTTPException(status_code=404, detail=message)
 
     # 原始下载
     if not format:
         # 根据实际文件扩展名决定 MIME 类型
-        ext = Path(asset.file_path).suffix.lower()
+        ext = file_path.suffix.lower()
         mime_map = {
             ".zip": "application/zip",
             ".pdf": "application/pdf",
@@ -709,7 +712,7 @@ def download_asset(
         }
         media_type = mime_map.get(ext, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         return FileResponse(
-            path=asset.file_path,
+            path=str(file_path),
             filename=asset.file_name,
             media_type=media_type,
         )
@@ -719,7 +722,7 @@ def download_asset(
     base_name = Path(asset.file_name).stem
 
     if format == "pdf":
-        pdf_path = convert_to_pdf(asset.file_path)
+        pdf_path = convert_to_pdf(str(file_path))
         return FileResponse(
             path=pdf_path,
             filename=f"{base_name}.pdf",
@@ -729,7 +732,7 @@ def download_asset(
 
     if format == "encrypted":
         pwd = password or "123456"
-        enc_path = encrypt_excel(asset.file_path, password=pwd)
+        enc_path = encrypt_excel(str(file_path), password=pwd)
         return FileResponse(
             path=enc_path,
             filename=f"{base_name}_加密.xlsx",

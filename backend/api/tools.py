@@ -32,6 +32,7 @@ from ..database.models import SopEntry, SopRound, SopRuleFile, SopResubmitToken,
 from ..utils.sop_mail import send_sop_mail
 from ..ai_engine.document_parser import DocumentParser
 from ..utils.upload_stream import get_excel_work_semaphore, save_upload_file, safe_upload_name
+from ..utils.integrate_formula_ai import MAX_DESCRIPTION_LENGTH, MAX_EXPECTED_RESULT_LENGTH
 
 router = APIRouter(prefix="/api/tools", tags=["智能小工具"])
 
@@ -923,7 +924,7 @@ async def _integration_workflow(request: Request, current_user=Depends(get_curre
         actions = ('create',)
     elif request.method == 'DELETE':
         actions = ('delete',)
-    elif action in {'analyze', 'select-sheets', 'suggest-sheet-mapping', 'reparse-headers', 'match', 'execute', 'apply-validate', 'result'}:
+    elif action in {'analyze', 'select-sheets', 'suggest-sheet-mapping', 'reparse-headers', 'match', 'generate-formula', 'execute', 'apply-validate', 'result'}:
         actions = ('create', 'apply', 'edit')
     else:
         actions = ()
@@ -1147,6 +1148,13 @@ async def _integrate_analyze_impl(files, tenant_id, parse_all_sheets, scheme_id,
     → 返回各文件列（带来源）+ 列头指纹 + 猜键/猜姓名/猜身份证列。不在此处调用 AI。
     主表由用户在后续步骤从上传文件里选定（不在此处固定）。
     """
+    scheme_multi_sheet = False
+    if scheme_id is not None:
+        with SessionLocal() as db:
+            scheme = next((r for r in _visible_integrate_schemes(db, current_user, workflow) if r.id == scheme_id), None)
+            if scheme and any(r.get('sheet_explicit') for r in _scheme_roles(scheme.config or {})):
+                parse_all_sheets = True
+                scheme_multi_sheet = True
     if not files or (workflow != "split" and not parse_all_sheets and len(files) < 2):
         raise HTTPException(status_code=400, detail="请至少上传 2 个文件（1 主表 + 至少 1 对照表）")
 
@@ -1194,9 +1202,9 @@ async def _integrate_analyze_impl(files, tenant_id, parse_all_sheets, scheme_id,
 
         (sdir / "_meta.json").write_text(json.dumps({
             "owner_id": getattr(current_user, "id", None),
-            "files": [] if parse_all_sheets else files_meta,
+            "files": [] if parse_all_sheets and not scheme_multi_sheet else files_meta,
             "sheet_catalog": files_meta if parse_all_sheets else [],
-            "sheet_selection_pending": bool(parse_all_sheets),
+            "sheet_selection_pending": bool(parse_all_sheets and not scheme_multi_sheet),
             "workbooks": workbooks,
             "parse_all_sheets": bool(parse_all_sheets),
             "header_ranges": {
@@ -1204,13 +1212,13 @@ async def _integrate_analyze_impl(files, tenant_id, parse_all_sheets, scheme_id,
             },
         }, ensure_ascii=False), encoding="utf-8")
         parse_elapsed = time.perf_counter() - started
-        matched_schemes = [] if parse_all_sheets else (_match_integrate_schemes(current_user, files_meta, scheme_id, workflow)
+        matched_schemes = [] if parse_all_sheets and not scheme_multi_sheet else (_match_integrate_schemes(current_user, files_meta, scheme_id, workflow)
                            if workflow == 'split' else _match_integrate_schemes(current_user, files_meta, scheme_id))
         logger.info("[integrate] analyze session=%s tables=%d parse=%.3fs total=%.3fs",
                     session_id, len(files_meta), parse_elapsed, time.perf_counter() - started)
         return {"session_id": session_id, "files": files_meta,
                 "parse_all_sheets": bool(parse_all_sheets),
-                "sheet_selection_pending": bool(parse_all_sheets),
+                "sheet_selection_pending": bool(parse_all_sheets and not scheme_multi_sheet),
                 "workbooks": workbooks,
                 "matched_schemes": matched_schemes}
     except asyncio.CancelledError:
@@ -1352,6 +1360,114 @@ class IntegrateMatchRequest(BaseModel):
     key_map: dict = {}
 
 
+class IntegrateFormulaRequest(BaseModel):
+    session_id: str
+    main_file: str
+    default_file: str
+    target_col: str
+    description: str
+    active_files: List[str]
+    selected_tokens: List[str] = []
+    current_formula: str = ''
+    include_main: bool = False
+    kind: str = 'ow'
+    key_map: dict = {}
+    expected_result: str = ''
+    output_file: str = ''
+    output_sheet: str = ''
+    data_scope: Optional[dict] = None
+    union_source_keys: bool = False
+    date_key_mode: str = 'off'
+
+
+@router.post('/integrate/generate-formula')
+@router.post('/table-split/generate-formula')
+async def integrate_generate_formula(req: IntegrateFormulaRequest, current_user=Depends(get_current_user),
+        workflow: str = Depends(_integration_workflow), stream: bool = Query(False)):
+    work = _generate_integrate_formula(req, current_user, workflow)
+    return _integration_heartbeat_response(work) if stream is True else await work
+
+
+async def _generate_integrate_formula(req, current_user, workflow):
+    if not any(has_permission(current_user, _integration_permission(workflow, a)) for a in ('create','edit','apply')):
+        raise HTTPException(403, detail='缺少权限：生成公式')
+    if not req.description.strip() or len(req.description)>MAX_DESCRIPTION_LENGTH or len(req.current_formula)>10000:
+        raise HTTPException(400, detail='请输入公式描述（最多20000字），原公式最多10000字')
+    if len(req.expected_result)>MAX_EXPECTED_RESULT_LENGTH or len(req.output_file)>200 or len(req.output_sheet)>31:
+        raise HTTPException(400, detail='预期结果最多8000字，输出文件名或Sheet名过长')
+    if req.date_key_mode not in ('off','yearmonthday','yearmonth','month','day'):
+        raise HTTPException(400, detail='日期关联键归一模式无效')
+    if len(req.active_files)>51 or len(req.selected_tokens)>3000 or req.kind not in ('ow','cmp'):
+        raise HTTPException(400, detail='公式生成范围无效')
+    path = _workflow_session_dir(req.session_id, workflow, current_user) / '_meta.json'
+    if not path.is_file():
+        raise HTTPException(400, detail='会话已过期，请重新上传解析')
+    meta=json.loads(path.read_text(encoding='utf-8'))
+    if meta.get('owner_id') != current_user.id:
+        raise HTTPException(403, detail='无权读取此会话')
+    tables={f['name']:f for f in meta.get('files',[])}
+    if (req.main_file not in req.active_files or req.default_file not in req.active_files or
+            len(set(req.active_files))!=len(req.active_files) or not set(req.active_files)<=set(tables) or
+            req.target_col not in tables[req.main_file].get('columns',[])):
+        raise HTTPException(400, detail='目标列或参与Sheet选择无效')
+    if req.default_file==req.main_file and not req.include_main:
+        raise HTTPException(400, detail='未开启主键捏合，不能把模板作为默认来源')
+    from ..utils.data_scope import validate_data_scope
+    try:
+        validate_data_scope(req.data_scope, {name: tables[name].get('columns',[]) for name in req.active_files}, req.key_map or None)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc)) from None
+    from ..utils.integrate_formula_ai import field_context_for_formula
+    fields=[];books=[];replacements={}
+    for name in req.active_files:
+        if name==req.main_file and not req.include_main:
+            continue
+        table=tables[name];fid='T'+str(len(books))
+        key_col=req.key_map.get(name) or table.get('suggested_key')
+        if key_col and key_col not in table.get('columns',[]):
+            raise HTTPException(400, detail='关联键列不存在，请先检查关联键设置')
+        book={'id':fid,'file':name,'physical_file':table.get('physical_file') or name,'sheet':table.get('sheet',''),
+              'key_column':key_col,'column_count':len(table.get('columns',[])),
+              'role':'template_original' if name==req.main_file else 'source','key_field_id':None}
+        books.append(book)
+        for col in table.get('columns',[]):
+            token=col if name==req.default_file else name+'.'+col
+            field={'id':'F'+str(len(fields)), 'file_id':fid, 'file':name, 'column':col,
+                   **field_context_for_formula(table,col), 'is_key':col==key_col,
+                   'selected':token in req.selected_tokens or name+'.'+col in req.selected_tokens}
+            if col==key_col:
+                book['key_field_id']=field['id']
+            fields.append(field);replacements[name+'.'+col]=field['id']
+            if name==req.default_file:
+                replacements[col]=field['id']
+    if not fields or len(fields)>3000:
+        raise HTTPException(400, detail='可用字段过多或为空，请调整本目标使用的来源Sheet')
+    # Only schema and user-authored rules are sent; no workbook rows or employee samples.
+    main=tables[req.main_file]
+    context={'description':req.description.strip(),'expected_result':req.expected_result.strip(),
+        'target':{'column':req.target_col,'file':req.main_file,'physical_file':main.get('physical_file') or req.main_file,
+                  'sheet':main.get('sheet',''),**field_context_for_formula(main,req.target_col)},
+        'output':{'file':req.output_file or main.get('physical_file') or req.main_file,'sheet':req.output_sheet or main.get('sheet',''),'column':req.target_col},
+        'execution':{'workflow':workflow,'kind':req.kind,'union_source_keys':req.union_source_keys,'date_key_mode':req.date_key_mode,
+                     'data_scope':req.data_scope or {'mode':'all'}},
+        'kind':req.kind,'default_file':req.default_file,'tables':books,'fields':fields,
+        'current_formula':_replace_expr_tokens(req.current_formula,replacements)}
+    from ..utils.integrate_formula_ai import generate_formula
+    async def generate():
+        from ..ai_engine.ai_provider import AIProviderFactory
+        provider=await asyncio.to_thread(AIProviderFactory.create_provider)
+        return await asyncio.to_thread(generate_formula,provider,context)
+    try:
+        return await asyncio.wait_for(generate(),timeout=90)
+    except ValueError as exc:
+        raise HTTPException(422, detail=str(exc)) from None
+    except asyncio.TimeoutError:
+        raise HTTPException(504, detail='生成公式超时，原公式未改动，请稍后重试') from None
+    except Exception as exc:
+        logger.warning('[formula-generation] failed: %s',type(exc).__name__)
+        raise HTTPException(503, detail='AI暂时无法生成公式，原公式未改动，请稍后重试') from None
+
+
 @router.post("/integrate/match")
 @router.post("/table-split/match")
 async def integrate_match(req: IntegrateMatchRequest, current_user=Depends(get_current_user), workflow: str = Depends(_integration_workflow)):
@@ -1448,6 +1564,23 @@ class IntegrateExecuteRequest(BaseModel):
     union_source_keys: bool = False       # 把所有对照表主键并集追加到主表
     data_scope: Optional[dict] = None
     active_files: Optional[List[str]] = None
+    output_tasks: Optional[List[dict]] = None
+
+
+def _validate_output_tasks(tasks, meta):
+    from ..utils.integrate_tasks import validate_tasks
+    from ..utils.data_scope import validate_data_scope
+    tables = {f['name']: f for f in meta.get('files', [])}
+    validate_tasks(tasks, tables)
+    for task in tasks:
+        cols = {f: tables[f].get('columns', []) for f in task['active_files']}
+        parsed = {f: {'df': pd.DataFrame(columns=c), 'sheet': tables[f].get('sheet', '')} for f, c in cols.items()}
+        errors = _validate_integrate_columns(parsed, task['key_map'], task.get('overwrite_pairs', []), task.get('compare_pairs', []), task['main_file'])
+        if errors:
+            raise ValueError(task['output_sheet'] + '：' + '；'.join(errors))
+        validate_data_scope(task.get('data_scope'), cols, task['key_map'])
+        if task.get('data_scope') and task['data_scope'].get('mode', 'all') != 'all' and not task.get('union_source_keys'):
+            raise ValueError('目标Sheet设置数据范围时请开启主键捏合')
 
 
 def _validate_integrate_columns(parsed, key_map, overwrite_pairs, compare_pairs, main_file):
@@ -1482,7 +1615,7 @@ def _validate_integrate_columns(parsed, key_map, overwrite_pairs, compare_pairs,
         expr = pair.get("source_expr") or pair.get("source_col")
         if ac and ac not in main_cols:
             errs.append(f"文件【{main_file}】的 sheet【{main_sheet}】的列 '{ac}' 不存在（覆盖/对比目标列）")
-        if not (f and f != main_file and f in parsed and expr):
+        if not (f and f in parsed and expr):
             continue
         fcols = _cols(f)
         expr = str(expr)
@@ -1509,6 +1642,9 @@ def _validate_integrate_columns(parsed, key_map, overwrite_pairs, compare_pairs,
 
 def _integrate_execute_impl(session_dir: str, request_data: dict) -> dict:
     """一次性子进程执行完整整合、公式重算和可选差异表生成。"""
+    if request_data.get('output_tasks'):
+        from backend.utils.integrate_tasks import execute_tasks
+        return execute_tasks(session_dir, request_data, _integrate_execute_impl)
     from backend.utils.integrate_engine import build_source_indexes, collect_source_keys, compute_diffs
     from backend.utils.integrate_writer import apply_integration, append_diff_sheet
 
@@ -1519,7 +1655,7 @@ def _integrate_execute_impl(session_dir: str, request_data: dict) -> dict:
     meta_by_file = {f.get("name"): f for f in meta.get("files", [])}
     header_ranges = meta.get("header_ranges") or {}
     main_meta = meta_by_file.get(main_file) or {}
-    main_path = sdir / (main_meta.get("physical_file") or main_file)
+    main_path = Path(request_data.get('_template_path') or sdir / (main_meta.get("physical_file") or main_file))
 
     def header_args(file_name: str):
         rng = header_ranges.get(file_name)
@@ -1559,7 +1695,7 @@ def _integrate_execute_impl(session_dir: str, request_data: dict) -> dict:
         parsed, request_data["key_map"], main_file,
         normalize_keys=request_data.get("normalize_keys", True),
         date_key_mode=request_data.get("date_key_mode", "off"),
-        include_main=bool(request_data.get("union_source_keys")),
+        include_main=bool(request_data.get("union_source_keys") or (request_data.get('split_config') and len(parsed)==1)),
     )
     split = request_data.get('split_config')
     # 拆表的模板提供版式，默认补齐数据表的记录；这不等于“主键捏合”中叠加模板原值。
@@ -1600,7 +1736,7 @@ def _integrate_execute_impl(session_dir: str, request_data: dict) -> dict:
                 raise ValueError(f'数据结束行超出工作表实际内容（最后一行为{last_row}），请重新确认明细范围')
         finally:
             range_book.Dispose()
-    out_path = sdir / f"整合结果_{main_file}"
+    out_path = Path(request_data.get('_output_path') or sdir / f"整合结果_{main_file}")
     stat = apply_integration(
         main_path=str(main_path), out_path=str(out_path),
         sheet_name=main_info["sheet"], head_data=main_info["head_data"],
@@ -1683,7 +1819,7 @@ async def integrate_download_result(session_id: str, token: str, current_user=De
         raise HTTPException(404, detail='结果不存在或已下载，请重新生成')
 
     def cleanup():
-        if workflow == 'split':
+        if workflow == 'split' or path.parent.name.startswith('batch_'):
             shutil.rmtree(path.parent, ignore_errors=True)
         else:
             path.unlink(missing_ok=True)
@@ -1711,6 +1847,13 @@ async def _integrate_execute_response(req, current_user, workflow):
 
     meta_path = sdir / "_meta.json"
     meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+    if req.output_tasks is not None:
+        if workflow == 'split':
+            raise HTTPException(400, detail='多个目标Sheet请使用多表整合对比入口')
+        try:
+            _validate_output_tasks(req.output_tasks, meta)
+        except ValueError as exc:
+            raise HTTPException(400, detail=str(exc))
     selected = next((f for f in meta.get("files", []) if f.get("name") == req.main_file), None)
     main_path = sdir / ((selected or {}).get("physical_file") or req.main_file)
     if not selected or not main_path.exists():
@@ -1748,13 +1891,15 @@ async def _integrate_execute_response(req, current_user, workflow):
             reason = "超时" if rr.timed_out else ("内存超限" if rr.killed_by_memory else rr.error)
             raise HTTPException(status_code=500, detail=f"整合执行失败（{reason}）")
         stat = rr.result
+        if req.output_tasks:
+            out_path = Path(stat['batch_path'])
         if workflow == 'split':
             out_path = Path(stat['archive'])
         if not out_path.exists():
             raise HTTPException(status_code=500, detail="整合未生成输出文件")
 
         from urllib.parse import quote
-        fname = "拆表结果.zip" if workflow == "split" else f"整合结果_{req.main_file}"
+        fname = out_path.name if req.output_tasks else ("拆表结果.zip" if workflow == "split" else f"整合结果_{req.main_file}")
         headers = {
             "Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}",
             "X-Integrate-Matched": str(stat.get("matched_rows", 0)),
@@ -1763,13 +1908,15 @@ async def _integrate_execute_response(req, current_user, workflow):
             "X-Integrate-Added": str(stat.get("added_rows", 0)),
             "X-Split-Groups": str(stat.get("group_count", 0)),
             "X-Split-Rows": str(stat.get("split_rows", 0)),
+            "X-Integrate-Tasks": str(stat.get('task_count', 1)),
+            "X-Integrate-Files": str(stat.get('output_count', 1)),
         }
         return FileResponse(
             str(out_path),
-            media_type="application/zip" if workflow == "split" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            media_type="application/zip" if workflow == "split" or out_path.suffix == '.zip' else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers=headers,
             # 保留上传源文件和会话配置，仅在客户端下载完成后删除本次结果。
-            background=(BackgroundTask(shutil.rmtree, out_path.parent, ignore_errors=True) if workflow == "split" else BackgroundTask(out_path.unlink, missing_ok=True)),
+            background=(BackgroundTask(shutil.rmtree, out_path.parent, ignore_errors=True) if workflow == "split" or req.output_tasks else BackgroundTask(out_path.unlink, missing_ok=True)),
         )
     except HTTPException:
         raise
@@ -2021,6 +2168,14 @@ def _required_cols_by_role(cfg: dict) -> dict:
                 and not re.search(r"[+\-*/(),<>=!]", expr) and not validate_formula_remainder(expr)):
             # 极旧方案可能没有 cols_by_fp，且 source_col 只保存了一个裸列名。
             add(src_idx, expr)
+    if cfg.get('output_tasks'):
+        from ..utils.integrate_tasks import task_scheme_config
+        role_indices = {r['file']: i for i, r in enumerate(roles)}
+        for task in cfg['output_tasks']:
+            local = task_scheme_config(cfg, task)
+            for idx, cols in _required_cols_by_role(local).items():
+                for col in cols:
+                    add(role_indices[local['roles'][idx]['file']], col)
     return required
 
 
@@ -2172,6 +2327,9 @@ def _resolved_scheme_config(cfg: dict, match: dict) -> dict:
             p.update({"source_role": src_idx, "source_expr": expr, "source_col": expr})
             new_pairs.append(p)
         resolved[list_name] = new_pairs
+    if cfg.get('output_tasks'):
+        from ..utils.integrate_tasks import resolve_task
+        resolved['output_tasks'] = [resolve_task(task, cfg, match, _resolved_scheme_config) for task in cfg['output_tasks']]
     return resolved
 
 
@@ -2243,6 +2401,7 @@ class IntegrateSchemeSaveRequest(BaseModel):
     union_source_keys: bool = False
     data_scope: Optional[dict] = None
     scheme_id: Optional[int] = None      # 传则为"修改已有方案"，不传为"新建"
+    output_tasks: Optional[List[dict]] = None
 
 
 @router.post("/integrate/scheme/save")
@@ -2260,6 +2419,14 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
     if not meta_path.exists():
         raise HTTPException(status_code=400, detail="会话已过期，请重新上传分析")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    if req.output_tasks is not None:
+        if workflow == 'split':
+            raise HTTPException(400, detail='拆表方案不支持多个目标Sheet')
+        try:
+            _validate_output_tasks(req.output_tasks, meta)
+        except ValueError as exc:
+            raise HTTPException(400, detail=str(exc))
+        req.key_map = {f: col for task in req.output_tasks for f, col in task['key_map'].items()}
     fp_by_file = {f["name"]: f["fingerprint"] for f in meta.get("files", [])}
     cols_by_file = {f["name"]: f.get("columns", []) for f in meta.get("files", [])}
     if req.main_file not in fp_by_file:
@@ -2316,7 +2483,10 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
                 out.append({"a_col": p.get("a_col"),
                             "source_fp": fp_by_file[f],
                             "source_role": role_of_file.get(f),
-                            "source_expr": _expr, "source_col": _expr})
+                            "source_expr": _expr, "source_col": _expr,
+                            "formula_description": str(p.get('formula_description') or '')[:MAX_DESCRIPTION_LENGTH],
+                            "formula_expected_result": str(p.get('formula_expected_result') or '')[:MAX_EXPECTED_RESULT_LENGTH],
+                            "formula_exact": bool(p.get('formula_exact'))})
         return out
 
     # 各角色列名（供应用校验时列级 diff）：主表 + 各对照表
@@ -2351,6 +2521,8 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
             for f in role_of_file if (meta.get("header_ranges") or {}).get(f)
         },
     }
+    if req.output_tasks:
+        config['output_tasks'] = req.output_tasks
     config["required_cols_by_role"] = {
         str(k): v for k, v in _required_cols_by_role(config).items()
     }
@@ -2464,10 +2636,17 @@ def _validate_integrate_import_config(config) -> dict:
             expr = str(pair.get("source_expr") or pair.get("source_col") or "")
             if len(expr) > 10000:
                 raise HTTPException(status_code=400, detail="方案中的公式长度超过限制")
+            for field,limit in (('formula_description',MAX_DESCRIPTION_LENGTH),('formula_expected_result',MAX_EXPECTED_RESULT_LENGTH)):
+                if not isinstance(pair.get(field,''),str) or len(pair.get(field,''))>limit:
+                    raise HTTPException(400, detail='方案中的公式描述或预期结果无效或超过字数限制')
     # JSON 往返生成独立、可序列化副本，避免带入非标准对象。
     from ..utils.data_scope import validate_data_scope
     saved_roles = _scheme_roles(config)
     try:
+        if config.get('output_tasks') is not None:
+            _validate_output_tasks(config['output_tasks'], {'files': [
+                {**role, 'name': role['file'], 'columns': (config.get('cols_by_fp') or {}).get(role.get('fp'), [])}
+                for role in saved_roles]})
         validate_data_scope(config.get('data_scope'),
             {role.get('file'): (config.get('cols_by_fp') or {}).get(role.get('fp'), []) for role in saved_roles})
     except ValueError as exc:
@@ -2594,7 +2773,7 @@ async def integrate_scheme_delete(scheme_id: int, current_user=Depends(get_curre
 
 def _sheet_mapping_options(cfg, uploaded, match):
     roles = match['roles']
-    if not any(f.get('sheet_explicit') for f in uploaded) and not any(r.get('sheet_explicit') for r in roles):
+    if not cfg.get('output_tasks') and not any(f.get('sheet_explicit') for f in uploaded) and not any(r.get('sheet_explicit') for r in roles):
         return None
     by_name = {f['name']: f for f in uploaded}
     rows, changed = [], False

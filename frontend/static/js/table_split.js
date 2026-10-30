@@ -31,7 +31,7 @@
                 const intro = document.querySelector('#integrate-work-view > .desc');
                 intro.textContent = kind === 'split'
                     ? '可只上传一张表直接拆分，也可选择模板并整合其他数据表后拆分。保留所选 Sheet 的表头、数据行后的汇总与备注、格式和公式，并保留工作簿的其他 Sheet。结果以 ZIP 下载。'
-                    : '选择主表模板，按关联键把对照表的值回填到主表，可选生成差异 Sheet，保留其他 Sheet、格式和未覆盖的公式。';
+                    : '选择模板和目标Sheet，每个目标独立配置来源、关联键、数据范围和公式，一次生成多Sheet工作簿或多个Excel。保留模板其他Sheet、格式和未覆盖的公式。';
                 for (const id of ['btn-int-new-scheme', 'btn-int-import-scheme']) {
                     document.getElementById(id).dataset.perm = permission + '.create';
                 }

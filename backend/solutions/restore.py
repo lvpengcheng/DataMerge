@@ -19,10 +19,39 @@ def values(model, data):
         typ = attr.columns[0].type
         if value and isinstance(typ, DateTime):
             value = datetime.fromisoformat(value)
+            if not typ.timezone:
+                from ..utils.timezone import naive_utc
+                value = naive_utc(value)
         elif value and isinstance(typ, Date):
             value = date.fromisoformat(value)
         result[key] = value
     return result
+
+
+def restore_solution_script(db, row, user_id):
+    """Recover a missing editable binding from a verified immutable snapshot.
+
+    Restoring creates tenant-local ids and files. It never reuses the exported
+    primary key, overwrites another tenant's script, or executes packaged code.
+    """
+    from ..database.models import Script, CalculationSolution
+    from .store import artifact
+    from .package import verify
+    script = db.query(Script).filter_by(id=row.script_id, tenant_id=row.tenant_id).first()
+    if script:
+        return script, None
+    package = artifact(row.digest)
+    verify(package)
+    script, directory = restore(db, package, row.tenant_id, user_id, script_name=row.name)
+    previous = row.script_id
+    related = db.query(CalculationSolution).filter_by(
+        tenant_id=row.tenant_id, name=row.name, script_id=previous).all()
+    for version in related:
+        version.script_id = script.id
+    row.script_id = script.id
+    row.source_session_id = script.source_session_id
+    script.is_active = any(version.is_active for version in related) or row.is_active
+    return script, directory
 
 
 def prepare(package, tenant):
@@ -120,7 +149,7 @@ def restore(db, package, tenant, user_id, prepared=None, target_script=None, scr
                     restored_rows.append(row)
         data = values(Script, records['script'])
         data.update(tenant_id=tenant, created_by=user_id, source_session_id=session.id if session else None,
-                    is_active=False, code=(package / 'business/script.py').read_bytes().decode('utf-8'))
+                    is_active=False, updated_at=datetime.utcnow(), code=(package / 'business/script.py').read_bytes().decode('utf-8'))
         if target_script is not None:
             if target_script.tenant_id != tenant:
                 raise ValueError('目标脚本不属于当前租户')

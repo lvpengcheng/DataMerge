@@ -7,6 +7,25 @@ const AUTH = {
     TOKEN_KEY: 'datamerge_token',
     USER_KEY: 'datamerge_user',
 
+    // Database timestamps are UTC. Older APIs omitted the timezone suffix.
+    // Interpret those as UTC and display all recorded events in Beijing time.
+    parseTimestamp(value) {
+        if (value instanceof Date) return value;
+        if (value == null || value === '') return null;
+        let text = String(value).trim();
+        if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(text)) {
+            text = text.replace(' ', 'T');
+            if (!/(?:Z|[+-]\d{2}:?\d{2})$/i.test(text)) text += 'Z';
+        }
+        const date = new Date(text);
+        return Number.isNaN(date.getTime()) ? null : date;
+    },
+
+    formatDateTime(value, options = {}) {
+        const date = this.parseTimestamp(value);
+        return date ? date.toLocaleString('zh-CN', {...options, timeZone:'Asia/Shanghai', hour12:false}) : '-';
+    },
+
     getToken() {
         return localStorage.getItem(this.TOKEN_KEY);
     },
