@@ -210,7 +210,9 @@ def normalize_key(val, enabled: bool = True, date_mode: str = "off") -> str:
 
 def _is_empty(v) -> bool:
     try:
-        if v is None or (isinstance(v, float) and pd.isna(v)):
+        # Date columns use NaT, nullable columns use pd.NA; both are missing
+        # just like float NaN. Do not stringify them into visible cell values.
+        if v is None or (pd.api.types.is_scalar(v) and pd.isna(v)):
             return True
     except Exception:
         pass

@@ -232,8 +232,7 @@ async function loadAiProviderOptions() {
 async function loadSessions() {
     if (!_currentTenantId) return;
     try {
-        const history = document.getElementById('show-training-history')?.checked ? '&include_history=true' : '';
-        const resp = await AUTH.authFetch(`/api/training/chat/sessions?tenant_id=${encodeURIComponent(_currentTenantId)}${history}`);
+        const resp = await AUTH.authFetch(`/api/training/chat/sessions?tenant_id=${encodeURIComponent(_currentTenantId)}`);
         if (!resp.ok) return;
         const data = await resp.json();
         _sessions = data.sessions || [];
