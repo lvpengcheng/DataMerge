@@ -114,7 +114,7 @@ def test_frozen_template_basename_preserves_business_owner_selection(context, mo
     assert (output / '王五.xlsx').read_text(encoding='utf-8') == '王五'
 
 
-def test_import_overwrites_same_name_solution_and_script(context):
+def test_import_replaces_current_solution_and_archives_old_binding(context):
     db, source, admin, root = context
     row = store.build(db, source, admin.id)
     archive = root / '方案.zip'
@@ -144,10 +144,13 @@ def test_import_overwrites_same_name_solution_and_script(context):
     package.export_zip(store.artifact(newer.digest), archive)
     second = imported()
     assert second['script_id'] == target.id
-    assert second['id'] == first['id'] and second['is_active']
+    assert second['id'] != first['id'] and second['is_active']
     assert second['digest'] == newer.digest and second['digest'] != first['digest']
     assert second['validation'] is None
-    assert db.query(CalculationSolution).filter_by(tenant_id='正式', name='工资').count() == 1
+    assert db.query(CalculationSolution).filter_by(tenant_id='正式', name='工资', is_active=True).count() == 1
+    previous = db.get(CalculationSolution, first['id'])
+    assert not previous.is_active and previous.digest == first['digest']
+    assert previous.validation['passed']
     assert db.query(Script).filter_by(tenant_id='正式', name='工资').count() == 1
     assert other.code == 'other tenant'
     assert target.code == source.code
@@ -318,3 +321,103 @@ def test_deleting_old_training_session_does_not_delete_reimported_current_script
     training_chat.delete_session(previous,db,admin)
     assert db.get(Script,script.id) and db.get(TrainingSession,current.id)
     assert not deleted
+
+
+def test_admin_toggle_controls_only_latest_published_solution(context, monkeypatch):
+    from datetime import datetime
+    from backend.admin.router import disable_script, enable_script
+    from backend.storage import storage_manager
+    db, script, admin, root = context
+    old = store.build(db, script, admin.id)
+    old.created_at = datetime(2026, 1, 1)
+    api.activate(db, old)
+    script.code = 'def main(): return 321\n'; db.commit()
+    latest = store.build(db, script, admin.id)
+    latest.created_at = datetime(2026, 1, 2)
+    api.activate(db, latest)
+    changes = []
+    monkeypatch.setattr(storage_manager, 'StorageManager', lambda: SimpleNamespace(
+        set_script_disabled=lambda *args: changes.append(args)))
+    asyncio.run(disable_script(script.id, db, admin))
+    assert not script.is_active and not latest.is_active and not old.is_active
+    asyncio.run(enable_script(script.id, db, admin))
+    assert script.is_active and latest.is_active and not old.is_active
+    assert changes == [('训练', '工资', True), ('训练', '工资', False)]
+    # Repair a pre-existing mismatch even if the script was already disabled.
+    script.is_active = False; latest.is_active = True; db.commit()
+    asyncio.run(disable_script(script.id, db, admin))
+    assert not latest.is_active
+
+
+def test_disabled_script_cannot_execute_active_package(context):
+    db, script, admin, root = context
+    row = store.build(db, script, admin.id)
+    api.activate(db, row)
+    script.is_active = False; db.commit()
+    with pytest.raises(ValueError, match='脚本已停用'):
+        execution.binding('训练', 'solution_' + row.id, db)
+
+
+def test_explicit_import_target_reuses_its_own_same_digest_version(context):
+    db, source, admin, root = context
+    built = store.build(db, source, admin.id)
+    archive = root / 'migration.zip'
+    package.export_zip(store.artifact(built.digest), archive)
+    (root / 'tenants/正式').mkdir(parents=True)
+    targets = [Script(tenant_id='正式', name='工资', code='old') for _ in range(2)]
+    db.add_all(targets); db.commit()
+
+    def imported(target):
+        return asyncio.run(api.import_package(
+            UploadFile(filename='migration.zip', file=io.BytesIO(archive.read_bytes())),
+            '正式', False, True, db, admin, ['正式'], script_id=str(target.id)))
+
+    first, second = [imported(target) for target in targets]
+    again = imported(targets[0])
+    assert again['id'] == first['id'] and again['script_id'] == targets[0].id
+    assert not db.get(CalculationSolution, second['id']).is_active
+    assert db.query(CalculationSolution).filter_by(tenant_id='正式', is_active=True).count() == 1
+
+
+def test_solution_selectors_show_one_current_script_per_name(context):
+    db, script, admin, root = context
+    row = store.build(db, script, admin.id)
+    api.activate(db, row)
+    archived = Script(tenant_id='训练', name=script.name, code='archived',
+                      version=999, is_active=False)
+    db.add(archived); db.commit()
+    result = api.listing('训练', db, admin, ['训练'])
+    assert [item['id'] for item in result['scripts']] == [script.id]
+    assert db.get(Script, archived.id)  # History is retained, not deleted.
+    script.is_active = False; db.commit()
+    result = api.listing('训练', db, admin, ['训练'])
+    assert len(result['scripts']) == 1
+
+
+def test_training_list_hides_replaced_import_session_but_history_keeps_it(context):
+    from backend.api.training_chat import list_chat_sessions
+    db, source, admin, root = context
+    row = store.build(db, source, admin.id)
+    archive = root / 'migration.zip'
+    package.export_zip(store.artifact(row.digest), archive)
+    (root / 'tenants/正式').mkdir(parents=True)
+
+    def imported():
+        return asyncio.run(api.import_package(
+            UploadFile(filename='migration.zip', file=io.BytesIO(archive.read_bytes())),
+            '正式', False, True, db, admin, ['正式'], script_name='工资'))
+
+    first = imported()
+    source.code = 'def main(): return 456\n'; db.commit()
+    newer = store.build(db, source, admin.id)
+    package.export_zip(store.artifact(newer.digest), archive)
+    second = imported()
+    assert first['script_id'] == second['script_id']
+    result = list_chat_sessions('正式', db, admin)
+    assert [item['id'] for item in result['sessions']] == [second['session_id']]
+    history = list_chat_sessions('正式', db, admin, include_history=True)
+    assert {item['id'] for item in history['sessions']} == {first['session_id'], second['session_id']}
+    assert next(item for item in history['sessions'] if item['id'] == first['session_id'])['is_history']
+    from backend.solutions.lifecycle import set_script_enabled
+    set_script_enabled(db, db.get(Script, second['script_id']), False); db.commit()
+    assert not list_chat_sessions('正式', db, admin)['sessions']

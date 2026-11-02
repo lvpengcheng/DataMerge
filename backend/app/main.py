@@ -8180,7 +8180,9 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
         from backend.solutions.catalog import tenant_versions
         versions, pending_solutions, unavailable_solutions = tenant_versions(
             db.query(CalculationSolution).filter_by(tenant_id=tenant_id)
-            .order_by(CalculationSolution.created_at.desc()).all())
+            .order_by(CalculationSolution.created_at.desc()).all(),
+            disabled_script_ids={script_id for (script_id,) in db.query(db_models.Script.id).filter_by(
+                tenant_id=tenant_id, is_active=False).all()})
         if versions:
             frozen_names = {item['name'] for item in versions}
             scripts = [item for item in scripts if item.get('name') not in frozen_names]

@@ -41,6 +41,9 @@
                     </div>
                 </div>
                 <!-- 会话列表 -->
+                <label style="display:flex;align-items:center;gap:6px;padding:6px 12px;font-size:12px;">
+                    <input type="checkbox" id="show-training-history" onchange="loadSessions()">显示历史训练
+                </label>
                 <div class="session-list" id="session-list">
                     <div class="session-list-empty" id="session-list-empty">选择租户后显示训练历史</div>
                 </div>
@@ -220,8 +223,8 @@
     </div>
 
     <script src="/static/js/auth.js?v=20261029-utc-display"></script>
-<script src="/static/js/training.js?v=20261029-migration-history"></script>
+<script src="/static/js/training.js?v=20261030-current-sessions"></script>
 <script src="/static/js/training_assets.js?v=20260907-assets"></script>
-<script src="/static/js/solutions.js?v=20261029-import-target"></script>
+<script src="/static/js/solutions.js?v=20261030-current-script"></script>
 </body>
 </html>

@@ -1458,7 +1458,7 @@ async def _generate_integrate_formula(req, current_user, workflow):
         provider=await asyncio.to_thread(AIProviderFactory.create_provider)
         return await asyncio.to_thread(generate_formula,provider,context)
     try:
-        return await asyncio.wait_for(generate(),timeout=90)
+        return await asyncio.wait_for(generate(),timeout=300)
     except ValueError as exc:
         raise HTTPException(422, detail=str(exc)) from None
     except asyncio.TimeoutError:

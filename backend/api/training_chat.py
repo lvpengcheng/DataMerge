@@ -1116,21 +1116,22 @@ def list_chat_sessions(
     tenant_id: str = Query(...),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
+    include_history: bool = False,
 ):
     """列出租户的训练会话（含最新准确率）"""
     sessions = (
         db.query(TrainingSession)
         .filter(TrainingSession.tenant_id == tenant_id)
         .order_by(TrainingSession.started_at.desc())
-        .limit(50)
         .all()
     )
 
     # 会话隐藏规则：会话“关联的脚本” = 它生成的(source_session_id) ∪ 它绑定的(final_script_id)。
     # 关联了脚本、且这些脚本全部被停用(无一 is_active) → 隐藏（含“生成该脚本的会话”）；
-    # 任一关联脚本仍启用（如该会话也产出了当前启用版）→ 显示；
+    # 会话仍是启用脚本的当前来源 → 显示；旧 final_script_id 不代表仍是当前来源。
     # 未产出/绑定任何脚本(纯训练尝试/历史) → 显示。
     _id_active = {}          # script.id -> is_active（供 final_script_id 反查）
+    _id_source = {}
     _src_any = set()         # 生成过脚本的会话 id
     _src_active = set()      # 生成的脚本中存在启用版的会话 id
     try:
@@ -1138,6 +1139,7 @@ def list_chat_sessions(
             Script.id, Script.source_session_id, Script.is_active
         ).filter(Script.tenant_id == tenant_id).all():
             _id_active[_sid] = _act
+            _id_source[_sid] = _src
             if _src is not None:
                 _src_any.add(_src)
                 if _act:
@@ -1145,24 +1147,33 @@ def list_chat_sessions(
     except Exception:
         pass
 
+    from ..database.models import CalculationSolution
+    solution_sessions = {}
+    for row in db.query(CalculationSolution).filter_by(tenant_id=tenant_id).all():
+        if row.source_session_id is not None:
+            solution_sessions.setdefault(row.source_session_id, []).append(row)
+
     def _session_hidden(s):
-        # An imported script is inactive until publication; that must not hide
-        # its editable training workspace as if it had been explicitly disabled.
-        if (s.config or {}).get('solution_import') or str(s.session_key or '').startswith('solution_'):
-            return False
         has_any = s.id in _src_any
         has_active = s.id in _src_active
         if s.final_script_id is not None and s.final_script_id in _id_active:
             has_any = True
-            if _id_active[s.final_script_id]:
+            # Re-import reuses the script id, but moves its editable source to
+            # the new session. A stale final_script_id does not keep the old one current.
+            if _id_active[s.final_script_id] and _id_source[s.final_script_id] in (None, s.id):
                 has_active = True
-        return has_any and not has_active
+        if has_any:
+            return not has_active
+        if s.id in solution_sessions:
+            return not any(row.is_active for row in solution_sessions[s.id])
+        return False
 
     result = []
     for s in sessions:
         cfg = s.config or {}
 
-        if _session_hidden(s):
+        is_history = _session_hidden(s)
+        if is_history and not include_history:
             continue  # 关联脚本全部已停用 → 会话不再显示
 
         script = None
@@ -1172,6 +1183,7 @@ def list_chat_sessions(
         latest_files = cfg.get("latest_files", {})
         result.append({
             "id": s.id,
+            "is_history": is_history,
             "session_key": s.session_key,
             "script_name": cfg.get("script_name") or (script.name if script else None),
             "mode": s.mode,
@@ -1187,7 +1199,7 @@ def list_chat_sessions(
             "has_code": bool(latest_files.get("script_file")),
         })
 
-    return {"sessions": result}
+    return {"sessions": result[:50]}
 
 
 def _serialize_iterations(iterations, session_root=None):

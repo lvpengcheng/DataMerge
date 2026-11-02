@@ -79,7 +79,7 @@ async function openSolutions() {
     const importArea = solutionElement('section', '', body);
     importArea.className = 'solutions-card';
     solutionElement('h3', '导入完整方案包', importArea);
-    solutionElement('p', '选择目标脚本或填写方案名称导入。同一租户下同名方案和脚本自动覆盖，不再新增同名方案，导入后立即启用。', importArea).className = 'solutions-muted';
+    solutionElement('p', '选择目标脚本或填写方案名称导入。同名新包导入成功后启用，原方案自动停用并保留为历史版本；同一个包重复导入不新增版本。', importArea).className = 'solutions-muted';
     const targetRow = solutionElement('div', '', importArea);
     targetRow.className = 'solutions-form-row';
     const targetLabel = solutionElement('label', '目标脚本', targetRow);
@@ -166,14 +166,20 @@ async function openSolutions() {
         versions.replaceChildren();
         solutionElement('h3', '所选脚本的方案版本', versions);
         const chosen=data.scripts.find(script => String(script.id) === select.value);
-        const rows = data.solutions.filter(row => String(row.script_id) === select.value ||
+        const rows = data.solutions.filter(row => (chosen && row.name === chosen.name) || String(row.script_id) === select.value ||
             (chosen?.needs_restore && String(row.script_id) === String(chosen.bound_script_id)));
         if (!rows.length) solutionElement('p', '当前脚本尚无方案，可从上方脚本转换或在下方导入。', versions).className = 'solutions-muted';
-        for (const row of rows) {
-            const box = solutionElement('article', '', versions);
+        const historical = rows.filter(row => !row.is_active);
+        let history;
+        if (historical.length) {
+            history = solutionElement('details', '', versions);
+            solutionElement('summary', '已停用的历史版本（' + historical.length + '）', history);
+        }
+        for (const row of [...rows.filter(row => row.is_active), ...historical]) {
+            const box = solutionElement('article', '', row.is_active ? versions : history);
             box.className = 'solutions-card';
             solutionElement('h4', row.name, box);
-            solutionElement('p', row.is_active ? '已启用：智算可直接选择此版本' : '历史方案', box);
+            solutionElement('p', (row.is_active ? '已启用：智算可直接选择此版本' : '已停用：历史方案') + ' · 版本 ' + (row.version || row.digest?.slice(0, 12) || '-'), box);
             if (row.validation?.completed) {
                 solutionElement('p', '实测准确率：' + (row.validation.accuracy * 100).toFixed(2) + '%；差异单元格：' + row.validation.total_differences, box);
                 const details = solutionElement('details', '', box);
@@ -196,6 +202,7 @@ async function openSolutions() {
                 status.textContent = '完整方案包已导出。';
             });
         }
+        if (history) versions.appendChild(history);
         }
         select.onchange = renderVersions;
         renderVersions();

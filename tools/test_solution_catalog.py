@@ -41,6 +41,13 @@ class SolutionCatalogTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '清单缺失'):
             verify(self.root / missing.digest)
 
+    def test_disabled_script_hides_its_stale_active_package(self):
+        row = self.row(1)
+        row.script_id = 972
+        self.write(row, json.dumps({'digest': row.digest}))
+        versions, pending, unavailable = tenant_versions([row], disabled_script_ids={972})
+        self.assertEqual((versions, pending, unavailable), ([], [], []))
+
     def test_malformed_and_mismatched_manifests_are_unavailable(self):
         rows = [self.row(i) for i in range(1, 5)]
         for row, content in zip(rows, ('not json', '[]', '{}', json.dumps({'digest': 'a' * 64}))):

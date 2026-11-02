@@ -77,7 +77,13 @@ def listing(tenant_id: str, db: Session = Depends(get_db), user=Depends(get_curr
     tenant_name(tenant_id)
     rows = db.query(Script).filter_by(tenant_id=tenant_id).all()
     solutions = db.query(CalculationSolution).filter_by(tenant_id=tenant_id).order_by(CalculationSolution.created_at.desc()).all()
-    scripts = [{'id': r.id, 'name': r.name, 'session_id': r.source_session_id} for r in rows]
+    active_bindings = {row.script_id for row in solutions if row.is_active}
+    current_scripts = {}
+    for row in sorted(rows, key=lambda r: (bool(r.is_active), r.id in active_bindings,
+                                           r.version or 0, r.id), reverse=True):
+        current_scripts.setdefault(row.name, row)
+    scripts = [{'id': r.id, 'name': r.name, 'session_id': r.source_session_id,
+                'is_active': r.is_active} for r in current_scripts.values()]
     represented = {r.name for r in rows}
     # A scheme remains usable after its editable session/script is deleted.
     # Offer its snapshot explicitly; restoration occurs only on the user's action.
@@ -292,18 +298,23 @@ async def import_package(file: UploadFile = File(...), tenant_id: str = Form(...
             named_solutions = (db.query(CalculationSolution).filter_by(tenant_id=tenant, name=name)
                                .order_by(CalculationSolution.is_active.desc(),
                                          CalculationSolution.created_at.desc(), CalculationSolution.id.desc()).all())
-            # Re-import updates the tenant-local binding; immutable packages and
-            # past training sessions remain available to historical calculations.
-            existing = next((row for row in named_solutions if row.digest == manifest['digest']),
-                            named_solutions[0] if named_solutions else None)
+            # Reuse an identical package; a different package gets its own binding
+            # so old solution ids keep pointing to their original immutable digest.
+            existing = next((row for row in named_solutions if row.digest == manifest['digest']), None)
+            preferred = existing or (named_solutions[0] if named_solutions else None)
             matching = db.query(Script).filter_by(tenant_id=tenant, name=name).all() if target is None else [target]
             if target is None and matching:
-                target = next((script for script in matching if existing and script.id == existing.script_id), None)
+                target = next((script for script in matching if preferred and script.id == preferred.script_id), None)
                 target = target or max(matching, key=lambda script: (bool(script.is_active), script.version or 0, script.id))
-            if existing is None and target is not None:
+            if target is not None:
                 # A script may have been renamed since its package was saved.
-                existing = db.query(CalculationSolution).filter_by(
+                exact = db.query(CalculationSolution).filter_by(
                     tenant_id=tenant, script_id=target.id, digest=manifest['digest']).first()
+                if exact:
+                    existing = exact
+                elif existing and existing.script_id != target.id and db.query(Script).filter_by(
+                        tenant_id=tenant, id=existing.script_id).first():
+                    existing = None
             if (existing and existing.digest == manifest['digest'] and target
                     and existing.name == name
                     and existing.script_id == target.id

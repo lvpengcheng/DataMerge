@@ -3,9 +3,11 @@ import json
 from .store import artifact
 
 
-def tenant_versions(rows):
+def tenant_versions(rows, disabled_script_ids=()):
     versions, pending, unavailable = [], [], []
     for row in rows:
+        if getattr(row, 'script_id', None) in disabled_script_ids:
+            continue
         identity = {'id': row.id, 'name': row.name, 'version': row.digest[:12]}
         if row.status == 'candidate':
             pending.append({**identity, 'validation_passed': bool((row.validation or {}).get('passed'))})

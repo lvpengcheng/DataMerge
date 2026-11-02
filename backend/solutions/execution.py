@@ -28,6 +28,9 @@ def binding(tenant, script_id, db=None):
                     break
         if not row:
             return None
+        script = db.query(Script).filter_by(id=row.script_id, tenant_id=tenant).first()
+        if script is not None and not script.is_active:
+            raise ValueError('方案关联脚本已停用，请在管理页启用后再计算')
         root = artifact(row.digest)
         manifest = verify(root)
         require_environment(manifest['environment'], ROOT)

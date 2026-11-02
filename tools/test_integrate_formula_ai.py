@@ -14,10 +14,11 @@ pytest_plugins = ('backend.tests.test_table_split_api',)
 
 class Provider:
     def __init__(self,*responses):
-        self.responses=list(responses);self.calls=[]
+        self.responses=list(responses);self.calls=[];self.options=[]
 
     def chat(self,messages,**kwargs):
         self.calls.append(json.loads(json.dumps(messages)))
+        self.options.append(kwargs)
         return self.responses[min(len(self.calls)-1,len(self.responses)-1)]
 
 
@@ -155,6 +156,31 @@ def test_long_description_expected_results_and_output_context_are_available_to_a
     assert '预期结果' in s.provider.calls[0][0]['content']
     too_long=s.client.post('/api/tools/integrate/generate-formula',json={**request,'description':'字'*20001})
     assert too_long.status_code==400
+
+
+@pytest.mark.parametrize('workflow',['integrate','table-split'])
+def test_formula_output_budget_respects_larger_provider_configuration(formula_session, workflow):
+    s=formula_session
+    s.provider.max_tokens=80000
+    response=s.client.post('/api/tools/'+workflow+'/generate-formula',json=s.request)
+    assert response.status_code==200,response.text
+    assert s.provider.options[0]['max_tokens']==80000
+    assert s.provider.options[0]['require_complete']
+
+
+def test_formula_truncation_retries_with_larger_budget_without_accepting_partial_output(formula_session, monkeypatch):
+    s=formula_session
+    original=s.provider.chat
+    budgets=[]
+    def chat(messages,**kwargs):
+        budgets.append(kwargs['max_tokens'])
+        if len(budgets)==1:
+            raise ValueError('AI_RESPONSE_TRUNCATED: AI 输出达到长度上限，结果不完整')
+        return original(messages,**kwargs)
+    monkeypatch.setattr(s.provider,'chat',chat)
+    response=s.client.post('/api/tools/integrate/generate-formula',json=s.request)
+    assert response.status_code==200,response.text
+    assert budgets==[32000,64000]
 
 
 def test_serializer_preserves_literals_rounding_and_does_not_turn_numeric_branches_into_text():

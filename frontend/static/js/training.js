@@ -232,7 +232,8 @@ async function loadAiProviderOptions() {
 async function loadSessions() {
     if (!_currentTenantId) return;
     try {
-        const resp = await AUTH.authFetch(`/api/training/chat/sessions?tenant_id=${encodeURIComponent(_currentTenantId)}`);
+        const history = document.getElementById('show-training-history')?.checked ? '&include_history=true' : '';
+        const resp = await AUTH.authFetch(`/api/training/chat/sessions?tenant_id=${encodeURIComponent(_currentTenantId)}${history}`);
         if (!resp.ok) return;
         const data = await resp.json();
         _sessions = data.sessions || [];
@@ -295,7 +296,7 @@ function _renderSessionList() {
 
         const statusSpan = document.createElement('span');
         statusSpan.className = `session-item-status ${s.status}`;
-        statusSpan.textContent = _statusText(s.status);
+        statusSpan.textContent = s.is_history ? '历史版本' : _statusText(s.status);
 
         const iterSpan = document.createElement('span');
         iterSpan.style.cssText = 'font-size:11px;color:#999;';

@@ -1504,9 +1504,8 @@ async def disable_script(
     s = db.query(Script).filter(Script.id == script_id).first()
     if not s:
         raise HTTPException(status_code=404, detail="脚本不存在")
-    if not s.is_active:
-        return {"success": True, "message": "脚本已是停用状态", "script_id": script_id}
-    s.is_active = False
+    from ..solutions.lifecycle import set_script_enabled
+    set_script_enabled(db, s, False)
     s.updated_at = datetime.utcnow()
     db.commit()
     # 同步到 FS 层禁用列表，确保 /api/tenant-scripts 也过滤掉
@@ -1528,8 +1527,6 @@ async def enable_script(
     s = db.query(Script).filter(Script.id == script_id).first()
     if not s:
         raise HTTPException(status_code=404, detail="脚本不存在")
-    if s.is_active:
-        return {"success": True, "message": "脚本已是启用状态", "script_id": script_id}
     # 检查同租户同名脚本是否已有启用版本，避免冲突
     existing = db.query(Script).filter(
         Script.tenant_id == s.tenant_id,
@@ -1542,7 +1539,8 @@ async def enable_script(
             status_code=400,
             detail=f"租户「{s.tenant_id}」已存在启用中的同名脚本「{s.name}」(v{existing.version})，请先停用后再恢复"
         )
-    s.is_active = True
+    from ..solutions.lifecycle import set_script_enabled
+    set_script_enabled(db, s, True)
     s.updated_at = datetime.utcnow()
     db.commit()
     # 同步从 FS 禁用列表移除

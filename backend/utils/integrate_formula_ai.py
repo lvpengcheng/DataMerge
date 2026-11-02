@@ -7,6 +7,7 @@ from .integrate_engine import _FORMULA_FUNCTIONS, _normalize_excel_formula
 
 MAX_DESCRIPTION_LENGTH = 20000
 MAX_EXPECTED_RESULT_LENGTH = 8000
+FORMULA_MAX_TOKENS = 32000
 
 
 def field_context_for_formula(table, column):
@@ -163,8 +164,15 @@ def generate_formula(provider, context):
     prompt_context={**context,'fields':[{k:v for k,v in field.items() if k!='file'} for field in context['fields']]}
     messages=[{'role':'system','content':SYSTEM_PROMPT.format(functions=', '.join(sorted(_FORMULA_FUNCTIONS)))},
               {'role':'user','content':json.dumps(prompt_context,ensure_ascii=False)}]
+    output_budget = max(FORMULA_MAX_TOKENS, int(getattr(provider, 'max_tokens', 0) or 0))
     for attempt in range(2):
-        raw=provider.chat(messages,temperature=0.1,max_tokens=5000,require_complete=True)
+        try:
+            raw=provider.chat(messages,temperature=0.1,max_tokens=output_budget,require_complete=True)
+        except ValueError as exc:
+            if 'AI_RESPONSE_TRUNCATED' not in str(exc) or attempt:
+                raise
+            output_budget *= 2
+            continue
         try:
             value=json.loads(re.sub(r'^```(?:json)?\s*|\s*```$','',str(raw).strip()))
             if not isinstance(value,dict):

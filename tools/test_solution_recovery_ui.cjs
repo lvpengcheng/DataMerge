@@ -14,12 +14,17 @@ const {chromium}=require('playwright');
    if(options?.method==='POST')return new Response(JSON.stringify({id:'new'}));
    return new Response(JSON.stringify({scripts:[{id:'solution_old',name:'满记迁移1028',needs_restore:true,bound_script_id:964},
      {id:972,name:'现有脚本'}],
-    solutions:[{id:'old',name:'满记迁移1028',script_id:964,is_active:true}]}));
+    solutions:[{id:'old',name:'满记迁移1028',script_id:964,is_active:true,version:'new-version'},
+     {id:'history',name:'满记迁移1028',script_id:900,is_active:false,version:'old-version'}]}));
   }};});
   await page.addScriptTag({path:path.resolve('frontend/static/js/solutions.js')});
   await page.evaluate(()=>openSolutions());
   assert.equal(await page.getByRole('button',{name:'转为方案',exact:true}).isEnabled(),true);
+  assert.equal(await page.getByRole('button',{name:'进入修正',exact:true,includeHidden:true}).count(),2);
   assert.equal(await page.getByRole('button',{name:'进入修正',exact:true}).count(),1);
+  assert.equal(await page.locator('.solutions-versions > details').getAttribute('open'),null);
+  await page.getByText('已停用的历史版本（1）',{exact:true}).click();
+  assert.equal(await page.getByRole('button',{name:'进入修正',exact:true}).count(),2);
   assert.match(await page.locator('.solutions-content select').innerText(),/从迁移方案恢复/);
   await page.getByRole('button',{name:'转为方案',exact:true}).click();
   await page.waitForFunction(()=>window.calls.some(c=>c.url==='/api/solutions'&&c.body));
