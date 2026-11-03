@@ -13,6 +13,7 @@ import logging
 import ast as _ast
 import re as _re
 import operator as _operator
+from datetime import date as _date
 from decimal import Decimal as _Decimal, ROUND_HALF_UP as _ROUND_HALF_UP
 from typing import Dict, List, Any, Optional
 
@@ -208,9 +209,13 @@ def _safe_arith_eval(expr: str, values=None) -> Any:
             return str(int(value))
         return str(value)
 
-    def ev(n, as_text=False):
+    def ev(n, as_text=False, numeric=False):
         if isinstance(n, _ast.Name) and values and n.id in values:
-            return values[n.id][1 if as_text else 0]
+            number, original = values[n.id]
+            # 日期作为结果（包括 IF 的返回分支）保留类型；四则/数值函数仍走数值通道。
+            if as_text or (not numeric and isinstance(original, _date)):
+                return original
+            return number
         if isinstance(n, _ast.BinOp) and isinstance(n.op, _ast.BitAnd):
             left, right = ev(n.left, True), ev(n.right, True)
             if left is None or right is None:
@@ -219,14 +224,14 @@ def _safe_arith_eval(expr: str, values=None) -> Any:
         if isinstance(n, _ast.Constant) and isinstance(n.value, str):
             return n.value
         if isinstance(n, _ast.BinOp) and type(n.op) in _ARITH_BINOPS:
-            l, r = ev(n.left), ev(n.right)
+            l, r = ev(n.left, numeric=True), ev(n.right, numeric=True)
             if l is None or r is None:
                 return None
             if isinstance(n.op, _ast.Div) and r == 0:
                 return None
             return _ARITH_BINOPS[type(n.op)](l, r)
         if isinstance(n, _ast.UnaryOp) and isinstance(n.op, (_ast.UAdd, _ast.USub)):
-            v = ev(n.operand)
+            v = ev(n.operand, numeric=True)
             if v is None:
                 return None
             return v if isinstance(n.op, _ast.UAdd) else -v
@@ -257,7 +262,7 @@ def _safe_arith_eval(expr: str, values=None) -> Any:
                 if len(n.args) != 3:
                     return None
                 cond = ev(n.args[0])
-                return ev(n.args[1] if bool(cond) else n.args[2], as_text) if cond is not None else None
+                return ev(n.args[1] if bool(cond) else n.args[2], as_text, numeric) if cond is not None else None
             if name in {"AND", "OR"}:
                 if not n.args:
                     return None
@@ -270,7 +275,7 @@ def _safe_arith_eval(expr: str, values=None) -> Any:
                     return None
                 val = ev(n.args[0])
                 return (not bool(val)) if val is not None else None
-            args = [ev(a) for a in n.args]
+            args = [ev(a, numeric=True) for a in n.args]
             if any(v is None or isinstance(v, bool) for v in args):
                 return None
             if name == "ROUND" and len(args) in (1, 2):
@@ -341,6 +346,9 @@ def eval_source_expr(expr, rows: List[dict], cols: List[str]):
     if not expr:
         return None
     if not rows or '&' in expr or '"' in expr or validate_formula_remainder(expr):
+        return eval_source_expr_cross(expr, '', {'': {'cols': cols, 'rows': {'key': rows}}}, 'key')
+    if any(isinstance(row.get(c), _date) for c in _expr_columns(expr, cols) for row in rows):
+        # 旧单表入口也必须保留 IF 返回的日期，不能先把日期列替换成数值 0。
         return eval_source_expr_cross(expr, '', {'': {'cols': cols, 'rows': {'key': rows}}}, 'key')
     is_formula = _expr_has_operator(expr, cols)
 

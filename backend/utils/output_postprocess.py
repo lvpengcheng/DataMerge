@@ -317,18 +317,29 @@ def finalize_output_workbook(output_path, template_path=None, expected_structure
         version2 = is_template_pipeline_v2(script_code)
         script_formats = version2 or is_source_pipeline_v2(script_code)
         expected_structure = prefer_script_column_schemas(expected_structure, script_code) if not script_formats else expected_structure
-        explicit_formats = read_explicit_formats(output_path) if not version2 else {}
+        explicit_formats = read_explicit_formats(output_path)
         handle = session.open(output_path)
         wb = handle.workbook
         template_ok = bool(template_path and os.path.exists(template_path))
-        if not script_formats:
+        from backend.utils.column_contract import column_contract_enabled, apply_column_contract
+        unified = column_contract_enabled()
+        # 汇总区整行样式（填充/边框/行高）不属于列契约，两种模式都保留；统一模式下先刷整行样式，
+        # 再由列契约最后裁决数字格式，保证脚本声明的格式不被模板样板行覆盖。
+        region_format = not script_formats and template_ok and restore_summary_format_enabled()
+        if unified:
+            if region_format:
+                restore_template_region_format(output_path, template_path, script_code, expected_structure)
+            # 统一列契约：值类型与格式在一个方法里逐格裁决、一次写入（含脚本显式格式）。
+            apply_column_contract(wb, output_path, script_code, template_path if template_ok else None,
+                                  expected_structure, explicit_formats, legacy_layers=not script_formats)
+        elif not script_formats:
             normalize_key_columns_to_text(output_path, explicit_formats=explicit_formats)
             if template_ok:
                 restore_formats_from_template(output_path, template_path, expected_structure)
             _normalize_source_sheet_formats_impl(output_path, template_path if template_ok else None)
             if not template_ok and expected_structure:
                 _apply_expected_schemas_in_workbook(wb, expected_structure, explicit_formats)
-            if template_ok and restore_summary_format_enabled():
+            if region_format:
                 restore_template_region_format(output_path, template_path, script_code, expected_structure)
         # Rename via Aspose so cross-sheet formula references follow the names.
         if sheet_name_map:
@@ -342,7 +353,8 @@ def finalize_output_workbook(output_path, template_path=None, expected_structure
                     pending.append((ws, replacement))
             for ws, replacement in pending:
                 ws.Name = replacement
-        apply_explicit_formats(wb, explicit_formats, sheet_name_map)
+        if not unified:  # 统一模式已在 apply_column_contract 内写过显式格式
+            apply_explicit_formats(wb, explicit_formats, sheet_name_map)
         wb.Settings.ForceFullCalculate = True
         wb.Settings.ReCalculateOnOpen = True
         wb.CalculateFormula()  # failure propagates; never publish a partial calculation

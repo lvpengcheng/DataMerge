@@ -22,6 +22,8 @@ const root = path.resolve(__dirname, '..');
                 resolved_scheme:{main_file:'test__工资.xlsx',role_files:['test__工资.xlsx','test__工资源.xlsx'],
                     config:{key_map_by_role:{'0':'工号','1':'工号'},
                         overwrite_pairs:[{a_col:'金额',source_role:1,source_expr:'金额*2'}],compare_pairs:[]}}}});
+            if (url.pathname.endsWith('/execute')) return route.fulfill({
+                contentType:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', body:'mock-result'});
             return route.fulfill({json: []});
         });
         await page.goto('http://datamerge.test/tools');
@@ -90,6 +92,36 @@ const root = path.resolve(__dirname, '..');
             method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:_integrateAnalysis.session_id})}));
         const executed=JSON.parse(requests.findLast(r => r.url.endsWith('/execute')).body);
         assert.deepEqual(Object.keys(executed.output_tasks[0].key_map).sort(),[...executed.output_tasks[0].active_files].sort());
+        // Applying a validated multi-target scheme must remain executable after tab redraws.
+        await page.evaluate(tasks => {
+            Tools._intFillFromScheme({main_file:tasks[0].main_file, role_files:tasks[0].active_files,
+                config:{output_tasks:tasks,key_map_by_role:{},overwrite_pairs:[]}});
+            _intApplyReady = true;
+            document.getElementById('int-execute').disabled = false;
+        }, saved.output_tasks);
+        for (const index of [1, 0, 1]) {
+            await page.locator(`[data-output-task="${index}"]`).click();
+            assert.equal(await page.locator('#int-execute').isEnabled(), true,
+                'Switching validated target sheets must keep Apply enabled');
+            assert.equal(await page.evaluate(() => _intApplyReady), true,
+                'The execution guard must retain the validation state too');
+            assert.match(await page.locator('#int-ow-list-rows tr').getAttribute('data-src'),
+                index ? /金额\*3/ : /金额\*2/);
+        }
+        const executeCount = requests.filter(r => r.url.endsWith('/execute')).length;
+        await page.locator('#int-execute').click();
+        await page.waitForFunction(() => document.getElementById('int-exec-status').textContent.includes('已生成下载'));
+        assert.equal(requests.filter(r => r.url.endsWith('/execute')).length, executeCount + 1);
+        const afterSwitch = JSON.parse(requests.findLast(r => r.url.endsWith('/execute')).body);
+        assert.equal(afterSwitch.output_tasks.length, 2);
+        assert.match(afterSwitch.output_tasks[0].overwrite_pairs[0].source_expr, /金额\*2$/);
+        assert.match(afterSwitch.output_tasks[1].overwrite_pairs[0].source_expr, /金额\*3$/);
+        // A fresh parse remains unvalidated; switching alone cannot unlock Apply.
+        await page.evaluate(() => Tools._renderIntegrateConfig(_integrateAnalysis));
+        assert.equal(await page.locator('#int-execute').isEnabled(), false);
+        await page.evaluate(() => Tools._showOutputTask(0));
+        assert.equal(await page.locator('#int-execute').isEnabled(), false);
+        assert.equal(await page.evaluate(() => _intApplyReady), false);
         assert.deepEqual(errors,[]);
         console.log('Target tabs: independent formulas/sources, switching, copy/remove, save and restore passed');
     } finally {await browser.close();}

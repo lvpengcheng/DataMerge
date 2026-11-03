@@ -10,6 +10,8 @@ CODE_CONTRACT = """
 不要把字段名直接转为 Python 变量名或属性。每行都需要的写值/写公式逻辑必须覆盖首行；
 只针对第二行后的条件块不得包住其他字段处理。不要保留含 #REF! 的模板公式作为正确结果。
 检查辅助函数和第三方对象的方法确实存在；不能虚构 API。检查零行、单行和多行路径。
+已有模块级 _COLUMN_SPECS 列契约必须保留，不能删除、动态重写或在函数内遮蔽；
+列类型/格式要求须持久化为模块级 _COLUMN_SPECS 纯字面量声明。
 """
 
 
@@ -18,12 +20,18 @@ def check_generated_code(code, available_names=()):
     from pyflakes.messages import UndefinedName, UndefinedLocal
     tree = ast.parse(code)
     checker = Checker(tree, filename='<generated>', builtins=set(available_names))
-    return [
+    issues = [
         {'line': item.lineno, 'kind': type(item).__name__,
          'message': item.message % item.message_args}
         for item in checker.messages
         if isinstance(item, (UndefinedName, UndefinedLocal))
     ]
+    from backend.utils.column_spec_edit import inspect_column_specs
+    try:
+        inspect_column_specs(code)
+    except ValueError as exc:
+        issues.append({'line': 1, 'kind': 'ColumnSpecContract', 'message': str(exc)})
+    return issues
 
 
 def describe_issues(issues):

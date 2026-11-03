@@ -35,6 +35,7 @@
     const render = Tools._renderIntegrateConfig;
     Tools._showOutputTask = function(index) {
         const schemeName = document.getElementById('int-scheme-name')?.value;
+        const applyReady = _intApplyReady;
         this._outputTaskIndex = index;
         const task = this._outputTasks[index];
         const files = allFiles().filter(f => task.active_files.includes(f.name));
@@ -49,6 +50,9 @@
         this._renderOutputTaskTabs();
         // Template selection is handled by the target picker to avoid erasing formulas.
         document.getElementById('int-main-file').disabled = true;
+        // A target tab redraw uses the same parsed files and validated scheme.
+        // Only a fresh parse/load should invalidate readiness, not this render.
+        _intApplyReady = applyReady;
         if (_intMode === 'apply') document.getElementById('int-execute').disabled = !_intApplyReady;
     };
     Tools._renderOutputTaskTabs = function() {

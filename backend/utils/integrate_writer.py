@@ -11,6 +11,7 @@
 """
 
 import logging
+from datetime import date, datetime
 from typing import Dict, List, Any, Optional
 
 import aspose_init  # noqa: F401 — 确保 Aspose 已初始化
@@ -59,7 +60,7 @@ def _is_identifier_column(column_name: str) -> bool:
     return any(hint in name for hint in _TEXT_ID_HINTS)
 
 
-def _put_value(cell, value, force_text: bool = False):
+def _put_value(cell, value, force_text: bool = False, date1904: bool = False):
     """写值到单元格（只写值，替换任何原公式）。长数字文本设 '@' 文本格式防科学计数。"""
     if value is CLEAR_CELL:
         # None 在本模块一直表示“不写，保留原值”，因此用独立哨兵值
@@ -73,6 +74,22 @@ def _put_value(cell, value, force_text: bool = False):
                 logger.warning("[integrate] 清空单元格失败，跳过")
         return
     if value is None:
+        return
+    if isinstance(value, date) and not force_text:
+        # pythonnet 对 Python datetime 的重载绑定不稳定；直接写本工作簿日期系统的
+        # 数值，不能用 str(datetime) 兜底，否则日期格式无法隐藏 00:00:00。
+        from .column_contract import canon_value, _style_code
+        from openpyxl.styles.numbers import is_date_format
+        if value != value:  # pandas.NaT
+            return
+        has_time = isinstance(value, datetime) and bool(
+            value.hour or value.minute or value.second or value.microsecond)
+        serial = canon_value(value, 'datetime' if has_time else 'date', date1904=date1904)
+        style = cell.GetStyle()
+        if not is_date_format(_style_code(style)):
+            style.Custom = 'yyyy/mm/dd hh:mm:ss' if has_time else 'yyyy/mm/dd'
+        cell.PutValue(serial)
+        cell.SetStyle(style)
         return
     # 长数字文本（身份证/银行卡/手机号）→ 文本格式
     s = str(value)
@@ -132,6 +149,7 @@ def _apply_integration_impl(
         ws = wb.Worksheets[wb.Worksheets.ActiveSheetIndex]
 
     cells = ws.Cells
+    date1904 = bool(wb.Settings.Date1904)
 
     # 关联键列索引 + 覆盖目标列索引
     if a_key_col not in head_data:
@@ -204,7 +222,7 @@ def _apply_integration_impl(
                     except Exception as copy_error:
                         logger.warning(f"[integrate] 复制新增行样式失败（继续写值）: {copy_error}")
                 _put_value(cells[dest, key_ci], item.get("value"),
-                           force_text=_is_identifier_column(a_key_col))
+                           force_text=_is_identifier_column(a_key_col), date1904=date1904)
             added_rows = len(missing)
             de = (de + added_rows) if had_data else (ds + added_rows - 1)
 
@@ -239,7 +257,7 @@ def _apply_integration_impl(
             ci = a_col_idx.get(ac)
             if ci is None:
                 continue
-            _put_value(cells[r0, ci], v, force_text=_is_identifier_column(ac))
+            _put_value(cells[r0, ci], v, force_text=_is_identifier_column(ac), date1904=date1904)
             overwritten += 1
 
     # 追加差异 sheet（输出方式2）
@@ -408,11 +426,14 @@ def _append_diff_sheet(wb, diff_rows: List[dict], diff_order: str) -> int:
                     continue
                 except Exception:
                     pass
-            _put_cell_plain(cell, v)
+            _put_cell_plain(cell, v, date1904=bool(wb.Settings.Date1904))
     return len(diff_rows)
 
 
-def _put_cell_plain(cell, value):
+def _put_cell_plain(cell, value, date1904=False):
+    if isinstance(value, date):
+        _put_value(cell, value, date1904=date1904)
+        return
     try:
         cell.PutValue(value)
     except Exception:

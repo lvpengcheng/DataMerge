@@ -3464,7 +3464,16 @@ async def adjust_code(
         logs_dir = tenant_dir / "training_logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
 
-        if is_formula_mode:
+        from ..utils.column_spec_edit import requires_column_specs
+        from ..utils.column_contract import read_column_specs
+        if requires_column_specs(adjustment_request) or read_column_specs(script_content):
+            # 旧调整接口同样通过共享入口写入/保护列声明，避免全函数重建丢失契约。
+            from ..ai_engine.precise_edit import run_precise_edit
+            adjusted_code = run_precise_edit(
+                ai_provider, script_content, adjustment_request,
+                extra_context=(f"目标列: {target_columns or '由用户要求确定'}\n"
+                               f"训练上下文:\n{original_prompt[:20000]}"))
+        elif is_formula_mode:
             from ..ai_engine.formula_code_generator import FormulaCodeGenerator
             formula_generator = FormulaCodeGenerator(ai_provider=ai_provider)
 

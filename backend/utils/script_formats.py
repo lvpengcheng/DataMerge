@@ -259,10 +259,10 @@ def track_script_formats():
 
 @contextmanager
 def preserve_template_formats():
-    """v2: no format snapshots or restoration; retain defaults while writing."""
+    """v2: retain defaults while writing and record explicit user overrides."""
     _install_tracking()
     token = _preserve_template.set(True)
-    legacy = _state.set(None)
+    legacy = _state.set({})
     try:
         yield
     finally:

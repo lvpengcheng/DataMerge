@@ -19,8 +19,8 @@ _SYSTEM_PROMPT = (
     "现在做外科手术式精确修改：只输出结构化替换对，绝不重写整段代码。严格按给定输出格式回答。"
     "用户指定当前目标使用哪些源文件时，设置模块级 SOURCE_FILES = [完整文件名列表]；"
     "未要求修改源范围时保留原 SOURCE_FILES，取消限制时设为 None。"
-    "用户要求列显示格式时，在业务填充函数内对对应单元格设置 number_format；"
-    "平台会保留这些明确设置（含 General），无需删除默认格式辅助函数。"
+    "用户要求列类型或显示格式时，必须通过响应 JSON 的 column_specs 提交列契约；"
+    "宿主会写入脚本顶部 _COLUMN_SPECS，保留未涉及的声明。"
     "若脚本含 TEMPLATE_PIPELINE_VERSION = 2，必须保留该版本及局部填充流程："
     "未明确覆盖的内容保留，write_template_cell 默认仅填空白；copy 模式源表在目标保存后原表复制，"
     "不要把源表视为已在 wb 中，也不要重新加入格式恢复或源表逐行写入逻辑。"
@@ -30,14 +30,14 @@ _SYSTEM_PROMPT = (
 )
 
 
-def parse_precise_edits(ai_response: str) -> list:
+def parse_precise_edit_payload(ai_response: str) -> dict:
     """从 AI 响应里稳健抽取 {"edits":[{find,replace,note},...]}。
 
     兼容：纯 JSON、```json 代码块包裹、前后带解释文字。取第一个能解析出
-    含 edits 数组的 JSON 对象。失败返回 []。
+    含 edits 数组（可为空）及可选 column_specs 的 JSON 对象。失败返回 {}。
     """
     if not ai_response:
-        return []
+        return {}
     text = ai_response.strip()
     candidates = []
     for m in re.finditer(r"```(?:json)?\s*([\s\S]*?)```", text):
@@ -49,19 +49,20 @@ def parse_precise_edits(ai_response: str) -> list:
         candidates.append(text[b:e + 1])
 
     for cand in candidates:
-        if not cand or ('"edits"' not in cand and "'edits'" not in cand):
+        if not cand:
             continue
         try:
             obj = json.loads(cand)
         except Exception:
             continue
-        edits = obj.get("edits") if isinstance(obj, dict) else None
-        if isinstance(edits, list) and edits:
-            out = [it for it in edits
-                   if isinstance(it, dict) and "find" in it and "replace" in it]
-            if out:
-                return out
-    return []
+        if isinstance(obj, dict) and isinstance(obj.get('edits'), list):
+            return obj
+    return {}
+
+
+def parse_precise_edits(ai_response: str) -> list:
+    return [it for it in parse_precise_edit_payload(ai_response).get('edits', [])
+            if isinstance(it, dict) and 'find' in it and 'replace' in it]
 
 
 def apply_precise_edits(code_segment: str, edits: list):
@@ -103,7 +104,8 @@ def apply_precise_edits(code_segment: str, edits: list):
 def build_prompt(code_segment: str, user_feedback: str, code_label: str = "当前代码",
                  extra_context: str = "") -> str:
     from backend.utils.generated_code_check import CODE_CONTRACT
-    extra_context = CODE_CONTRACT + '\n' + extra_context
+    from backend.utils.column_spec_edit import COLUMN_SPEC_EDIT_CONTRACT
+    extra_context = CODE_CONTRACT + '\n' + COLUMN_SPEC_EDIT_CONTRACT + '\n' + extra_context
     code_segment = code_segment.replace('\r\n', '\n')
     return f"""你正在做**外科手术式**精确修改。下面是{code_label}。请**只**根据【修改指示】改动直接相关的代码，
 以 JSON 输出一组精确替换，**严禁重写整段代码**。
@@ -244,8 +246,13 @@ def run_precise_edit(
         except Exception:
             pass
 
+    payload = parse_precise_edit_payload(ai_response)
     edits = parse_precise_edits(ai_response)
-    if not edits:
+    spec_updates = payload.get('column_specs', {})
+    from backend.utils.column_spec_edit import requires_column_specs, merge_column_spec_edit
+    if requires_column_specs(user_feedback) and not spec_updates:
+        return retry_validation('列格式/类型要求必须写入 column_specs；请返回真实列名、sheet 及 Excel 格式码')
+    if not edits and not spec_updates:
         log("[精确编辑] 未解析到有效替换对，交由兜底")
         # AI 常在无法完成时用自然语言说明原因，截一段带回给用户
         _hint = (ai_response or "").strip().replace("\n", " ")
@@ -257,7 +264,7 @@ def run_precise_edit(
         return retry_validation('部分替换无法定位，整组修改已放弃，避免只增加调用却遗漏定义：' + str(failed))
     for note, cnt in failed:
         log(f"[精确编辑] ⚠ 片段无法唯一定位（出现 {cnt} 次），已跳过: {note}")
-    if not applied:
+    if not applied and not spec_updates:
         log("[精确编辑] 无任何可套用的替换，交由兜底")
         _locs = "；".join(
             f"“{note}”在代码中出现 {cnt} 次（需唯一才能定位）" for note, cnt in failed
@@ -293,6 +300,11 @@ def run_precise_edit(
     if syn_err:
         log(f"[精确编辑] 语法校验未通过：{syn_err}，交由兜底")
         return _fail(f"改动后代码语法不通过（{syn_err}），已放弃以免写入坏代码")
+
+    try:
+        complete_code = merge_column_spec_edit(full_code, complete_code, spec_updates)
+    except (ValueError, SyntaxError) as exc:
+        return retry_validation('列契约 AST 检查未通过：' + str(exc))
 
     from backend.utils.generated_code_check import check_generated_code, describe_issues
     try:
