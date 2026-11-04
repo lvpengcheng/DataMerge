@@ -70,18 +70,9 @@ def prepare(package, tenant):
 
 def restore(db, package, tenant, user_id, prepared=None, target_script=None, script_name=None):
     from ..database.models import Script, TrainingSession, TrainingMessage, TrainingIteration, DataAsset
+    from .package import validate_training_archive
     raw = json.loads((package / 'archive/records.json').read_text(encoding='utf-8'))
-    def require_archived(path):
-        if path and (not isinstance(path, str) or not path.startswith('asset://') or
-                     not Path(materialize(path, package)).exists()):
-            raise ValueError('方案引用了未归档的训练文件，请在源环境补齐后重新导出')
-    for item in raw['assets']:
-        require_archived(item['file_path'])
-    cfg = (raw.get('session') or {}).get('config') or {}
-    for key in ('source_dir', 'expected_file', 'template_path', 'rule_files_dir'):
-        require_archived(cfg.get(key))
-    for path in cfg.get('expected_files') or []:
-        require_archived(path)
+    validate_training_archive(package, raw)
     # The archive stays immutable. Editable training uses its own complete copy.
     destination = prepared or prepare(package, tenant)
     try:

@@ -1890,6 +1890,9 @@ async def start_training(
                     _cfg['rule_files_dir'] = str(persisted_rules)
                 if p_expected:
                     _cfg["expected_file"] = p_expected
+                # Single-target training must not retain the temporary upload
+                # path in the list after persisting its scalar counterpart.
+                _cfg["expected_files"] = [p_expected] if p_expected else []
                 if p_template:
                     _cfg["template_path"] = p_template
                     _cfg["mode"] = "template"

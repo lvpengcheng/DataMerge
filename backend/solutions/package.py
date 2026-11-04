@@ -79,8 +79,33 @@ def verify(root):
     return manifest
 
 
+def validate_training_archive(root, records=None):
+    """Apply the same training-reference checks before export and restore."""
+    root = Path(root)
+    if records is None:
+        records = json.loads((root / 'archive/records.json').read_text(encoding='utf-8'))
+
+    def require_archived(path, field):
+        if not path:
+            return
+        if not isinstance(path, str) or not path.startswith('asset://'):
+            raise ValueError(f'方案引用了未归档的训练文件（{field}: {path}），请在源环境补齐后重新导出')
+        target = root / safe_name(path[8:])
+        if not target.exists():
+            raise ValueError(f'方案归档中缺少训练文件（{field}: {path}），请在源环境补齐后重新导出')
+
+    for index, item in enumerate(records.get('assets') or []):
+        require_archived(item.get('file_path'), f'assets[{index}].file_path')
+    cfg = (records.get('session') or {}).get('config') or {}
+    for key in ('source_dir', 'expected_file', 'template_path', 'rule_files_dir'):
+        require_archived(cfg.get(key), f'session.config.{key}')
+    for index, path in enumerate(cfg.get('expected_files') or []):
+        require_archived(path, f'session.config.expected_files[{index}]')
+
+
 def export_zip(root, destination):
     manifest = verify(root)
+    validate_training_archive(root)
     with zipfile.ZipFile(destination, 'w', zipfile.ZIP_DEFLATED) as archive:
         for name in ['manifest.json', *sorted(manifest['files'])]:
             archive.write(Path(root) / name, name)

@@ -9,7 +9,7 @@ import ast
 from datetime import datetime, date
 from pathlib import Path
 
-from .package import canonical, digest_file, seal, verify, scrub
+from .package import canonical, digest_file, seal, verify, scrub, validate_training_archive
 from .environment import fingerprint, calculation_settings
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -116,6 +116,17 @@ def build(db, script, user_id):
 
         session = records['session']
         if session:
+            # Older single-target sessions persisted only expected_file, leaving
+            # its duplicate list entry pointing at the temporary upload folder.
+            cfg = dict(session.get('config') or {})
+            expected = cfg.get('expected_file')
+            targets = cfg.get('expected_files') or []
+            if (expected and len(targets) == 1 and targets[0] != expected
+                    and Path(targets[0]).name == Path(expected).name
+                    and Path(expected).is_file() and not Path(targets[0]).exists()):
+                cfg['expected_files'] = [expected]
+                session['config'] = cfg
+        if session:
             session_root = ROOT / 'tenants' / script.tenant_id / 'training_chat' / str(session['id'])
             if session_root.is_dir():
                 for f in sorted(session_root.rglob('*')):
@@ -156,11 +167,17 @@ def build(db, script, user_id):
                     elif candidate.is_dir():
                         key = hashlib.sha256(str(candidate).encode()).hexdigest()[:20]
                         relative = 'archive/attachments/' + key
+                        target_dir = stage / relative
+                        target_dir.mkdir(parents=True, exist_ok=True)
                         for f in candidate.rglob('*'):
                             if f.is_symlink():
                                 raise ValueError('训练资源包含链接')
                             if f.is_file() and f.name != '.env' and '__pycache__' not in f.parts:
                                 copy_file(f, relative + '/' + f.relative_to(candidate).as_posix())
+                        # ZIP inventories contain files only; retain empty
+                        # referenced directories with an inert placeholder.
+                        if not any(target_dir.iterdir()):
+                            (target_dir / '.archive-directory').write_bytes(b'')
                         paths[value] = paths[str(candidate)] = 'asset://' + relative
                 except OSError:
                     return
@@ -213,6 +230,7 @@ def build(db, script, user_id):
         (stage / 'business/script.py').write_bytes(script_code.encode('utf-8'))
         (stage / 'archive').mkdir(exist_ok=True)
         records = replace_paths(records, paths)
+        validate_training_archive(stage, records)
         (stage / 'archive/records.json').write_bytes(canonical(records))
         from .inputs import snapshot
         snapshot(ROOT, script.tenant_id, stage / 'archive/context', db)
