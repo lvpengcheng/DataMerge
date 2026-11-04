@@ -222,7 +222,7 @@ def _sheet_references(expression):
     return names
 
 
-def copy_original_source_sheets(output_path, plan, workbook_factory=None):
+def copy_original_source_sheets(output_path, plan, workbook_factory=None, key_specs=None):
     """Native whole-worksheet copy AFTER openpyxl saves the target.
 
     Sources never pass through openpyxl load/save or DataFrame row writing.
@@ -324,6 +324,9 @@ def copy_original_source_sheets(output_path, plan, workbook_factory=None):
                     cell = iterator.Current
                     if not cell.IsFormula and cell.Type == CellValueType.IsDateTime:
                         copied.Cells[cell.Row, cell.Column].PutValue(cell.DateTimeValue)
+        if key_specs is not None:
+            from backend.utils.column_contract import normalize_native_keys
+            normalize_native_keys(output, key_specs)
         fd, staged = tempfile.mkstemp(prefix='.sources_', suffix=Path(output_path).suffix,
                                       dir=Path(output_path).resolve().parent)
         os.close(fd)

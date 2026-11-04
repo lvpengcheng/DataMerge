@@ -249,6 +249,9 @@ class ModularCodeGenerator:
 
         log(f"批量提示词生成完成，长度: {len(prompt)}")
 
+        from backend.utils.generated_code_check import CODE_CONTRACT
+        prompt = CODE_CONTRACT + '\n' + prompt
+
         # 记录完整提示词到日志文件
         if self.training_logger:
             self.training_logger.log_full_prompt(prompt, "modular_batch")
@@ -573,6 +576,9 @@ class ModularCodeGenerator:
             manual_headers=manual_headers
         )
 
+        from backend.utils.generated_code_check import CODE_CONTRACT
+        prompt = CODE_CONTRACT + '\n' + prompt
+
         # 检查是否支持流式生成
         has_stream = hasattr(self.ai_provider, 'generate_code_with_stream') and stream_callback
 
@@ -638,6 +644,8 @@ import logging
 
 # 导入Excel智能解析器
 from excel_parser import IntelligentExcelParser
+from backend.utils.column_contract import normalize_modular_source_keys, normalize_frame_tables, canon_value
+KEY_POLICY_VERSION = 1
 
 # 导入openpyxl用于Excel增强输出
 from openpyxl import Workbook
@@ -692,21 +700,8 @@ def convert_region_to_dataframe(region) -> pd.DataFrame:
 # ============================================================
 
 def normalize_emp_code(emp_code) -> str:
-    """标准化工号：转换为8位字符串，不足前面补0
-
-    示例：
-    - "123" -> "00000123"
-    - "12345678" -> "12345678"
-    - 12345 -> "00012345"
-    """
-    if pd.isna(emp_code) or emp_code == "":
-        return ""
-    # 转换为字符串并去除空格
-    code_str = str(emp_code).strip()
-    # 如果是纯数字，补齐到8位
-    if code_str.isdigit():
-        return code_str.zfill(8)
-    return code_str
+    # 不擅自补齐长度，前导零只保留源数据已存在的部分。
+    return canon_value(emp_code, 'key')
 
 '''
 
@@ -819,7 +814,7 @@ def process_excel_files(input_folder: str, output_folder: str, expected_file: st
         logger.info("")
         logger.info(">>> 步骤1/6: 加载源数据")
         logger.info("-" * 40)
-        data_store = load_all_data(input_folder)
+        data_store = normalize_modular_source_keys(load_all_data(input_folder), globals().get("_COLUMN_SPECS"))
         if not data_store:
             logger.error("数据加载失败")
             return False
@@ -886,6 +881,7 @@ def process_excel_files(input_folder: str, output_folder: str, expected_file: st
         output_path = os.path.join(output_folder, "{output_filename}")
 
         # 直接调用save_excel_with_details（该函数在模块级别已定义）
+        result = normalize_frame_tables(result, globals().get("_COLUMN_SPECS"))
         save_excel_with_details(result, output_path, column_sources, column_formulas, intermediate_columns)
         logger.info("保存完成（带批注和公式）")
 
@@ -915,7 +911,9 @@ def main():
 '''
 
         # 合并完整代码
-        full_code = header + modules_code + main_function
+        from backend.utils.column_spec_edit import detach_generated_specs
+        key_declarations, modules_code = detach_generated_specs(modules_code)
+        full_code = header + key_declarations + modules_code + main_function
 
         # 验证生成的代码语法
         full_code = self._validate_and_fix_merged_code(full_code)

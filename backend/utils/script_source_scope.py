@@ -144,6 +144,13 @@ def source_scoped_generation(function):
     """Use the same input subset when generating code and when running it."""
     @wraps(function)
     def wrapped(*args, **kwargs):
+        def prepared(result):
+            from backend.utils.column_spec_edit import prepare_column_contract_script
+            code = result[0] if isinstance(result, tuple) and result else result
+            if isinstance(code, str) and code.strip():
+                code = prepare_column_contract_script(code)
+                return (code, *result[1:]) if isinstance(result, tuple) else code
+            return result
         bound = inspect.signature(function).bind(*args, **kwargs)
         bound.apply_defaults()
         options = bound.arguments
@@ -151,7 +158,7 @@ def source_scoped_generation(function):
         original = options.get('original_code', options.get('full_code', ''))
         if ((isinstance(structure, dict) and len(structure.get('workbooks') or {}) > 1)
                 or 'MULTI_WORKBOOK_SCRIPTS =' in original):
-            return function(*args, **kwargs)
+            return prepared(function(*args, **kwargs))
         from backend.utils.multi_target_rules import rules_for_structure
         rules = rules_for_structure(options.get('rules_content'), structure,
                                     Path(options.get('template_path') or '').name)
@@ -168,5 +175,5 @@ def source_scoped_generation(function):
             if code:
                 code += '\n\nSOURCE_FILES = ' + repr(selection) + '\n'
                 result = (code, *result[1:]) if isinstance(result, tuple) else code
-        return result
+        return prepared(result)
     return wrapped

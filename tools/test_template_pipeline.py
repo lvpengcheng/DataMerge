@@ -128,7 +128,7 @@ class TemplatePipelineTests(unittest.TestCase):
         self.assertEqual(plan[0]['sheet_name'], '原始明细')
         self.assertTrue(plan[0]['placeholder'])
         self.assertEqual((self.inputs / '考勤.xlsx').read_bytes(), original_bytes)
-        self.assertEqual(read_explicit_formats(path), {})  # v2 has no restore manifest
+        self.assertEqual(read_explicit_formats(path), {'目标': {'D5': '0.0000'}})
         calls = {node.func.id for node in ast.walk(ast.parse(code))
                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
         self.assertNotIn('_restore_number_formats', calls)
@@ -150,7 +150,7 @@ class TemplatePipelineTests(unittest.TestCase):
         self.addCleanup(wb.close)
         self.assertEqual(wb.active['A1'].number_format, 'General')
         self.assertEqual(wb.active['B1'].number_format, 'yyyy/mm/dd')
-        self.assertEqual(read_explicit_formats(self.outputs / 'formats.xlsx'), {})
+        self.assertEqual(read_explicit_formats(self.outputs / 'formats.xlsx'), {'Sheet': {'B1': 'yyyy/mm/dd'}})
 
     def test_explicit_overwrite_and_clear_preserve_formulas_by_default(self):
         wb = load_workbook(self.template)
@@ -250,6 +250,7 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
              patch.object(post, '_normalize_source_sheet_formats_impl') as source, \
              patch.object(post, '_apply_expected_schemas_in_workbook') as schemas, \
              patch.object(post, 'restore_template_region_format') as summary, \
+             patch('backend.utils.column_contract.apply_column_contract') as contract, \
              patch.object(post, '_sheet_summary_from_workbook', return_value=[]):
             for marker in ('TEMPLATE_PIPELINE_VERSION = 2', 'SOURCE_PIPELINE_VERSION = 2'):
                 with self.subTest(marker=marker):
@@ -257,6 +258,7 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
         for repair in (key, template, source, schemas, summary):
             repair.assert_not_called()
         self.assertEqual(book.CalculateFormula.call_count, 2)
+        self.assertEqual(contract.call_count, 2)
         self.assertTrue(result['calculated'])
 
     def test_selected_training_name_can_resolve_confirmed_original_upload(self):

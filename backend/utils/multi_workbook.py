@@ -283,7 +283,12 @@ def execute_workbooks(targets, environment):
                     env[key] = environment[key]
             if template:
                 env["TEMPLATE_PATH"] = template
-            result_info = invoke_script_main(env["main"], env)
+            try:
+                result_info = invoke_script_main(env["main"], env)
+            except Exception as exc:
+                # Keep the workbook identity in diagnostics so a correction can
+                # target the failing child instead of rewriting passing siblings.
+                raise ValueError(f'{name}: {exc}') from exc
             if isinstance(result_info, dict) and result_info.get("success") is False:
                 raise ValueError(f"{name}: {result_info.get('error') or '脚本报告执行失败'}")
             result = pick_result_output(child_dir.glob("*.xlsx"), template)
@@ -311,7 +316,8 @@ def precise_edit_workbooks(provider, code, feedback, **kwargs):
         if named and name not in named:
             continue
         edited = run_precise_edit(provider, target["code"], feedback,
-            **{**kwargs, "extra_context": rules_for_workbook(kwargs.get("extra_context", ""), name) + f"\n当前交付文件: {name}"})
+            **{**kwargs, "workbook_name": name,
+               "extra_context": rules_for_workbook(kwargs.get("extra_context", ""), name) + f"\n当前交付文件: {name}"})
         if not edited:
             return None
         target["code"] = edited

@@ -257,7 +257,7 @@ def main():
              patch.object(post, 'normalize_key_columns_to_text'), \
              patch.object(post, '_normalize_source_sheet_formats_impl'), \
              patch.object(post, '_sheet_summary_from_workbook', return_value=[]), \
-             patch('backend.utils.script_formats.apply_explicit_formats') as apply:
+             patch('backend.utils.column_contract.apply_column_contract') as apply:
             post.finalize_output_workbook(path)
             post.finalize_output_workbook(path)
         self.assertEqual(apply.call_count, 2)

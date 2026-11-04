@@ -157,7 +157,9 @@ class NativeDateFormatTests(unittest.TestCase):
             schemas = {'sheets': {'账单明细': {'column_schemas': {
                 '入职日期': {'field_type': 'date', 'number_format': 'yyyy-mm-dd'},
             }}}}
-            code = "_COL_MAP = {'账单明细': {'regions': [{'data_start_row': 6, 'data_end_row': 7}]}}"
+            # 统一列契约中，明确格式要求使用 _COLUMN_SPECS；训练推断的 schemas 不能压过模板。
+            code = ("_COL_MAP = {'账单明细': {'regions': [{'data_start_row': 6, 'data_end_row': 7}]}}\n"
+                    "_COLUMN_SPECS = {'账单明细': {'入职日期': {'type':'datetime','format':'yyyy-mm-dd'}}}")
             finalize_output_workbook(output, template, schemas, code)
             result = load_workbook(output, data_only=False)
             try:

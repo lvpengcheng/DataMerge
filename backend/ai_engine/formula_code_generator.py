@@ -1770,6 +1770,8 @@ from excel_parser import IntelligentExcelParser
 from backend.utils.source_sheet_writer import dt_to_excel_serial, is_long_digit_text
 from backend.utils.data_helpers import apply_dataframe_column_schemas, region_schemas_by_name, assign_sheet_keys
 from backend.utils.template_pipeline import source_origin, prepare_formula_source_sheets, copy_original_source_sheets
+from backend.utils.column_contract import normalize_source_keys, normalize_workbook_keys
+KEY_POLICY_VERSION = 1
 
 SOURCE_PIPELINE_VERSION = __SOURCE_PIPELINE_VERSION__
 SOURCE_SHEET_MODE = __SOURCE_SHEET_MODE__
@@ -1927,7 +1929,7 @@ def load_source_data(input_folder, manual_headers):
     _cached = globals().get('_pre_loaded_source_data')
     if _cached is not None:
         print(f"[性能优化] 使用预加载源数据（{len(_cached)}个sheet，跳过Excel解析）")
-        return _cached
+        return normalize_source_keys(_cached, globals().get('_COLUMN_SPECS'))
 
     source_data = {}
     parser = IntelligentExcelParser()
@@ -2036,7 +2038,7 @@ def load_source_data(input_folder, manual_headers):
             f"输入目录: {input_folder}, 文件列表: {all_files}"
         )
 
-    return source_data
+    return normalize_source_keys(source_data, globals().get('_COLUMN_SPECS'))
 
 
 def _is_date_column(col_name, df=None):
@@ -2310,11 +2312,12 @@ def main():
     _normalize_date_columns(source_data)
 
     # 步骤1.5: 应用数据清洗规则（如果定义了clean_source_data函数）
-    if 'clean_source_data' in globals():
+    _clean_source = globals().get('clean_source_data')
+    if callable(_clean_source):
         if SOURCE_SHEET_MODE != 'rebuild':
             raise ValueError('源表清洗重建需要在规则中明确 SOURCE_SHEET_MODE: rebuild')
         print("步骤1.5: 应用数据清洗规则...")
-        cleaned = clean_source_data(source_data)
+        cleaned = _clean_source(source_data)
         if cleaned is not None:
             source_data = cleaned
             print(f"清洗完成，共 {len(source_data)} 个源数据sheet")
@@ -2392,10 +2395,11 @@ def main():
 
     # 保存文件（公式由 compare_excel_files 在沙箱外用 Aspose 计算，避免占用沙箱执行时间）
     output_path = os.path.join(globals().get('output_folder', ''), "薪资汇总表.xlsx")
+    normalize_workbook_keys(wb, globals().get('_COLUMN_SPECS'))
     wb.save(output_path)
     wb.close()
     if _source_copy_plan:
-        copy_original_source_sheets(output_path, _source_copy_plan)
+        copy_original_source_sheets(output_path, _source_copy_plan, key_specs=globals().get('_COLUMN_SPECS', {}))
     print(f"保存成功: {output_path}")
     print("=" * 60)
     print("处理完成!")
@@ -2404,13 +2408,16 @@ def main():
     return True
 '''
 
+        # 固定骨架必须保留 AI 的匹配键声明，不能被后面的函数抽取误删。
+        from backend.utils.column_spec_edit import detach_generated_specs
+        _column_spec_prefix, fill_function_code = detach_generated_specs(fill_function_code or '')
         # 拼接完整代码前，清理fill_function_code中函数定义之前的垃圾代码
         if fill_function_code:
             fill_function_code = self._clean_before_function_def(fill_function_code)
             # 同时清理函数体结束后的游离模块级代码（如 n_rows = len(main_df)）
             fill_function_code = self._clean_after_function_body(fill_function_code)
 
-        complete_code = template + fill_function_code + main_template
+        complete_code = template + _column_spec_prefix + fill_function_code + main_template
         complete_code = complete_code.replace('__SOURCE_PIPELINE_VERSION__',
             '2' if getattr(self, '_source_pipeline_v2', True) else '1')
         complete_code = complete_code.replace('__SOURCE_SHEET_MODE__',
@@ -3585,6 +3592,11 @@ def main():
         log: callable = None
     ) -> str:
         """统一的AI对话调用方法"""
+        from backend.utils.generated_code_check import CODE_CONTRACT
+        system_prompt = CODE_CONTRACT + '\n' + system_prompt
+        messages = [{**message, 'content': CODE_CONTRACT + '\n' + message['content']}
+                    if message.get('role') == 'system' and isinstance(message.get('content'), str)
+                    else message for message in messages]
         response = ""
         effective_max_tokens = getattr(self.ai_provider, 'max_tokens', 32000)
 

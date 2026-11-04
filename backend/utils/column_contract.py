@@ -2,21 +2,24 @@
 
 以前格式由 6 个后处理函数各自判断、按执行顺序覆盖（主键转文本、模板格式还原、
 源_ 默认样式兜底、expected schema、汇总区重刷、脚本显式格式），谁最后跑谁说了算。
-现在它们都退化为"规则来源层"，只提供规则，不写单元格；由 apply_column_contract
-逐格裁决后一次写入。
+现在它们都退化为"规则来源层"。源数据/模板填充/原表复制入口复用 canon_value，
+最终由 apply_column_contract 在重算前裁决，避免各阶段采用不同的主键算法。
 
 每个单元格分别裁决两件事，按优先级取第一个给出答案的层：
   - kind（值类型，决定 VLOOKUP 能否匹配）：key / text / date / datetime / number / raw
   - format（number_format，决定显示）
 
 层次（高 → 低）：
-  1. explicit  脚本里显式写的单元格 number_format（值不动）
+  1. explicit  脚本里显式写的单元格 number_format（仅显示；不豁免主键值归一）
   2. spec      脚本 _COLUMN_SPECS 常量（智训"执行修改"里用户指定的列类型/格式）
-  3. template  本次实际使用的模板类型/格式（汇总区位移时按位移后的行号）
-  4. schema    训练推断的 expected_structure column_schemas（模板未覆盖的位置兜底）
-  5. key       列名命中主键关键词 → 规范文本（兼容旧 normalize_key_columns_to_text）
+  3. identity  明确的主键/ID 默认规范文本；含义不明确的 code/编号 必须显式 type=key
+  4. template  本次实际使用的模板类型/格式（主键由统一文本策略裁决）
+  5. schema    训练推断的 expected_structure column_schemas（模板未覆盖的位置兜底）
   6. inherited 源_ sheet 继承模板非 General 默认样式的单元格 → General/日期
-  都没有 → 保持原样。v2 管线只启用 explicit + spec + 本次模板，不使用训练推断兜底。
+  都没有 → 保持原样。v2 管线也保护主键，但不使用训练推断兜底。
+  显式 type=key 表示规范文本，type=raw 表示保留类型及当前格式。
+  normalize_match_key 为历史辅助键方案保留；新生成脚本直接查询统一为文本的主键。
+  本层不能恢复脚本已转换的源类型，也不能恢复 Excel 已丢失的长编号精度。
 
 _COLUMN_SPECS 写法（sheet 名用 "*" 表示所有含该列的 sheet）：
     _COLUMN_SPECS = {
@@ -32,12 +35,14 @@ import logging
 import math
 import os
 import re
+from decimal import Decimal, InvalidOperation
+from numbers import Integral, Real
 from collections import Counter
 from datetime import date, datetime
 
 logger = logging.getLogger(__name__)
 
-KINDS = ("key", "text", "date", "datetime", "number", "raw")
+from backend.utils.column_spec_schema import KINDS, decode_column_specs, literal_column_specs
 _HEADER_SCAN_ROWS = 30
 _EXCEL_EPOCH = datetime(1899, 12, 30)
 _DATE1904_OFFSET = 1462
@@ -68,35 +73,23 @@ def read_column_specs(script_code):
         targets = node.targets if isinstance(node, ast.Assign) else ([node.target] if isinstance(node, ast.AnnAssign) else [])
         if any(isinstance(t, ast.Name) and t.id == "_COLUMN_SPECS" for t in targets):
             try:
-                specs = ast.literal_eval(node.value)
+                specs = literal_column_specs(node.value)
             except (ValueError, TypeError) as e:
-                logger.warning(f"[列契约] _COLUMN_SPECS 不是纯字面量，忽略: {e}")
+                raise ValueError(f'_COLUMN_SPECS 声明非法，未执行代码: {e}') from e
     return normalize_column_specs(specs)
 
 
 def normalize_column_specs(specs):
-    """{sheet: {列: "kind" | {"type", "format", "parse"}}} → 统一成 dict 形式，丢弃无效项。"""
+    """所有入口共用同一声明解析，再构造运行时的列名匹配索引。"""
+    canonical = decode_column_specs(specs, allow_internal=True)
     result = {}
-    if not isinstance(specs, dict):
-        return result
-    for sheet, columns in specs.items():
-        if not isinstance(columns, dict):
-            continue
+    for sheet, columns in canonical.items():
         for column, spec in columns.items():
             if isinstance(spec, str):
-                spec = {"type": spec}
-            if not isinstance(spec, dict):
-                continue
-            kind = spec.get("type")
-            if kind is not None and kind not in KINDS:
-                logger.warning(f"[列契约] {sheet}.{column} 的类型 {kind!r} 不支持，仅保留格式")
-                kind = None
-            fmt = spec.get("format") or None
-            if kind is None and not fmt:
-                continue
-            result.setdefault(str(sheet).strip(), {})[_header_key(column)] = {
-                "type": kind, "format": fmt, "parse": spec.get("parse") or None,
-                "name": str(column).strip()}
+                spec = {'type': spec}
+            result.setdefault(sheet, {})[_header_key(column)] = {
+                'type': spec.get('type'), 'format': spec.get('format'),
+                'parse': spec.get('parse'), 'name': str(column).strip()}
     return result
 
 
@@ -109,15 +102,217 @@ def _clean_text(s):
 def _canon_key(v):
     if v is None or isinstance(v, (bool, datetime, date)):
         return v
-    if isinstance(v, int):
-        return str(v)
-    if isinstance(v, float):
+    if isinstance(v, Integral):
+        return str(int(v))
+    if isinstance(v, Real):
         if not math.isfinite(v):
             return v
-        return str(int(v)) if v.is_integer() else format(v, ".15g")
+        return str(int(v)) if float(v).is_integer() else repr(float(v))
     if isinstance(v, str):
         return _clean_text(v) or v
     return v
+
+
+def normalize_match_key(value):
+    """独立生成匹配键，不改原值；空值不匹配，文本前导零保持有意义。
+
+    123 / 123.0 / '123' 匹配；'00123' 不与 '123' 合并。
+    调用方仍需检查同一匹配键的多条记录，不能默认覆盖重复记录。
+    """
+    if value is None or isinstance(value, (bool, date, datetime)):
+        return None
+    if isinstance(value, Real) and not math.isfinite(value):
+        return None
+    result = _canon_key(value)
+    return result if isinstance(result, str) and result.strip() else None
+
+
+def _is_identifier_column(header):
+    # 只识别明确标识字段。不能因为含 code / 编号 / id 就改变业务数值列。
+    text = re.sub(r'[（(][^()（）]*[)）]', '', str(header or ''))
+    name = re.sub(r'[\s_-]+', '', text).casefold()
+    if name in {'psid', 'id', 'employeeid', 'employeecode', 'employeenumber',
+                'staffid', 'staffcode', 'staffnumber', 'nationalid',
+                'identitynumber', 'idnumber', 'passportnumber', 'bankaccount',
+                'bankaccountnumber', 'cardnumber', 'taxid', 'payrollid',
+                '工号', '员工工号', '外服工号', '员工编号', '员工号', '职工号',
+                '人员编号', '工作证号', '员工id', '身份证', '身份证号', '身份证号码',
+                '证件号', '证件号码', '银行卡', '银行卡号', '银行账号', '银行账户',
+                '社保号', '社保账号', '公积金号', '公积金账号', '手机号', '手机号码',
+                '联系电话', '税号', '纳税人识别号'}:
+        return True
+    return False
+
+
+def _sheet_specs(specs, sheet):
+    aliases = (str(sheet).removeprefix('源_'), str(sheet), '源_' + str(sheet).removeprefix('源_'))
+    declared = dict(specs.get('*', {}))
+    for alias in dict.fromkeys(aliases):
+        declared.update(specs.get(alias, {}))
+    return declared
+
+
+def _column_rules(columns, specs, sheet):
+    """所有入口共用：精确声明覆盖默认主键规则；format-only 不取消默认键类型。"""
+    rules = {}
+    declared = _sheet_specs(specs, sheet)
+    for column in columns:
+        key = _header_key(column)
+        explicit = declared.get(key, {})
+        identifier = _is_identifier_column(column)
+        if not identifier and not explicit:
+            continue
+        rule = {'type': 'key' if identifier else None, 'format': '@' if identifier else None,
+                'parse': None, 'name': str(column)}
+        rule.update({k: v for k, v in explicit.items() if v is not None})
+        if not explicit.get('format'):
+            rule['format'] = '@' if rule.get('type') in ('key', 'text') else None
+        if rule:
+            rules[key] = rule
+    return rules
+
+
+def normalize_source_keys(source_data, specs=None):
+    """统一内存主键，复制发生改动的 DataFrame，不污染预加载缓存或源文件。"""
+    if not isinstance(source_data, dict):
+        return source_data
+    specs = normalize_column_specs(specs or {})
+    effective = {}
+    groups = {}
+    for sheet, entry in source_data.items():
+        if isinstance(entry, dict) and entry.get('df') is not None:
+            group = groups.setdefault(id(entry), {'names': [], 'declared': {}})
+            group['names'].append(str(sheet))
+            for name, rule in _sheet_specs(specs, sheet).items():
+                previous = group['declared'].get(name, {})
+                if previous.get('type') and rule.get('type') and previous['type'] != rule['type']:
+                    raise ValueError(f'同一源表的别名对 {name} 声明了冲突类型')
+                group['declared'][name] = {**previous, **{k: v for k, v in rule.items() if v is not None}}
+    for sheet, entry in source_data.items():
+        df = entry.get('df') if isinstance(entry, dict) else None
+        if df is not None:
+            effective[str(sheet)] = _column_rules(df.columns, {'*': groups[id(entry)]['declared']}, sheet)
+            for column in df.columns:
+                rule = effective[str(sheet)].get(_header_key(column), {})
+                if rule.get('type') == 'key':
+                    risky = sum(isinstance(v, Real) and not isinstance(v, bool)
+                                and math.isfinite(v) and abs(v) >= 1e15 for v in df[column])
+                    if risky:
+                        logger.warning('[列契约] %s.%s 有 %s 个超过 15 位的数值主键，可能已丢失精度；请核对原始文本',
+                                       sheet, column, risky)
+    return apply_specs_to_source_data(source_data, effective)
+
+
+def normalize_workbook_keys(wb, specs=None):
+    """openpyxl 填充前后统一模板/结果主键；保留公式及字体、边框、行高。"""
+    specs = normalize_column_specs(specs or {})
+    changed = 0
+    for ws in wb.worksheets:
+        headers = {}
+        # 多行表头也支持；每列以首个明确标识表头或显式声明表头为准。
+        wanted = set(specs.get('*', {}))
+        for alias in (ws.title, ws.title.removeprefix('源_'), '源_' + ws.title):
+            wanted.update(specs.get(alias, {}))
+        for row in ws.iter_rows(max_row=min(ws.max_row, _HEADER_SCAN_ROWS)):
+            for cell in row:
+                key = _header_key(cell.value)
+                if cell.column not in headers and (_is_identifier_column(cell.value) or key in wanted):
+                    headers[cell.column] = (cell.row, str(cell.value))
+        rules = _column_rules([name for _, name in headers.values()], specs, ws.title)
+        for column, (header, name) in headers.items():
+            rule = rules.get(_header_key(name), {})
+            if rule.get('type') != 'key':
+                continue
+            for row in range(header + 1, ws.max_row + 1):
+                cell = ws.cell(row, column)
+                if cell.value is None or cell.data_type == 'f':
+                    continue
+                value = canon_value(cell.value, 'key')
+                if type(value) is not type(cell.value) or value != cell.value:
+                    cell.value = value
+                    changed += 1
+                if isinstance(value, str):
+                    cell.data_type = 's'
+                    cell.number_format = rule.get('format') or '@'
+    return changed
+
+
+def normalize_frame_tables(tables, specs=None):
+    """模块化模式的 {sheet: DataFrame} 适配，复用相同值转换与缓存保护。"""
+    import pandas as pd
+    if not isinstance(tables, dict) or any(not isinstance(df, pd.DataFrame) for df in tables.values()):
+        raise ValueError('表数据必须为 {sheet: DataFrame}')
+    entries = {name: {'df': df} for name, df in tables.items()}
+    return {name: entry['df'] for name, entry in normalize_source_keys(entries, specs).items()}
+
+
+def normalize_modular_source_keys(store, specs=None):
+    """模块化加载接口 files/filename/sheets 适配，不修改加载缓存。"""
+    if not isinstance(store, dict) or not isinstance(store.get('files'), dict):
+        raise ValueError('模块化源数据必须包含 files 字典')
+    files = {}
+    specs = normalize_column_specs(specs or {})
+    from pathlib import Path
+    for filename, entry in store['files'].items():
+        sheets = entry.get('sheets') if isinstance(entry, dict) else None
+        if not isinstance(sheets, dict):
+            raise ValueError('模块化源文件必须包含 sheets 字典')
+        effective = {}
+        for name in sheets:
+            rules = _sheet_specs(specs, name)
+            qualified = str(Path(filename).stem) + '_' + str(name)
+            # 文件限定声明比同名 sheet 声明更精确；避免同名源表串用声明。
+            rules = {**rules, **specs.get(qualified, {}), **specs.get('源_' + qualified, {})}
+            effective[str(name)] = rules
+        files[filename] = {**entry, 'sheets': normalize_frame_tables(sheets, effective)}
+    return {**store, 'files': files}
+
+
+def normalize_native_keys(wb, specs=None):
+    """原表整表复制后也要处理主键，在保存/公式重算前调用；不改原始文件。"""
+    from Aspose.Cells import CellValueType
+    specs = normalize_column_specs(specs or {})
+    changed = 0
+    for si in range(wb.Worksheets.Count):
+        ws = wb.Worksheets[si]
+        cells = ws.Cells
+        names = {}
+        wanted = set(specs.get('*', {}))
+        for alias in (str(ws.Name), str(ws.Name).removeprefix('源_'), '源_' + str(ws.Name)):
+            wanted.update(specs.get(alias, {}))
+        for row in range(min(_HEADER_SCAN_ROWS, cells.MaxDataRow + 1)):
+            for col in range(cells.MaxDataColumn + 1):
+                name = cells[row, col].Value
+                if col not in names and (_is_identifier_column(name) or _header_key(name) in wanted):
+                    names[col] = (row, str(name))
+        rules = _column_rules([name for _, name in names.values()], specs, str(ws.Name))
+        for col, (header, name) in names.items():
+            rule = rules.get(_header_key(name), {})
+            if rule.get('type') != 'key':
+                continue
+            risky = 0
+            for row in range(header + 1, cells.MaxDataRow + 1):
+                cell = cells[row, col]
+                if cell.IsFormula or cell.Type == CellValueType.IsNull:
+                    continue
+                original, is_date, convertible = _native_value(cell, CellValueType)
+                if not convertible or is_date:
+                    continue
+                if isinstance(original, Real) and math.isfinite(original) and abs(original) >= 1e15:
+                    risky += 1
+                value = canon_value(original, 'key')
+                if type(value) is not type(original) or value != original:
+                    cell.PutValue(value)
+                    changed += 1
+                style = cell.GetStyle()
+                fmt = _fmt_from_code(rule.get('format') or '@')
+                if not _style_matches(style, fmt):
+                    _set_fmt(style, fmt)
+                    cell.SetStyle(style)
+            if risky:
+                logger.warning('[列契约] %s.%s 有 %s 个超过 15 位的数值主键，可能已丢失精度；请核对原始文本',
+                               ws.Name, name, risky)
+    return changed
 
 
 def _canon_text(v):
@@ -138,10 +333,19 @@ def _to_number(v):
     if negative:
         s = s[1:-1]
     percent = s.endswith("%")
-    try:
-        n = float(s.rstrip("%"))
-    except ValueError:
+    if not percent and re.fullmatch(r'[+-]?[0-9]{16,}', s):
         return v
+    try:
+        exact = Decimal(s.rstrip("%"))
+    except InvalidOperation:
+        return v
+    if not exact.is_finite():
+        return v
+    # Excel 数值仅可靠保留 15 位有效数字。长文本整数不得先转 float 再判断，
+    # 包括用科学计数法表示的长编号；原字符串保留，避免不可逆的尾数损失。
+    if not percent and exact == exact.to_integral_value() and exact.copy_abs() >= Decimal('1e15'):
+        return v
+    n = float(exact)
     if not math.isfinite(n):
         return v
     n = n / 100 if percent else n
@@ -198,7 +402,7 @@ def canon_value(value, kind, parse=None, date1904=False):
     text     → 文本（与 _schema_text_value 同规则）
     date     → 日期序列号，截掉时间部分（45296.354 → 45296.0）
     datetime → 日期时间序列号，保留时间
-    number   → 文本数字转数值（"1,234.50" / "12%" / "(100)"）
+    number   → 文本数字转数值（"1,234.50" / "12%" / "(100)"）；长整数文本保留以免丢精度
     raw/None → 不转换
     """
     if kind == "key":
@@ -292,14 +496,20 @@ def _spec_layer(cells, sheet_specs):
     from backend.utils.output_postprocess import _scan_summary_rows
     first = min(hr for hr, _ in columns.values()) + 1
     summary = set(_scan_summary_rows(cells, cells.MaxDataRow, cells.MaxDataColumn, first))
+    end = min(summary) if len(summary) == 1 else cells.MaxDataRow + 1
     rules = {ci: (hr, sheet_specs[key]) for ci, (hr, key) in columns.items()}
 
     def layer(cell, row, col, style, has_value):
         hit = rules.get(col)
-        if not hit or row <= hit[0] or not has_value or row in summary:
+        if not hit or row <= hit[0] or row >= end or not has_value or row in summary:
             return None
         spec = hit[1]
-        return spec["type"], spec["parse"], _fmt_from_code(spec["format"])
+        fmt = _fmt_from_code(spec["format"])
+        if fmt is None and spec['type'] in ('key', 'text'):
+            fmt = (None, '@')
+        if spec['type'] == 'raw' and fmt is None:
+            fmt = (None, str(style.Custom)) if style.Custom else (style.Number or 0, None)
+        return spec["type"], spec["parse"], fmt
     return layer, [spec for _, spec in rules.values()]
 
 
@@ -354,6 +564,7 @@ def _template_layer(cells, tcells):
     last_col = tcells.MaxDataColumn
     template_max_row = tcells.MaxDataRow
     formula_cells = {}
+    policies = {}  # 模板不在本轮改动；同一模板坐标只读取、解析一次格式。
     summaries = _scan_summary_rows(tcells, template_max_row, last_col, 1)
     data_end = min(summaries) if summaries else template_max_row + 1
     samples = {}
@@ -387,29 +598,47 @@ def _template_layer(cells, tcells):
             candidates = formula_cells.get((col, str(cell.Formula).strip()), [])
             if len(candidates) == 1:
                 tcell = candidates[0]
+        coordinate = (tcell.Row, tcell.Column)
+        if coordinate in policies:
+            return policies[coordinate]
         tstyle = tcell.GetStyle()
         custom = str(tstyle.Custom or "")
         fmt = (None, custom) if custom else (tstyle.Number or 0, None)
         # 本次模板的 General 也是明确选择，不能让训练时的 date/schema 再把它覆盖。
         # 日期样式只控制显示，保留真实时间值；只有显式 type=date 才截掉时间。
         code = _fmt_code(fmt)
-        plain = re.sub(r'"[^"]*"|\\.|\[[^\]]*\]', '', code)
-        kind = ('datetime' if _is_date_fmt(fmt) else 'text' if '@' in plain
-                else 'number' if re.search(r'[0#?]', plain) else 'raw')
-        return kind, None, fmt
+        # 四段格式是 正数;负数;零;文本。会计/货币格式的最后一段常含 @，
+        # 它不表示数值应该转为文本。先移除字面量/占位间距，再只分析数值段。
+        plain = re.sub(r'"[^"]*"|\\.|_.|\*.|\[[^\]]*\]', '', code)
+        numeric_sections = ';'.join(plain.split(';')[:3])
+        kind = ('datetime' if _is_date_fmt(fmt)
+                else 'number' if re.search(r'[0#?]', numeric_sections)
+                else 'raw' if re.search(r'general', numeric_sections, re.I)
+                else 'text' if '@' in numeric_sections else 'raw')
+        policies[coordinate] = (kind, None, fmt)
+        return policies[coordinate]
     return layer
 
 
 def _key_layer(cells):
-    from backend.utils.output_postprocess import _is_key_column
-    key_cols = {ci for ci in range(cells.MaxDataColumn + 1) if _is_key_column(cells[0, ci].Value)}
+    """默认主键文本策略，与 source/openpyxl 入口使用相同 canon_value。"""
+    key_cols = {}
+    for row in range(min(_HEADER_SCAN_ROWS, cells.MaxDataRow + 1)):
+        for ci in range(cells.MaxDataColumn + 1):
+            if ci not in key_cols and _is_identifier_column(cells[row, ci].Value):
+                key_cols[ci] = row
     if not key_cols:
         return None
 
     def layer(cell, row, col, style, has_value):
-        if col not in key_cols or row < 1 or not has_value or cell.IsFormula:
+        if col not in key_cols or row <= key_cols[col] or not has_value or cell.IsFormula:
             return None
+        value = cell.Value
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)
+              and math.isfinite(value) and abs(value) >= 1e15):
+            layer.precision_risks += 1
         return "key", None, (None, "@")
+    layer.precision_risks = 0
     return layer
 
 
@@ -504,7 +733,7 @@ def apply_column_contract(wb, output_path=None, script_code=None, template_path=
                           expected_structure=None, explicit_formats=None, legacy_layers=True):
     """按列契约逐格裁决值类型和格式，一次写入已打开的 Aspose 工作簿（不保存、不重算）。
 
-    legacy_layers=False（v2 管线）时仅使用 explicit + spec + 本次模板。
+    legacy_layers=False（v2 管线）时使用 explicit + spec + identity + 本次模板。
     返回 {"values": n, "formats": n, "by_layer": {...}, "failed": n}。
     """
     import json
@@ -540,16 +769,19 @@ def apply_column_contract(wb, output_path=None, script_code=None, template_path=
             cells = ws.Cells
             if cells.MaxDataRow < 0 or cells.MaxDataColumn < 0:
                 continue
-            if not (legacy_layers or specs.get("*") or specs.get(name) or name in tpl_sheets):
+            identity_layer = _key_layer(cells)
+            sheet_specs = _sheet_specs(specs, name)
+            if not (legacy_layers or sheet_specs or name in tpl_sheets
+                    or identity_layer is not None):
                 continue
             explicit = set((explicit_formats or {}).get(name, {}))
             layers = []
-            sheet_specs = {**specs.get("*", {}), **specs.get(name, {})}
             spec_layer, used_specs = _spec_layer(cells, sheet_specs) if sheet_specs else (None, [])
             for spec in used_specs:
                 logger.info(f"[列契约] {name}.{spec['name']}: 类型={spec['type'] or '-'} "
                             f"格式={spec['format'] or '-'} 解析={spec['parse'] or '-'}（来源: 脚本声明）")
             layers.append(("spec", spec_layer))
+            layers.append(("identity", identity_layer))
             tws = tpl_sheets.get(name)
             if tws is not None:
                 layers.append(("template", _template_layer(cells, tws.Cells)))
@@ -557,7 +789,6 @@ def apply_column_contract(wb, output_path=None, script_code=None, template_path=
                 schemas = (structure_sheets.get(name) or {}).get("column_schemas") or {}
                 if schemas and (tws is not None or not template_ok):
                     layers.append(("schema", _schema_layer(cells, schemas, template_ok)))
-                layers.append(("key", _key_layer(cells)))
                 if default_code and name.startswith("源_"):
                     layers.append(("inherited", _inherited_layer(cells, default_code)))
             layers = [(label, fn) for label, fn in layers if fn is not None]
@@ -568,8 +799,7 @@ def apply_column_contract(wb, output_path=None, script_code=None, template_path=
             it = cells.GetEnumerator()
             while it.MoveNext():
                 cell = it.Current
-                if str(cell.Name) in explicit:
-                    continue
+                explicit_cell = str(cell.Name) in explicit
                 row, col = cell.Row, cell.Column
                 is_formula = cell.IsFormula
                 has_value = is_formula or cell.Type != CellValueType.IsNull
@@ -586,6 +816,12 @@ def apply_column_contract(wb, output_path=None, script_code=None, template_path=
                         fmt, fmt_src = decision[2], label
                     if kind_src and fmt_src:
                         break
+                # 显式显示格式不能让主键跳过值归一，否则查找列与查找值仍类型不一致。
+                # 其他显式格式沿用旧优先级，避免改变日期/金额的既有行为。
+                if explicit_cell:
+                    if kind != 'key':
+                        continue
+                    fmt = None
                 # 用户声明了日期类型但没给日期格式时，不让下层的常规格式把序列号露出来
                 if kind_src == "spec" and kind in _DEFAULT_DATE_FORMATS and (fmt is None or not _is_date_fmt(fmt)):
                     fmt, fmt_src = (None, _DEFAULT_DATE_FORMATS[kind]), "spec"
@@ -615,6 +851,12 @@ def apply_column_contract(wb, output_path=None, script_code=None, template_path=
                         if not _style_matches(cell.GetStyle(), fmt):
                             failed += 1
                         stats[f"{fmt_src}:格式"] += 1
+            if identity_layer is not None and identity_layer.precision_risks:
+                count = identity_layer.precision_risks
+                stats['identity:precision_risk'] += count
+                logger.warning(
+                    "[列契约] %s 有 %s 个主键/ID 已以超过 15 位的数值存储，"
+                    "可能已丢失精度；转成文本不能恢复尾数，请核对原始文本编号", name, count)
 
         # 第 1 层：脚本显式单元格格式，复用原有实现（上面的循环已跳过这些单元格）
         from backend.utils.script_formats import apply_explicit_formats
@@ -630,4 +872,5 @@ def apply_column_contract(wb, output_path=None, script_code=None, template_path=
         logger.info(f"[列契约] 改值 {values} 格、改格式 {formats} 格，按来源: {dict(stats)}")
     if failed:
         logger.warning(f"[列契约] {failed} 个单元格格式写入后校验不一致，请检查格式码是否有效")
-    return {"values": values, "formats": formats, "by_layer": dict(stats), "failed": failed}
+    return {"values": values, "formats": formats, "by_layer": dict(stats), "failed": failed,
+            "precision_risks": stats['identity:precision_risk']}

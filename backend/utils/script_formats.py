@@ -23,6 +23,7 @@ _MANIFEST = 'datamerge/explicit_number_formats.json'
 _DEFAULT_HELPERS = {
     '_restore_number_formats', 'apply_target_column_schemas', '_normalize_key_columns',
     'write_source_sheets', '_append_source_sheets', '_snapshot_number_formats', 'write_source_dataframe',
+    'normalize_workbook_keys',
 }
 
 
@@ -132,32 +133,55 @@ def read_explicit_formats(path):
 
 
 def write_explicit_formats(path, formats):
-    # Called after an Excel writer replaces the archive; never append duplicates.
-    if formats:
-        with zipfile.ZipFile(path) as archive:
-            if _MANIFEST in archive.namelist():
-                if json.loads(archive.read(_MANIFEST)) == formats:
-                    return
-                # Some writers preserve unknown archive members. Replace the old
-                # manifest rather than adding a duplicate (notably after rename).
-                import tempfile
-                fd, staged = tempfile.mkstemp(suffix='.xlsx', dir=os.path.dirname(os.path.abspath(path)))
-                os.close(fd)
-                try:
-                    with zipfile.ZipFile(staged, 'w') as replacement:
-                        for info in archive.infolist():
-                            if info.filename != _MANIFEST:
-                                replacement.writestr(info, archive.read(info.filename))
-                        replacement.writestr(_MANIFEST, json.dumps(formats, ensure_ascii=False),
-                                             compress_type=zipfile.ZIP_DEFLATED)
-                    archive.close()
-                    os.replace(staged, path)
-                finally:
-                    if os.path.exists(staged):
-                        os.remove(staged)
-                return
-        with zipfile.ZipFile(path, 'a', compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr(_MANIFEST, json.dumps(formats, ensure_ascii=False))
+    """Atomically store the manifest as a valid OPC part, including legacy repair."""
+    if not formats:
+        return
+    import shutil
+    import tempfile
+    import xml.etree.ElementTree as ET
+
+    content_file = '[Content_Types].xml'
+    ns = 'http://schemas.openxmlformats.org/package/2006/content-types'
+    override_tag = '{%s}Override' % ns
+    part_name = '/' + _MANIFEST
+    with zipfile.ZipFile(path) as archive:
+        if archive.namelist().count(content_file) != 1:
+            raise ValueError('工作簿内容类型清单缺失或重复')
+        content = ET.fromstring(archive.read(content_file))
+        if content.tag != '{%s}Types' % ns:
+            raise ValueError('工作簿内容类型清单无效')
+        overrides = [node for node in content.findall(override_tag)
+                     if node.get('PartName') == part_name]
+        valid_type = len(overrides) == 1 and overrides[0].get('ContentType') == 'application/json'
+        names = archive.namelist()
+        same_manifest = names.count(_MANIFEST) == 1 and json.loads(archive.read(_MANIFEST)) == formats
+        if same_manifest and valid_type:
+            return
+        for node in overrides:
+            content.remove(node)
+        ET.SubElement(content, override_tag, {'PartName': part_name, 'ContentType': 'application/json'})
+        content_xml = ET.tostring(content, encoding='utf-8', xml_declaration=True)
+        fd, staged = tempfile.mkstemp(suffix=os.path.splitext(str(path))[1],
+                                      dir=os.path.dirname(os.path.abspath(path)))
+        os.close(fd)
+        try:
+            with zipfile.ZipFile(staged, 'w') as replacement:
+                replacement.comment = archive.comment
+                for info in archive.infolist():
+                    if info.filename == _MANIFEST:
+                        continue
+                    if info.filename == content_file:
+                        replacement.writestr(info, content_xml)
+                    else:
+                        with archive.open(info) as src, replacement.open(info, 'w') as dst:
+                            shutil.copyfileobj(src, dst, length=1024 * 1024)
+                replacement.writestr(_MANIFEST, json.dumps(formats, ensure_ascii=False),
+                                     compress_type=zipfile.ZIP_DEFLATED)
+            archive.close()
+            os.replace(staged, path)
+        finally:
+            if os.path.exists(staged):
+                os.remove(staged)
 
 
 def apply_explicit_formats(wb, formats, sheet_name_map=None):

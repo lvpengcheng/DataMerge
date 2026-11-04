@@ -21,6 +21,17 @@ from backend.ai_engine.prompt_generator import PromptGenerator
 
 
 class FormulaSourceCopyTests(unittest.TestCase):
+    def test_matching_key_specs_survive_formula_function_extraction(self):
+        fill="""
+_COLUMN_SPECS={'*': {'code':'key'}}
+def fill_result_sheets(wb, source_sheets, salary_year, salary_month, monthly_hours):
+    pass
+"""
+        code=self.build(fill=fill)
+        from backend.utils.column_contract import read_column_specs
+        self.assertEqual(read_column_specs(code)['*']['code']['type'],'key')
+        compile(code,'<formula-key-policy>','exec')
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)

@@ -229,12 +229,14 @@ def build_result_workbook(source_data, salary_year, salary_month, monthly_hours)
 {rules_short}
 
 ## 输出要求
-**只输出 `def build_result_workbook(...)` 函数体**，用 ```python 代码块包裹。不要 import、不要 main、不要解释文字。
+**输出 `def build_result_workbook(...)` 及模块级 `_COLUMN_SPECS` 匹配键声明，放在同一个 python 代码块**。不要 import、不要 main、不要解释文字。
 """
 
     # ==================== AI 调用 ====================
 
     def _call_ai(self, prompt: str, stream_callback=None, thinking_callback=None) -> str:
+        from backend.utils.generated_code_check import CODE_CONTRACT
+        prompt = CODE_CONTRACT + '\n' + prompt
         messages = [
             {"role": "system", "content": "你是 Python + pandas + openpyxl 专家，擅长 HR/薪酬数据处理。严格按用户给定的输出格式回答。"},
             {"role": "user", "content": prompt},
@@ -344,44 +346,8 @@ output_folder = globals().get("output_folder", "")
 input_folder = globals().get("input_folder", r"{input_folder}")
 
 
-# ---- 键列强制文本（与 output_postprocess 主键归一同规则）----
-# 避免 pd.read_excel / 预加载把数字型工号、证件号读成 int，导致内存 join 两端类型不一致匹配失败
-_KEY_KW = ("工号", "员工工号", "员工编号", "员工号", "职工号", "人员编号", "工作证号", "员工id",
-           "身份证", "证件号", "身份证号", "银行卡", "卡号", "银行账号",
-           "社保号", "社保账号", "公积金号", "公积金账号",
-           "手机号", "联系电话", "税号", "纳税人识别号", "编号")
-_KEY_EX = ("工资", "金额", "薪资", "比例", "系数", "天数", "月数", "说明", "规则", "姓名")
-
-
-def _is_key_col(name):
-    n = str(name or "").strip().lower()
-    if not n or any(e in n for e in _KEY_EX):
-        return False
-    return any(k in n for k in _KEY_KW)
-
-
-def _canon_key(v):
-    import math
-    if v is None or isinstance(v, bool):
-        return v
-    if isinstance(v, float):
-        if math.isnan(v) or math.isinf(v):
-            return v
-        return str(int(v)) if v == int(v) else repr(v)
-    if isinstance(v, int):
-        return str(v)
-    return str(v).strip()
-
-
-def _normalize_key_columns(df):
-    """把命中主键/ID 关键词的列统一成规范文本（110.0→"110"），与输出端主键归一同规则。"""
-    try:
-        for _c in list(df.columns):
-            if _is_key_col(_c):
-                df[_c] = df[_c].map(_canon_key)
-    except Exception as _e:
-        print(f"[键列归一警告] {{_e}}")
-    return df
+from backend.utils.column_contract import normalize_source_keys, normalize_workbook_keys
+KEY_POLICY_VERSION = 1
 
 
 def load_source_data():
@@ -392,10 +358,7 @@ def load_source_data():
     pre = globals().get("_pre_loaded_source_data")
     if pre:
         print(f"使用预加载源数据：{{len(pre)}} 个 sheet")
-        for _v in pre.values():
-            if isinstance(_v, dict) and _v.get("df") is not None:
-                _normalize_key_columns(_v["df"])
-        return pre
+        return normalize_source_keys(pre, globals().get('_COLUMN_SPECS'))
 
     out = {{}}
     for fname in os.listdir(input_folder):
@@ -412,14 +375,13 @@ def load_source_data():
                 # identifiers then exceed IEEE-754 precision and their trailing digits
                 # are already corrupted before key-column normalization can stringify them.
                 df = pd.read_excel(fp, sheet_name=sn, dtype=object)
-                _normalize_key_columns(df)
                 key = sn if sn not in out else f"{{Path(fname).stem}}_{{sn}}"
                 out[key] = {{"df": df, "columns": list(df.columns),
                              "source_file": fname, "source_sheet": sn}}
         except Exception as e:
             print(f"[源数据加载警告] {{fname}}: {{e}}")
     print(f"加载完成：{{len(out)}} 个 sheet")
-    return out
+    return normalize_source_keys(out, globals().get('_COLUMN_SPECS'))
 
 
 # ==================== AI 生成 ====================
@@ -441,6 +403,7 @@ def main():
 
     # 3. 保存到 output_folder
     out_path = os.path.join(output_folder, "薪资汇总表.xlsx")
+    normalize_workbook_keys(wb, globals().get('_COLUMN_SPECS'))
     wb.save(out_path)
     print(f"保存成功：{{out_path}}")
     print("=" * 60)

@@ -29,19 +29,18 @@ def invoke_script_main(main, environment):
                                               environment.get('input_folder'))
                 namespace['load_source_data'] = selected_loader
         from backend.utils.column_contract import (
-            column_contract_enabled, normalize_column_specs, apply_specs_to_source_data)
-        specs = normalize_column_specs(namespace.get('_COLUMN_SPECS')) if column_contract_enabled() else {}
-        if specs:
-            # 源数据注入前按 _COLUMN_SPECS 归一（与输出端 canon_value 同规则），Python 侧匹配也一致
+            normalize_column_specs, normalize_source_keys)
+        # 格式兼容模式不应让源键重新出现两套类型规则；保留类型须逐列声明 raw。
+        specs = normalize_column_specs(namespace.get('_COLUMN_SPECS'))
+        try:
             if namespace.get('_pre_loaded_source_data') is not None:
-                namespace['_pre_loaded_source_data'] = apply_specs_to_source_data(
+                namespace['_pre_loaded_source_data'] = normalize_source_keys(
                     namespace['_pre_loaded_source_data'], specs)
             current_loader = namespace.get('load_source_data')
             if callable(current_loader):
                 def spec_loader(*args, **kwargs):
-                    return apply_specs_to_source_data(current_loader(*args, **kwargs), specs)
+                    return normalize_source_keys(current_loader(*args, **kwargs), specs)
                 namespace['load_source_data'] = spec_loader
-        try:
             with (preserve_template_formats() if version2 else track_script_formats()):
                 if callable(schema_helper) and not version2:
                     namespace['apply_target_column_schemas'] = protect_explicit_values(schema_helper)
@@ -56,11 +55,10 @@ def invoke_script_main(main, environment):
                     namespace.pop('input_folder', None)
                 else:
                     namespace['input_folder'] = original_input
-            if selection is not None or specs:
-                if callable(loader):
-                    namespace['load_source_data'] = loader
-                if cached is not None:
-                    namespace['_pre_loaded_source_data'] = cached
+            if callable(loader):
+                namespace['load_source_data'] = loader
+            if cached is not None:
+                namespace['_pre_loaded_source_data'] = cached
 
 
 def _invoke_script_main(main, environment):

@@ -260,7 +260,7 @@ class AssembleCodeGenerator(TemplateCodeGenerator):
         # 0.3) 结构化字段映射清单（供错误反馈弹窗逐列复核，必须输出）
         parts.append(
             "【字段映射清单输出要求】在 `def fill_template(...)` 的**正上方、同一个代码块内**，"
-            "先输出一个模块级常量 `FIELD_MAPPING`（这是唯一允许出现在函数定义之外的顶层赋值语句），"
+            "先输出模块级常量 `FIELD_MAPPING`；匹配键类型同时用 `_COLUMN_SPECS` 纯字面量声明，"
             "格式严格如下：\n"
             "```\n"
             "FIELD_MAPPING = {\n"

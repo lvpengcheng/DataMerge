@@ -333,7 +333,6 @@ def finalize_output_workbook(output_path, template_path=None, expected_structure
             apply_column_contract(wb, output_path, script_code, template_path if template_ok else None,
                                   expected_structure, explicit_formats, legacy_layers=not script_formats)
         elif not script_formats:
-            normalize_key_columns_to_text(output_path, explicit_formats=explicit_formats)
             if template_ok:
                 restore_formats_from_template(output_path, template_path, expected_structure)
             _normalize_source_sheet_formats_impl(output_path, template_path if template_ok else None)
@@ -341,6 +340,9 @@ def finalize_output_workbook(output_path, template_path=None, expected_structure
                 _apply_expected_schemas_in_workbook(wb, expected_structure, explicit_formats)
             if region_format:
                 restore_template_region_format(output_path, template_path, script_code, expected_structure)
+        if not unified:
+            from backend.utils.column_contract import normalize_native_keys, read_column_specs
+            normalize_native_keys(wb, read_column_specs(script_code))
         # Rename via Aspose so cross-sheet formula references follow the names.
         if sheet_name_map:
             import uuid
@@ -1205,12 +1207,9 @@ _KEY_COL_EXCLUDE = ["工资", "金额", "薪资", "比例", "系数", "天数", 
 
 def _is_key_column(header) -> bool:
     """按列名关键词判断是否主键/ID 列（不做数据探测）。"""
-    name = str(header or "").strip().lower()
-    if not name:
-        return False
-    if any(exc.lower() in name for exc in _KEY_COL_EXCLUDE):
-        return False
-    return any(kw.lower() in name for kw in _KEY_COL_KEYWORDS)
+    from backend.utils.column_contract import _is_identifier_column
+    return _is_identifier_column(header)
+
 
 
 def _canon_key_text(v):
@@ -1261,52 +1260,9 @@ def normalize_key_columns_to_text(output_path, source_sheet_prefix="源_", expli
         logger.warning(f"[主键归一] 打开失败，跳过: {output_path} - {e}")
         return 0
     try:
-        touched = False
-        for si in range(wb.Worksheets.Count):
-            ws = wb.Worksheets[si]
-            cells = ws.Cells
-            try:
-                mc = cells.MaxDataColumn
-                mr = cells.MaxDataRow
-            except Exception:
-                mc, mr = -1, -1
-            if mc < 0 or mr < 1:
-                continue
-            # 第 0 行表头 → 找出键列
-            key_cols = [ci for ci in range(0, mc + 1)
-                        if _is_key_column(cells[0, ci].Value)]
-            if not key_cols:
-                continue
-            for ci in key_cols:
-                for ri in range(1, mr + 1):  # 跳过表头
-                    cell = cells[ri, ci]
-                    if str(cell.Name) in (explicit_formats or {}).get(str(ws.Name), {}):
-                        continue
-                    if cell.IsFormula:
-                        # PutValue 会删除原公式；主键归一仅处理源值，保留结果公式及依赖。
-                        continue
-                    canon = _canon_key_text(cell.Value)
-                    if canon is None:
-                        continue
-                    # 已是规范文本则跳过（幂等，避免无谓写入）
-                    try:
-                        if isinstance(cell.Value, str) and cell.Value == canon and cell.GetStyle().Custom == '@':
-                            continue
-                    except Exception:
-                        pass
-                    try:
-                        style = cell.GetStyle()
-                        style.Custom = "@"           # 文本格式
-                        cell.SetStyle(style)
-                        cell.PutValue(canon)         # 文本格式下按字符串存，不再科学计数
-                        changed += 1
-                        touched = True
-                    except Exception:
-                        continue
-        if touched:
-            wb.Save(str(output_path))
-            logger.info(f"[主键归一] 已把 {changed} 个主键/ID 单元格统一成规范文本"
-                        f"（源_ 与结果表两端一致，Aspose 保值）: {output_path}")
+        from backend.utils.column_contract import normalize_native_keys
+        changed = normalize_native_keys(wb)
+        wb.Save(str(output_path))
     except Exception as e:
         logger.warning(f"[主键归一] 处理异常，按原文件: {output_path} - {e}")
         return 0

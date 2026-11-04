@@ -4,7 +4,8 @@ import copy
 import pprint
 import re
 
-from backend.utils.column_contract import KINDS, _header_key
+from backend.utils.column_spec_schema import (KINDS, header_key as _header_key,
+    decode_column_specs, literal_column_specs, DECLARATION_CONTRACT)
 
 
 COLUMN_SPEC_EDIT_CONTRACT = """
@@ -21,35 +22,54 @@ sheet 明确时使用准确 sheet 名，未限定 sheet 时用 "*"；列名必�
 用户要求列格式时必须返回非空 column_specs，不能仅写 number_format 或靠文字说明。
 已有显式 number_format 优先级高于列声明：本轮涉及的列如有冲突，需在 edits 中移除或同步这些
 显式赋值，避免覆盖新声明；不得改动其他列。legacy 模式还需同步显式格式以兼容旧后处理。
-"""
+多文件模式每次只编辑当前交付文件：column_specs 直接按 sheet 分组，不要再套文件名一层。
+""" + DECLARATION_CONTRACT
 
 
 def _validate_specs(specs):
     if not isinstance(specs, dict):
         raise ValueError('_COLUMN_SPECS 必须是字典')
-    for sheet, columns in specs.items():
-        if not isinstance(sheet, str) or not sheet.strip() or not isinstance(columns, dict):
-            raise ValueError('列声明需要非空 sheet 名及列字典')
-        seen = set()
-        for column, spec in columns.items():
-            if not isinstance(column, str) or not _header_key(column):
-                raise ValueError('列名必须是非空字符串')
-            key = _header_key(column)
-            if key in seen:
-                raise ValueError(f'列名忽略空格后重复: {column}')
-            seen.add(key)
-            if isinstance(spec, str):
-                spec = {'type': spec}
-            if not isinstance(spec, dict) or not spec or set(spec) - {'type', 'format', 'parse'}:
-                raise ValueError(f'{sheet}.{column} 的声明字段无效')
-            if 'type' in spec and spec['type'] not in KINDS:
-                raise ValueError(f'{sheet}.{column} 的 type 不支持')
-            for field in ('format', 'parse'):
-                if field in spec and (not isinstance(spec[field], str) or not spec[field].strip()):
-                    raise ValueError(f'{sheet}.{column} 的 {field} 必须是非空字符串')
-            if not (spec.get('type') or spec.get('format')):
-                raise ValueError(f'{sheet}.{column} 缺少 type 或 format')
+    normalized = decode_column_specs(specs)
+    if normalized != specs:
+        raise ValueError('_COLUMN_SPECS 需要标准的 sheet/列字典；可通过统一解析器规范化来源元信息或类型别名')
     return specs
+
+
+def normalize_spec_updates(updates, workbook_name=None):
+    return decode_column_specs(updates, workbook_name=workbook_name)
+
+
+def detach_generated_specs(code):
+    """合并分步生成的模块级列声明，避免函数抽取把它们当游离代码删掉。"""
+    tree = ast.parse(code)
+    merged, declarations = {}, []
+    for node in tree.body:
+        targets = node.targets if isinstance(node, ast.Assign) else (
+            [node.target] if isinstance(node, ast.AnnAssign) else [])
+        if not any(isinstance(target, ast.Name) and target.id == '_COLUMN_SPECS' for target in targets):
+            continue
+        if len(targets) != 1:
+            raise ValueError('_COLUMN_SPECS 必须独立赋值')
+        values = normalize_spec_updates(literal_column_specs(node.value))
+        for sheet, columns in values.items():
+            for column, rule in columns.items():
+                target = merged.setdefault(sheet, {})
+                name = next((n for n in target if _header_key(n) == _header_key(column)), column)
+                prior = target.get(name, {})
+                prior = {'type': prior} if isinstance(prior, str) else prior
+                rule = {'type': rule} if isinstance(rule, str) else rule
+                if prior.get('type') and rule.get('type') and prior['type'] != rule['type']:
+                    raise ValueError(f'分步生成的 {sheet}.{column} 类型声明冲突')
+                target[name] = {**prior, **rule}
+        declarations.append(node)
+        if node.col_offset or any(other is not node and other.lineno <= node.end_lineno
+                                  and other.end_lineno >= node.lineno for other in tree.body):
+            raise ValueError('_COLUMN_SPECS 声明必须独占语句行')
+    lines = code.splitlines(keepends=True)
+    for node in reversed(declarations):
+        lines[node.lineno - 1:node.end_lineno] = []
+    prefix = '_COLUMN_SPECS = ' + pprint.pformat(merged, sort_dicts=False) + '\n' if declarations else ''
+    return prefix, ''.join(lines)
 
 
 def _root(node):
@@ -58,7 +78,7 @@ def _root(node):
     return isinstance(node, ast.Name) and node.id == '_COLUMN_SPECS'
 
 
-def inspect_column_specs(code):
+def inspect_column_specs(code, allow_legacy=False):
     """Strict AST check: one module literal, no later reassignment/mutation."""
     tree = ast.parse(code)
     declarations = []
@@ -84,10 +104,42 @@ def inspect_column_specs(code):
     if declaration is None:
         return {}, None, tree
     try:
-        specs = ast.literal_eval(declaration.value)
+        specs = literal_column_specs(declaration.value)
     except (ValueError, TypeError) as exc:
-        raise ValueError('_COLUMN_SPECS 必须是纯字面量，不能使用动态表达式') from exc
+        raise ValueError(f'_COLUMN_SPECS 必须是纯字面量且不能有重复键: {exc}') from exc
+    if allow_legacy:
+        specs = decode_column_specs(specs)
     return _validate_specs(specs), declaration, tree
+
+
+def canonicalize_column_specs(code):
+    """Normalize known literal declaration shapes without executing code or changing rules."""
+    specs, declaration, _ = inspect_column_specs(code, allow_legacy=True)
+    if declaration is None or ast.literal_eval(declaration.value) == specs:
+        return code
+    value = declaration.value
+    lines = code.splitlines(keepends=True)
+    first, last = value.lineno - 1, value.end_lineno - 1
+    prefix = lines[first].encode('utf-8')[:value.col_offset].decode('utf-8')
+    suffix = lines[last].encode('utf-8')[value.end_col_offset:].decode('utf-8')
+    lines[first:last + 1] = [prefix + pprint.pformat(specs, sort_dicts=False, width=100) + suffix]
+    result = ''.join(lines)
+    assert inspect_column_specs(result)[0] == specs
+    return result
+
+
+def prepare_column_contract_script(code):
+    """Shared boundary for generated/imported single and multi-workbook scripts."""
+    from backend.utils.multi_workbook import script_targets, script_wrapper, build_script
+    targets = script_targets(code)
+    if not targets:
+        return canonicalize_column_specs(code)
+    changed = False
+    for target in targets.values():
+        normalized = prepare_column_contract_script(target['code'])
+        changed |= normalized != target['code']
+        target['code'] = normalized
+    return build_script(targets, wrapper=script_wrapper(code)) if changed else code
 
 
 def requires_column_specs(feedback):
@@ -100,16 +152,30 @@ def requires_column_specs(feedback):
         feedback or '', re.S))
 
 
-def merge_column_spec_edit(original, edited, updates):
+def merge_column_spec_edit(original, edited, updates, workbook_name=None):
     """Reject lost declarations, then write validated, field-wise merged literals."""
-    old, _, _ = inspect_column_specs(original)
+    old, old_declaration, _ = inspect_column_specs(original, allow_legacy=True)
+    legacy = old_declaration is not None and ast.literal_eval(old_declaration.value) != old
+    edited = canonicalize_column_specs(edited)
     current, declaration, tree = inspect_column_specs(edited)
-    updates = _validate_specs(updates)
+    updates = normalize_spec_updates(updates, workbook_name)
     if current != old:
-        raise ValueError('已有 _COLUMN_SPECS 被删除或改写；请保留原声明，通过 column_specs 提交变更')
+        # A broken legacy list must be repairable. Require every old field to
+        # survive; normal valid declarations still require structured updates.
+        preserved = legacy
+        for sheet, columns in old.items():
+            current_columns = current.get(sheet, {})
+            for column, rule in columns.items():
+                name = next((key for key in current_columns if _header_key(key) == _header_key(column)), column)
+                candidate = current_columns.get(name, {})
+                candidate = {'type': candidate} if isinstance(candidate, str) else candidate
+                rule = {'type': rule} if isinstance(rule, str) else rule
+                preserved = preserved and all(candidate.get(key) == value for key, value in rule.items())
+        if not preserved:
+            raise ValueError('已有 _COLUMN_SPECS 被删除或改写；请保留原声明，通过 column_specs 提交变更')
     if not updates:
         return edited
-    merged = copy.deepcopy(old)
+    merged = copy.deepcopy(current)
     for sheet, columns in updates.items():
         target = merged.setdefault(sheet, {})
         for column, spec in columns.items():

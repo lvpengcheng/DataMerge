@@ -512,6 +512,13 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
 **结构**：`{{ "<源_sheet名>": {{ "header_row": int, "data_start_row": int, "columns": [ {{ "letter": "A", "name": "列名" }}, ... ] }} }}`
 - key 是最终结果中的源 sheet 名（带 `源_` 前缀）；copy 模式在目标保存后才复制，填充时不可直接 `wb[key]` 访问
 - 公式中 sheet 名也用这个 key（如 `'源_考勤明细'!A:Z`）
+- Python 的 `source_data` 字典使用的是原始解析 key，**不等于** `_SOURCE_MAP` 的 `源_` sheet 名。
+  读取 DataFrame 时用 `_SK_TO_SHEET` 反查：
+  `raw_key = next(k for k, sheet in _SK_TO_SHEET.items() if sheet == src_key)`，
+  然后 `df = source_data[raw_key]['df']`。不要写 `source_data['源_员工档案']`，也不要用缺失时空表兜底。
+- 若规则明确“本批名单由源表决定、清除模板旧数据”，这是覆盖相应数据区的明确授权：
+  工号及主表字段必须从当前批次源表重写，不能沿用模板已填的旧工号/月份再查新源表。
+  使用 write_template_cell 时，对这些规则明确要求替换的字段传 overwrite=True；未授权区域仍保留。
 - `letter` 是源 sheet 中该列的列字母，写 VLOOKUP 时用得上
 - `data_start_row`：源数据真实起始行；遍历源数据务必从这行开始，**不要硬编码 2**
 
@@ -523,7 +530,7 @@ def fill_template(wb, source_data, salary_year, salary_month, monthly_hours):
 {rules_short}
 
 ## 输出要求
-**只输出 `def fill_template(...)` 函数体**，用 ```python 代码块包裹。不要 import 模块（除了从 openpyxl.utils 临时导入）、不要 main、不要解释文字。
+**输出 `def fill_template(...)` 及模块级 `_COLUMN_SPECS` 匹配键声明，放在同一个 python 代码块**。不要 import 模块（除了从 openpyxl.utils 临时导入）、不要 main、不要解释文字。
 - **严禁在 `fill_template` 内用 `ws.insert_rows()` / `ws.delete_rows()` 或手动行移位改变行数**（openpyxl 插删行不搬样式，汇总行格式会丢）。需要增删行时，用函数上方的 `CLEANING_SPEC`（见"数据清洗"章节），`fill_template` 内只用 `cleaned_rows(sheet_name)` 逐行填列。
 """
 
@@ -867,44 +874,8 @@ output_folder = globals().get("output_folder", "")
 input_folder = globals().get("input_folder", "")
 
 
-# ---- 键列强制文本（与 output_postprocess 主键归一同规则）----
-# 避免 pd.read_excel / 预加载把数字型工号、证件号读成 int，导致内存 join 两端类型不一致匹配失败
-_KEY_KW = ("工号", "员工工号", "员工编号", "员工号", "职工号", "人员编号", "工作证号", "员工id",
-           "身份证", "证件号", "身份证号", "银行卡", "卡号", "银行账号",
-           "社保号", "社保账号", "公积金号", "公积金账号",
-           "手机号", "联系电话", "税号", "纳税人识别号", "编号")
-_KEY_EX = ("工资", "金额", "薪资", "比例", "系数", "天数", "月数", "说明", "规则", "姓名")
-
-
-def _is_key_col(name):
-    n = str(name or "").strip().lower()
-    if not n or any(e in n for e in _KEY_EX):
-        return False
-    return any(k in n for k in _KEY_KW)
-
-
-def _canon_key(v):
-    import math
-    if v is None or isinstance(v, bool):
-        return v
-    if isinstance(v, float):
-        if math.isnan(v) or math.isinf(v):
-            return v
-        return str(int(v)) if v == int(v) else repr(v)
-    if isinstance(v, int):
-        return str(v)
-    return str(v).strip()
-
-
-def _normalize_key_columns(df):
-    """把命中主键/ID 关键词的列统一成规范文本（110.0→"110"），与输出端主键归一同规则。"""
-    try:
-        for _c in list(df.columns):
-            if _is_key_col(_c):
-                df[_c] = df[_c].map(_canon_key)
-    except Exception as _e:
-        print(f"[键列归一警告] {{_e}}")
-    return df
+from backend.utils.column_contract import normalize_source_keys, normalize_workbook_keys
+KEY_POLICY_VERSION = 1
 
 
 def load_source_data():
@@ -915,10 +886,7 @@ def load_source_data():
     pre = globals().get("_pre_loaded_source_data")
     if pre:
         print(f"使用预加载源数据：{{len(pre)}} 个 sheet")
-        for _v in pre.values():
-            if isinstance(_v, dict) and _v.get("df") is not None:
-                _normalize_key_columns(_v["df"])
-        return pre
+        return normalize_source_keys(pre, globals().get('_COLUMN_SPECS'))
 
     out = {{}}
     # 【与智训/智算预加载一致】回退路径也走 IntelligentExcelParser 区域检测（剥标题横幅、
@@ -981,7 +949,6 @@ def load_source_data():
                             _merged[_sn] = range(1, len(_merged) + 1)
                 except Exception:
                     pass
-                _normalize_key_columns(_merged)
                 _collected.append((Path(fname).stem, _sheet_data.sheet_name, _merged, _cols,
                                    _fmts, _schemas))
         except Exception as e:
@@ -1002,7 +969,7 @@ def load_source_data():
     print(f"加载完成：{{len(out)}} 个 sheet")
     if not out:
         raise ValueError("没有可读取的源数据，请检查文件和表头配置")
-    return out
+    return normalize_source_keys(out, globals().get('_COLUMN_SPECS'))
 
 
 def _append_source_sheets(wb, source_data):
@@ -1354,14 +1321,17 @@ def main():
     print(f"模板已复制至：{{out_path}}")
 
     source_data = load_source_data()
-    if callable(globals().get('clean_source_data')):
+    _clean_source = globals().get('clean_source_data')
+    if callable(_clean_source):
         if SOURCE_SHEET_MODE != 'rebuild':
             raise ValueError('源表需要清洗/合并时，请按规则使用 SOURCE_SHEET_MODE: rebuild 并重新生成脚本')
-        _cleaned = clean_source_data(source_data)
+        _cleaned = _clean_source(source_data)
         if _cleaned is not None:
             if not isinstance(_cleaned, dict):
                 raise ValueError('clean_source_data 必须返回源数据字典或原地修改后返回 None')
             source_data = _cleaned
+
+    source_data = normalize_source_keys(source_data, globals().get('_COLUMN_SPECS'))
 
     # 阶段0（可选）：AI 输出了 CLEANING_SPEC 时，在 openpyxl 打开前先做结构化增删行
     # （Aspose 独立 pass，含跨表引用更新；无 CLEANING_SPEC 则完全跳过，模板行结构不变）。
@@ -1437,7 +1407,9 @@ def main():
         print("使用人工修正映射执行（{{len(FIELD_MAPPING)}} 列），不重新 AI 生成")
 
     print("步骤：调用 AI 生成的 fill_template 写入规则要求的列...")
+    normalize_workbook_keys(wb, globals().get('_COLUMN_SPECS'))
     fill_template(wb, source_data, salary_year, salary_month, monthly_standard_hours)
+    normalize_workbook_keys(wb, globals().get('_COLUMN_SPECS'))
 
     try:
         import json as _json
@@ -1477,7 +1449,7 @@ def main():
     wb.save(out_path)
     wb.close()
     if _source_copy_plan:
-        copy_original_source_sheets(out_path, _source_copy_plan)
+        copy_original_source_sheets(out_path, _source_copy_plan, key_specs=globals().get('_COLUMN_SPECS', {{}}))
     print(f"保存成功：{{out_path}}")
 
     # 结构化字段映射导出（智能组表）：AI 输出了 FIELD_MAPPING 时写 JSON 供引擎落库
@@ -1500,7 +1472,8 @@ def main():
 if __name__ == "__main__":
     main()
 '''
-        return skeleton
+        from backend.utils.column_spec_edit import canonicalize_column_specs
+        return canonicalize_column_specs(skeleton)
 
     # ==================== 差异修正（chat 修正流程） ====================
 

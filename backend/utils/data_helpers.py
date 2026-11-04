@@ -186,16 +186,10 @@ def apply_dataframe_column_schemas(df: pd.DataFrame, column_schemas: dict) -> pd
                 if isinstance(v, (int, float)):
                     return int(v) if field_type == "integer" and float(v).is_integer() else v
                 if isinstance(v, str):
-                    raw = v.strip()
-                    pct = raw.endswith("%")
-                    raw = raw.rstrip("%").replace(",", "")
-                    try:
-                        n = float(raw)
-                        if pct:
-                            n /= 100
-                        return int(n) if field_type == "integer" and n.is_integer() else n
-                    except Exception:
-                        return v
+                    # 长文本编号不可先经 float 损失尾数，再在后面的主键层转回文本。
+                    from backend.utils.column_contract import canon_value
+                    n = canon_value(v, 'number')
+                    return int(n) if field_type == 'integer' and isinstance(n, (int, float)) and float(n).is_integer() else n
                 return v
             df[name] = df[name].map(_number)
         elif field_type in ("date", "datetime"):

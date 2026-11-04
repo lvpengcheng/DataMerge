@@ -148,6 +148,8 @@ class CodeSandbox:
         # 主进程先做代码清理与安全检查：坏代码/危险代码不进子进程
         try:
             script_content = self._clean_code_syntax(script_content)
+            from backend.utils.column_spec_edit import prepare_column_contract_script
+            script_content = prepare_column_contract_script(script_content)
         except Exception as e:
             result["error"] = f"代码清理失败: {e}"
             return result

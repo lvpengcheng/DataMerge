@@ -185,6 +185,7 @@ def run_precise_edit(
     indent_fixer=None,
     training_logger=None,
     reason_sink: Optional[list] = None,
+    workbook_name: Optional[str] = None,
     _validation_retry: bool = True,
 ) -> Optional[str]:
     """模式无关精确编辑。
@@ -226,7 +227,7 @@ def run_precise_edit(
             extra_context=extra_context + '\n上次编辑未提交。请重新提供完整替换组并解决：\n' + reason,
             stream_callback=stream_callback, thinking_callback=thinking_callback,
             indent_fixer=indent_fixer, training_logger=training_logger,
-            reason_sink=reason_sink, _validation_retry=False)
+            reason_sink=reason_sink, workbook_name=workbook_name, _validation_retry=False)
 
     if not full_code:
         return _fail("没有可修改的原始代码")
@@ -302,7 +303,7 @@ def run_precise_edit(
         return _fail(f"改动后代码语法不通过（{syn_err}），已放弃以免写入坏代码")
 
     try:
-        complete_code = merge_column_spec_edit(full_code, complete_code, spec_updates)
+        complete_code = merge_column_spec_edit(full_code, complete_code, spec_updates, workbook_name)
     except (ValueError, SyntaxError) as exc:
         return retry_validation('列契约 AST 检查未通过：' + str(exc))
 
