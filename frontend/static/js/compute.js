@@ -1491,7 +1491,7 @@ async function loadTenantScripts(tenantId) {
     checkCanCompute();
 
     try {
-        const resp = await AUTH.authFetch(`/api/tenant-scripts/${encodeURIComponent(tenantId)}`);
+        const resp = await AUTH.authFetch(`/api/tenant-scripts/${encodeURIComponent(tenantId)}?scope=compute`);
         if (loadId !== _tenantScriptsLoadId) return;
         if (!resp.ok) {
             group.style.display = 'none';
@@ -1506,8 +1506,7 @@ async function loadTenantScripts(tenantId) {
         }
         selector.disabled = false;
 
-        // 按分数排序，最高分在前
-        const scripts = data.scripts.sort((a, b) => (b.score || 0) - (a.score || 0));
+        const scripts = data.scripts;
         scriptsCache = scripts;
 
         selector.innerHTML = scripts.map(s => {
@@ -1520,7 +1519,7 @@ async function loadTenantScripts(tenantId) {
 
         group.style.display = 'block';
 
-        // 优先使用 active 脚本（用户设为最佳的），否则用最高分
+        // 使用服务端选定的当前版本。
         const activeScript = scripts.find(s => s.is_active);
         currentScriptId = activeScript ? activeScript.script_id : scripts[0].script_id;
         // 同步 select 元素的选中状态

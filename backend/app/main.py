@@ -7981,8 +7981,8 @@ async def get_training_logs(tenant_id: str, limit: int = 50):
 
 
 @app.get("/api/tenant-scripts/{tenant_id}")
-async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
-    """获取租户的所有训练脚本列表
+async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db), scope: str = "all"):
+    """获取租户的训练脚本。智算仅列会话最终脚本及启用的已发布方案。
 
     显示规则：
       - FS 目录名固定为 script_<hash12>(磁盘哈希命名)
@@ -7993,6 +7993,45 @@ async def get_tenant_scripts(tenant_id: str, db: Session = Depends(get_db)):
     import re as _re
 
     try:
+        if scope == "compute":
+            from backend.database.models import CalculationSolution
+            from backend.solutions.catalog import tenant_versions
+            from backend.utils.script_lookup import current_training_scripts
+
+            versions, pending, unavailable = tenant_versions(
+                db.query(CalculationSolution).filter_by(tenant_id=tenant_id)
+                .order_by(CalculationSolution.created_at.desc()).all(),
+                disabled_script_ids={sid for (sid,) in db.query(db_models.Script.id).filter_by(
+                    tenant_id=tenant_id, is_active=False).all()},
+            )
+            published_names = {entry["name"] for entry in versions}
+            hash_id = _re.compile(r"^script_[0-9a-f]{12}$", _re.I)
+
+            def display_name(row):
+                if row.name and not hash_id.fullmatch(row.name):
+                    return row.name
+                if row.created_at:
+                    return row.created_at.strftime("训练 %Y-%m-%d %H:%M")
+                return f"未命名脚本 #{row.id}"
+
+            scripts = versions + [
+                {"script_id": str(row.id), "db_id": row.id, "name": display_name(row),
+                 "version": row.version, "score": row.accuracy, "mode": row.mode,
+                 "created": row.created_at.isoformat() if row.created_at else None,
+                 "is_active": False}
+                for row in current_training_scripts(db, tenant_id)
+                if row.name not in published_names
+            ]
+            if scripts:
+                scripts[0]["is_active"] = True
+            return {
+                "tenant_id": tenant_id,
+                "active_script_id": scripts[0]["script_id"] if scripts else None,
+                "scripts": scripts,
+                "pending_solutions": pending,
+                "unavailable_solutions": unavailable,
+            }
+
         tenant_dir = storage_manager.get_tenant_dir(tenant_id)
         training_dir = tenant_dir / "training"
         active_script = storage_manager.get_active_script(tenant_id)

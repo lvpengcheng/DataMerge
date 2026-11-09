@@ -1,6 +1,10 @@
 """Shared calling convention for training and compute script main functions."""
 import inspect
 import os
+from pathlib import Path
+
+_TEMPLATE_ARGUMENTS = ("_template_override_path", "template_path", "template_file")
+_MISSING = object()
 
 
 def invoke_script_main(main, environment):
@@ -11,6 +15,19 @@ def invoke_script_main(main, environment):
     selection = validate_source_files(namespace.get('SOURCE_FILES'))
     environment = dict(environment)
     original_input = namespace.get('input_folder')
+    template_path = environment.get('_template_override_path') or namespace.get('_template_override_path')
+    template_bindings = {}
+    if template_path:
+        template = Path(template_path).resolve()
+        if not template.is_file():
+            raise ValueError(f'指定的模板文件不可用：{template.name}。请重新上传模板或检查智训模板绑定。')
+        input_folder = environment.get('input_folder') or original_input
+        if input_folder and template.is_relative_to(Path(input_folder).resolve()):
+            raise ValueError(f'模板「{template.name}」位于源文件目录，请通过模板入口上传。')
+        template_bindings = dict.fromkeys(_TEMPLATE_ARGUMENTS, str(template))
+        if 'TEMPLATE_PATH' in namespace:
+            template_bindings['TEMPLATE_PATH'] = str(template)
+        environment.update(template_bindings)
     loader = namespace.get('load_source_data')
     schema_helper = namespace.get('apply_target_column_schemas')
     cached = namespace.get('_pre_loaded_source_data')
@@ -44,9 +61,16 @@ def invoke_script_main(main, environment):
             with (preserve_template_formats() if version2 else track_script_formats()):
                 if callable(schema_helper) and not version2:
                     namespace['apply_target_column_schemas'] = protect_explicit_values(schema_helper)
+                saved_template_bindings = {key: namespace.get(key, _MISSING) for key in template_bindings}
+                namespace.update(template_bindings)
                 try:
                     return _invoke_script_main(main, environment)
                 finally:
+                    for key, value in saved_template_bindings.items():
+                        if value is _MISSING:
+                            namespace.pop(key, None)
+                        else:
+                            namespace[key] = value
                     if callable(schema_helper):
                         namespace['apply_target_column_schemas'] = schema_helper
         finally:
@@ -71,6 +95,7 @@ def _invoke_script_main(main, environment):
         'output_path': 'output_folder',
         'salary_year': 'salary_year', 'salary_month': 'salary_month',
         'monthly_standard_hours': 'monthly_standard_hours', 'standard_hours': 'monthly_standard_hours',
+        **dict.fromkeys(_TEMPLATE_ARGUMENTS, '_template_override_path'),
     }
     signature = inspect.signature(main)
     positional, keywords = [], {}

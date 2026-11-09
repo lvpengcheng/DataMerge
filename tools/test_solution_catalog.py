@@ -10,6 +10,26 @@ from backend.solutions.catalog import tenant_versions
 from backend.solutions.package import verify
 
 
+def test_compute_catalog_selects_one_final_script_per_training_session():
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    from backend.database.models import Base, Script, TrainingSession
+    from backend.utils.script_lookup import current_training_scripts
+
+    engine = create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        db.add_all(TrainingSession(id=i, tenant_id='GWS', session_key=f'gws-{i}', user_id=1,
+                                   final_script_id=final)
+                   for i, final in [(1, 10), (2, None), (3, 15), (4, 12)])
+        for identity, session, enabled in [(10, 1, True), (11, 1, True), (12, 2, True),
+                                           (13, 2, True), (14, None, True), (15, 3, False)]:
+            db.add(Script(id=identity, tenant_id='GWS', name=f'脚本{identity}', code='pass',
+                          source_session_id=session, is_active=enabled))
+        db.flush()
+        assert [row.id for row in current_training_scripts(db, 'GWS')] == [13, 10]
+
+
 class SolutionCatalogTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
