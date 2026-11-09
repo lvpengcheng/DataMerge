@@ -834,6 +834,8 @@ def _persist_iteration_files(tenant_id: str, session_id: int, iteration_num: int
                 if fn.lower().endswith((".xlsx", ".xls", ".xlsm")) and not fn.startswith("~"):
                     src = os.path.join(output_dir, fn)
                     if "diff" in fn.lower() or "_diff" in fn or "差异对比" in fn:
+                        if run_result.get("comparison_complete") is False:
+                            continue
                         dst = iter_dir / f"diff_{fn}"
                         shutil.copy2(src, dst)
                         paths["diff_file"] = str(dst)
@@ -865,6 +867,7 @@ def _run_single_iteration(
     rules_content: str = None,
     expected_structure: Dict = None,
     template_override_path: str = None,
+    target_sheets=None,
 ) -> Dict[str, Any]:
     """执行单轮训练：运行代码 → 对比 → 返回结果（与 TrainingEngine._execute_and_validate 一致）"""
     from ..sandbox.code_sandbox import CodeSandbox
@@ -951,7 +954,9 @@ def _run_single_iteration(
 
         from backend.utils.multi_workbook import workbook_definitions, validate_workbooks
         if len(workbook_definitions(expected_structure)) > 1:
-            result = validate_workbooks(output_dir, code, expected_structure, rules_content, tenant_id)
+            result = validate_workbooks(
+                output_dir, code, expected_structure, rules_content, tenant_id,
+                target_sheets=target_sheets, allow_incomplete=True)
             result["execution_time"] = execution_time
             return result
 
@@ -997,14 +1002,14 @@ def _run_single_iteration(
         comparison_primary_keys = extract_primary_keys_from_rules(rules_content) if rules_content else None
         logger.info(f"[对比] rules_content长度={len(rules_content) if rules_content else 0}, 提取到主键={comparison_primary_keys}")
 
-        comparison = compare_excel_files_multi_sheet(
+        from backend.utils.training_validation import compare_for_training, training_comparison_sheets
+        comparison = compare_for_training(lambda: compare_excel_files_multi_sheet(
             result_file, expected_file, diff_output,
             primary_keys=comparison_primary_keys,
             result_calculated=True,
             calculate_expected_formulas=True,
-        )
-        from backend.utils.excel_comparator import require_complete_comparison
-        require_complete_comparison(comparison)
+            selected_sheets=training_comparison_sheets(code, expected_structure, target_sheets),
+        ))
 
         total = comparison.get("total_cells", 1)
         matched = comparison.get("matched_cells", 0)
@@ -1026,7 +1031,7 @@ def _run_single_iteration(
                 }
 
         # 构建详细差异文本（供 generate_correction_code 使用）
-        detailed_diff = comparison.get("detailed_text", "")
+        detailed_diff = comparison.get("warning") or comparison.get("detailed_text", "")
         if not detailed_diff and (diff_summary or missing_sheets):
             lines = []
             if is_multi:
@@ -1088,9 +1093,11 @@ def _run_single_iteration(
             "per_sheet": per_sheet if is_multi else None,
             "missing_sheets": missing_sheets if missing_sheets else None,
             "extra_sheets": extra_sheets if extra_sheets else None,
-            "diff_file": diff_output if os.path.exists(diff_output) else None,
+            "diff_file": diff_output if comparison.get("comparison_complete") is not False and os.path.exists(diff_output) else None,
             "output_dir": str(output_dir),
             "execution_time": execution_time,
+            "comparison_complete": comparison.get("comparison_complete", True),
+            "comparison_warning": comparison.get("warning"),
             "formula_warning": formula_warning,
             "formula_report": formula_report,
         }
@@ -2232,6 +2239,7 @@ def main(source_dir, output_dir, **kwargs):
                 pre_loaded_source_data=_full_source_data,
                 rules_content=config.get("rules_content", ""),
                 expected_structure=config.get("expected_structure"),
+                target_sheets=config.get("target_sheets"),
             )
 
             # 记录迭代
@@ -2244,6 +2252,8 @@ def main(source_dir, output_dir, **kwargs):
                 generated_code=code,
                 accuracy=accuracy,
                 execution_result={"success": run_result.get("success"),
+                                  "comparison_warning": run_result.get("comparison_warning"),
+                                  "comparison_complete": run_result.get("comparison_complete", True),
                                   "total_cells": run_result.get("total_cells"),
                                   "matched_cells": run_result.get("matched_cells")},
                 error_details=run_result.get("diff_details") if not run_result.get("success") or accuracy < 1.0 else None,
@@ -2267,6 +2277,8 @@ def main(source_dir, output_dir, **kwargs):
                 _sm.save_script(
                     tenant_id, code,
                     {"success": run_result.get("success", False),
+                 "comparison_warning": run_result.get("comparison_warning"),
+                 "comparison_complete": run_result.get("comparison_complete", True),
                      "best_score": accuracy,
                      "total_iterations": iteration_num,
                      "best_code": code, "mode": mode,
@@ -2307,13 +2319,15 @@ def main(source_dir, output_dir, **kwargs):
             saved_files["has_rules"] = bool(config.get("rules_content"))
             if saved_files:
                 config["latest_files"] = saved_files
-                config["validation_stale"] = not bool(run_result.get("success"))
+                config["validation_stale"] = not bool(run_result.get("success")) or run_result.get("comparison_complete") is False
                 ts.config = config
                 flag_modified(ts, "config")  # 关键：首轮 latest_files 就地更新须标记，否则下载指向错文件
                 db.commit()
 
             # 生成差异描述消息
-            if run_result.get("success"):
+            if run_result.get("comparison_warning"):
+                _add_message(db, sid, "system", run_result["comparison_warning"], "status", {"comparison_complete": False})
+            elif run_result.get("success"):
                 acc_pct = f"{accuracy * 100:.1f}%"
                 if accuracy >= 1.0:
                     msg_content = f"第 {iteration_num} 轮完成，准确率 {acc_pct}，所有数据匹配！"
@@ -2342,6 +2356,8 @@ def main(source_dir, output_dir, **kwargs):
                 "iteration": iteration_num,
                 "accuracy": accuracy,
                 "success": run_result.get("success", False),
+                 "comparison_warning": run_result.get("comparison_warning"),
+                 "comparison_complete": run_result.get("comparison_complete", True),
                 "diff_details": run_result.get("diff_details"),
                 "error": run_result.get("error"),
                 "formula_warning": run_result.get("formula_warning", False),
@@ -2823,6 +2839,7 @@ async def send_message(
                 pre_loaded_source_data=_full_source_data,
                 rules_content=config.get("rules_content", ""),
                 expected_structure=config.get("expected_structure"),
+                target_sheets=config.get("target_sheets"),
                 template_override_path=config.get("template_path"),
             )
 
@@ -2837,7 +2854,7 @@ async def send_message(
             accuracy = run_result.get("accuracy", 0)
             prev_best = context.get("best_accuracy") or 0
 
-            if accuracy < prev_best and prev_best > 0:
+            if run_result.get("comparison_complete") is not False and accuracy < prev_best and prev_best > 0:
                 drop_msg = (
                     f"本轮修改导致准确率从 {prev_best*100:.1f}% 下降到 {accuracy*100:.1f}%，"
                     f"将基于当前代码继续修正。"
@@ -2853,6 +2870,8 @@ async def send_message(
                 generated_code=code,
                 accuracy=accuracy,
                 execution_result={"success": run_result.get("success"),
+                                  "comparison_warning": run_result.get("comparison_warning"),
+                                  "comparison_complete": run_result.get("comparison_complete", True),
                                   "total_cells": run_result.get("total_cells"),
                                   "matched_cells": run_result.get("matched_cells")},
                 error_details=run_result.get("diff_details"),
@@ -2867,6 +2886,8 @@ async def send_message(
                 _sm.save_script(
                     session.tenant_id, code,
                     {"success": run_result.get("success", False),
+                 "comparison_warning": run_result.get("comparison_warning"),
+                 "comparison_complete": run_result.get("comparison_complete", True),
                      "best_score": accuracy,
                      "total_iterations": iteration_num,
                      "best_code": code, "mode": session.mode or "formula",
@@ -2907,12 +2928,14 @@ async def send_message(
             saved_files["has_rules"] = bool(config.get("rules_content"))
             if saved_files:
                 config["latest_files"] = saved_files
-                config["validation_stale"] = not bool(run_result.get("success"))
+                config["validation_stale"] = not bool(run_result.get("success")) or run_result.get("comparison_complete") is False
                 session.config = config
                 flag_modified(session, "config")  # 关键：latest_files 就地更新须标记，否则下载仍指向旧输出
                 db.commit()
 
-            if run_result.get("success"):
+            if run_result.get("comparison_warning"):
+                _add_message(db, session_id, "system", run_result["comparison_warning"], "status", {"comparison_complete": False})
+            elif run_result.get("success"):
                 acc_pct = f"{accuracy * 100:.1f}%"
                 if accuracy >= 1.0:
                     diff_msg = f"第 {iteration_num} 轮完成，准确率 {acc_pct}，所有数据匹配！"
@@ -2938,6 +2961,8 @@ async def send_message(
                 "iteration": iteration_num,
                 "accuracy": accuracy,
                 "success": run_result.get("success", False),
+                 "comparison_warning": run_result.get("comparison_warning"),
+                 "comparison_complete": run_result.get("comparison_complete", True),
                 "diff_details": run_result.get("diff_details"),
                 "error": run_result.get("error"),
                 "formula_warning": run_result.get("formula_warning", False),
@@ -3231,6 +3256,7 @@ async def send_message(
                 pre_loaded_source_data=_full_source_data,
                 rules_content=config.get("rules_content", ""),
                 expected_structure=config.get("expected_structure"),
+                target_sheets=config.get("target_sheets"),
             )
 
             accuracy = run_result.get("accuracy", 0)
@@ -3243,6 +3269,8 @@ async def send_message(
                 generated_code=code,
                 accuracy=accuracy,
                 execution_result={"success": run_result.get("success"),
+                                  "comparison_warning": run_result.get("comparison_warning"),
+                                  "comparison_complete": run_result.get("comparison_complete", True),
                                   "total_cells": run_result.get("total_cells"),
                                   "matched_cells": run_result.get("matched_cells")},
                 error_details=run_result.get("diff_details") if not run_result.get("success") or accuracy < 1.0 else None,
@@ -3262,6 +3290,8 @@ async def send_message(
                 _sm.save_script(
                     tenant_id, code,
                     {"success": run_result.get("success", False),
+                 "comparison_warning": run_result.get("comparison_warning"),
+                 "comparison_complete": run_result.get("comparison_complete", True),
                      "best_score": accuracy,
                      "total_iterations": iteration_num,
                      "best_code": code, "mode": mode,
@@ -3300,12 +3330,14 @@ async def send_message(
             saved_files["has_rules"] = bool(config.get("rules_content"))
             if saved_files:
                 config["latest_files"] = saved_files
-                config["validation_stale"] = not bool(run_result.get("success"))
+                config["validation_stale"] = not bool(run_result.get("success")) or run_result.get("comparison_complete") is False
                 session.config = config
                 flag_modified(session, "config")
                 db.commit()
 
-            if run_result.get("success"):
+            if run_result.get("comparison_warning"):
+                _add_message(db, session_id, "system", run_result["comparison_warning"], "status", {"comparison_complete": False})
+            elif run_result.get("success"):
                 acc_pct = f"{accuracy * 100:.1f}%"
                 if accuracy >= 1.0:
                     msg_content = f"重新生成第 {iteration_num} 轮完成，准确率 {acc_pct}，所有数据匹配！"
@@ -3333,6 +3365,8 @@ async def send_message(
                 "iteration": iteration_num,
                 "accuracy": accuracy,
                 "success": run_result.get("success", False),
+                 "comparison_warning": run_result.get("comparison_warning"),
+                 "comparison_complete": run_result.get("comparison_complete", True),
                 "diff_details": run_result.get("diff_details"),
                 "error": run_result.get("error"),
                 "formula_warning": run_result.get("formula_warning", False),
@@ -3696,6 +3730,7 @@ def _validate_uploaded_code(session_id, code_content, template_upload, user_id, 
         pre_loaded_source_data=_full_source_data,
         rules_content=config.get("rules_content", ""),
         expected_structure=config.get("expected_structure"),
+        target_sheets=config.get("target_sheets"),
         template_override_path=_tpl_override,
     )
 
@@ -3710,6 +3745,8 @@ def _validate_uploaded_code(session_id, code_content, template_upload, user_id, 
         generated_code=code_content,
         accuracy=accuracy,
         execution_result={"success": run_result.get("success"),
+                                  "comparison_warning": run_result.get("comparison_warning"),
+                                  "comparison_complete": run_result.get("comparison_complete", True),
                           "source": "manual_upload"},
         error_details=run_result.get("diff_details"),
         status="completed" if run_result.get("success") else "failed",
@@ -3726,7 +3763,7 @@ def _validate_uploaded_code(session_id, code_content, template_upload, user_id, 
     config["latest_detailed_diff"] = (run_result.get("detailed_diff") or "")[:70000]
     if iter_files:
         config["latest_files"] = iter_files
-        config["validation_stale"] = not bool(run_result.get("success"))
+        config["validation_stale"] = not bool(run_result.get("success")) or run_result.get("comparison_complete") is False
     session.config = dict(config)  # 触发 SQLAlchemy 变更检测
     db.commit()
 
@@ -3738,6 +3775,8 @@ def _validate_uploaded_code(session_id, code_content, template_upload, user_id, 
         _sm.save_script(
             session.tenant_id, code_content,
             {"success": run_result.get("success", False),
+                 "comparison_warning": run_result.get("comparison_warning"),
+                 "comparison_complete": run_result.get("comparison_complete", True),
              "best_score": accuracy,
              "total_iterations": iteration_num,
              "best_code": code_content, "mode": mode,
@@ -3799,7 +3838,9 @@ def _validate_uploaded_code(session_id, code_content, template_upload, user_id, 
         logger.warning(f"[upload-code] 保存脚本到DB失败: {e}")
 
     # 消息
-    if run_result.get("success"):
+    if run_result.get("comparison_warning"):
+        _add_message(db, session_id, "system", run_result["comparison_warning"], "status", {"comparison_complete": False})
+    elif run_result.get("success"):
         acc_pct = f"{accuracy * 100:.1f}%"
         msg = f"手动上传代码已验证，准确率 {acc_pct}"
         if accuracy < 1.0:
@@ -3822,6 +3863,8 @@ def _validate_uploaded_code(session_id, code_content, template_upload, user_id, 
         "iteration": iteration_num,
         "accuracy": accuracy,
         "success": run_result.get("success", False),
+                 "comparison_warning": run_result.get("comparison_warning"),
+                 "comparison_complete": run_result.get("comparison_complete", True),
         "diff_details": {
             "field_diff_samples": run_result.get("diff_details"),
             "total_cells": run_result.get("total_cells"),

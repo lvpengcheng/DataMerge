@@ -210,7 +210,8 @@ def validate(payload):
         rules = manifest['metadata'].get('rules_content')
         comparison = compare_excel_files_multi_sheet(str(result), expected, str(Path(temp) / 'diff.xlsx'),
                                                      primary_keys=extract_primary_keys_from_rules(rules) if rules else None,
-                                                     result_calculated=True, calculate_expected_formulas=True)
+                                                     result_calculated=True, calculate_expected_formulas=True,
+                                                     selected_sheets=list(structure.get("sheets", {})) or None)
         require_complete_comparison(comparison)
         comparison['formula_warning'] = bool(finalized.get('formula_warning'))
         return comparison

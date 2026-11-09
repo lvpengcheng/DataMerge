@@ -1159,22 +1159,21 @@ class TrainingEngine:
 
                 # 比较结果 - 根据预期文件sheet数选择单sheet或多sheet对比
                 comparison_output_file = str(self.training_logger.log_dir / f"差异对比_{iteration_num}.xlsx")
-                comparison_result = compare_excel_files_multi_sheet(
+                from backend.utils.training_validation import compare_for_training, training_comparison_sheets
+                comparison_result = compare_for_training(lambda: compare_excel_files_multi_sheet(
                     result_file=output_path,
                     expected_file=expected_file,
                     output_file=comparison_output_file,
                     primary_keys=comparison_primary_keys,
                     result_calculated=True,
                     calculate_expected_formulas=True,
-                )
+                    selected_sheets=training_comparison_sheets(code, expected_structure),
+                ))
 
                 # 计算匹配分数（基于单元格匹配数量）
                 total_cells = comparison_result.get("total_cells", 0)
                 matched_cells = comparison_result.get("matched_cells", 0)
                 total_diff = comparison_result.get("total_differences", 0)
-
-                from backend.utils.excel_comparator import require_complete_comparison
-                require_complete_comparison(comparison_result)
 
                 # 使用单元格匹配率作为分数
                 if total_cells > 0:
@@ -1188,7 +1187,7 @@ class TrainingEngine:
                         score = 0.0
                         self.training_logger.log_warning("未找到可对比的单元格(total_cells=0)，请检查结果文件的sheet结构")
 
-                comparison_text = f"差异对比完成: 匹配 {matched_cells}/{total_cells} 个单元格, 匹配率 {score:.2%}, 差异 {total_diff} 处"
+                comparison_text = comparison_result.get("warning") or f"差异对比完成: 匹配 {matched_cells}/{total_cells} 个单元格, 匹配率 {score:.2%}, 差异 {total_diff} 处"
                 self.training_logger.log_info(comparison_text)
 
                 # 生成详细的差异描述用于AI修正
@@ -1200,7 +1199,7 @@ class TrainingEngine:
 
                 # 重命名差异对比文件为统一格式
                 saved_comparison_path = ""
-                if Path(comparison_output_file).exists():
+                if comparison_result.get("comparison_complete") is not False and Path(comparison_output_file).exists():
                     saved_comparison_path = self.training_logger.save_comparison_excel(comparison_output_file, mode_type="formula")
                     # 删除临时的差异对比文件
                     Path(comparison_output_file).unlink(missing_ok=True)
@@ -1224,7 +1223,7 @@ class TrainingEngine:
                 )
 
                 # 更新最佳结果
-                if score > best_score:
+                if score > best_score or (comparison_result.get("comparison_complete") is False and not best_code):
                     best_score = score
                     best_code = code
                     best_output_path = output_path
@@ -1233,6 +1232,10 @@ class TrainingEngine:
                     self.training_logger.log_iteration_complete(iteration_num, score, is_best=True)
                 else:
                     self.training_logger.log_iteration_complete(iteration_num, score, is_best=False)
+
+                if comparison_result.get("comparison_complete") is False:
+                    self.training_logger.log_warning(comparison_result["warning"])
+                    break
 
                 # 如果分数达到完美匹配阈值，提前结束
                 if score >= self.training_perfect_threshold:
@@ -1262,7 +1265,8 @@ class TrainingEngine:
         final_score = best_score
         # 构建返回结果
         result = {
-            "success": final_score >= self.training_success_threshold,
+            "success": final_score >= self.training_success_threshold or bool(iteration_results and comparison_result.get("comparison_complete") is False),
+            "comparison_warning": comparison_result.get("warning") if iteration_results else None,
             "best_score": final_score,
             "current_score": best_score,
             "historical_best_score": historical_best_score,
@@ -1454,13 +1458,18 @@ class TrainingEngine:
                 )
 
                 # 更新最佳代码
-                is_best = score > best_score
+                incomplete = execution_result.get("comparison_complete") is False
+                is_best = score > best_score or (incomplete and not best_code)
                 if is_best:
                     best_score = score
                     best_code = code
 
                 # 记录迭代完成
                 self.training_logger.log_iteration_complete(iteration_num, score, is_best)
+
+                if incomplete:
+                    self.training_logger.log_warning(comparison)
+                    break
 
                 # 如果达到完美匹配阈值，提前结束
                 if score >= self.training_perfect_threshold:
@@ -1491,8 +1500,11 @@ class TrainingEngine:
                 execution_result = iter_result.get("execution_result", {})
                 best_result_excel = execution_result.get("training_output_file", "")
                 best_comparison_excel = execution_result.get("comparison_excel_file", "")
-                break
+                if best_result_excel:
+                    break
 
+        comparison_incomplete = bool(iteration_results and
+            iteration_results[-1].get("execution_result", {}).get("comparison_complete") is False)
         # 返回训练结果
         result = {
             "tenant_id": tenant_id,
@@ -1506,7 +1518,8 @@ class TrainingEngine:
             "rules_content": rules_content,
             "iteration_results": iteration_results,
             "total_iterations": len(iteration_results),
-            "success": best_score >= self.training_success_threshold,
+            "success": best_score >= self.training_success_threshold or comparison_incomplete,
+            "comparison_warning": iteration_results[-1]["comparison_result"] if comparison_incomplete else None,
             "generation_mode": "modular",
             "log_file": self.training_logger.get_log_file_path(),
             "training_summary": self.training_logger.get_training_summary_path()
@@ -1984,32 +1997,35 @@ class TrainingEngine:
 
                     # 使用独立的差异对比组件进行对比（根据预期sheet数选择）
                     comparison_output_file = str(output_dir / "差异对比.xlsx")
-                    comparison_result = compare_excel_files_multi_sheet(
+                    from backend.utils.training_validation import compare_for_training, training_comparison_sheets
+                    comparison_result = compare_for_training(lambda: compare_excel_files_multi_sheet(
                         result_file=str(output_file),
                         expected_file=expected_file,
                         output_file=comparison_output_file,
                         primary_keys=comparison_primary_keys,
                         result_calculated=True,
                         calculate_expected_formulas=True,
-                    )
+                        selected_sheets=training_comparison_sheets(code, expected_structure),
+                    ))
 
                     # 保存差异对比Excel到training_logs，然后删除临时文件
-                    if Path(comparison_output_file).exists():
+                    if comparison_result.get("comparison_complete") is not False and Path(comparison_output_file).exists():
                         saved_comparison_file = self.training_logger.save_comparison_excel(comparison_output_file)
                         if saved_comparison_file:
                             result["comparison_excel_file"] = saved_comparison_file
                         # 删除临时的差异对比文件，只保留training_logs中的版本
                         Path(comparison_output_file).unlink(missing_ok=True)
 
-                    from backend.utils.excel_comparator import require_complete_comparison
-                    require_complete_comparison(comparison_result)
-
                     # 根据对比结果判断是否成功
                     total_diff = comparison_result.get("total_differences", 0)
                     matched_cells = comparison_result.get("matched_cells", 0)
                     total_cells = comparison_result.get("total_cells", 0)
                     result["success"] = bool(comparison_result.get("success")) and total_diff == 0
-                    if total_diff == 0:
+                    if comparison_result.get("comparison_complete") is False:
+                        result["success"] = True
+                        result["comparison_complete"] = False
+                        result["comparison"] = comparison_result["warning"]
+                    elif total_diff == 0:
                         result["comparison"] = "所有检查项都通过！"
                     else:
                         field_diff_samples = comparison_result.get("field_diff_samples", {})
@@ -2106,7 +2122,7 @@ class TrainingEngine:
 
     def _calculate_match_score(self, execution_result: Dict[str, Any]) -> float:
         """计算匹配分数"""
-        if not execution_result["success"]:
+        if not execution_result["success"] or execution_result.get("comparison_complete") is False:
             return 0.0
 
         comparison = execution_result.get("comparison", "")

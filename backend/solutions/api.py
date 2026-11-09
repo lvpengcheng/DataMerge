@@ -295,14 +295,14 @@ async def import_package(file: UploadFile = File(...), tenant_id: str = Form(...
                 target = target or register_legacy_script(db, ROOT, tenant, legacy_id, user.id)
             # Import stores the package without executing any of its Python.
             name = target.name if target else import_solution.name if import_solution else new_name or manifest['name']
-            named_solutions = (db.query(CalculationSolution).filter_by(tenant_id=tenant, name=name)
+            named_solutions = (db.query(CalculationSolution).filter_by(tenant_id=tenant, name=name, created_by=user.id)
                                .order_by(CalculationSolution.is_active.desc(),
                                          CalculationSolution.created_at.desc(), CalculationSolution.id.desc()).all())
             # Reuse an identical package; a different package gets its own binding
             # so old solution ids keep pointing to their original immutable digest.
             existing = next((row for row in named_solutions if row.digest == manifest['digest']), None)
             preferred = existing or (named_solutions[0] if named_solutions else None)
-            matching = db.query(Script).filter_by(tenant_id=tenant, name=name).all() if target is None else [target]
+            matching = db.query(Script).filter_by(tenant_id=tenant, name=name, created_by=user.id).all() if target is None else [target]
             if target is None and matching:
                 target = next((script for script in matching if preferred and script.id == preferred.script_id), None)
                 target = target or max(matching, key=lambda script: (bool(script.is_active), script.version or 0, script.id))
@@ -335,7 +335,7 @@ async def import_package(file: UploadFile = File(...), tenant_id: str = Form(...
                 script.config = {**(script.config or {}), 'solution_import_legacy_id': legacy_id}
             if create_tenant:
                 db.add(TenantAuthorization(tenant_id=tenant, org_id=user.org_id, granted_by=user.id))
-            row = existing or CalculationSolution(id=uuid.uuid4().hex, tenant_id=tenant,
+            row = existing or next((item for item in named_solutions if item.created_by == user.id and (not target or item.script_id == target.id)), None) or CalculationSolution(id=uuid.uuid4().hex, tenant_id=tenant,
                                                   digest=manifest['digest'], created_by=user.id)
             if row.digest != manifest['digest']:
                 # Validation belongs to an exact package, never to its name.

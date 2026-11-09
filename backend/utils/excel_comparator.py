@@ -795,8 +795,23 @@ def _resolve_declared_key_columns(expected_df: pd.DataFrame,
     return available_keys
 
 
-def require_complete_comparison(result):
+def _shared_sheet_keys(expected_df, result_df, primary_keys):
+    """A workbook-wide key hint applies only where all its columns exist on both sides."""
+    keys = [_standardize_column_name(key) for key in (primary_keys or [])]
+    if not keys or not all(keys) or len(set(keys)) != len(keys):
+        return []
+    expected_columns = [_standardize_column_name(col) for col in expected_df.columns]
+    result_columns = [_standardize_column_name(col) for col in result_df.columns]
+    if all(expected_columns.count(key) == result_columns.count(key) == 1 for key in keys):
+        return keys
+    return []
+
+
+def require_complete_comparison(result, allow_timeout=False):
     """Infrastructure/read failures are never interpreted as zero differences."""
+    if allow_timeout and result.get("timed_out"):
+        logger.warning(result.get("warning") or "结果对比超时，已保留生成结果，成功率尚未评估")
+        return result
     if result.get("resource_failure"):
         from backend.utils.training_validation import TrainingResourceFailure
         raise TrainingResourceFailure(result.get("error") or "对比资源不足")
@@ -1170,7 +1185,8 @@ def _read_with_header_fallback(primary_keys: Optional[List[str]],
                                exp_sheet_name: Optional[str], res_sheet_name: Optional[str],
                                exp_ws, res_ws,
                                exp_hdr_row: int, res_hdr_row: int,
-                               res_formulas_reader=None):
+                               res_formulas_reader=None, *,
+                               resolve_key_columns=_resolve_declared_key_columns):
     """在候选表头行中选出让「指定主键」真正命中的那一行，再读两侧 DataFrame。
 
     表头行侦测（IntelligentExcelParser）会因版式差异给出错误行：既可能是多行表头的
@@ -1199,7 +1215,7 @@ def _read_with_header_fallback(primary_keys: Optional[List[str]],
 
     if not primary_keys:
         return exp_df, res_df, res_formulas, None
-    if len(_resolve_declared_key_columns(exp_df, res_df, primary_keys)) == len(primary_keys):
+    if len(resolve_key_columns(exp_df, res_df, primary_keys)) == len(primary_keys):
         return exp_df, res_df, res_formulas, None
 
     exp_candidates = _header_row_candidates(exp_file, exp_sheet_name, exp_ws, exp_hdr_row)
@@ -1216,8 +1232,8 @@ def _read_with_header_fallback(primary_keys: Optional[List[str]],
                 continue
             if res_row not in res_cache:
                 res_cache[res_row], _ = _read_side(None, res_ws, res_row)
-            if len(_resolve_declared_key_columns(exp_cache[row], res_cache[res_row],
-                                                 primary_keys)) != len(primary_keys):
+            if len(resolve_key_columns(exp_cache[row], res_cache[res_row],
+                                       primary_keys)) != len(primary_keys):
                 continue
             # 命中主键：真正读一次（result 侧要带公式）
             res_df, res_formulas = _read_side(res_formulas_reader, res_ws, res_row)
@@ -1451,6 +1467,7 @@ def _compare_excel_files_multi_sheet_impl(
     skip_source_filter: bool = False,
     result_calculated: bool = False,
     calculate_expected_formulas: bool = False,
+    selected_sheets: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """（子进程执行体）对比两个 Excel 文件的所有 Sheet 差异（多Sheet版本）。
 
@@ -1487,6 +1504,7 @@ def _compare_excel_files_multi_sheet_impl(
                 skip_source_filter=skip_source_filter,
                 result_calculated=result_calculated,
                 calculate_expected_formulas=False,
+                selected_sheets=selected_sheets,
             )
 
     # 【第1次打开 result】Aspose 计算公式（expected 不需要，外部已计算）。
@@ -1533,6 +1551,9 @@ def _compare_excel_files_multi_sheet_impl(
             exp_compare_sheets = [n for n in exp_sheets if not _is_source_or_param(n)]
         if not exp_compare_sheets:
             exp_compare_sheets = exp_sheets  # 全部都像源数据时回退
+
+        if selected_sheets is not None:
+            exp_compare_sheets = list(dict.fromkeys(selected_sheets))
 
         logger.info(f"[多Sheet对比] 预期文件sheets: {exp_sheets}, 对比sheets: {exp_compare_sheets}")
         logger.info(f"[多Sheet对比] 结果文件sheets: {res_sheets}")
@@ -1602,21 +1623,30 @@ def _compare_excel_files_multi_sheet_impl(
                     exp_ws_map[exp_sheet_name], res_ws_map[res_sheet_name],
                     exp_hdr_row, res_hdr_row,
                     res_formulas_reader=_aspose_read_sheet_df_and_formulas,
+                    resolve_key_columns=_shared_sheet_keys,
                 )
                 if header_note:
                     formula_warning = f"{formula_warning} {header_note}".strip()
 
-                # 标准化列名
+                # 工作簿规则中的主键只是提示，每对同名 Sheet 单独选择主键。
+                sheet_keys = _shared_sheet_keys(exp_df, res_df, primary_keys)
                 exp_df.columns = _standardize_unique_columns(exp_df.columns)
                 res_df.columns = _standardize_unique_columns(res_df.columns)
 
-                resolved_keys = _resolve_primary_keys(exp_df, res_df, primary_keys)
+                if not sheet_keys:
+                    common = exp_df.columns.intersection(res_df.columns, sort=False)
+                    sheet_keys = detect_primary_keys(exp_df.loc[:, common])
+                    if primary_keys:
+                        logger.info("[多Sheet对比] '%s' 不适用通用主键 %s，自动选择 %s",
+                                    exp_sheet_name, primary_keys, sheet_keys)
+                resolved_keys = _resolve_primary_keys(exp_df, res_df, sheet_keys)
 
                 # 写入共享workbook的对应sheet
                 sheet_result = _compare_dataframes_core(
                     res_df, exp_df, resolved_keys, output_file, res_formulas,
                     wb_shared=combined_wb, sheet_title=exp_sheet_name
                 )
+                sheet_result["primary_keys"] = resolved_keys
                 per_sheet[exp_sheet_name] = sheet_result
             except Exception as e:
                 logger.error(f"[多Sheet对比] 对比sheet '{exp_sheet_name}' 失败: {e}")
@@ -1692,6 +1722,7 @@ def compare_excel_files_multi_sheet(
     skip_source_filter: bool = False,
     result_calculated: bool = False,
     calculate_expected_formulas: bool = False,
+    selected_sheets: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """对比两个 Excel 文件的所有 Sheet 差异（多Sheet版本）。
 
@@ -1703,7 +1734,8 @@ def compare_excel_files_multi_sheet(
         result_file:  生成的结果文件路径
         expected_file: 预期的结果文件路径
         output_file:  差异报告输出文件路径(可选)
-        primary_keys: 主键列名列表，如 ["工号"]。默认自动检测
+        primary_keys: 通用主键提示，如 ["工号"]。仅当整组列在当前两张 Sheet 中
+                      均可唯一匹配时使用，否则从该对 Sheet 的共有列自动检测。
 
     Returns:
         兼容 compare_excel_files() 的结果字典，额外包含 per_sheet / missing_sheets / extra_sheets
@@ -1719,6 +1751,7 @@ def compare_excel_files_multi_sheet(
             "skip_source_filter": skip_source_filter,
             "result_calculated": result_calculated,
             "calculate_expected_formulas": calculate_expected_formulas,
+            "selected_sheets": selected_sheets,
         },
         timeout=default_timeout("write"),   # 对比+生成差异文件，给足 600s
         max_memory_mb=default_max_memory_mb(),
@@ -1731,8 +1764,8 @@ def compare_excel_files_multi_sheet(
         "total_differences": 0, "total_cells": 0, "matched_cells": 0,
         "match_rate": 0.0, "success": False, "comparison_complete": False,
         "error": r.error or f"对比执行失败（{reason}）",
-        "resource_failure": r.killed,
-        "warning": f"对比执行失败（{reason}）",
+        "resource_failure": r.killed, "timed_out": r.timed_out,
+        "warning": "结果对比超时，已保留生成结果，成功率尚未评估" if r.timed_out else f"对比执行失败（{reason}）",
         "per_sheet": {}, "missing_sheets": [], "extra_sheets": [],
         "field_diff_samples": {}, "unmatched_expected": 0, "unmatched_result": 0,
         "output_file": output_file,

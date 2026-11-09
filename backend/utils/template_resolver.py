@@ -47,9 +47,22 @@ def extract_template_ref(script_code):
         return None, None, None
     name = hsh = baked = None
     if script_code:
-        m = _NAME_RE.search(script_code); name = m.group(2) if m else None
-        m = _HASH_RE.search(script_code); hsh = m.group(2) if m else None
-        m = _PATH_RE.search(script_code); baked = m.group(2) if m else None
+        # 只读取实际执行的顶层赋值，忽略注释和函数内的同名变量。
+        values = {}
+        try:
+            for node in ast.parse(script_code).body:
+                if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    for target in targets:
+                        if isinstance(target, ast.Name) and target.id in ('TEMPLATE_NAME', 'TEMPLATE_HASH', 'TEMPLATE_PATH'):
+                            try:
+                                value = ast.literal_eval(node.value)
+                            except (ValueError, TypeError):
+                                value = None
+                            values[target.id] = value if isinstance(value, str) else None
+        except SyntaxError:
+            pass
+        name, hsh, baked = (values.get(key) for key in ('TEMPLATE_NAME', 'TEMPLATE_HASH', 'TEMPLATE_PATH'))
     if not name and baked:
         # os.path.basename 只理解当前操作系统的分隔符：Linux 处理
         # ``E:\\...\\模板.xlsx`` 时会把整条路径当文件名。迁移场景必须同时兼容

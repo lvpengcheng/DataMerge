@@ -120,7 +120,7 @@ def test_import_replaces_current_solution_and_archives_old_binding(context):
     archive = root / '方案.zip'
     package.export_zip(store.artifact(row.digest), archive)
     (root / 'tenants/正式').mkdir(parents=True)
-    target = Script(tenant_id='正式', name='工资', code='old')
+    target = Script(tenant_id='正式', name='工资', code='old', created_by=1)
     other = Script(tenant_id='其他', name='工资', code='other tenant')
     db.add_all([target, other]); db.commit()
 
@@ -144,13 +144,13 @@ def test_import_replaces_current_solution_and_archives_old_binding(context):
     package.export_zip(store.artifact(newer.digest), archive)
     second = imported()
     assert second['script_id'] == target.id
-    assert second['id'] != first['id'] and second['is_active']
+    assert second['id'] == first['id'] and second['is_active']
     assert second['digest'] == newer.digest and second['digest'] != first['digest']
     assert second['validation'] is None
     assert db.query(CalculationSolution).filter_by(tenant_id='正式', name='工资', is_active=True).count() == 1
     previous = db.get(CalculationSolution, first['id'])
-    assert not previous.is_active and previous.digest == first['digest']
-    assert previous.validation['passed']
+    assert previous.is_active and previous.digest == second['digest']
+    assert previous.validation is None
     assert db.query(Script).filter_by(tenant_id='正式', name='工资').count() == 1
     assert other.code == 'other tenant'
     assert target.code == source.code

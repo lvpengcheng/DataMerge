@@ -1,6 +1,7 @@
 """Real workbook/API coverage for independent targets and saved role translation."""
 import copy
 import io
+import json
 import zipfile
 
 import pytest
@@ -8,7 +9,47 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill
 
 from backend.api import tools
+from backend.database.models import IntegrateTemplate, Organization
 pytest_plugins = ('backend.tests.test_table_split_api',)
+
+
+def test_scheme_name_scope_for_save_rename_and_import(api, tmp_path, monkeypatch):
+    client, state, sessions = api
+    for suffix in ('', '.create', '.edit'):
+        state.user.role.permissions['tools.data_integrate' + suffix] = True
+    monkeypatch.setattr(tools, '_workflow_session_dir', lambda *args: tmp_path)
+    (tmp_path / '_meta.json').write_text(json.dumps({'files': [
+        {'name': 'main.xlsx', 'fingerprint': 'main', 'columns': ['工号']},
+        {'name': 'source.xlsx', 'fingerprint': 'source', 'columns': ['工号']},
+    ]}), encoding='utf-8')
+    request = {'session_id': 'test', 'main_file': 'main.xlsx',
+               'key_map': {'main.xlsx': '工号', 'source.xlsx': '工号'},
+               'overwrite_pairs': [], 'compare_pairs': []}
+    with sessions() as db:
+        db.add_all([Organization(id=3, name='下级', parent_id=1),
+                    Organization(id=4, name='更下级', parent_id=3, is_active=False)])
+        db.add_all([
+            IntegrateTemplate(tenant_id='org:4', org_id=4, name='下级方案', config={}),
+            IntegrateTemplate(tenant_id='org:2', org_id=2, name='其他组织方案', config={}),
+            IntegrateTemplate(tenant_id='org:1', org_id=1, name='本组织方案', config={}),
+        ])
+        db.commit()
+    path = '/api/tools/integrate/scheme/save'
+    saved = client.post(path, json={**request, 'name': '其他组织方案'})
+    assert saved.status_code == 200, saved.text
+    scheme_id = saved.json()['id']
+    for payload in ({'name': '下级方案'}, {'name': '本组织方案'},
+                    {'name': '下级方案', 'scheme_id': scheme_id},
+                    {'name': '本组织方案', 'scheme_id': scheme_id}):
+        response = client.post(path, json={**request, **payload})
+        assert response.status_code == 400
+        assert response.json()['detail'] == f"同组织内已存在同名方案「{payload['name']}」，请换个名称"
+    assert client.post(path, json={**request, 'name': '其他组织方案', 'scheme_id': scheme_id}).status_code == 200
+    archive = client.get(f'/api/tools/integrate/scheme/{scheme_id}/export')
+    imported = client.post('/api/tools/integrate/scheme/import', data={'name': '下级方案'},
+                           files={'file': ('scheme.json', archive.content, 'application/json')})
+    assert imported.status_code == 400
+    assert imported.json()['detail'] == '同组织内已存在同名方案「下级方案」，请换个名称'
 
 
 def workbook(source=False):

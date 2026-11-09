@@ -4,11 +4,11 @@ from ..database.models import CalculationSolution, Script
 
 
 def activate(db, row, *, commit=True):
-    for previous in db.query(CalculationSolution).filter_by(tenant_id=row.tenant_id).filter(
+    for previous in db.query(CalculationSolution).filter_by(tenant_id=row.tenant_id, created_by=row.created_by).filter(
             or_(CalculationSolution.name == row.name, CalculationSolution.script_id == row.script_id)).all():
         if previous.id != row.id:
             previous.is_active = False
-    for script in db.query(Script).filter_by(tenant_id=row.tenant_id, name=row.name).all():
+    for script in db.query(Script).filter_by(tenant_id=row.tenant_id, name=row.name, created_by=row.created_by).all():
         script.is_active = script.id == row.script_id
     row.status, row.is_active = 'published', True
     if commit:

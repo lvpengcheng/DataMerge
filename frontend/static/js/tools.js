@@ -1097,15 +1097,7 @@ const Tools = {
     async _intSaveScheme(asNew) {
         const name = (document.getElementById('int-scheme-name').value || '').trim();
         if (!name) { alert('请填写方案名称'); return; }
-        if (asNew) {
-            if (_intMode === 'edit' && _intEditingSchemeId) {
-                const cur = _integrateSchemeList.find(s => s.id === _intEditingSchemeId);
-                if (cur && name === cur.name) { alert('另存为需使用新的方案名称，请修改后再保存'); return; }
-            }
-            // 重名预检：与其它方案同名（后端也有同名校验兜底）
-            const dup = _integrateSchemeList.find(s => s.name === name && s.id !== _intEditingSchemeId);
-            if (dup) { alert(`已存在同名方案「${name}」，请换个名称`); return; }
-        }
+        // 可见列表可能包含其他组织，名称范围由后端按所属组织及下级组织校验。
         const key_map = {};
         document.querySelectorAll('.int-key').forEach(s => { key_map[s.dataset.file] = s.value; });
         const overwrite_pairs = this._readSectionPairs('ow');

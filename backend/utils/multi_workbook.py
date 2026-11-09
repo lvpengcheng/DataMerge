@@ -362,10 +362,13 @@ def create_zip(destination, files, *, values_files=None):
     return destination
 
 
-def validate_workbooks(output_dir, code, structure, rules_content=None, tenant_id=None):
+def validate_workbooks(output_dir, code, structure, rules_content=None, tenant_id=None,
+                       *, target_sheets=None, allow_incomplete=False):
+    from functools import partial
     from backend.utils.excel_comparator import (
         compare_excel_files_multi_sheet, extract_primary_keys_from_rules, require_complete_comparison)
-    from backend.utils.training_validation import finalize_training_output
+    from backend.utils.training_validation import (
+        compare_for_training, finalize_training_output, training_comparison_sheets)
     definitions = workbook_definitions(structure)
     targets = script_targets(code)
     results = select_outputs(Path(output_dir).glob("*.xlsx"), structure)
@@ -380,18 +383,30 @@ def validate_workbooks(output_dir, code, structure, rules_content=None, tenant_i
         warning = warning or bool(finalized.get("formula_warning"))
         reports[result.name] = finalized.get("formula_report") or {}
         diff = Path(output_dir) / f"_diff_{index + 1}.xlsx"
-        comparison = compare_excel_files_multi_sheet(
+        selected = target_sheets.get(result.name) if isinstance(target_sheets, dict) else None
+        compare = partial(
+            compare_excel_files_multi_sheet,
             str(result), expected["expected_file"], str(diff),
             primary_keys=extract_primary_keys_from_rules(rules_for_workbook(rules_content, result.name)) if rules_content else None,
-            result_calculated=True, calculate_expected_formulas=True)
-        require_complete_comparison(comparison)
+            result_calculated=True, calculate_expected_formulas=True,
+            selected_sheets=training_comparison_sheets(child_code, expected, selected))
+        if allow_incomplete:
+            comparison = compare_for_training(compare)
+        else:
+            comparison = compare()
+            require_complete_comparison(comparison)
         total += comparison.get("total_cells", 0)
         matched += comparison.get("matched_cells", 0)
         details[result.name] = comparison
+        if comparison.get("warning"):
+            text.append(comparison["warning"])
         text.append(f"### 交付文件: {result.name}\n{comparison.get('detailed_text', '')}")
-        if diff.exists():
+        if comparison.get("comparison_complete") is not False and diff.exists():
             diffs.append(diff)
-    return {"success": True, "accuracy": matched / total if total else 0,
+    complete = all(d.get("comparison_complete", True) for d in details.values())
+    return {"success": True, "comparison_complete": complete,
+            "comparison_warning": "；".join(d["warning"] for d in details.values() if d.get("warning")) or None,
+            "accuracy": matched / total if complete and total else 0,
             "total_cells": total, "matched_cells": matched,
             "total_differences": total - matched, "diff_details": details,
             "detailed_diff": "\n\n".join(text), "output_dir": str(output_dir),

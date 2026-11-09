@@ -25,6 +25,7 @@ from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, Q
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 
 from ..auth.dependencies import get_current_user, require_permission, has_permission
 from ..database.connection import SessionLocal
@@ -1940,6 +1941,39 @@ def _user_org_tree_ids(db, current_user) -> List[int]:
     return _get_org_and_children_ids(db, oid)
 
 
+def _check_scheme_name_available(db, model, name, tenant_id, org_id, workflow, exclude_id=None):
+    """名称在所属组织及其全部下级组织内唯一；旧私人方案按 tenant 检查。"""
+    from sqlalchemy import or_, text
+    # 不同组织的唯一约束不能防止上下级同时创建同名方案；将名称检查和写入串行化。
+    if db.get_bind().dialect.name == "postgresql":
+        db.execute(text("SELECT pg_advisory_xact_lock(:key)"),
+                   {"key": 17473901 if workflow == "integrate" else 17473902})
+    conditions = [model.tenant_id == tenant_id]
+    if org_id:
+        from ..database.models import Organization
+        org_ids = {org_id}
+        pending = [org_id]
+        while pending:
+            children = db.query(Organization.id).filter(Organization.parent_id.in_(pending)).all()
+            pending = [child.id for child in children if child.id not in org_ids]
+            org_ids.update(pending)
+        conditions.extend([model.org_id.in_(org_ids),
+                           model.tenant_id.in_([f"org:{oid}" for oid in org_ids])])
+    query = db.query(model).filter(model.name == name, or_(*conditions))
+    if exclude_id is not None:
+        query = query.filter(model.id != exclude_id)
+    if query.first():
+        raise HTTPException(status_code=400, detail=f"同组织内已存在同名方案「{name}」，请换个名称")
+
+
+def _is_scheme_name_integrity_error(exc, workflow):
+    """只转换方案名称唯一约束错误，其他数据库错误仍按原错误处理。"""
+    constraint = "uq_integrate_tpl_name" if workflow == "integrate" else "uq_table_split_tpl_name"
+    original = getattr(exc, "orig", None)
+    return (getattr(getattr(original, "diag", None), "constraint_name", None) == constraint
+            or f"{_integration_model(workflow).__tablename__}.tenant_id, {_integration_model(workflow).__tablename__}.name" in str(original))
+
+
 def _visible_integrate_schemes(db, current_user, workflow="integrate"):
     """当前用户可见的整合方案行：
     - admin：全部；
@@ -2544,6 +2578,9 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
                 raise HTTPException(status_code=403, detail="缺少权限: 修改方案")
             if not _can_edit_scheme(row, current_user):
                 raise HTTPException(status_code=403, detail="只有创建人或管理员可以保存修改到该方案，其他人请使用「另存为」")
+            if row.name != name:
+                _check_scheme_name_available(db, IntegrateTemplate, name, row.tenant_id,
+                                             row.org_id, workflow, exclude_id=row.id)
             row.name = name
             row.config = config
             row.updated_by = uid
@@ -2551,9 +2588,7 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
             # 新建/另存为：需 create 权限 + 组织内方案名唯一（重名提醒）
             if not has_permission(current_user, _integration_permission(workflow, "create")):
                 raise HTTPException(status_code=403, detail="缺少权限: 新增方案")
-            dup = db.query(IntegrateTemplate).filter_by(tenant_id=tenant_id, name=name).first()
-            if dup:
-                raise HTTPException(status_code=400, detail=f"同组织内已存在同名方案「{name}」，请换个名称")
+            _check_scheme_name_available(db, IntegrateTemplate, name, tenant_id, org_id, workflow)
             row = IntegrateTemplate(tenant_id=tenant_id, name=name, config=config,
                                     org_id=org_id, created_by=uid, updated_by=uid)
             db.add(row)
@@ -2563,6 +2598,12 @@ async def integrate_scheme_save(req: IntegrateSchemeSaveRequest, current_user=De
     except HTTPException:
         db.rollback()
         raise
+    except IntegrityError as e:
+        db.rollback()
+        if _is_scheme_name_integrity_error(e, workflow):
+            raise HTTPException(status_code=400, detail=f"同组织内已存在同名方案「{name}」，请换个名称")
+        logger.exception("integrate/scheme/save 数据库异常")
+        raise HTTPException(status_code=500, detail="保存方案失败，请稍后重试")
     except Exception as e:
         db.rollback()
         logger.exception("integrate/scheme/save 异常")
@@ -2723,9 +2764,7 @@ async def integrate_scheme_import(
     tenant_id = f"org:{org_id}" if org_id else f"user:{uid}"
     db = SessionLocal()
     try:
-        dup = db.query(IntegrateTemplate).filter_by(tenant_id=tenant_id, name=imported_name).first()
-        if dup:
-            raise HTTPException(status_code=400, detail=f"同组织内已存在同名方案「{imported_name}」，请修改导入名称")
+        _check_scheme_name_available(db, IntegrateTemplate, imported_name, tenant_id, org_id, workflow)
         row = IntegrateTemplate(
             tenant_id=tenant_id, name=imported_name, config=config,
             org_id=org_id, created_by=uid, updated_by=uid,
@@ -2737,6 +2776,12 @@ async def integrate_scheme_import(
     except HTTPException:
         db.rollback()
         raise
+    except IntegrityError as e:
+        db.rollback()
+        if _is_scheme_name_integrity_error(e, workflow):
+            raise HTTPException(status_code=400, detail=f"同组织内已存在同名方案「{imported_name}」，请换个名称")
+        logger.exception("integrate/scheme/import 数据库异常")
+        raise HTTPException(status_code=500, detail="导入方案失败，请稍后重试")
     except Exception as e:
         db.rollback()
         logger.exception("integrate/scheme/import 异常")

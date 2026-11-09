@@ -1463,7 +1463,8 @@ function _handleSSEEvent(event) {
 
         case 'iteration_complete': {
             _finishCodeStream();  // 结束代码流式显示
-            const acc = event.accuracy;
+            if (event.comparison_warning) _addSystemMessage(event.comparison_warning, 'status');
+            const acc = event.comparison_complete === false ? null : event.accuracy;
             _currentAccuracy = acc;
 
             // 设置 _currentCode 标记，使 "设为最佳"/"下载代码" 按钮可见
@@ -1474,6 +1475,8 @@ function _handleSSEEvent(event) {
             if (event.rollback) {
                 const msg = `本轮修改导致准确率从 ${(event.accuracy * 100).toFixed(1)}% 下降到 ${(event.attempted_accuracy * 100).toFixed(1)}%，已自动回滚到之前的最佳代码。`;
                 _addSystemMessage(msg, 'status', { rollback: true, accuracy: event.accuracy });
+            } else if (event.success && event.comparison_complete === false) {
+                _addSystemMessage(`第 ${event.iteration} 轮结果已生成，成功率尚未评估，可下载结果检查。`, 'status');
             } else if (event.success) {
                 const accPct = (acc * 100).toFixed(1);
                 if (acc >= 1.0) {
@@ -1883,11 +1886,15 @@ function _renderIterationCodeSummary(iteration, target) {
  */
 function _renderOrphanIteration(iteration, target) {
     // 显示迭代结果
-    const acc = iteration.accuracy;
+    const comparisonIncomplete = iteration.execution_result?.comparison_complete === false;
+    const acc = comparisonIncomplete ? null : iteration.accuracy;
     let resultText = iteration.execution_result?.source === 'solution_import'
         ? '已导入方案代码，可直接执行修正（尚未在本环境验证）' : `第 ${iteration.iteration_num} 轮`;
     if (acc != null) {
         resultText += ` — 准确率 ${(acc * 100).toFixed(1)}%`;
+    }
+    if (comparisonIncomplete) {
+        resultText += '（结果已生成，成功率尚未评估）';
     }
     if (iteration.status === 'failed') {
         resultText += '（执行失败）';
@@ -2262,7 +2269,11 @@ async function _doUploadCode(codeFile, templateFile) {
             formData.set('template_password', passwords[templateFile.name]);
         }
 
-        if (data.success) {
+        if (data.comparison_warning) _addSystemMessage(data.comparison_warning, 'status');
+        if (data.success && data.comparison_complete === false) {
+            _currentAccuracy = null;
+            _addSystemMessage('结果已生成，成功率尚未评估，可下载结果检查。', 'status');
+        } else if (data.success) {
             const accPct = (data.accuracy * 100).toFixed(1);
             _currentAccuracy = data.accuracy;
             _currentCode = 'uploaded';  // 标记有代码，使按钮可见

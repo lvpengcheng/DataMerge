@@ -1,5 +1,38 @@
 """Shared post-execution validation for every training entry point."""
+import logging
+
 from backend.utils.subprocess_runner import run_in_subprocess, default_timeout, default_max_memory_mb
+
+logger = logging.getLogger(__name__)
+
+
+def training_comparison_sheets(code, expected_structure, selected_sheets=None):
+    """Prefer the training selection, then the template targets recorded in the script."""
+    from backend.utils.compute_precheck import _extract_colmap
+
+    if isinstance(selected_sheets, dict):
+        selected_sheets = selected_sheets.get((expected_structure or {}).get("file_name"))
+    if selected_sheets:
+        return list(selected_sheets)
+    targets = _extract_colmap(code) if code and "_COL_MAP" in code else None
+    return list(targets or (expected_structure or {}).get("sheets") or {}) or None
+
+
+def compare_for_training(compare):
+    """Comparison runs after output generation and may leave accuracy unassessed."""
+    from backend.utils.excel_comparator import require_complete_comparison
+
+    comparison = {}
+    try:
+        comparison = compare()
+        return require_complete_comparison(comparison)
+    except Exception as exc:
+        logger.warning("智训结果对比未完成，已保留生成结果: %s", exc)
+        reason = "结果对比超时" if comparison.get("timed_out") else f"结果对比未完成：{exc}"
+        return {
+            "comparison_complete": False,
+            "warning": f"{reason}。结果已生成，可下载，成功率尚未评估。",
+        }
 
 
 class TrainingResourceFailure(RuntimeError):
