@@ -30,33 +30,31 @@ def invoke_script_main(main, environment):
         environment.update(template_bindings)
     loader = namespace.get('load_source_data')
     schema_helper = namespace.get('apply_target_column_schemas')
-    cached = namespace.get('_pre_loaded_source_data')
+    original_cache = namespace.get('_pre_loaded_source_data', _MISSING)
+    cached = environment.get('_pre_loaded_source_data', namespace.get('_pre_loaded_source_data'))
     with selected_input_folder(environment.get('input_folder', original_input), selection, cached) as folder:
-        if selection is not None:
-            reserved = namespace.get('_RESULT_SHEET_NAMES') or (namespace.get('_COL_MAP') or {}).keys()
-            filtered_cache = (filter_source_data(cached, selection, reserved, folder)
-                              if cached else cached)
-            environment['input_folder'] = folder
-            namespace['input_folder'] = folder
-            if cached is not None:
-                namespace['_pre_loaded_source_data'] = filtered_cache
-            if callable(loader):
-                def selected_loader(*args, **kwargs):
-                    return filter_source_data(loader(*args, **kwargs), selection, reserved,
-                                              environment.get('input_folder'))
-                namespace['load_source_data'] = selected_loader
         from backend.utils.column_contract import (
             normalize_column_specs, normalize_source_keys)
         # 格式兼容模式不应让源键重新出现两套类型规则；保留类型须逐列声明 raw。
         specs = normalize_column_specs(namespace.get('_COLUMN_SPECS'))
+        reserved = ()
+        if selection is not None:
+            reserved = namespace.get('_RESULT_SHEET_NAMES') or (namespace.get('_COL_MAP') or {}).keys()
         try:
-            if namespace.get('_pre_loaded_source_data') is not None:
-                namespace['_pre_loaded_source_data'] = normalize_source_keys(
-                    namespace['_pre_loaded_source_data'], specs)
-            current_loader = namespace.get('load_source_data')
-            if callable(current_loader):
+            if selection is not None:
+                environment['input_folder'] = folder
+                namespace['input_folder'] = folder
+            if cached is not None:
+                selected_cache = filter_source_data(cached, selection, reserved, folder) if cached else cached
+                normalized_cache = normalize_source_keys(selected_cache, specs)
+                namespace['_pre_loaded_source_data'] = normalized_cache
+            if callable(loader):
                 def spec_loader(*args, **kwargs):
-                    return normalize_source_keys(current_loader(*args, **kwargs), specs)
+                    if cached:
+                        print(f"[性能优化] 使用预加载源数据（{len(normalized_cache)}个sheet，跳过Excel解析）")
+                        return normalized_cache
+                    data = filter_source_data(loader(*args, **kwargs), selection, reserved, folder)
+                    return normalize_source_keys(data, specs)
                 namespace['load_source_data'] = spec_loader
             with (preserve_template_formats() if version2 else track_script_formats()):
                 if callable(schema_helper) and not version2:
@@ -82,7 +80,10 @@ def invoke_script_main(main, environment):
             if callable(loader):
                 namespace['load_source_data'] = loader
             if cached is not None:
-                namespace['_pre_loaded_source_data'] = cached
+                if original_cache is _MISSING:
+                    namespace.pop('_pre_loaded_source_data', None)
+                else:
+                    namespace['_pre_loaded_source_data'] = original_cache
 
 
 def _invoke_script_main(main, environment):

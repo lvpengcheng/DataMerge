@@ -6,6 +6,52 @@ import pytest
 from backend.utils.template_resolver import extract_template_ref, resolve_template_path
 
 
+def test_mapped_compute_source_runs_with_same_input_as_training(tmp_path, monkeypatch):
+    from backend.api.training_chat import _load_full_source_data
+    from backend.utils.fast_header_matcher import FastHeaderMatcher
+    from backend.utils.script_entry import invoke_script_main
+    from excel_parser import ExcelRegion, IntelligentExcelParser, SheetData
+
+    source_dir = tmp_path / 'training'
+    source_dir.mkdir()
+    (source_dir / '员工.xlsx').touch()
+    formats = {'B': '@'}
+    rows = [{'A': None, 'B': 123}, {'A': None, 'B': '00456'}]
+    training_sheet = SheetData('员工明细', [ExcelRegion(
+        head_data={'序号': 'A', 'PSID': 'B'}, data=rows, column_formats=formats)])
+    monkeypatch.setattr(IntelligentExcelParser, 'parse_excel_file', lambda *args, **kwargs: [training_sheet])
+    training = _load_full_source_data(str(source_dir), reserved_sheet_names={'员工明细'})
+
+    upload = str(tmp_path / '本月.xlsx')
+    upload_sheet = SheetData('当月', [ExcelRegion(
+        head_data={'行号': 'A', '员工代码': 'B'}, data=rows, column_formats=formats)])
+    mapping = {'本月.xlsx': {
+        'expected_file': '员工.xlsx', 'file_path': upload,
+        'sheet_mapping': {'当月': '员工明细'},
+        'header_mapping_by_sheet': {'当月': {'行号': '序号', '员工代码': 'PSID'}},
+    }}
+    compute = FastHeaderMatcher()._build_pre_loaded_from_memory(
+        mapping, {(upload, '当月'): upload_sheet}, reserved_sheet_names={'员工明细'})
+
+    namespace = {}
+    exec('''
+def load_source_data():
+    raise AssertionError('preloaded sheets should not be read again')
+
+def main():
+    sources = load_source_data()
+    assert sources is _pre_loaded_source_data
+    entry = sources['员工_员工明细']
+    return entry['columns'], entry['column_formats'], entry['df'].to_dict('list')
+''', namespace)
+    expected = (['序号', 'PSID'], {'PSID': '@'}, {'序号': [1, 2], 'PSID': ['123', '00456']})
+    assert invoke_script_main(namespace['main'], {'_pre_loaded_source_data': training}) == expected
+    assert invoke_script_main(namespace['main'], {'_pre_loaded_source_data': compute}) == expected
+    assert '_pre_loaded_source_data' not in namespace
+    assert compute['员工_员工明细']['source_origins'][0]['sheet_name'] == '当月'
+    assert compute['员工_员工明细']['df']['PSID'].iloc[0] == 123
+
+
 def test_default_template_ignores_stale_comments(tmp_path):
     directory = tmp_path / 'tenants' / 'demo' / 'templates'
     directory.mkdir(parents=True)

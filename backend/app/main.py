@@ -5397,17 +5397,6 @@ async def run_compute_task(
                     except Exception as _e:
                         logger.warning(f"[加密支持] 注入失败: {_e}")
 
-                # 【关键】替换 load_source_data，使用预加载数据
-                if pre_loaded_source_data and hasattr(module, 'load_source_data'):
-                    _original_load = module.load_source_data
-                    # *args/**kwargs 兼容两种签名：公式模式 load_source_data(input_folder, manual_headers)
-                    # 与 模板/自动模式 load_source_data()（无参）。否则模板脚本会报
-                    # "missing 2 required positional arguments: input_folder and manual_headers"。
-                    def _cached_load(*args, _data=pre_loaded_source_data, **kwargs):
-                        print(f"[性能优化] 使用预加载源数据（{len(_data)}个sheet，跳过Excel解析）")
-                        return _data
-                    module.load_source_data = _cached_load
-
                 # 调用main函数
                 if hasattr(module, 'main'):
                     from backend.utils.script_entry import invoke_script_main
@@ -5415,6 +5404,7 @@ async def run_compute_task(
                         "input_folder": execution_source_dir, "output_folder": str(output_dir),
                         "salary_year": salary_year, "salary_month": salary_month,
                         "monthly_standard_hours": standard_hours,
+                        **({'_pre_loaded_source_data': pre_loaded_source_data} if pre_loaded_source_data else {}),
                     })
                 else:
                     raise Exception("脚本缺少main函数")
@@ -7244,22 +7234,15 @@ async def compute_with_script_stream(
                                 except Exception as _e:
                                     logger.warning(f"[加密支持] 注入失败: {_e}")
 
-                            # 【关键】替换 load_source_data，使用预加载数据
-                            if pre_loaded_source_data and hasattr(module, 'load_source_data'):
-                                _original_load = module.load_source_data
-                                # *args/**kwargs 兼容公式模式(input_folder, manual_headers)与模板/自动模式(无参)
-                                def _cached_load(*args, _data=pre_loaded_source_data, **kwargs):
-                                    print(f"[性能优化] 使用预加载源数据（{len(_data)}个sheet，跳过Excel解析）")
-                                    return _data
-                                module.load_source_data = _cached_load
-
                             # 调用main函数
                             if hasattr(module, 'main'):
                                 from backend.utils.script_entry import invoke_script_main
                                 result = invoke_script_main(module.main, {
                                     'input_folder': str(source_dir), 'output_folder': str(output_dir),
                                     'salary_year': salary_year, 'salary_month': salary_month,
-                                    'monthly_standard_hours': standard_hours})
+                                    'monthly_standard_hours': standard_hours,
+                                    **({'_pre_loaded_source_data': pre_loaded_source_data} if pre_loaded_source_data else {}),
+                                })
                             else:
                                 raise Exception("脚本缺少main函数")
 

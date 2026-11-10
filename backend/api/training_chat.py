@@ -495,14 +495,14 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None,
 
     reserved_sheet_names: 结果 sheet 名集合；命中时强制 file_base_sheet 形式。
     """
-    import pandas as pd
+    from backend.utils.data_helpers import assign_sheet_keys, build_source_sheet_entry
+    from backend.utils.template_pipeline import source_origin
     from excel_parser import IntelligentExcelParser
 
     source_data = {}
     parser = IntelligentExcelParser()
     _passwords = file_passwords or {}
-    _collected: list = []  # [(file_base, sheet_name, merged_df, columns)]
-    _source_origins = {}
+    collected = {}
 
     for filename in sorted(os.listdir(source_dir)):
         if not filename.lower().endswith((".xlsx", ".xls", ".xlsm")) or filename.startswith('~'):
@@ -537,70 +537,21 @@ def _load_full_source_data(source_dir: str, manual_headers: Dict = None,
                 raise ValueError(f"源文件没有可用结构: {filename}")
 
             for sheet_data in results:
-                from backend.utils.template_pipeline import source_origin
-                _source_origins[(file_base, sheet_data.sheet_name)] = [
-                    source_origin(file_path, sheet_data.sheet_name, sheet_data.regions)]
-                dfs = []
-                columns = None
-                column_schemas = None
-                column_formats = None
-                for region in sheet_data.regions:
-                    from backend.utils.data_helpers import convert_region_to_dataframe
-                    df = convert_region_to_dataframe(region)
-
-                    if df.empty and len(df.columns) == 0:
-                        continue
-                    if columns is None:
-                        columns = list(df.columns)
-                        from backend.utils.data_helpers import region_schemas_by_name, region_formats_by_name
-                        column_schemas = region_schemas_by_name(
-                            region.head_data, getattr(region, "column_schemas", None) or {})
-                        column_formats = region_formats_by_name(
-                            region.head_data, getattr(region, "column_formats", None) or {})
-                    dfs.append(df)
-
-                if not dfs:
-                    continue
-
-                merged_df = dfs[0] if len(dfs) == 1 else pd.concat(dfs, ignore_index=True)
-
-                # 序号列补全：如果序号/SN列存在但全为空，填充连续序号
-                # 防止AI生成的clean_source_data误将None转"None"后过滤掉所有行
-                _sn_candidates = [c for c in merged_df.columns
-                                  if '序号' in str(c) or 'S/N' in str(c).upper()]
-                for _sn_col in _sn_candidates:
-                    if len(merged_df) > 0 and merged_df[_sn_col].isna().all():
-                        merged_df[_sn_col] = range(1, len(merged_df) + 1)
-                        logger.info(f"[序号补全] {file_base}: 列'{_sn_col}'全空, 已填充1~{len(merged_df)}")
-
-                _collected.append((file_base, sheet_data.sheet_name, merged_df, columns,
-                                   column_schemas or {}, column_formats or {}))
+                sheet_name = sheet_data.sheet_name
+                origins = [source_origin(file_path, sheet_name, sheet_data.regions)]
+                entry = build_source_sheet_entry(sheet_data.regions, file_base, sheet_name, origins)
+                if entry is not None:
+                    collected[file_base, sheet_name] = entry
 
         except Exception as e:
             raise ValueError(f"后台全量加载失败，不能使用不完整源数据: {filename}: {e}") from e
 
-    # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 / 撞结果 sheet → 加文件名前缀
-    # 按 (file_base, sheet) 排序，使字典顺序确定，并与智算侧 _build_pre_loaded_from_memory 完全一致
-    # （脚本 find_source_sheet 按首个匹配返回，依赖字典顺序，必须两边一致）。
-    from backend.utils.data_helpers import assign_sheet_keys
-    _collected.sort(key=lambda x: (str(x[0]), str(x[1])))
-    key_map = assign_sheet_keys(
-        ((fb, sn) for fb, sn, _, _, _, _ in _collected),
-        reserved_names=reserved_sheet_names,
-    )
-    for file_base, sheet_name, merged_df, columns, column_schemas, column_formats in _collected:
-        final_key = key_map[(file_base, sheet_name)]
-        entry = {
-            "df": merged_df,
-            "source_file": file_base,
-            "source_sheet": sheet_name,
-            "columns": columns,
-            "column_schemas": column_schemas,
-            "column_formats": column_formats,
-            "source_origins": _source_origins[(file_base, sheet_name)],
-        }
-        source_data[final_key] = entry
-        logger.info(f"[后台全量加载] {final_key}: {len(merged_df)} 行")
+    pairs = sorted(collected)
+    key_map = assign_sheet_keys(pairs, reserved_names=reserved_sheet_names)
+    for pair in pairs:
+        key = key_map[pair]
+        source_data[key] = collected[pair]
+        logger.info("[后台全量加载] %s: %s 行", key, len(collected[pair]['df']))
 
     return source_data
 

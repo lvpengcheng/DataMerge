@@ -273,17 +273,6 @@ class CodeSandbox:
                     except Exception as _e:
                         output_buffer.write(f"[加密支持] 注入失败: {_e}\n")
 
-                # 【性能优化】如果有预加载的源数据，替换 load_source_data 避免重复解析
-                _pre_loaded = exec_globals.get('_pre_loaded_source_data')
-                if _pre_loaded and 'load_source_data' in exec_globals:
-                    _original_load = exec_globals['load_source_data']
-                    # 使用 *args/**kwargs 兼容无参（template/auto 模式）和带参（formula 模式）两种签名
-                    def _cached_load_source_data(*args, _data=_pre_loaded, **kwargs):
-                        output_buffer.write(f"[性能优化] 使用预加载源数据（{len(_data)}个sheet，跳过Excel解析）\n")
-                        return _data
-                    exec_globals['load_source_data'] = _cached_load_source_data
-                    output_buffer.write(f"[性能优化] 已注入预加载源数据缓存\n")
-
                 # 尝试调用主函数
                 if 'main' in exec_globals and callable(exec_globals['main']):
                     from backend.utils.script_entry import invoke_script_main
@@ -331,6 +320,12 @@ class CodeSandbox:
                             break
 
                     if entry_func:
+                        # 旧式入口仍按原有签名调用，并兼容预加载。
+                        cached = exec_globals.get('_pre_loaded_source_data')
+                        if cached and 'load_source_data' in exec_globals:
+                            def cached_loader(*args, **kwargs):
+                                return cached
+                            exec_globals['load_source_data'] = cached_loader
                         # 调用找到的入口函数
                         input_folder = execution_env.get('input_folder', '')
                         output_folder = execution_env.get('output_folder', '')

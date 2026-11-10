@@ -1288,24 +1288,17 @@ class FastHeaderMatcher:
         与脚本 load_source_data 返回格式一致:
         {"文件名_Sheet名": {"df": DataFrame, "columns": [列名]}}
         """
-        from backend.utils.data_helpers import (
-            convert_region_to_dataframe, region_formats_by_name, region_schemas_by_name,
-        )
-        import pandas as pd
+        from backend.utils.data_helpers import assign_sheet_keys, build_source_sheet_entry
+        from backend.utils.template_pipeline import source_origin
 
         source_data = {}
-
-        # 先采集所有 (file_base, train_sheet, merged_df, columns)，最后统一分配 key
-        _collected = []
-        _source_origins = {}
+        collected = []
 
         for input_file_name, mapping_info in file_mapping.items():
             expected_file = mapping_info.get("expected_file", input_file_name)
             file_base = os.path.splitext(expected_file)[0]
             file_path = mapping_info.get("file_path", "")
-            needs_rewrite = mapping_info.get("needs_rewrite", False)
             sheet_mapping = mapping_info.get("sheet_mapping", {})
-            header_mapping = mapping_info.get("header_mapping", {})
 
             for input_sheet, train_sheet in sheet_mapping.items():
                 header_mapping = (mapping_info.get('header_mapping_by_sheet') or {}).get(
@@ -1314,17 +1307,10 @@ class FastHeaderMatcher:
                 sheet_data = parsed_sheets_map.get((file_path, input_sheet))
                 if not sheet_data:
                     raise ValueError(f"映射表缺少解析数据: {input_file_name}/{input_sheet}")
-                from backend.utils.template_pipeline import source_origin
-                _source_origins[(file_base, train_sheet)] = [
-                    source_origin(file_path, input_sheet, sheet_data.regions, header_mapping)]
-
-                dfs = []
-                first_columns = None
-                first_formats = None
-                first_schemas = None
+                origins = [source_origin(file_path, input_sheet, sheet_data.regions, header_mapping)]
+                regions = []
                 for region in sheet_data.regions:
-                    # needs_rewrite 时需要映射表头名（input → train）
-                    if header_mapping:
+                    if header_mapping or selected_columns is not None:
                         from excel_parser import ExcelRegion
                         mapped_head = {}
                         for col_name, col_letter in region.head_data.items():
@@ -1334,75 +1320,32 @@ class FastHeaderMatcher:
                             if mapped_name in mapped_head and mapped_head[mapped_name] != col_letter:
                                 raise ValueError(f"多个源列映射为同一列 {mapped_name}: {input_file_name}/{input_sheet}")
                             mapped_head[mapped_name] = col_letter
-                        mapped_region = ExcelRegion(
+                        region = ExcelRegion(
                             head_data=mapped_head,
                             data=region.data,
                             formula=region.formula,
                             column_formats=getattr(region, "column_formats", None) or {},
                             column_schemas=getattr(region, "column_schemas", None) or {},
                         )
-                        df = convert_region_to_dataframe(mapped_region)
-                        _fmts = region_formats_by_name(mapped_head, mapped_region.column_formats)
-                        _schemas = region_schemas_by_name(mapped_head, mapped_region.column_schemas)
-                    else:
-                        df = convert_region_to_dataframe(region)
-                        _fmts = region_formats_by_name(region.head_data, getattr(region, "column_formats", None) or {})
-                        _schemas = region_schemas_by_name(
-                            region.head_data, getattr(region, "column_schemas", None) or {})
+                    regions.append(region)
 
-                    if df.empty and len(df.columns) == 0:
-                        continue
-                    if first_columns is None:
-                        first_columns = list(df.columns)
-                        first_formats = _fmts
-                        first_schemas = _schemas
-                    dfs.append(df)
-
-                if not dfs:
-                    continue
-
-                if len(dfs) == 1:
-                    merged_df = dfs[0]
-                else:
-                    merged_df = pd.concat(dfs, ignore_index=True)
-
-                # 与训练侧 _load_full_source_data 对齐：空的"序号/S/N"列自动补 1..N。
-                # 否则脚本里"按序号非空过滤行"在智算时会把全部行滤掉，导致结果与智训不一致。
-                try:
-                    _sn_cands = [c for c in merged_df.columns
-                                 if '序号' in str(c) or 'S/N' in str(c).upper()]
-                    for _sn in _sn_cands:
-                        if len(merged_df) > 0 and merged_df[_sn].isna().all():
-                            merged_df[_sn] = range(1, len(merged_df) + 1)
-                except Exception:
-                    pass
-
-                _collected.append((file_base, train_sheet, merged_df, first_columns,
-                                   first_formats, first_schemas))
+                entry = build_source_sheet_entry(regions, file_base, train_sheet, origins)
+                if entry is not None:
+                    collected.append((file_base, train_sheet, entry))
 
         # 跨文件分配 key：sheet 名不重复 → 直接用 sheet 名；重复 / 撞结果 sheet → 加文件名前缀
         # 关键①：按 (file_base, sheet) 排序后再建字典，顺序确定且与训练侧一致（find_source_sheet 按首个匹配）。
         # 关键②：冲突计数用"训练期望全集"(expected_pairs)，而非仅本次匹配到的文件 —— 否则当本次只匹配到
         #         重复 sheet 的其中一个文件时会漏判冲突 → key 不加前缀(数据)，而训练是(3月_数据)，脚本就找不到源。
-        _collected.sort(key=lambda x: (str(x[0]), str(x[1])))
-        _pairs_for_keys = sorted({(fb, sn) for fb, sn, _, _, _, _ in _collected} | set(expected_pairs or []))
-        key_map = assign_sheet_keys(
-            _pairs_for_keys,
-            reserved_names=reserved_sheet_names,
-        )
-        for file_base, train_sheet, merged_df, first_columns, first_formats, first_schemas in _collected:
-            key = key_map[(file_base, train_sheet)]
+        collected.sort(key=lambda item: (item[0], item[1]))
+        pairs = {(file_base, sheet) for file_base, sheet, _ in collected}
+        key_map = assign_sheet_keys(sorted(pairs | set(expected_pairs or [])), reserved_names=reserved_sheet_names)
+        for file_base, sheet, entry in collected:
+            key = key_map[file_base, sheet]
             if key in source_data:
                 raise ValueError(f"多个上传 Sheet 映射到同一训练表 {key}，请明确纵向合并规则")
-            entry = {"df": merged_df, "columns": first_columns,
-                     "source_file": file_base, "source_sheet": train_sheet,
-                     "source_origins": _source_origins[(file_base, train_sheet)]}
-            if first_formats:
-                entry["column_formats"] = first_formats
-            if first_schemas:
-                entry["column_schemas"] = first_schemas
             source_data[key] = entry
-            logger.info(f"[预加载] {key}: {len(merged_df)}行 × {len(first_columns)}列")
+            logger.info(f"[预加载] {key}: {len(entry['df'])}行 × {len(entry['columns'])}列")
 
         return source_data
 

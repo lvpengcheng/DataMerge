@@ -3,8 +3,12 @@
 这些函数可以在沙箱内外统一使用
 """
 
+import logging
+
 import pandas as pd
 from typing import Dict, Any, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -142,6 +146,37 @@ def region_schemas_by_name(head_data, column_schemas) -> dict:
         name: dict(schemas[letter])
         for name, letter in (head_data or {}).items()
         if letter in schemas
+    }
+
+
+def build_source_sheet_entry(regions, source_file, source_sheet, source_origins):
+    """把已对齐名称的区域组装为智训和智算脚本共用的源表。"""
+    frames = []
+    for region in regions:
+        frame = convert_region_to_dataframe(region)
+        if len(frame.columns) == 0:
+            continue
+        if not frames:
+            columns = list(frame.columns)
+            formats = region_formats_by_name(region.head_data, getattr(region, 'column_formats', None))
+            schemas = region_schemas_by_name(region.head_data, getattr(region, 'column_schemas', None))
+        frames.append(frame)
+    if not frames:
+        return None
+
+    frame = frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
+    for column in frame.columns:
+        if ('序号' in str(column) or 'S/N' in str(column).upper()) and len(frame) and frame[column].isna().all():
+            frame[column] = range(1, len(frame) + 1)
+            logger.info('[序号补全] %s.%s: %s 行', source_file, column, len(frame))
+    return {
+        'df': frame,
+        'columns': columns,
+        'source_file': source_file,
+        'source_sheet': source_sheet,
+        'source_origins': source_origins,
+        'column_formats': formats,
+        'column_schemas': schemas,
     }
 
 
