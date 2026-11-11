@@ -15,7 +15,7 @@ const settings = {ai_provider: 'deepseek', mode: 'formula', salary_year: 2026, s
     monthly_standard_hours: 174, manual_headers: null, multi_sheet_source: false, use_history: false};
 let request, calls = 0, fail = false, resetCount = 0;
 const context = vm.createContext({console, FormData, File, Option: function(label, value) { this.label = label; this.value = value; },
-    _currentSessionId: 7, _currentAccuracy: 1, _isStreaming: false, _filePasswordsMap: {},
+    _currentSessionId: 7, _currentAccuracy: 1, _isStreaming: false, _filePasswordsMap: {}, _sheetPickerResolver: null,
     document: {getElementById: field, createElement: tag => new Element(tag), createTextNode: text => ({textContent: text})},
     onModeChange() {}, toggleAttachPopover() {}, _setUIStreaming() {}, alert() {},
     _downloadOriginalFile(...args) { context.download = args; },
@@ -60,5 +60,20 @@ vm.runInContext(fs.readFileSync('frontend/static/js/training_assets.js', 'utf8')
     assert.equal(await context.saveSessionAssets(), false);
     assert.equal(field('source-files').files[0].name, 'bad.xlsx', 'failed updates keep selected files for correction');
     assert.equal(resetCount, 1);
+    fail = false;
+    field('source-files').files = [];
+    field('target-file').files = [new File(['excel'], 'updated.xlsx')];
+    context._pickTargetSheets = async (file, mode) => {
+        assert.equal(file.name, 'updated.xlsx');
+        assert.equal(mode, 'formula');
+        return null;
+    };
+    const callsBeforePicker = calls;
+    assert.equal(await context.saveSessionAssets(), false);
+    assert.equal(calls, callsBeforePicker);
+    context._pickTargetSheets = async () => ['工资明细'];
+    assert.equal(await context.saveSessionAssets(), true);
+    assert.deepEqual(JSON.parse(request.options.body.get('settings')), {target_sheets: ['工资明细']});
+    assert.equal(request.options.body.getAll('target_files')[0].name, 'updated.xlsx');
     console.log('Training assets UI: restore, merge upload, provider switch, scoped download, retry preservation passed.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

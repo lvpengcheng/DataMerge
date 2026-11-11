@@ -1074,8 +1074,7 @@ function _startTraining(userText) {
     const salaryMonth = document.getElementById('salary-month').value.trim();
     const standardHours = document.getElementById('standard-hours').value.trim();
 
-    // 模板/自动模式：先轻量解析目标文件，弹出 sheet 多选框，让用户勾选目标 sheet
-    const _needsPicker = (mode === 'template' || mode === 'auto') && targetFile;
+    const _needsPicker = ['formula', 'template', 'auto'].includes(mode) && targetFile;
     const _go = (selectedSheets) => {
         _submitStartTraining(userText, sourceFiles, targetFiles, ruleFiles,
                              aiProvider, mode, salaryMonth, standardHours,
@@ -1086,7 +1085,7 @@ function _startTraining(userText) {
         return;
     }
     if (_needsPicker) {
-        _pickTargetSheets(targetFiles.length > 1 ? targetFiles : targetFile).then(selectedSheets => {
+        _pickTargetSheets(targetFiles.length > 1 ? targetFiles : targetFile, mode).then(selectedSheets => {
             if (selectedSheets === null) {
                 console.log('[训练] 用户取消 sheet 选择，跳过本次训练');
                 return;  // 取消才中止
@@ -1096,7 +1095,7 @@ function _startTraining(userText) {
             alert('目标文件分析失败：' + err.message);
         });
     } else {
-        _go([]);  // 公式模式/直接导入：不需选择
+        _go([]);
     }
 }
 
@@ -1146,7 +1145,7 @@ let _sheetPickerResolver = null;  // Promise resolve 函数
 let _sheetPickerFiles = null;
 let _sheetPickerControllers = [];
 
-function _pickTargetSheets(targetFiles) {
+function _pickTargetSheets(targetFiles, mode) {
     const multiple = Array.isArray(targetFiles);
     const files = multiple ? targetFiles : [targetFiles];
     return new Promise((resolve, reject) => {
@@ -1218,8 +1217,9 @@ function _pickTargetSheets(targetFiles) {
                     </div>
                     ${file.sheets === null ? '<div style="padding:10px;color:#888;">正在上传并读取工作表...</div>' : file.sheets.map(s => {
                         const previewStr = (s.preview || []).slice(0, 2).map(row => row.filter(x => x !== null && x !== '').slice(0, 6).join(' | ')).join(' / ') || '(空)';
+                        const checked = mode !== 'formula' || s.name === file.defaultSheet;
                         return `<label style="display:block;padding:6px 4px;border-bottom:1px solid #f0f0f0;cursor:pointer;">
-                            <input type="checkbox" class="sheet-picker-chk" data-file-index="${fileIndex}" data-name="${safe(s.name)}" checked style="width:auto;margin-right:8px;">
+                            <input type="checkbox" class="sheet-picker-chk" data-file-index="${fileIndex}" data-name="${safe(s.name)}" ${checked ? 'checked' : ''} style="width:auto;margin-right:8px;">
                             <span style="font-weight:500;">${safe(s.name)}</span>
                             <div style="margin-left:24px;font-size:12px;color:#888;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${safe(previewStr)}</div>
                         </label>`;
@@ -1247,8 +1247,10 @@ function _pickTargetSheets(targetFiles) {
                         method: 'POST', body: fd, signal: controller.signal});
                     const data = await response.json();
                     if (!response.ok) throw new Error(data.detail || ('HTTP ' + response.status));
-                    if (!data.sheets || !data.sheets.length) throw new Error('没有可用 Sheet');
-                    return {name: names[index], sheets: data.sheets};
+                    const sheets = (data.sheets || []).filter(s => mode !== 'formula' || s.visible !== false);
+                    if (!sheets.length) throw new Error('没有可用 Sheet');
+                    const defaultSheet = (sheets.find(s => s.active) || sheets[0]).name;
+                    return {name: names[index], sheets, defaultSheet};
                 })();
                 const result = await Promise.race([request, new Promise((_, fail) => {
                     timer = setTimeout(() => {

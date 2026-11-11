@@ -6,7 +6,7 @@ from pathlib import Path, PureWindowsPath
 EXCEL_SUFFIXES = {'.xlsx', '.xls', '.xlsm'}
 RULE_SUFFIXES = EXCEL_SUFFIXES | {'.txt', '.md', '.pdf', '.docx'}
 PUBLIC_SETTINGS = ('ai_provider', 'salary_year', 'salary_month', 'monthly_standard_hours',
-                   'manual_headers', 'multi_sheet_source', 'use_history', 'mode')
+                   'manual_headers', 'multi_sheet_source', 'use_history', 'mode', 'target_sheets')
 
 
 def basename(value):
@@ -19,6 +19,35 @@ def excel_files(directory):
         return []
     return sorted((p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in EXCEL_SUFFIXES
                    and not p.name.startswith('~')), key=lambda p: p.name.casefold())
+
+
+def validate_target_sheets(selection):
+    groups = list(selection.values()) if isinstance(selection, dict) else [selection]
+    if not groups or any(not isinstance(names, list) or not names or
+                         any(not isinstance(name, str) or not name.strip() for name in names)
+                         for names in groups):
+        raise ValueError('每个目标文件至少需要选择一个 Sheet')
+    return selection
+
+
+def select_formula_target_sheets(structure, selection):
+    """Use the same selected structure for generation, comparison and later revisions."""
+    from backend.utils.multi_workbook import combine_structures, workbook_definitions
+
+    if selection is None:
+        return structure
+    workbooks = workbook_definitions(structure)
+    if workbooks:
+        if not isinstance(selection, dict) or selection.keys() != workbooks.keys():
+            raise ValueError('请为每个目标文件选择需要处理的 Sheet')
+        return combine_structures({name: select_formula_target_sheets(info, selection[name])
+                                   for name, info in workbooks.items()})
+    sheets = structure.get('sheets') or {}
+    if not isinstance(selection, list) or any(name not in sheets for name in selection):
+        raise ValueError('目标文件中找不到所选 Sheet，请重新选择')
+    selected = {name: info for name, info in sheets.items() if name in selection}
+    return {**structure, 'sheets': selected,
+            'total_regions': sum(info.get('regions', 0) for info in selected.values())}
 
 
 def resolve_asset_config(config, session_root):
@@ -114,6 +143,8 @@ def validate_settings(settings):
             raise ValueError(f'{key} 必须是布尔值')
     if cfg.get('manual_headers') is not None and not isinstance(cfg['manual_headers'], dict):
         raise ValueError('手动表头必须是 JSON 对象')
+    if 'target_sheets' in cfg:
+        validate_target_sheets(cfg['target_sheets'])
     return cfg
 
 
@@ -160,7 +191,8 @@ def stage_revision(config, session_root, uploads, settings, source_mode='merge')
             paths.append(str(target / path.name))
         cfg['expected_files'] = paths
         cfg['expected_file'] = paths[0]
-        cfg.pop('target_sheets', None)  # Sheet selections belonged to the previous workbook.
+        if 'target_sheets' not in settings:
+            cfg.pop('target_sheets', None)
     if uploads.get('rules'):
         cfg.setdefault('rule_base_content', cfg.get('rules_content', '') if not cfg.get('rule_files_dir') else '')
         target = revision / 'rules'
@@ -228,6 +260,9 @@ def prepare_revision(config, revision_path, changed_categories):
                 info['template_path'] = path
             definitions[Path(path).with_suffix('.xlsx').name] = info
         cfg['expected_structure'] = combine_structures(definitions)
+    if cfg.get('mode') == 'formula' and cfg.get('target_sheets') is not None:
+        cfg['expected_structure'] = select_formula_target_sheets(
+            cfg.get('expected_structure') or {}, cfg['target_sheets'])
     if 'rules' in changed_categories:
         from backend.ai_engine.document_parser import get_document_parser
         parts = [cfg.get('rule_base_content', '')]

@@ -16,7 +16,7 @@ const list = {
     set innerHTML(html) {
         this.html = html;
         checkboxes = [...html.matchAll(/<input[^>]*data-file-index="(\d+)" data-name="([^"]*)"[^>]*>/g)].map(match => ({
-            checked: true,
+            checked: /\schecked(?:\s|>)/.test(match[0]),
             getAttribute(name) { return name === 'data-file-index' ? match[1] : decode(match[2]); },
         }));
     },
@@ -174,5 +174,23 @@ const simple = value => JSON.parse(JSON.stringify(value));
     ctx._startTraining('失败不应训练');
     await flush();
     assert.equal(submissions.length, 1, '解析失败不能默认处理全部 Sheet');
+
+    nodes.get('mode').value = 'formula';
+    responses = async name => response([
+        {name: '说明', active: name === files[1].name},
+        {name: '结果', active: name === files[0].name},
+        {name: '隐藏', visible: false},
+    ]);
+    ctx._startTraining('公式模式双目标');
+    await flush();
+    assert.equal(submissions.length, 1, '公式模式需要等用户确认 Sheet');
+    assert.doesNotMatch(list.html, /隐藏/);
+    assert.deepEqual(checkboxes.map(c => c.checked), [false, true, true, false]);
+    checkboxes[0].checked = true;
+    ctx.closeSheetPicker(false);
+    await flush();
+    assert.deepEqual(JSON.parse(submissions[1].form.get('target_sheets')), {
+        '员工明细.xlsx': ['说明', '结果'], '部门汇总.xlsx': ['说明'],
+    });
     console.log('PASS: grouped multi-file selection, independent same-name sheets, passwords, per-file validation, escaping, legacy single-file payload, loading/cancellation, stale results, duplicate guard and training multipart submission');
 })().catch(error => { console.error(error); process.exitCode = 1; });

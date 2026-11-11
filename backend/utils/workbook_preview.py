@@ -142,8 +142,14 @@ def peek_xlsx_sheets(path):
                                             else posixpath.normpath(posixpath.join('xl', target)))
         result, references = [], []
         budget = _TOTAL_PREVIEW_LIMIT
-        for sheet in workbook.findall('{' + _MAIN + '}sheets/{' + _MAIN + '}sheet'):
-            row = {'name': sheet.get('name', ''), 'preview': []}
+        view = workbook.find(f'{{{_MAIN}}}bookViews/{{{_MAIN}}}workbookView')
+        try:
+            active_index = int(view.get('activeTab', '0')) if view is not None else 0
+        except ValueError:
+            active_index = 0
+        for index, sheet in enumerate(workbook.findall(f'{{{_MAIN}}}sheets/{{{_MAIN}}}sheet')):
+            row = {'name': sheet.get('name', ''), 'preview': [], 'active': index == active_index,
+                   'visible': sheet.get('state', 'visible') == 'visible'}
             result.append(row)
             location = locations.get(sheet.get('{' + _REL + '}id'))
             if not location or not location.startswith('xl/worksheets/') or budget <= 0:
@@ -194,7 +200,9 @@ def peek_legacy_sheets(path, password=None):
             preview = [[str(cells[r, c].StringValue or '').strip()[:200]
                         for c in range(min(_COLS, cells.MaxDataColumn + 1))]
                        for r in range(min(_ROWS, cells.MaxDataRow + 1))]
-            result.append({'name': str(sheet.Name), 'preview': preview})
+            result.append({'name': str(sheet.Name), 'preview': preview,
+                           'active': index == workbook.Worksheets.ActiveSheetIndex,
+                           'visible': bool(sheet.IsVisible)})
         return result
     finally:
         workbook.Dispose()

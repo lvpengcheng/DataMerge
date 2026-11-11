@@ -1516,7 +1516,7 @@ async def peek_template_sheets(
 ):
     """智训前轻量解析目标/模板文件，仅返回 sheet 列表 + 简短表头预览。
 
-    用于：模板/自动模式点击智训后弹出 sheet 多选框；用户勾选后再调 /start。
+    用于智训前选择目标 Sheet，公式模式默认选择激活 Sheet。
     避免在 /start 阶段把所有 sheet 都喂给 AI。
     """
     work_dir = tempfile.mkdtemp(prefix=f"peek_{current_user.id}_")
@@ -1566,11 +1566,19 @@ async def start_training(
     use_history: bool = Form(False),  # 启用历史数据(月度累加场景)
     file_passwords: Optional[str] = Form(None),  # JSON: {"文件名": "密码"}
     script_name: Optional[str] = Form(None),  # 用户为本次训练命名的脚本名
-    target_sheets: Optional[str] = Form(None),  # JSON 数组：模板/自动模式下用户勾选的目标 sheet 名
+    target_sheets: Optional[str] = Form(None),  # 单文件的 Sheet 列表，或按目标文件名分组
     current_user=Depends(get_current_user),
     accessible_tenants: list = Depends(get_operable_tenants),
 ):
     """开始训练（首轮），返回 SSE 流"""
+    from ..utils.training_assets import select_formula_target_sheets, validate_target_sheets
+
+    selected_target_sheets = None
+    if target_sheets is not None:
+        try:
+            selected_target_sheets = validate_target_sheets(json.loads(target_sheets))
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(422, '目标 Sheet 选择无效，请重新选择') from exc
 
     # 租户权限校验:同名脚本通过版本号自增允许复用（persistence.save_script 自动 +1）
     if not session_id:
@@ -1634,21 +1642,6 @@ async def start_training(
         except Exception:
             logger.warning(f"file_passwords JSON 解析失败: {_fp_raw}")
 
-    # 解析 target_sheets（模板/自动模式：用户勾选的目标 sheet 列表）
-    _parsed_target_sheets: Optional[List[str]] = None
-    if target_sheets:
-        try:
-            _ts = json.loads(target_sheets)
-            if isinstance(_ts, list):
-                _parsed_target_sheets = [str(x).strip() for x in _ts if str(x).strip()]
-                logger.info(f"[chat训练] 用户勾选 target_sheets: {_parsed_target_sheets}")
-            elif isinstance(_ts, dict):
-                _parsed_target_sheets = {
-                    str(name): [str(x) for x in sheets] for name, sheets in _ts.items()
-                    if isinstance(sheets, list)}
-        except Exception:
-            logger.warning(f"target_sheets JSON 解析失败: {target_sheets}")
-
     # 重预处理改到 SSE 建立后执行；这些变量由后台协调任务在启动正式智训前填充。
     all_excel_files = []
 
@@ -1702,10 +1695,13 @@ async def start_training(
                 ts.status = "running"
                 expected_struct_dict = _analyze_expected_structure(
                     expected_files if len(expected_files) > 1 else expected_file) if expected_file else {}
+                if mode == 'formula':
+                    expected_struct_dict = select_formula_target_sheets(expected_struct_dict, selected_target_sheets)
                 updated_config = dict(ts.config or {})
                 updated_config.update(expected_file=expected_file, expected_files=expected_files,
-                                      expected_structure=expected_struct_dict)
+                                      expected_structure=expected_struct_dict, target_sheets=selected_target_sheets)
                 ts.config = updated_config
+                ts.expected_structure = expected_struct_dict or None
                 db.commit()
             else:
                 session_key = f"{tenant_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -1729,6 +1725,8 @@ async def start_training(
                     logger.warning(f"预期文件结构分析失败: {e}")
                     if len(expected_files) > 1:
                         raise
+                if mode == 'formula':
+                    expected_struct_dict = select_formula_target_sheets(expected_struct_dict, selected_target_sheets)
 
                 config = {
                     "source_dir": source_dir,
@@ -1747,7 +1745,7 @@ async def start_training(
                     "mode": mode,
                     "file_passwords": passwords,
                     "script_name": (script_name or "").strip() or f"script_{tenant_id}",
-                    "target_sheets": _parsed_target_sheets,
+                    "target_sheets": selected_target_sheets,
                 }
                 ts = persistence.create_session(
                     tenant_id=tenant_id,

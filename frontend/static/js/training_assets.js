@@ -82,7 +82,7 @@ function _renderSessionAssets(data) {
 }
 
 async function saveSessionAssets() {
-    if (!_currentSessionId || _savingAssets) return false;
+    if (!_currentSessionId || _savingAssets || _sheetPickerResolver) return false;
     const sessionId = _currentSessionId;
     const status = document.getElementById('session-asset-status');
     const button = document.getElementById('save-session-assets');
@@ -92,12 +92,18 @@ async function saveSessionAssets() {
         const changed = Object.fromEntries(Object.entries(settings).filter(([key, value]) =>
             JSON.stringify(value) !== JSON.stringify(_sessionSettings?.[key])));
         if (!inputs.some(input => input.files.length) && !Object.keys(changed).length) return true;
+        const targetFiles = Array.from(inputs[1].files);
+        if (settings.mode === 'formula' && targetFiles.length) {
+            const selection = await _pickTargetSheets(targetFiles.length > 1 ? targetFiles : targetFiles[0], 'formula');
+            if (selection === null || _currentSessionId !== sessionId) return false;
+            changed.target_sheets = selection;
+        }
         const form = new FormData();
         form.append('settings', JSON.stringify(changed));
         form.append('source_mode', document.getElementById('source-update-mode').value);
         form.append('file_passwords', JSON.stringify(_filePasswordsMap || {}));
         for (const file of inputs[0].files) form.append('source_files', file);
-        for (const file of inputs[1].files) form.append('target_files', file);
+        for (const file of targetFiles) form.append('target_files', file);
         for (const file of inputs[2].files) form.append('rule_files', file);
         _savingAssets = true; button.disabled = true; _setUIStreaming(_isStreaming);
         status.textContent = '正在排队验证并保存，原文件在成功前保持可用…';
