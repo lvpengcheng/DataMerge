@@ -237,7 +237,8 @@ def execute_workbooks(targets, environment):
     output = Path(environment["output_folder"])
     output.mkdir(parents=True, exist_ok=True)
     # Isolated globals and folders prevent same-named functions/sheets/files colliding.
-    with tempfile.TemporaryDirectory(prefix="multi_", dir=output) as staging:
+    from .workbook_staging import workbook_staging
+    with workbook_staging(prefix="multi_", dir=output) as staging:
         completed = []
         for index, (name, target) in enumerate(targets.items()):
             validate_name(name)
@@ -303,6 +304,8 @@ def execute_workbooks(targets, environment):
                 staged_report = Path(staging) / f"{index}.json"
                 shutil.copy2(report, staged_report)
                 completed.append((staged_report, output / (name + ".fill_report.json")))
+            # Functions retain their globals; discard the child scope before cleanup.
+            env.clear()
         for source, destination in completed:
             os.replace(source, destination)
     return {"output_files": list(targets)}

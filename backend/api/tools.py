@@ -1299,16 +1299,32 @@ async def _integrate_reparse_headers_impl(req, current_user, workflow):
     if not old_files:
         raise HTTPException(status_code=400, detail="会话中没有可重新解析的文件")
 
+    ranges = req.header_ranges or {}
+    if not ranges or not set(ranges).issubset(old_files):
+        raise HTTPException(status_code=400, detail="请选择当前会话中的表并指定表头范围")
+
     new_meta = []
     started = time.perf_counter()
     parsed_count = 0
     for name, old in old_files.items():
+        # A target tab can submit only its visible tables. Other uploads retain
+        # both their parsed metadata and automatic/manual header status.
+        if name not in ranges and name not in req.sheet_selections:
+            new_meta.append(old)
+            continue
         selected_sheet = req.sheet_selections.get(name) or old.get('sheet')
         if selected_sheet != old.get('sheet'):
             if old.get('sheet_explicit') or selected_sheet not in (old.get('available_sheets') or []):
                 raise HTTPException(400, detail=f'{name}: 请选择有效的可见Sheet')
-        spec = (req.header_ranges or {}).get(name) or {}
+        spec = ranges.get(name) or {}
         try:
+            if not isinstance(spec, dict) or any(
+                isinstance(spec.get(key), bool)
+                or not isinstance(spec.get(key), (str, int))
+                or not str(spec.get(key)).strip().isdecimal()
+                for key in ('start_row', 'end_row')
+            ):
+                raise ValueError('invalid header row')
             start = int(spec.get("start_row"))
             end = int(spec.get("end_row"))
         except (TypeError, ValueError):

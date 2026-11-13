@@ -33,6 +33,8 @@ function environment() {
     });
     vm.runInContext(fs.readFileSync('frontend/static/js/tools.js', 'utf8') + '\nthis.tools = Tools;', context);
     const tools = context.tools;
+    // Transport streaming has separate tests; keep this fixture about wizard state.
+    tools._intFetch = context.AUTH.authFetch;
     tools._renderIntegrateConfig = () => {vm.runInContext('_intApplyReady = false', context);};
     tools._intFillFromScheme = scheme => filled.push(scheme);
     tools._intConfirmColumnMappings = async () => true;
@@ -69,6 +71,28 @@ function environment() {
     assert.equal(JSON.parse(env.calls[0].body).header_ranges['main.xlsx'].end_row, 2, 'manual range must be preserved');
     assert.equal(JSON.parse(env.calls[0].body).scheme_id, 12);
     assert.equal(env.filled.length, 2, 'manual reparse must reload scheme mappings');
+
+    // Apply tabs can hide uploads that the server still knows about.
+    const partial = environment();
+    await partial.tools._analyzeIntegrate();
+    partial.context.document.querySelectorAll = () => [{
+        dataset: {file: 'main.xlsx'}, querySelector: () => ({value: '1'}),
+    }];
+    partial.calls.length = 0;
+    await partial.tools._intReparseHeaders();
+    assert.deepEqual(JSON.parse(partial.calls[0].body).header_ranges, {
+        'main.xlsx': {start_row: 1, end_row: 1},
+        'source.xlsx': {start_row: 1, end_row: 1},
+    });
+    const alerts = [];
+    partial.context.alert = message => alerts.push(message);
+    partial.context.document.querySelectorAll = () => [{
+        dataset: {file: 'main.xlsx'}, querySelector: () => ({value: '1.5'}),
+    }];
+    partial.calls.length = 0;
+    await partial.tools._intReparseHeaders();
+    assert.equal(partial.calls.length, 0, 'fractional rows must not be truncated to integers');
+    assert.equal(alerts.length, 1);
 
     env.setValidation({ok: false, reasons: ['missing required column']});
     await env.tools._intPrefillForApply();

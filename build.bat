@@ -9,6 +9,10 @@ REM ==========================================
 
 set VERSION=1.0.0
 set RELEASES_DIR=releases
+if /I "%~1"=="iis" (
+    set "IIS_RUNTIME_ARCHIVES=%~2"
+    goto :BUILD_IIS
+)
 
 echo.
 echo ==========================================
@@ -109,6 +113,9 @@ echo ------------------------------------------
 
 set IIS_PKG=DataMerge-IIS-v%VERSION%
 set IIS_DIR=%RELEASES_DIR%\%IIS_PKG%
+if not defined IIS_RUNTIME_ARCHIVES set "IIS_RUNTIME_ARCHIVES=%RELEASES_DIR%\iis-runtime-archives"
+powershell -NoProfile -ExecutionPolicy Bypass -File "tools\iis\install.ps1" -PrepareArchivesIn "%IIS_RUNTIME_ARCHIVES%"
+if errorlevel 1 exit /b 1
 
 if exist "%IIS_DIR%" rd /s /q "%IIS_DIR%"
 mkdir "%IIS_DIR%"
@@ -138,52 +145,19 @@ if exist web.config copy /Y web.config "%IIS_DIR%\" >nul
 REM 只发 .env.example 模板，不打包 .env（避免泄露密钥；部署时由 install.bat 提示复制为 .env）
 if exist .env.example copy /Y .env.example "%IIS_DIR%\.env.example" >nul
 
-echo [5/6] 生成安装脚本...
-(
-echo @echo off
-echo chcp 65001 ^>nul 2^>nul
-echo echo ========================================
-echo echo   DataMerge 安装脚本
-echo echo ========================================
-echo echo.
-echo.
-echo python --version ^>nul 2^>^&1
-echo if errorlevel 1 ^(
-echo     echo [错误] 未检测到 Python，请先安装 Python 3.11+
-echo     pause
-echo     exit /b 1
-echo ^)
-echo.
-echo echo [1/2] 安装依赖...
-echo pip install --upgrade pip
-echo pip install -r requirements.txt
-echo.
-echo if not exist .env if exist .env.example copy /Y .env.example .env ^>nul
-echo echo [2/2] 初始化数据库...
-echo python -m backend.database.init_db
-echo.
-echo echo ========================================
-echo echo   安装完成!
-echo echo ========================================
-echo echo.
-echo echo 下一步:
-echo echo   1. 编辑 .env 文件（已从 .env.example 生成），配置 AI API Key
-echo echo   2. 运行 start.bat 启动服务
-echo echo   3. 访问 http://localhost:8000
-echo echo.
-echo pause
-) > "%IIS_DIR%\install.bat"
-
-(
-echo @echo off
-echo chcp 65001 ^>nul 2^>nul
-echo echo 启动 DataMerge 服务...
-echo python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
-) > "%IIS_DIR%\start.bat"
+echo [5/6] 复制 IIS 安装脚本和运行时配置...
+for %%f in (install.bat install.ps1 start.bat calculation-constraints.txt SOLUTION-RUNTIME.md) do (
+    copy /Y "tools\iis\%%f" "%IIS_DIR%\" >nul || exit /b 1
+)
+copy /Y "tools\iis\runtimeconfig.json" "%IIS_DIR%\libs\runtimeconfig.json" >nul || exit /b 1
+for %%f in (cpython-3.11.17+20261013-x86_64-pc-windows-msvc-install_only_stripped.tar.gz dotnet-runtime-9.0.21-win-x64.zip) do (
+    copy /Y "%IIS_RUNTIME_ARCHIVES%\%%f" "%IIS_DIR%\" >nul || exit /b 1
+)
 
 echo [6/6] 打包 zip...
 if not exist "%RELEASES_DIR%" mkdir "%RELEASES_DIR%"
-powershell -command "Compress-Archive -Path '%IIS_DIR%\*' -DestinationPath '%RELEASES_DIR%\%IIS_PKG%.zip' -Force"
+powershell -NoProfile -Command "Compress-Archive -Path '%IIS_DIR%\*' -DestinationPath '%RELEASES_DIR%\%IIS_PKG%.zip' -Force -ErrorAction Stop"
+if errorlevel 1 exit /b 1
 rd /s /q "%IIS_DIR%"
 
 for %%A in (%RELEASES_DIR%\%IIS_PKG%.zip) do (
@@ -194,8 +168,8 @@ for %%A in (%RELEASES_DIR%\%IIS_PKG%.zip) do (
 echo.
 echo   部署步骤:
 echo     1. 解压到 C:\inetpub\wwwroot\DataMerge
-echo     2. 运行 install.bat
-echo     3. 编辑 .env 配置 API Key
+echo     2. 运行 install.bat 安装 Python 3.11.17 和 .NET 9.0.21
+echo     3. 编辑 .env，首次部署按需运行 install.bat -InitializeDatabase
 echo     4. 在 IIS 创建网站指向该目录
 echo.
 goto :EOF

@@ -72,7 +72,8 @@ def launch(params_file, solution, mode):
     manifest = verify(root)
     from .environment import runtime_python
     executable = runtime_python(manifest['environment'], ROOT)
-    return [executable, '-I', '-X', 'utf8', '-u', str(root / 'runtime/backend/solutions/worker.py'),
+    # The deployment owns the bootstrap/OS bridge; calculation modules stay frozen.
+    return [executable, '-I', '-X', 'utf8', '-u', str(ROOT / 'backend/solutions/worker.py'),
             str(root), mode, str(params_file), str(ROOT)]
 
 

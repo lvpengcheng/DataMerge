@@ -7,8 +7,58 @@ import subprocess
 import json
 import hashlib
 import ast
+import re
 from pathlib import Path
 from .package import digest_file
+
+# This is the spreadsheet execution contract, not a hash of the host's tools,
+# web server, GPU drivers or Python executable. Platform wheels may differ.
+CALCULATION_PACKAGES = frozenset({
+    'numpy', 'pandas', 'openpyxl', 'xlrd', 'pythonnet', 'clr-loader',
+    'et-xmlfile', 'python-dateutil', 'pytz', 'tzdata', 'six', 'cffi',
+})
+
+
+def compatibility_errors(expected, actual):
+    errors = []
+    for key in ('python', 'implementation'):
+        if not expected.get(key) or expected.get(key) != actual.get(key):
+            errors.append(f'{key}: 方案={expected.get(key)}，本机={actual.get(key)}')
+    aliases = {'amd64': 'x86_64', 'aarch64': 'arm64'}
+    machines = [aliases.get(str(e.get('machine', '')).lower(), str(e.get('machine', '')).lower())
+                for e in (expected, actual)]
+    if not machines[0] or machines[0] != machines[1]:
+        errors.append('CPU 架构不兼容')
+    if expected.get('platform') not in ('win32', 'linux') or actual.get('platform') not in ('win32', 'linux'):
+        if expected.get('platform') != actual.get('platform'):
+            errors.append('不支持此操作系统组合')
+    required = {v for v in expected.get('dotnet', []) if v.startswith('Microsoft.NETCore.App ')}
+    if not required or not required.issubset(set(actual.get('dotnet', []))):
+        errors.append('.NET Core: 需要 ' + ', '.join(sorted(required)))
+    def packages(env):
+        return {re.sub(r'[-_.]+', '-', k.lower()): v for k, v in env.get('packages', {}).items()}
+    wanted, installed = packages(expected), packages(actual)
+    for name in sorted(CALCULATION_PACKAGES & wanted.keys()):
+        if installed.get(name) != wanted[name]:
+            errors.append(f'{name}: 方案={wanted[name]}，本机={installed.get(name, "未安装")}')
+    return errors
+
+
+def prepare_platform_runtime(expected, runtime, host):
+    """Add only the destination Skia native binary to the private execution copy."""
+    import shutil
+    runtime, host = Path(runtime), Path(host)
+    filename = 'libSkiaSharp.dll' if sys.platform == 'win32' else 'libSkiaSharp.so'
+    target = runtime / 'libs' / filename
+    if target.is_file() or not (runtime / 'libs/SkiaSharp.dll').is_file():
+        return
+    native = host / 'libs' / filename
+    managed = host / 'libs/SkiaSharp.dll'
+    if not native.is_file() or not managed.is_file():
+        raise ValueError('本机缺少平台运行库：' + filename)
+    if digest_file(managed) != expected.get('native', {}).get('SkiaSharp.dll'):
+        raise ValueError('本机 SkiaSharp 程序集与方案版本不一致，无法适配平台运行库')
+    shutil.copy2(native, target)
 
 
 def fingerprint(root):
@@ -18,7 +68,8 @@ def fingerprint(root):
         if p.is_file() and p.suffix.lower() in ('.dll', '.so', '.json', '.dylib'):
             native[p.relative_to(libs).as_posix()] = digest_file(p)
     try:
-        dotnet = subprocess.run(['dotnet', '--list-runtimes'], capture_output=True, text=True, timeout=10)
+        local = Path(os.environ.get('DOTNET_ROOT', '')) / ('dotnet.exe' if os.name == 'nt' else 'dotnet')
+        dotnet = subprocess.run([str(local.resolve()) if local.is_file() else 'dotnet', '--list-runtimes'], capture_output=True, text=True, timeout=10)
         dotnet_versions = sorted(' '.join(line.split()[:2]) for line in dotnet.stdout.splitlines())
     except (OSError, subprocess.TimeoutExpired):
         dotnet_versions = []
@@ -51,6 +102,9 @@ def runtime_python(expected, root):
     current['native'] = expected['native']
     if current == expected:
         return sys.executable
+    errors = compatibility_errors(expected, current)
+    if not errors:
+        return sys.executable
     registry = Path(root) / 'solution_store' / 'runtimes.json'
     candidates = json.loads(registry.read_text(encoding='utf-8')) if registry.exists() else {}
     executable = candidates.get(environment_id(expected))
@@ -63,9 +117,10 @@ def runtime_python(expected, root):
         if result.returncode == 0:
             actual = json.loads(result.stdout.strip().splitlines()[-1])
             actual['native'] = expected['native']
-            if actual == expected:
+            if actual == expected or not compatibility_errors(expected, actual):
                 return executable
-    raise ValueError('方案运行环境不匹配，请保留并登记原 Python/依赖/.NET 环境；禁止自动使用当前依赖。环境标识：' + environment_id(expected))
+    raise ValueError('方案运行环境不兼容，禁止自动使用不兼容依赖。请安装对应版本或登记兼容环境：'
+                     + '；'.join(errors) + '。环境标识：' + environment_id(expected))
 
 
 def calculation_settings():

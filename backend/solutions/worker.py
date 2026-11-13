@@ -8,7 +8,24 @@ import tempfile
 from pathlib import Path
 
 
+def deployment_support():
+    """Load trusted bootstrap helpers under an alias, without caching host backend modules."""
+    import importlib.util
+    import importlib
+    directory = Path(__file__).resolve().parent
+    spec = importlib.util.spec_from_file_location('_solution_host', directory / '__init__.py',
+                                                  submodule_search_locations=[str(directory)])
+    module = importlib.util.module_from_spec(spec)
+    sys.modules['_solution_host'] = module
+    # Some legacy test fixtures contain only the individual module files.
+    if (directory / '__init__.py').is_file():
+        spec.loader.exec_module(module)
+    return importlib.import_module('_solution_host.environment')
+
+
 def main():
+    sys.dont_write_bytecode = True
+    support = deployment_support()
     package, mode, params_file, host = map(str, sys.argv[1:5])
     package, host = Path(package), Path(host)
     # The package is never writable by ordinary execution: use a private copy
@@ -23,9 +40,18 @@ def main():
         from backend.solutions.package import verify
         manifest = verify(package)
         if manifest.get('environment') is not None:
-            from backend.solutions.environment import fingerprint
-            if fingerprint(runtime) != manifest['environment']:
-                raise ValueError('隔离工作进程的实际运行环境与方案不一致，已停止计算')
+            actual = support.fingerprint(runtime)
+            expected = manifest['environment']
+            errors = support.compatibility_errors(expected, actual)
+            if actual != expected and errors:
+                raise ValueError('隔离工作进程的实际运行环境与方案不兼容：' + '；'.join(errors))
+            if actual.get('native') != expected.get('native'):
+                raise ValueError('方案计算程序集校验失败')
+            support.prepare_platform_runtime(expected, runtime, host)
+            actual = support.fingerprint(runtime)
+            print('SOLUTION_RUNTIME=' + json.dumps({'original': support.environment_id(expected),
+                  'actual': support.environment_id(actual), 'platform': actual['platform'],
+                  'compatibility_policy': 'spreadsheet-v1', 'environment': actual}, ensure_ascii=False), flush=True)
         from backend.solutions.store import materialize
         settings = manifest['settings']
         from backend.solutions.environment import calculation_settings
@@ -59,6 +85,17 @@ def main():
             return None
         template_resolver.resolve_template_path = resolve
         import backend.app.main as app
+        # Older packages retain the TemporaryDirectory cleanup bug. Patch only
+        # that module's staging facade, leaving business code and artifacts intact.
+        helper = Path(__file__).resolve().parents[1] / 'utils/workbook_staging.py'
+        frozen_multi = runtime / 'backend/utils/multi_workbook.py'
+        if helper.is_file() and frozen_multi.is_file():
+            import importlib.util
+            spec = importlib.util.spec_from_file_location('_solution_staging', helper)
+            cleanup = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(cleanup)
+            from backend.utils import multi_workbook
+            cleanup.install_legacy_cleanup(multi_workbook)
         metadata = materialize(manifest['metadata'], package)
         app._load_script_info_for_precheck = lambda *a, **k: metadata
         from backend.storage.storage_manager import StorageManager

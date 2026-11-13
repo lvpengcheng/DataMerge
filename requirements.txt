@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # 核心依赖
 fastapi>=0.115.0
 uvicorn[standard]==0.24.0

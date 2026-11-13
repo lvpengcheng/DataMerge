@@ -841,12 +841,15 @@ const Tools = {
     },
 
     async _intReparseHeaders() {
-        const ranges = {};
+        // Target tabs render only their active files; retain ranges for other uploads.
+        const ranges = Object.fromEntries((_integrateAnalysis.files || []).map(f => [f.name, {
+            start_row: f.header_start, end_row: f.header_end,
+        }]));
         let invalid = null;
         document.querySelectorAll('.int-header-range').forEach(row => {
-            const start = parseInt(row.querySelector('.int-header-start')?.value, 10);
-            const end = parseInt(row.querySelector('.int-header-end')?.value, 10);
-            if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start) invalid = row.dataset.file;
+            const start = Number(row.querySelector('.int-header-start')?.value);
+            const end = Number(row.querySelector('.int-header-end')?.value);
+            if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end - start > 20) invalid = row.dataset.file;
             ranges[row.dataset.file] = { start_row: start, end_row: end };
         });
         if (invalid) { alert(`文件「${invalid}」的列头起止行无效`); return; }
